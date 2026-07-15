@@ -1,0 +1,16 @@
+{
+  "id": "d10_wrongop_py_validation",
+  "language": "python",
+  "label": "defect",
+  "defect_class": "wrong-operator",
+  "intent": "is_valid_age(a) is True only when a is between 0 and 120 inclusive.",
+  "diff": [
+    "--- a/age.py",
+    "+++ b/age.py",
+    "@@ -1,2 +1,2 @@",
+    " def is_valid_age(a):",
+    "-    return a >= 0 and a <= 120",
+    "+    return a >= 0 or a <= 120"
+  ],
+  "why": "`or` makes the predicate true for every integer (e.g. -5 satisfies a <= 120); should be `and`."
+}

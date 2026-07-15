@@ -1,0 +1,18 @@
+{
+  "id": "c11_dict_get_default_py",
+  "language": "python",
+  "label": "clean",
+  "defect_class": "clean",
+  "intent": "count_for(counts, key) returns the stored count, or 0 when the key is absent.",
+  "diff": [
+    "--- a/counts.py",
+    "+++ b/counts.py",
+    "@@ -1,4 +1,2 @@",
+    " def count_for(counts, key):",
+    "-    if key in counts:",
+    "-        return counts[key]",
+    "-    return 0",
+    "+    return counts.get(key, 0)"
+  ],
+  "why": "dict.get(key, 0) is the correct equivalent of the absent-key guard."
+}

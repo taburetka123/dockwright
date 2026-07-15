@@ -1,0 +1,21 @@
+{
+  "id": "d06_boundary_kt_retry",
+  "language": "kotlin",
+  "label": "defect",
+  "defect_class": "wrong-boundary",
+  "intent": "Retry an operation up to MAX_ATTEMPTS times total (MAX_ATTEMPTS = 3 means at most 3 calls).",
+  "diff": [
+    "--- a/Retry.kt",
+    "+++ b/Retry.kt",
+    "@@ -2,7 +2,7 @@",
+    "     var attempts = 0",
+    "     while (true) {",
+    "         attempts++",
+    "         try { return op() } catch (e: Exception) {",
+    "-            if (attempts >= MAX_ATTEMPTS) throw e",
+    "+            if (attempts > MAX_ATTEMPTS) throw e",
+    "         }",
+    "     }"
+  ],
+  "why": "`> MAX_ATTEMPTS` lets the loop run a 4th attempt before giving up; bound should be `>=`."
+}

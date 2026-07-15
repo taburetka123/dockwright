@@ -1,0 +1,22 @@
+{
+  "id": "c04_errorhandling_kt_rethrow",
+  "language": "kotlin",
+  "label": "clean",
+  "defect_class": "clean",
+  "intent": "loadConfig parses the config; on failure it logs context then propagates so startup aborts.",
+  "diff": [
+    "--- a/Config.kt",
+    "+++ b/Config.kt",
+    "@@ -1,3 +1,8 @@",
+    " fun loadConfig(path: String): Config {",
+    "-    return parse(readFile(path))",
+    "+    return try {",
+    "+        parse(readFile(path))",
+    "+    } catch (e: Exception) {",
+    "+        log.error(\"failed to load config at $path\", e)",
+    "+        throw e",
+    "+    }",
+    " }"
+  ],
+  "why": "Logs then rethrows \u2014 error still propagates; correct."
+}

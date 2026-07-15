@@ -1,0 +1,19 @@
+{
+  "id": "c01_refactor_extract_py",
+  "language": "python",
+  "label": "clean",
+  "defect_class": "clean",
+  "intent": "total_price extracts the per-item subtotal into a helper; behavior is unchanged.",
+  "diff": [
+    "--- a/cart.py",
+    "+++ b/cart.py",
+    "@@ -1,2 +1,5 @@",
+    "+def _line_total(item):",
+    "+    return item.price * item.qty",
+    "+",
+    " def total_price(items):",
+    "-    return sum(item.price * item.qty for item in items)",
+    "+    return sum(_line_total(item) for item in items)"
+  ],
+  "why": "Pure equivalent refactor; no behavior change."
+}
