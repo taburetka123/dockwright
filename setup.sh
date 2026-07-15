@@ -446,6 +446,14 @@ echo "→ Stamped deploy provenance to $DEPLOY_STAMP (sha=$DEPLOY_SHA branch=$DE
 # FILES_ONLY (S6 sandbox) skips doctor (needs $DOCKWRIGHT_BIN + the wired config it
 # verifies) and the overlay setup.d runner below.
 if [ "${DOCKWRIGHT_SETUP_FILES_ONLY:-}" != "1" ]; then
+# Ensure the default/configured worker home exists so a bare spawn_worker never
+# falls back to the manager's (untrusted) cwd on a fresh install (fix M-1). NOT
+# RENDER_BIN-gated: the S6 sandbox sets DOCKWRIGHT_ORCH_BIN but neither HOME nor
+# CLAUDE_ORCH_WORKER_HOME, so a RENDER_BIN gate would mkdir the operator's real
+# worker home during FILES_ONLY tests. The FILES_ONLY guard is the machine-mutation seam.
+WORKER_HOME="$("$DOCKWRIGHT_BIN" ensure-worker-home || true)"
+[ -n "$WORKER_HOME" ] && echo "→ Ensured worker home exists: $WORKER_HOME"
+
 echo "→ Verifying environment wiring (dockwright doctor)…"
 DOCTOR_ARGS=(--orch-bin "$DOCKWRIGHT_BIN" --claude-json "$HOME/.claude.json" --settings "$SETTINGS"
     --brew-prefix "$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
@@ -474,3 +482,8 @@ echo "  Start a session:"
 echo "    dockwright manager"
 echo "  (or manually: tmux -L dockwright -f ~/.claude/dockwright/dockwright.tmux.conf new-session,"
 echo "  then launch claude (or codex) inside it and run /manager)."
+echo ""
+echo "  Optional self-improvement (off by default, extra token cost):"
+echo "    dockwright selffix enable    # session-end retrospectives (findings)"
+echo "    dockwright gardener enable   # background digest of findings into ranked proposals (needs selffix)"
+echo "                                 #   --lane all also arms the weekly web-research sweep"

@@ -104,6 +104,28 @@ def _looks_like_session(command: str) -> bool:
     return bool(tokens) and os.path.basename(tokens[0]) in ("claude", "codex")
 
 
+def _tmux_socket() -> str:
+    return (os.environ.get("DOCKWRIGHT_TMUX_SOCKET")
+            or os.environ.get("CLAUDE_ORCH_TMUX_SOCKET")  # deprecated, one release
+            or "dockwright")
+
+
+def _live_pane_ids():
+    """Pane ids alive on the orchestrator tmux server; None when tmux cannot
+    answer (error/timeout), set() when the server simply isn't running.
+    Mirrors registry._live_pane_ids semantics — intentionally duplicated to
+    keep this script stdlib-only, the same way _prune_active mirrors registry."""
+    try:
+        proc = subprocess.run(
+            ["tmux", "-L", _tmux_socket(), "list-panes", "-a", "-F", "#{pane_id}"],
+            capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return set() if "no server" in (proc.stderr or "").lower() else None
+    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+
 def _prune_handoffs(now: float) -> tuple[int, int]:
     if not HANDOFFS.is_dir():
         return 0, 0
@@ -189,13 +211,15 @@ def _append_spend_drop(record: dict, source: str) -> None:
     mirrors registry. Best-effort: hygiene must never fail on observability."""
     try:
         spend = record.get("spend")
-        if not isinstance(spend, dict):
-            return
+        spend = spend if isinstance(spend, dict) else {}
         totals = {key: spend[key]
                   for key in ("turns", "out_tokens", "in_tokens",
                               "cache_read_tokens", "cache_creation_tokens")
                   if isinstance(spend.get(key), int) and not isinstance(spend.get(key), bool)}
-        if not totals:
+        if not totals and source != "preflight_prune":
+            # A preflight prune unlinks the record with no other durable trace,
+            # so it ledgers even at zero spend; closed_prune records were
+            # already ledgered at their original drop.
             return
         entry = {
             "ts": time.time(),
@@ -236,16 +260,18 @@ def _prune_active() -> tuple[list[str], list[str]]:
     Closed lanes: pid<=0 / out-of-range / missing pid, and alive-pid records
     whose process isn't a session. A recycled pid claimed by ANOTHER claude
     session is indistinguishable from the record's own and is kept silently —
-    still the safe direction. Residual lane (narrowed, NOT closed): a record
-    whose stored pid is positive but DEAD while its session lives on (e.g. a
-    resume that kept the old incarnation's pid) still deletes — a dead pid has
-    no command line left to check.
+    still the safe direction. Residual lane closed by the pane gate: a record
+    whose stored pid is dead while its pane lives (Linux transient-$PPID
+    registrations, recycled pids) is KEPT and reported; only a dead pid with
+    no surviving pane deletes.
 
     Returns (pruned_labels, kept_odd_labels)."""
     if not ACTIVE.is_dir():
         return [], []
     pruned: list[str] = []
     kept_odd: list[str] = []
+    live_panes = None
+    panes_fetched = False
     for p in ACTIVE.iterdir():
         if p.suffix != ".json":
             continue
@@ -261,6 +287,17 @@ def _prune_active() -> tuple[list[str], list[str]]:
             if not _looks_like_session(_process_command(pid)):
                 kept_odd.append(f"{label} (alive but non-session command)")
             continue
+        window_id = record.get("window_id") or record.get("iterm_sid") or ""
+        if window_id:
+            if not panes_fetched:
+                live_panes = _live_pane_ids()
+                panes_fetched = True
+            if live_panes is None:
+                kept_odd.append(f"{label} (dead pid; tmux unanswerable, pane {window_id} unverified)")
+                continue
+            if str(window_id) in live_panes:
+                kept_odd.append(f"{label} (dead pid but live pane {window_id})")
+                continue
         sid = record.get("claude_sid")
         _append_spend_drop(record, "preflight_prune")
         p.unlink(missing_ok=True)

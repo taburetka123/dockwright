@@ -60,7 +60,7 @@ There is no daemon. Sessions register themselves through SessionStart/Stop hooks
 - **Artifacts & pipeline.** Workers persist specs/plans/results as durable per-task documents (`artifact_put`); `pipeline_status(task_key)` replays the whole board — artifacts × assignments × events — after any crash or recreate.
 - **Account pooling & auto-switch.** Optional: spawns round-robin across multiple `/login` accounts weighted by rate-limit headroom; when the active account hits its limit, a pointer flips and new spawns plus manager recovery ride the healthy one.
 - **The compose seam.** Deployed agent files are generated from generic cores (`deploy/agents/*.core.md`) + your private overlay drop-ins + `dockwright.toml` vars — the shipped product stays generic, your conventions live outside the repo.
-- **Optional modules.** A self-improvement loop (session retrospectives digested into ranked improvement proposals) ships inert, off by default. If you use [Superpowers](https://github.com/obra/superpowers), bind its skills via overlay vars; otherwise a framework-neutral engineering chain ships as-is.
+- **Optional modules.** A self-improvement loop (session retrospectives digested into ranked improvement proposals) ships inert, off by default. If you use [Superpowers](https://github.com/obra/superpowers), bind its skills via overlay vars; otherwise a framework-neutral engineering chain ships as-is. Turn it on: `dockwright selffix enable` (session-end retros; extra token cost), then `dockwright gardener enable` to digest them into ranked proposals.
 
 ## Commands
 

@@ -983,10 +983,24 @@ def _published_count(claude_sid: str):
         return None
 
 def worker_done_impl(claude_sid: str, summary: str) -> dict:
-    """Write a one-shot done event for an active worker. Returns the event id."""
+    """Write a one-shot done event for an active worker. Returns the event id.
+
+    Self-heals when the active record is gone but the claimed assignment
+    survives: a reaped registration must not strand a finished worker's
+    completion signal — the assignment carries the routing fields (name,
+    parent manager); spend died with the record and is unknowable."""
     record = state.read_json(paths.ACTIVE / f"{claude_sid}.json")
+    self_healed = False
     if record is None:
-        raise ValueError(f"session {claude_sid} not registered; cannot signal done")
+        assignment = state.read_json(paths.assignment_path(claude_sid))
+        if (not isinstance(assignment, dict)
+                or assignment.get("claude_sid") != claude_sid):
+            raise ValueError(f"session {claude_sid} not registered; cannot signal done")
+        record = {
+            "name": assignment.get("name"),
+            "parent_manager_name": assignment.get("parent_manager_name"),
+        }
+        self_healed = True
     if record.get("nested"):
         return {
             "ok": False,
@@ -1013,8 +1027,13 @@ def worker_done_impl(claude_sid: str, summary: str) -> dict:
     published = _published_count(claude_sid)
     if published is not None:
         done_event["ticket"], done_event["artifacts_published"] = published
+    if self_healed:
+        done_event["self_healed"] = True
     state.write_json_atomic(done_dir / f"{claude_sid}-{event_id}.json", done_event)
-    return {"ok": True, "event_id": event_id}
+    result = {"ok": True, "event_id": event_id}
+    if self_healed:
+        result["self_healed"] = True
+    return result
 
 # A done event landing within this many seconds BEFORE a re-task is treated as
 # the just-finished task's legit completion, not a stale event — without the
@@ -2194,7 +2213,7 @@ async def spawn_worker_impl(
     if gate.get("status") == "paused":
         return gate
     if cwd is None:
-        home = paths.worker_home()
+        home = paths.ensure_worker_home()
         cwd = str(home) if home.is_dir() else os.getcwd()
     if name is None:
         name = f"worker-{int(time.time())}"

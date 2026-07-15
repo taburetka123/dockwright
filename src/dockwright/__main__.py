@@ -69,6 +69,15 @@ def main() -> None:
     elif cmd == "manager":
         from .manager_launch import main as manager_main
         sys.exit(manager_main(sys.argv[2:]))
+    elif cmd == "ensure-worker-home":
+        from .ensure_worker_home import main as ewh_main
+        sys.exit(ewh_main(sys.argv[2:]))
+    elif cmd == "selffix":
+        from .pipeline_wiring import selffix_main
+        sys.exit(selffix_main(sys.argv[2:]))
+    elif cmd == "gardener":
+        from .pipeline_wiring import gardener_main
+        sys.exit(gardener_main(sys.argv[2:]))
     else:
         print(f"Unknown subcommand: {cmd}", file=sys.stderr)
         sys.exit(2)

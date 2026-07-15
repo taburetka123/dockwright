@@ -126,21 +126,38 @@ def _apply_captured_window_id(sid: str, record: dict) -> None:
         return
 
 
-def _ancestor_pids(start_pid: int, max_hops: int = 15) -> set:
-    """Strict process-ancestors of start_pid, walked ppid-by-ppid.
+def _iter_ancestors(start_pid: int, max_hops: int = 15):
+    """Lazy strict process-ancestors of start_pid, walk order (parent first).
 
-    Stops at pid 1, a self-loop, a cycle, or any lookup failure — best-effort
-    by design, the caller treats a short walk as "no match"."""
+    Same semantics as _ancestor_chain (exclusive, cycle/failure-stopping) but
+    yields on demand: a caller that only needs the nearest match (e.g.
+    _resolve_session_pid) can stop as soon as it finds one instead of paying
+    for the full walk's `ps` calls up front."""
     from .identity import _ppid_of
-    ancestors: set = set()
+    seen: set = set()
     cursor = start_pid
     for _ in range(max_hops):
         parent = _ppid_of(cursor)
-        if parent is None or parent <= 1 or parent == cursor or parent in ancestors:
+        if parent is None or parent <= 1 or parent == cursor or parent in seen:
             break
-        ancestors.add(parent)
+        yield parent
+        seen.add(parent)
         cursor = parent
-    return ancestors
+
+
+def _ancestor_chain(start_pid: int, max_hops: int = 15) -> list:
+    """Strict process-ancestors of start_pid in walk order (parent first).
+
+    Excludes start_pid itself — _ancestor_pids consumers (nested detection)
+    rely on the exclusive semantics. Stops at pid 1, a self-loop, a cycle, or
+    any lookup failure — best-effort by design, callers treat a short walk as
+    "no match"."""
+    return list(_iter_ancestors(start_pid, max_hops))
+
+
+def _ancestor_pids(start_pid: int, max_hops: int = 15) -> set:
+    """Strict process-ancestors of start_pid, walked ppid-by-ppid."""
+    return set(_ancestor_chain(start_pid, max_hops))
 
 
 def _pid_looks_like_session(pid: int) -> bool:
@@ -163,6 +180,31 @@ def _pid_looks_like_session(pid: int) -> bool:
         return _looks_like_session(result.stdout.strip())
     except Exception:
         return False
+
+
+def _resolve_session_pid() -> int:
+    """Pid of the long-lived claude/codex CLI process owning this session.
+
+    On macOS the hook wrapper's $PPID (CLAUDE_PARENT_PID) IS the claude
+    process. On Linux, claude's hook runner interposes a short-lived
+    intermediate (`/bin/sh -c …` on 2.1.210), so the captured pid dies within
+    seconds of registration — and recording it made every prune-bearing fleet
+    call reap the record. Resolve the NEAREST ancestor whose process is a
+    claude/codex session instead, walking from the captured pid and falling
+    back to our own live chain when the intermediate is already gone. Nearest
+    (not farthest) match keeps a nested `claude -p` child resolving to its OWN
+    claude — /clear-rotation supersede and nested detection both key on it.
+    No session on either chain → the captured pid (old behavior; the prune's
+    pane-liveness gate covers that residual)."""
+    raw = os.environ.get("CLAUDE_PARENT_PID", "")
+    captured = int(raw) if raw.isdigit() else os.getppid()
+    for start in dict.fromkeys((captured, os.getppid())):
+        if _pid_looks_like_session(start):
+            return start
+        for pid in _iter_ancestors(start):
+            if _pid_looks_like_session(pid):
+                return pid
+    return captured
 
 
 def _proc_argv(pid: int) -> list | None:
@@ -386,7 +428,7 @@ def session_start() -> None:
         return
     agent = os.environ["CLAUDE_AGENT"]
     iterm_sid = os.environ.get("CLAUDE_ITERM_SID") or get_driver().current_pane_id() or ""
-    cli_pid = int(os.environ.get("CLAUDE_PARENT_PID", os.getppid()))
+    cli_pid = _resolve_session_pid()
     paths.ensure_dirs()
     existing = state.read_json(paths.ACTIVE / f"{sid}.json")
     if existing is not None and existing.get("name") and existing.get("agent") == agent:

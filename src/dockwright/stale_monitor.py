@@ -220,6 +220,15 @@ except ValueError:
     _IDLE_HOURS = 2.0
 IDLE_THRESHOLD_SEC = int(_IDLE_HOURS * 3600)
 AUTOCLOSE_CADENCE_SEC = 3600
+# Orphan-window alarm: a pane in the workers tmux session with no backing
+# active record — the report-only sweep's "orphan terminal window" — pages on
+# the doubling ladder once continuously orphan past the grace (the VM-E2E
+# ghost sat invisible for 22 minutes). Spawn-in-flight windows are protected
+# by their assignments/.pending/*.window sidecar until the SessionStart claim
+# consumes it. Session name is a literal (standalone script);
+# test_stale_monitor pins it to terminal.WORKERS_OS_WINDOW_CLASS.
+WORKERS_SESSION_NAME = "claude-workers"
+ORPHAN_GRACE_SEC = _env_positive_int("CLAUDE_ORCH_ORPHAN_GRACE_SEC", 120)
 
 HOME = Path(os.environ.get("HOME", ""))
 
@@ -238,6 +247,7 @@ _LEGACY_ROOT = HOME / ".claude" / "orchestrator"  # deprecated, one release
 ACTIVE = ROOT / "active"
 QUESTIONS = ROOT / "questions"
 CLOSED = ROOT / "closed"
+ASSIGNMENTS_PENDING = ROOT / "assignments" / ".pending"
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
 CODEX_SESSIONS = HOME / ".codex" / "sessions"
 # entries must be lowercase — matched against text.lower(). RATE_LIMIT_SIGNATURES
@@ -1405,6 +1415,102 @@ def _autoclose_idle_worker(record_path: Path, record: dict, elapsed_sec: int) ->
     return f"AUTOCLOSED {name} idle {elapsed_sec // 60}min"
 
 
+def _scan_orphan_windows(now: int, emitted: dict, next_emitted: dict, emit) -> None:
+    """Page ORPHAN_WINDOW for workers-session panes with no backing record.
+
+    Protection is FLEET-GLOBAL regardless of --manager scoping (orphan-ness is
+    a fleet property): every active record's window id, closed records with a
+    pending question (sweep's invariant), and spawn-in-flight .window sidecars.
+    Fail-safe: one non-nested worker record with an EMPTY window id makes pane
+    attribution unreliable — skip the whole scan (stderr note) rather than
+    false-page; nested records carry window_id="" by design and don't count.
+    Crash-proof: driver absent or unanswerable → no scan, never a raise."""
+    if _get_driver is None:
+        return
+    try:
+        os_windows = _get_driver().ls()
+    except Exception:
+        return
+    if os_windows is None:
+        return
+    candidates: dict = {}
+    for osw in os_windows:
+        if not isinstance(osw, dict) or osw.get("wm_class") != WORKERS_SESSION_NAME:
+            continue
+        tabs = osw.get("tabs")
+        if not isinstance(tabs, list):
+            continue
+        for tab in tabs:
+            if not isinstance(tab, dict):
+                continue
+            windows = tab.get("windows")
+            if not isinstance(windows, list):
+                continue
+            for win in windows:
+                if isinstance(win, dict) and win.get("id") is not None:
+                    candidates[str(win["id"])] = str(tab.get("title") or "?")
+    if not candidates:
+        return
+    protected: set = set()
+    if ACTIVE.is_dir():
+        for p in ACTIVE.iterdir():
+            if p.suffix != ".json":
+                continue
+            record = _load(p)
+            if record is None:
+                continue
+            wid = record.get("window_id") or record.get("iterm_sid") or ""
+            if wid:
+                protected.add(str(wid))
+            elif record.get("agent") == "worker" and not record.get("nested"):
+                print(f"stale_monitor: orphan scan skipped (worker "
+                      f"{record.get('name')} has no window id — pane "
+                      f"attribution unreliable)", file=sys.stderr)
+                return
+    if CLOSED.is_dir():
+        pending_sids = _pending_question_sids()
+        for p in CLOSED.iterdir():
+            if p.suffix != ".json":
+                continue
+            record = _load(p)
+            if record is None or record.get("claude_sid") not in pending_sids:
+                continue
+            wid = record.get("window_id") or record.get("iterm_sid") or ""
+            if wid:
+                protected.add(str(wid))
+    if ASSIGNMENTS_PENDING.is_dir():
+        for sidecar in ASSIGNMENTS_PENDING.glob("*.window"):
+            try:
+                wid = sidecar.read_text().strip()
+            except OSError:
+                continue
+            if wid:
+                protected.add(wid)
+    base_min = max(1, ORPHAN_GRACE_SEC // 60)
+    for pane_id, title in candidates.items():
+        if pane_id in protected:
+            continue          # key (if any) not carried forward → clock resets
+        key = f"orphan:{pane_id}"
+        prev = emitted.get(key)
+        prev = prev if isinstance(prev, dict) else {}
+        first_seen = prev.get("first_seen")
+        if not isinstance(first_seen, (int, float)):
+            first_seen = now
+        paged = prev.get("paged")
+        paged = paged if isinstance(paged, int) else 0
+        entry = {"first_seen": first_seen, "paged": paged}
+        elapsed = int(now - first_seen)
+        if elapsed >= ORPHAN_GRACE_SEC:
+            threshold = _highest_threshold(max(elapsed // 60, base_min), base_min)
+            if threshold is not None and threshold > paged:
+                entry["paged"] = threshold
+                emit("orphan-window", pane_id,
+                     f"ORPHAN_WINDOW {pane_id} tab={title!r} ({elapsed // 60}min) "
+                     f"— no backing active record",
+                     key)
+        next_emitted[key] = entry
+
+
 def main(manager_name: str | None = None) -> int:
     now = int(time.time())
     emitted_state_path = _emitted_state_path(manager_name)
@@ -2001,6 +2107,7 @@ def main(manager_name: str | None = None) -> int:
                         emit("question", record.get("worker_name", ""),
                              f"STALE_QUESTION {qid} worker={record.get('worker_name', '')} ({elapsed_min}min)",
                              key)
+    _scan_orphan_windows(now, emitted, next_emitted, emit)
     pruned_cache = {s: p for s, p in codex_log_cache.items() if s in seen_codex_sids}
     if pruned_cache:
         next_emitted["codex_log_cache"] = pruned_cache
@@ -2062,11 +2169,20 @@ def main(manager_name: str | None = None) -> int:
                 rollup = _build_rollup_line(buffer or {}, manager_name, now)
                 # Un-burn the rungs whose lines only ever reached the buffer:
                 # dropping the dedup key re-fires the same crossing live on the
-                # next scan instead of waiting for the next doubling.
+                # next scan instead of waiting for the next doubling. Dict-valued
+                # ladders (orphan:<pane>) keep their own first_seen clock inside
+                # that same entry — popping the whole dict would erase it and
+                # restart the grace window from scratch, so only their "paged"
+                # rung resets in place; int-valued STALE_* keys still pop outright.
                 suppressed = (buffer or {}).get("suppressed_keys")
                 if isinstance(suppressed, list):
                     for suppressed_key in suppressed:
-                        if isinstance(suppressed_key, str):
+                        if not isinstance(suppressed_key, str):
+                            continue
+                        entry = next_emitted.get(suppressed_key)
+                        if isinstance(entry, dict) and "paged" in entry:
+                            entry["paged"] = 0
+                        else:
                             next_emitted.pop(suppressed_key, None)
                 flag_path.unlink(missing_ok=True)
                 print(rollup)

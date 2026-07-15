@@ -1,4 +1,6 @@
 """Durable token-spend ledger: one JSONL line per finished spend period.
+Prune-sourced drops append even at zero spend — a pruned record has no closed/
+successor, so this line is its only forensic trace.
 
 Capture-side counterpart of `dockwright spend-report`. Every path that drops
 a spend-carrying session record (session_end unlink, /clear rotation, dead-pid
@@ -38,8 +40,17 @@ def _append_line(entry: dict) -> None:
         os.close(fd)
 
 
+# Sources that UNLINK a record leaving no other durable trace (no closed/
+# record, no successor active record): the ledger line is the only forensics
+# a reaped session gets, so these append even at zero spend. Other drop
+# sources keep the skip — their drops leave another durable record, and
+# unconditional appends would add one line per session end fleet-wide
+# (nested teammates, zero-spend codex workers) to a file with no rotation.
+_TRACELESS_DROP_SOURCES = frozenset({"prune", "preflight_prune"})
+
+
 def append_drop_event(record, source: str) -> None:
-    """Archive a record's accumulated spend at drop time.
+    """Archive a record's drop — spend totals when present, and for prune sources even without (drop forensics).
 
     Best-effort: spend is observability; the drop paths calling this (teardown
     hooks, prunes, resume) must proceed no matter what happens here. Cursor
@@ -52,7 +63,9 @@ def append_drop_event(record, source: str) -> None:
             return
         spend = _spend_totals(record.get("spend"))
         if spend is None:
-            return
+            if source not in _TRACELESS_DROP_SOURCES:
+                return
+            spend = {}
         _append_line({
             "ts": time.time(),
             "sid": record.get("claude_sid"),

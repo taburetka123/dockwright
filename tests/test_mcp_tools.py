@@ -1262,6 +1262,62 @@ def test_worker_done_never_raises_from_stamp(fresh_orchestrator_dir, monkeypatch
     assert result["ok"] is True                          # done event survives a broken store
 
 
+def test_worker_done_self_heals_from_claimed_assignment(fresh_orchestrator_dir):
+    # M-2 ghost lane: the active record was reaped seconds after registration,
+    # but the claimed assignment survives — the completion signal must land.
+    state.write_json_atomic(paths.assignment_path("w9"), {
+        "assignment_id": "a-1", "claude_sid": "w9", "name": "fix-thing",
+        "parent_manager_name": "boss", "claimed_at": 1000.0,
+    })
+    result = worker_done_impl(claude_sid="w9", summary="done anyway")
+    assert result["ok"] is True
+    assert result["self_healed"] is True
+    events = [state.read_json(p) for p in paths.DONE.rglob("w9-*.json")]
+    assert len(events) == 1
+    event = events[0]
+    assert event["worker_name"] == "fix-thing"
+    assert event["parent_manager_name"] == "boss"
+    assert event["summary"] == "done anyway"
+    assert event["self_healed"] is True
+    assert event["spend"] is None
+
+
+def test_worker_done_no_record_no_assignment_still_rejects(fresh_orchestrator_dir):
+    with pytest.raises(ValueError, match="not registered"):
+        worker_done_impl(claude_sid="ghost-sid", summary="done")
+
+
+def test_worker_done_rejects_assignment_with_foreign_sid_stamp(fresh_orchestrator_dir):
+    # A hand-edited/corrupt assignment whose claude_sid stamp disagrees with
+    # its filename must not reconstruct a done event for the wrong worker.
+    state.write_json_atomic(paths.assignment_path("w9"),
+                            {"claude_sid": "other", "name": "fix-thing"})
+    with pytest.raises(ValueError, match="not registered"):
+        worker_done_impl(claude_sid="w9", summary="done")
+
+
+def test_worker_done_active_record_path_has_no_self_healed_marker(fresh_orchestrator_dir):
+    state.write_json_atomic(paths.ACTIVE / "w1.json",
+                            {"claude_sid": "w1", "agent": "worker", "name": "alpha"})
+    result = worker_done_impl(claude_sid="w1", summary="normal done")
+    assert result == {"ok": True, "event_id": result["event_id"]}
+    event = [state.read_json(p) for p in paths.DONE.rglob("w1-*.json")][0]
+    assert "self_healed" not in event
+
+
+def test_wait_for_worker_harvests_self_healed_done_event(fresh_orchestrator_dir):
+    import asyncio
+    from dockwright.mcp_server import wait_for_worker_impl
+    state.write_json_atomic(paths.assignment_path("w9"), {
+        "claude_sid": "w9", "name": "fix-thing", "parent_manager_name": "boss",
+    })
+    worker_done_impl(claude_sid="w9", summary="ghost finished")
+    result = asyncio.run(wait_for_worker_impl("fix-thing", timeout_sec=2,
+                                              manager_name="boss"))
+    assert result["found"] == "done"
+    assert result["summary"] == "ghost finished"
+
+
 import signal
 from dockwright.mcp_server import (
     prepare_handoff_impl, become_manager_with_takeover_impl,
@@ -2494,13 +2550,27 @@ def test_spawn_worker_default_cwd_uses_worker_home_when_present(fresh_orchestrat
     _asyncio.run(spawn_worker_impl(initial_prompt="poke", name="wh-present"))
     assert captured["cwd"] == str(home)
 
-def test_spawn_worker_default_cwd_falls_back_to_getcwd_when_home_absent(fresh_orchestrator_dir, monkeypatch, tmp_path):
+def test_spawn_worker_default_cwd_creates_worker_home_when_absent(fresh_orchestrator_dir, monkeypatch, tmp_path):
     captured = _patch_spawn_worker_tab(monkeypatch)
-    absent = tmp_path / "does-not-exist"
+    absent = tmp_path / "projects" / "work" / "worker"
     monkeypatch.setenv("CLAUDE_ORCH_WORKER_HOME", str(absent))
     monkeypatch.chdir(tmp_path)
     _asyncio.run(spawn_worker_impl(initial_prompt="poke", name="wh-absent"))
-    assert captured["cwd"] == str(tmp_path)  # os.getcwd() fallback
+    assert captured["cwd"] == str(absent)   # created, NOT os.getcwd()
+    assert absent.is_dir()
+
+
+def test_spawn_worker_default_cwd_falls_back_to_getcwd_when_mkdir_fails(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    # Parent is a regular file → ensure_worker_home()'s mkdir raises OSError
+    # (fail-open), home is not a dir, so cwd falls back to os.getcwd().
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x")
+    monkeypatch.setenv("CLAUDE_ORCH_WORKER_HOME", str(blocker / "worker"))
+    monkeypatch.chdir(tmp_path)
+    _asyncio.run(spawn_worker_impl(initial_prompt="poke", name="wh-mkdir-fail"))
+    assert captured["cwd"] == str(tmp_path)   # os.getcwd() fallback preserved
+
 
 def test_spawn_worker_explicit_cwd_unaffected_by_worker_home(fresh_orchestrator_dir, monkeypatch, tmp_path):
     captured = _patch_spawn_worker_tab(monkeypatch)
