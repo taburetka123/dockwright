@@ -1,0 +1,17 @@
+{
+  "id": "c10_validation_bound_kt",
+  "language": "kotlin",
+  "label": "clean",
+  "defect_class": "clean",
+  "intent": "isValidPercent(p) is true only for p in 0..100 inclusive.",
+  "diff": [
+    "--- a/Percent.kt",
+    "+++ b/Percent.kt",
+    "@@ -1,2 +1,2 @@",
+    " fun isValidPercent(p: Int): Boolean {",
+    "-    return p in 0..100",
+    "+    return p >= 0 && p <= 100",
+    " }"
+  ],
+  "why": "`p in 0..100` and `p >= 0 && p <= 100` are equivalent inclusive bounds; correct."
+}

@@ -1,0 +1,16 @@
+{
+  "id": "d01_offbyone_py_range",
+  "language": "python",
+  "label": "defect",
+  "defect_class": "off-by-one",
+  "intent": "sum_first(xs, n) returns the sum of the first n elements of xs (0-indexed).",
+  "diff": [
+    "--- a/sum.py",
+    "+++ b/sum.py",
+    "@@ -1,2 +1,2 @@",
+    " def sum_first(xs, n):",
+    "-    return sum(xs[i] for i in range(n))",
+    "+    return sum(xs[i] for i in range(n + 1))"
+  ],
+  "why": "range(n + 1) reads index n, one past the requested window -> IndexError / wrong sum."
+}

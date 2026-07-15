@@ -1,0 +1,19 @@
+{
+  "id": "d02_offbyone_kt_range",
+  "language": "kotlin",
+  "label": "defect",
+  "defect_class": "off-by-one",
+  "intent": "printAll iterates every element of items by index and prints it.",
+  "diff": [
+    "--- a/Printer.kt",
+    "+++ b/Printer.kt",
+    "@@ -1,5 +1,5 @@",
+    " fun printAll(items: List<String>) {",
+    "-    for (i in 0 until items.size) {",
+    "+    for (i in 0..items.size) {",
+    "         println(items[i])",
+    "     }",
+    " }"
+  ],
+  "why": "0..items.size is inclusive of size -> IndexOutOfBoundsException on the last iteration; should be `until`."
+}

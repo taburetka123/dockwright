@@ -1,0 +1,29 @@
+{
+  "remoteControlAtStartup": false,
+  "disableRemoteControl": true,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|NotebookEdit|MultiEdit",
+        "hooks": [
+          {"type": "command", "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"verifier worker is read-only by construction - report findings in the worker_done summary; the manager spawns a follow-up fixer worker for changes\"}}'", "timeout": 10}
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "deny": [
+      "Write",
+      "Edit",
+      "NotebookEdit",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git rebase:*)",
+      "Bash(git reset:*)",
+      "Bash(git checkout:*)",
+      "Bash(gh pr merge:*)",
+      "Bash(gh pr edit:*)",
+      "Bash(rm:*)"
+    ]
+  }
+}

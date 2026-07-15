@@ -1,0 +1,383 @@
+{
+  "run_id": "sonnet-r3",
+  "model": "sonnet",
+  "repeats": 3,
+  "headline": "Verifier catches 100% of injected defects at 0% false-positive rate over 24 cases (model=sonnet, 3 runs/case, majority vote); precision 100%.",
+  "case_metrics": {
+    "recall": 1.0,
+    "false_positive_rate": 0.0,
+    "precision": 1.0,
+    "accuracy": 1.0,
+    "tp": 12,
+    "fp": 0,
+    "tn": 12,
+    "fn": 0,
+    "n": 24
+  },
+  "run_metrics": {
+    "recall": 1.0,
+    "false_positive_rate": 0.0,
+    "precision": 1.0,
+    "accuracy": 1.0,
+    "tp": 36,
+    "fp": 0,
+    "tn": 36,
+    "fn": 0,
+    "n": 72
+  },
+  "per_defect_class_recall": {
+    "broken-error-handling": 1.0,
+    "dropped-null-check": 1.0,
+    "off-by-one": 1.0,
+    "resource-leak": 1.0,
+    "wrong-boundary": 1.0,
+    "wrong-operator": 1.0
+  },
+  "cases": [
+    {
+      "case_id": "c01_refactor_extract_py",
+      "label": "clean",
+      "defect_class": "clean",
+      "language": "python",
+      "runs": [
+        false,
+        false,
+        false
+      ],
+      "majority_flagged": false,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "c02_nullsafe_kt",
+      "label": "clean",
+      "defect_class": "clean",
+      "language": "kotlin",
+      "runs": [
+        false,
+        false,
+        false
+      ],
+      "majority_flagged": false,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "c03_boundary_py_inclusive",
+      "label": "clean",
+      "defect_class": "clean",
+      "language": "python",
+      "runs": [
+        false,
+        false,
+        false
+      ],
+      "majority_flagged": false,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "c04_errorhandling_kt_rethrow",
+      "label": "clean",
+      "defect_class": "clean",
+      "language": "kotlin",
+      "runs": [
+        false,
+        false,
+        false
+      ],
+      "majority_flagged": false,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "c05_new_param_default_py",
+      "label": "clean",
+      "defect_class": "clean",
+      "language": "python",
+      "runs": [
+        false,
+        false,
+        false
+      ],
+      "majority_flagged": false,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "c06_looks_offbyone_but_ok_py",
+      "label": "clean",
+      "defect_class": "clean",
+      "language": "python",
+      "runs": [
+        false,
+        false,
+        false
+      ],
+      "majority_flagged": false,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "c07_last_element_py",
+      "label": "clean",
+      "defect_class": "clean",
+      "language": "python",
+      "runs": [
+        false,
+        false,
+        false
+      ],
+      "majority_flagged": false,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "c08_early_return_guard_kt",
+      "label": "clean",
+      "defect_class": "clean",
+      "language": "kotlin",
+      "runs": [
+        false,
+        false,
+        false
+      ],
+      "majority_flagged": false,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "c09_rename_equiv_py",
+      "label": "clean",
+      "defect_class": "clean",
+      "language": "python",
+      "runs": [
+        false,
+        false,
+        false
+      ],
+      "majority_flagged": false,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "c10_validation_bound_kt",
+      "label": "clean",
+      "defect_class": "clean",
+      "language": "kotlin",
+      "runs": [
+        false,
+        false,
+        false
+      ],
+      "majority_flagged": false,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "c11_dict_get_default_py",
+      "label": "clean",
+      "defect_class": "clean",
+      "language": "python",
+      "runs": [
+        false,
+        false,
+        false
+      ],
+      "majority_flagged": false,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "c12_resource_context_manager_py",
+      "label": "clean",
+      "defect_class": "clean",
+      "language": "python",
+      "runs": [
+        false,
+        false,
+        false
+      ],
+      "majority_flagged": false,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "d01_offbyone_py_range",
+      "label": "defect",
+      "defect_class": "off-by-one",
+      "language": "python",
+      "runs": [
+        true,
+        true,
+        true
+      ],
+      "majority_flagged": true,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "d02_offbyone_kt_range",
+      "label": "defect",
+      "defect_class": "off-by-one",
+      "language": "kotlin",
+      "runs": [
+        true,
+        true,
+        true
+      ],
+      "majority_flagged": true,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "d03_nullcheck_kt_dropped",
+      "label": "defect",
+      "defect_class": "dropped-null-check",
+      "language": "kotlin",
+      "runs": [
+        true,
+        true,
+        true
+      ],
+      "majority_flagged": true,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "d04_nullcheck_py_dropped",
+      "label": "defect",
+      "defect_class": "dropped-null-check",
+      "language": "python",
+      "runs": [
+        true,
+        true,
+        true
+      ],
+      "majority_flagged": true,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "d05_boundary_py_threshold",
+      "label": "defect",
+      "defect_class": "wrong-boundary",
+      "language": "python",
+      "runs": [
+        true,
+        true,
+        true
+      ],
+      "majority_flagged": true,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "d06_boundary_kt_retry",
+      "label": "defect",
+      "defect_class": "wrong-boundary",
+      "language": "kotlin",
+      "runs": [
+        true,
+        true,
+        true
+      ],
+      "majority_flagged": true,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "d07_errorhandling_py_bare_except",
+      "label": "defect",
+      "defect_class": "broken-error-handling",
+      "language": "python",
+      "runs": [
+        true,
+        true,
+        true
+      ],
+      "majority_flagged": true,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "d08_errorhandling_kt_swallow",
+      "label": "defect",
+      "defect_class": "broken-error-handling",
+      "language": "kotlin",
+      "runs": [
+        true,
+        true,
+        true
+      ],
+      "majority_flagged": true,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "d09_resourceleak_py",
+      "label": "defect",
+      "defect_class": "resource-leak",
+      "language": "python",
+      "runs": [
+        true,
+        true,
+        true
+      ],
+      "majority_flagged": true,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "d10_wrongop_py_validation",
+      "label": "defect",
+      "defect_class": "wrong-operator",
+      "language": "python",
+      "runs": [
+        true,
+        true,
+        true
+      ],
+      "majority_flagged": true,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "d11_offbyone_ts_index",
+      "label": "defect",
+      "defect_class": "off-by-one",
+      "language": "typescript",
+      "runs": [
+        true,
+        true,
+        true
+      ],
+      "majority_flagged": true,
+      "agreement": 1.0,
+      "correct": true
+    },
+    {
+      "case_id": "d12_nullcheck_ts_optional",
+      "label": "defect",
+      "defect_class": "dropped-null-check",
+      "language": "typescript",
+      "runs": [
+        true,
+        true,
+        true
+      ],
+      "majority_flagged": true,
+      "agreement": 1.0,
+      "correct": true
+    }
+  ],
+  "n_cases": 24,
+  "n_runs_scored": 72,
+  "n_runs_errored": 0,
+  "n_heuristic_fallbacks": 0,
+  "mean_case_agreement": 1.0,
+  "n_cases_with_disagreement": 0,
+  "total_cost_usd": 17.197,
+  "mean_duration_ms": 6840,
+  "trace_file": "evals/traces/sonnet-r3.jsonl"
+}

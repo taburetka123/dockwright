@@ -1,0 +1,22 @@
+{
+  "id": "d09_resourceleak_py",
+  "language": "python",
+  "label": "defect",
+  "defect_class": "resource-leak",
+  "intent": "read_header(path) opens the file, returns its first line, and must not leak the handle on the error path.",
+  "diff": [
+    "--- a/header.py",
+    "+++ b/header.py",
+    "@@ -1,4 +1,6 @@",
+    " def read_header(path):",
+    "-    with open(path) as f:",
+    "-        return f.readline()",
+    "+    f = open(path)",
+    "+    line = f.readline()",
+    "+    if not line:",
+    "+        return None",
+    "+    f.close()",
+    "+    return line"
+  ],
+  "why": "On the empty-line path the function returns before f.close(), leaking the file handle; the `with` form was correct."
+}

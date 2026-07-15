@@ -1,0 +1,18 @@
+{
+  "id": "d12_nullcheck_ts_optional",
+  "language": "typescript",
+  "label": "defect",
+  "defect_class": "dropped-null-check",
+  "intent": "fullName(u) returns the user's profile name; findUser can return null when no user matches.",
+  "diff": [
+    "--- a/name.ts",
+    "+++ b/name.ts",
+    "@@ -1,4 +1,4 @@",
+    " function fullName(id: string): string {",
+    "   const u = findUser(id); // User | null",
+    "-  return u ? u.profile.name : \"unknown\";",
+    "+  return u.profile.name;",
+    " }"
+  ],
+  "why": "Dropping the truthiness guard dereferences null when findUser returns null."
+}
