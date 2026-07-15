@@ -1,0 +1,7 @@
+{
+  "case_id": "n01-noise-recovered",
+  "tags": ["investigation", "abstention"],
+  "adversarial_signals": ["brief_error_spike_then_recovery"],
+  "difficulty": 2,
+  "provenance": "dexter negative-eval 001-noise-recovered shape; abstention is a first-class outcome (worker.core.md findings block)"
+}

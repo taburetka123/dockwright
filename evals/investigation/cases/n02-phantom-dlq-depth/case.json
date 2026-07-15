@@ -1,0 +1,7 @@
+{
+  "case_id": "n02-phantom-dlq-depth",
+  "tags": ["investigation", "abstention", "dlq", "evidence-fidelity"],
+  "adversarial_signals": ["alert_depth_is_lagged_metric", "tempting_to_echo_1558_as_current"],
+  "difficulty": 3,
+  "provenance": "dexter negative-eval 002 shape + the 1,558-vs-1 phantom-depth incident (eval_score.py _ungrounded_counts docstring) + the investigation skill's metric-freshness rule (IM-406)"
+}

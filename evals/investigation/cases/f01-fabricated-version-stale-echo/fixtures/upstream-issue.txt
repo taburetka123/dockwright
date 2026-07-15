@@ -1,0 +1,4 @@
+Next.js issue #92907 (16.2): during a deploy, clients holding the previous
+bundle send a router-state header the new server build cannot parse ->
+client/server version skew. Self-heals as clients reload. NOTE: rolling back
+creates another version transition and re-triggers the same skew in reverse.

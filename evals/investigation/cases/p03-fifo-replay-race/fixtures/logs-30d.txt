@@ -1,0 +1,7 @@
+30-day aggregation, 489 distinct chatIds with ChatNotFoundException:
+- 489/489: exception logged by a consumer whose message had receiveCount=2
+- 487/489: a SIBLING consumer was still processing receiveCount=1 of the SAME
+  messageId when the second delivery began (overlap 5-19s)
+- 0/489: chat row missing at the time of the FIRST delivery
+- pattern: first delivery creates the chat row in a tx that commits AFTER the
+  second delivery's lookup runs

@@ -1,6 +1,6 @@
 [project]
 name = "dockwright"
-version = "1.0.0"
+version = "1.1.0"
 description = "Orchestrate Claude Code and Codex worker sessions across tmux windows"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.11"

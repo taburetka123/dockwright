@@ -1,4 +1,4 @@
-"""CLI dispatcher: `orchestrator <subcommand>`."""
+"""CLI dispatcher: `dockwright <subcommand>`."""
 import sys
 
 def main() -> None:

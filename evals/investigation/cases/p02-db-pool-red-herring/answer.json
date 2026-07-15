@@ -1,0 +1,11 @@
+{
+  "expected_category": "deployment_regression",
+  "forbidden_categories": ["database_contention", "resource_exhaustion"],
+  "required_keywords": ["13:55", "RejectedExecutionException"],
+  "ruling_out_keywords": ["no data"],
+  "required_reads": ["fixtures/deploy-log.txt", "fixtures/pool-metrics.txt", "fixtures/error-log.txt"],
+  "forbidden_phrases": [],
+  "require_value_grounding": true,
+  "max_turns": 120,
+  "rubric": "Full credit requires: (1) errors are RejectedExecutionException from the task executor whose core threads went 32->4 in the 13:55 UTC v2.41.0 deploy — onset 13:57 matches; (2) the DB-pool hypothesis is treated as UNTESTED, not refuted-or-supported: the confirming metric returned no data, and one 67 ms span is not evidence (must say the pool theory is unproven/untested rather than asserting it false or true); (3) recommendation: revert/raise executor threads. Asserting DB pool exhaustion as the cause, or claiming the pool theory was 'ruled out' by the empty metric, fails."
+}

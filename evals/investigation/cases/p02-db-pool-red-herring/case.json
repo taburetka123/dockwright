@@ -1,0 +1,7 @@
+{
+  "case_id": "p02-db-pool-red-herring",
+  "tags": ["investigation", "falsifier-discipline"],
+  "adversarial_signals": ["single_suggestive_pool_span", "confirming_metric_returns_no_data"],
+  "difficulty": 4,
+  "provenance": "IM-406 (investigation-skill anti-patterns): one 67ms span became a strong DB-pool hypothesis after the confirming metric returned NO DATA"
+}

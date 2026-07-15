@@ -1,0 +1,11 @@
+staging> SELECT COUNT(*) FROM vendor_locations;
+  9142
+staging> SELECT COUNT(*) FROM vendor_locations WHERE market IS NOT NULL;
+  0
+staging> SELECT COUNT(*) FROM vendor_to_markets;
+  9142
+staging> SELECT vendor_id, market_id FROM vendor_to_markets LIMIT 2;
+  v-00017 | PHX
+  v-00017 | TUS
+staging> -- MARKET column added 2026-07-10 by TKT-8501 migration; grep of all writers:
+staging> -- no code path writes vendor_locations.MARKET (0 INSERT/UPDATE references repo-wide)

@@ -1,4 +1,4 @@
-"""FastMCP server exposing orchestrator tools for manager + worker sessions."""
+"""FastMCP server exposing dockwright tools for manager + worker sessions."""
 import asyncio
 import fcntl
 import json

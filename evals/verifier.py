@@ -1,4 +1,4 @@
-"""Drive the orchestrator's code-review verifier on a single case, offline.
+"""Drive dockwright's code-review verifier on a single case, offline.
 
 The verifier this harness reproduces is the production Tier-2 verifier binding
 (model: opus), spawned read-only with ``presets/verifier-settings.json`` and

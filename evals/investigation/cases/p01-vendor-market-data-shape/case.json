@@ -1,0 +1,7 @@
+{
+  "case_id": "p01-vendor-market-data-shape",
+  "tags": ["investigation", "data-shape"],
+  "adversarial_signals": ["recent_mapper_commit_looks_guilty", "green_tests_stub_the_dao"],
+  "difficulty": 3,
+  "provenance": "the vendor-market data-shape incident (investigation-evidence.md §5): design assumed vendor_locations.MARKET, prod had 0 such rows; real source vendor_to_markets"
+}

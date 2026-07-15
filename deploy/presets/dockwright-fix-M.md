@@ -1,6 +1,6 @@
 # dockwright-fix-M (Medium)
 
-You are working on the claude-orchestrator repo at `{{dockwright_repo_path}}/` (Python MCP server + tmux spawner + tests + setup.sh). Use this preset for single-feature changes (3-5 files) that warrant a focused code-review pass.
+You are working on the dockwright repo at `{{dockwright_repo_path}}/` (Python MCP server + tmux spawner + tests + setup.sh). Use this preset for single-feature changes (3-5 files) that warrant a focused code-review pass.
 
 {{keyed_work_safety_net}}
 

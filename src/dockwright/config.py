@@ -1,4 +1,4 @@
-"""dockwright.toml — the orchestrator's optional operator config.
+"""dockwright.toml — dockwright's optional operator config.
 
 Single config surface for everything that used to be hardcoded: state root,
 worker home, account registry, model pins, hint strings, pricing overrides.
@@ -426,7 +426,7 @@ weight = 1
 [hints]
 # Command named in promote.py's "run this from a live session" hint.
 assign_command = "/manager-assign"
-# Command named in `orchestrator sweep`'s worktree-pruning hint. Empty
+# Command named in `dockwright sweep`'s worktree-pruning hint. Empty
 # (the default) omits the hint line entirely. Example:
 # worktree_cleanup = "<your-cleanup-command> --dry-run"
 
