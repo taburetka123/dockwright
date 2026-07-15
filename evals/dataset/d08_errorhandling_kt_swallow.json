@@ -1,0 +1,21 @@
+{
+  "id": "d08_errorhandling_kt_swallow",
+  "language": "kotlin",
+  "label": "defect",
+  "defect_class": "broken-error-handling",
+  "intent": "loadConfig reads and parses the config file; on any failure it must propagate so startup aborts loudly.",
+  "diff": [
+    "--- a/Config.kt",
+    "+++ b/Config.kt",
+    "@@ -1,3 +1,7 @@",
+    " fun loadConfig(path: String): Config {",
+    "-    return parse(readFile(path))",
+    "+    return try {",
+    "+        parse(readFile(path))",
+    "+    } catch (e: Exception) {",
+    "+        Config.EMPTY",
+    "+    }",
+    " }"
+  ],
+  "why": "Swallowing the exception and returning Config.EMPTY masks a missing/corrupt config; the app boots in a silently-broken state."
+}

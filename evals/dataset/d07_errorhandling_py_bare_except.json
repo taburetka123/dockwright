@@ -1,0 +1,19 @@
+{
+  "id": "d07_errorhandling_py_bare_except",
+  "language": "python",
+  "label": "defect",
+  "defect_class": "broken-error-handling",
+  "intent": "parse_amount(s) returns the integer cents in s, or raises ValueError on bad input so the caller can react.",
+  "diff": [
+    "--- a/money.py",
+    "+++ b/money.py",
+    "@@ -1,2 +1,5 @@",
+    " def parse_amount(s):",
+    "-    return int(s)",
+    "+    try:",
+    "+        return int(s)",
+    "+    except Exception:",
+    "+        pass"
+  ],
+  "why": "Bad input now silently returns None instead of raising; the swallowed error hides failures from the caller."
+}

@@ -1,0 +1,16 @@
+{
+  "id": "c06_looks_offbyone_but_ok_py",
+  "language": "python",
+  "label": "clean",
+  "defect_class": "clean",
+  "intent": "all_indices(xs) returns the list of valid indices [0 .. len-1] of xs.",
+  "diff": [
+    "--- a/idx.py",
+    "+++ b/idx.py",
+    "@@ -1,2 +1,2 @@",
+    " def all_indices(xs):",
+    "-    return [i for i in range(0, len(xs))]",
+    "+    return list(range(len(xs)))"
+  ],
+  "why": "FP trap: range(len(xs)) is exclusive of len -> correct indices; a sloppy reviewer might cry off-by-one."
+}

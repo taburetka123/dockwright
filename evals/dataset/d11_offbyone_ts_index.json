@@ -1,0 +1,17 @@
+{
+  "id": "d11_offbyone_ts_index",
+  "language": "typescript",
+  "label": "defect",
+  "defect_class": "off-by-one",
+  "intent": "lastItem(xs) returns the final element of a non-empty array.",
+  "diff": [
+    "--- a/list.ts",
+    "+++ b/list.ts",
+    "@@ -1,3 +1,3 @@",
+    " function lastItem<T>(xs: T[]): T {",
+    "-  return xs[xs.length - 1];",
+    "+  return xs[xs.length];",
+    " }"
+  ],
+  "why": "xs[xs.length] is always undefined (one past the end); should be length - 1."
+}

@@ -1,0 +1,17 @@
+{
+  "id": "c08_early_return_guard_kt",
+  "language": "kotlin",
+  "label": "clean",
+  "defect_class": "clean",
+  "intent": "discount applies 10% only to non-null carts; a null cart yields 0.",
+  "diff": [
+    "--- a/Discount.kt",
+    "+++ b/Discount.kt",
+    "@@ -1,3 +1,4 @@",
+    " fun discount(cart: Cart?): Double {",
+    "+    if (cart == null) return 0.0",
+    "     return cart.total * 0.10",
+    " }"
+  ],
+  "why": "Adds a correct null guard before the deref; correct."
+}

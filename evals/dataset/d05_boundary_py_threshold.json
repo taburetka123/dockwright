@@ -1,0 +1,16 @@
+{
+  "id": "d05_boundary_py_threshold",
+  "language": "python",
+  "label": "defect",
+  "defect_class": "wrong-boundary",
+  "intent": "Free shipping applies when the order total is at least 50 (>= 50, inclusive).",
+  "diff": [
+    "--- a/shipping.py",
+    "+++ b/shipping.py",
+    "@@ -1,2 +1,2 @@",
+    " def free_shipping(total):",
+    "-    return total >= 50",
+    "+    return total > 50"
+  ],
+  "why": "Spec is inclusive at 50; `> 50` wrongly denies free shipping for a total of exactly 50."
+}

@@ -1,0 +1,17 @@
+{
+  "id": "c03_boundary_py_inclusive",
+  "language": "python",
+  "label": "clean",
+  "defect_class": "clean",
+  "intent": "Free shipping applies when the order total is at least 50 (>= 50, inclusive).",
+  "diff": [
+    "--- a/shipping.py",
+    "+++ b/shipping.py",
+    "@@ -1,2 +1,2 @@",
+    " def free_shipping(total):",
+    "-    if total >= 50: return True",
+    "-    return False",
+    "+    return total >= 50"
+  ],
+  "why": "Equivalent simplification that preserves the inclusive boundary; correct."
+}

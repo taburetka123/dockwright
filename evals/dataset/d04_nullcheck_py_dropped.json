@@ -1,0 +1,17 @@
+{
+  "id": "d04_nullcheck_py_dropped",
+  "language": "python",
+  "label": "defect",
+  "defect_class": "dropped-null-check",
+  "intent": "display_name(user) returns user['name'] uppercased; user may be None for anonymous callers.",
+  "diff": [
+    "--- a/user.py",
+    "+++ b/user.py",
+    "@@ -1,4 +1,3 @@",
+    " def display_name(user):",
+    "-    if user is None:",
+    "-        return \"Anonymous\"",
+    "     return user[\"name\"].upper()"
+  ],
+  "why": "Dropping the None guard raises TypeError when user is None."
+}

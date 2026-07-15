@@ -1,0 +1,17 @@
+{
+  "id": "c05_new_param_default_py",
+  "language": "python",
+  "label": "clean",
+  "defect_class": "clean",
+  "intent": "format_price gains an optional currency symbol, defaulting to '$' to stay backward compatible.",
+  "diff": [
+    "--- a/price.py",
+    "+++ b/price.py",
+    "@@ -1,2 +1,2 @@",
+    "-def format_price(amount):",
+    "-    return \"$%.2f\" % amount",
+    "+def format_price(amount, symbol=\"$\"):",
+    "+    return \"%s%.2f\" % (symbol, amount)"
+  ],
+  "why": "Additive optional param with a default; existing callers unaffected."
+}

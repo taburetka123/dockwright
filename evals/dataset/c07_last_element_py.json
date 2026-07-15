@@ -1,0 +1,16 @@
+{
+  "id": "c07_last_element_py",
+  "language": "python",
+  "label": "clean",
+  "defect_class": "clean",
+  "intent": "last(xs) returns the final element of a non-empty list.",
+  "diff": [
+    "--- a/last.py",
+    "+++ b/last.py",
+    "@@ -1,2 +1,2 @@",
+    " def last(xs):",
+    "-    return xs[len(xs) - 1]",
+    "+    return xs[-1]"
+  ],
+  "why": "FP trap: xs[-1] is the correct, idiomatic last element (mirror of the off-by-one defect d11/spike)."
+}

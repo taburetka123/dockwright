@@ -1,0 +1,40 @@
+---
+description: Auto-recovery takeover after an account-limit flip (launched by stale_monitor, not humans)
+argument-hint: <from_sid>
+---
+
+# /manager-takeover-recovery
+
+You are a fresh manager session launched automatically by the stale monitor because the previous manager (`from_sid` in `$ARGUMENTS`) bricked on a session-limit banner and the account pointer was flipped. You are running on the NEW account. Recover the fleet, in this exact order:
+
+1. Parse `from_sid` from `$ARGUMENTS`. Missing/empty ⇒ tell the user "ERROR: /manager-takeover-recovery requires the bricked manager's sid" and stop.
+2. Resolve your own sid: `echo $CLAUDE_CODE_SESSION_ID` (managers run under Claude Code). Do not invent or synthesize a sid.
+3. Call the `dockwright` MCP tool `prepare_recovery_handoff` with `from_sid=<from_sid>`. It synthesizes the handoff (placeholder narrative — a subagent writes the real one in step 9) and returns `handoff_id`. If it errors with "not an active manager", call `list_managers` first: if a live manager already exists (a racing takeover succeeded, or another manager owns the fleet), report "predecessor already taken over by <name>; standing down" and STOP — do not run steps 4-10, do not touch workers. If NO live manager exists, call `become_manager` with `claude_sid=<your sid>` (and `name=<predecessor's name>` if known from the monitor prompt or handoff context) BEFORE continuing — then proceed from step 6 (attach_existing + monitors + sweep) as the registered owner; do NOT call `become_manager_with_takeover`.
+4. Call `become_manager_with_takeover` with `claude_sid=<your sid>`, `takeover_from=<from_sid>`, `handoff_id=<id>`. It closes the predecessor's tab gracefully (SIGHUP → grace → SIGKILL, so its SessionEnd hooks run), and you inherit its name + domain. If it returns an error, surface it and stop.
+5. Tab paint + predecessor-closed verification: follow `/manager-resume` steps 4b and 4c exactly (same tmux commands). RUN, substituting `<name>`/`<domain>` from the `become_manager_with_takeover` return:
+
+```bash
+SOCK="${DOCKWRIGHT_TMUX_SOCKET:-${CLAUDE_ORCH_TMUX_SOCKET:-dockwright}}"
+[ -n "$TMUX_PANE" ] && tmux -L "$SOCK" rename-window -t "$TMUX_PANE" "<name> · <domain>" \
+  && tmux -L "$SOCK" set-window-option -t "$TMUX_PANE" window-status-current-style "bg=#aa0066,fg=#ffffff" \
+  && tmux -L "$SOCK" set-window-option -t "$TMUX_PANE" window-status-style "bg=#440022,fg=#ffffff"
+```
+
+(Mirrors `TmuxDriver.set_tab_title`/`set_tab_color`; colors match `MANAGER_TAB_COLOR` in `hooks.py`. Skip silently if `$TMUX_PANE` is unset.) Then verify the predecessor pane is closed:
+
+```bash
+SOCK="${DOCKWRIGHT_TMUX_SOCKET:-${CLAUDE_ORCH_TMUX_SOCKET:-dockwright}}"
+tmux -L "$SOCK" list-panes -a -F '#{pane_id} #{window_name}'   # confirm no pane's window-name carries <predecessor-name> / the from_sid
+# stray predecessor pane still open? close it: tmux -L "$SOCK" kill-pane -t <pane_id>
+```
+
+Confirm no pane's window-name carries the predecessor's title or `from_sid`; if one remains, kill it with `tmux -L "$SOCK" kill-pane -t <pane_id>`. Two live managers is split-brain — do not skip.
+6. Call `attach_existing`; then arm the four Monitor tasks exactly as `/manager-resume` step 9, one `Monitor` task each:
+   - `while true; do dockwright monitor questions; sleep 2; done`
+   - `while true; do dockwright monitor turn-ends; sleep 5; done`
+   - `while true; do dockwright monitor done; sleep 2; done`
+   - `while true; do dockwright monitor stale; sleep 60; done`
+7. Un-brick the workers: `list_workers(manager_sid=<your sid>)`. A worker bricked by the old account's limit shows the limit banner as its latest output (`get_worker_tail`) or sits processing+silent. The handoff's `workers_snapshot` (synthesized by step 3's `prepare_recovery_handoff`) lists each worker's last state/summary — use it alongside `get_worker_tail` to identify the bricked ones. For each bricked worker: `kill_worker(name)`, wait for its closed record (`list_closed_workers` shows the name — retry briefly; the SessionEnd hook writes it asynchronously after the tab closes), then `resume_worker(name)` — the respawn rides the flipped pointer onto the new account. Leave healthy workers alone (a mixed-account fleet is a safe transient).
+8. Load manager memory + the domain notebook (same load as `/manager-resume` step 7). Run, substituting `<domain>`: `bash -c 'TODAY=$(date +%s); for f in ~/.claude/dockwright/manager-memory/<domain>/*.md; do [ -e "$f" ] || continue; mtime=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f"); age=$(( (TODAY - mtime) / 86400 )); [ "$age" -le 7 ] && echo "$mtime $f"; done | sort -rn | head -5 | while read -r _ f; do echo "MEMORY $f"; done; NB=~/.claude/dockwright/notebook/<domain>.md; if [ -s "$NB" ]; then SZ=$(wc -c < "$NB"); echo "NOTEBOOK $NB ($SZ bytes)"; [ "$SZ" -le 4096 ] || echo "NOTEBOOK_WARN [notebook >4KB ($SZ bytes) — archive resolved entries to notebook/archive/]"; fi' 2>/dev/null`. The command prints **paths only** — `Read` each printed `MEMORY <path>` and the `NOTEBOOK <path>` with the Read tool (Read paginates, so nothing is dropped). It used to `cat` the files inline, but 5 memory distills + the notebook can total ~35 KB and overflow the Bash inline-output cap, leaving only a ~2 KB preview in context — silently dropping memory and notebook content.
+9. Dispatch ONE subagent (Agent tool, general-purpose) with: "Read the tail (~200 lines) of `~/.claude/projects/*/<from_sid>.jsonl` and the `workers_snapshot` in `~/.claude/dockwright/handoffs/<handoff_id>.json`. (1) Replace that handoff's `narrative_summary` with a real 5-15 line narrative of what the predecessor was doing (in-flight work, decisions, open questions) — update the JSON atomically (python3: load, set field, write tmp, os.replace). (2) Run `dockwright distill <from_sid> --domain <domain>` and report the written path." This runs on the new account's quota and keeps your context clean.
+10. Surface a takeover brief: "Auto-recovered from account-limit flip: took over `<name>` from `<from_sid[:8]>`; account flipped (account `<x>`→`<y>`, from the last flip entry in `~/.claude/dockwright/account-flips.jsonl`); N workers resumed, M questions pending; narrative + predecessor distill dispatched." Then load the manager agent definition from `~/.claude/agents/manager.md` and operate as a normal manager. **This file exceeds the ~25k-token single-Read cap, so a single `Read` silently truncates it — page it to EOF:** run `wc -l ~/.claude/agents/manager.md` for the line count N, then `Read` it in windows of ≤200 lines (`offset=1`, then `offset=201`, … each with `limit=200`) until a window reaches line N. **Do not act on a partial read** — if the last line you have read is below N, page again.
