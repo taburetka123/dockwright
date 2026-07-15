@@ -1,4 +1,4 @@
-"""Report-only maintenance scan: `orchestrator sweep [--dry-run]`.
+"""Report-only maintenance scan: `dockwright sweep [--dry-run]`.
 
 Prints three classes of debris with per-item evidence, modifying NOTHING:
 

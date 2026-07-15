@@ -1,5 +1,5 @@
 {
-  "_note": "Each ORCHESTRATOR hook command uses the @@DOCKWRIGHT_BIN@@ placeholder; setup.sh substitutes the absolute venv-binary path at install time so hooks invoke the orchestrator by explicit path (never bare-PATH resolution). The canon-edit-guard PreToolUse hook is a FOREIGN hook that intentionally carries no placeholder (it runs `~/.claude/scripts/canon-edit-guard.sh` directly); env_install merges it idempotently by exact-command match. The MCP server is registered via `claude mcp add --scope user dockwright <abs-dockwright-bin> mcp-server` — NOT via the mcpServers key here. Claude Code reads MCP servers from ~/.claude.json only.",
+  "_note": "Each DOCKWRIGHT hook command uses the @@DOCKWRIGHT_BIN@@ placeholder; setup.sh substitutes the absolute venv-binary path at install time so hooks invoke the orchestrator by explicit path (never bare-PATH resolution). The canon-edit-guard PreToolUse hook is a FOREIGN hook that intentionally carries no placeholder (it runs `~/.claude/scripts/canon-edit-guard.sh` directly); env_install merges it idempotently by exact-command match. The MCP server is registered via `claude mcp add --scope user dockwright <abs-dockwright-bin> mcp-server` — NOT via the mcpServers key here. Claude Code reads MCP servers from ~/.claude.json only.",
   "hooks": {
     "PreToolUse": [
       {

@@ -703,7 +703,7 @@ def _notify_macos(message: str) -> None:
         sanitized = message.replace('"', "")
         subprocess.run(
             ["osascript", "-e",
-             f'display notification "{sanitized}" with title "orchestrator"'],
+             f'display notification "{sanitized}" with title "dockwright"'],
             capture_output=True, timeout=2, check=False,
         )
     except Exception:

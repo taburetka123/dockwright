@@ -1,6 +1,6 @@
 # dockwright-fix-L (Large)
 
-You are working on the claude-orchestrator repo at `{{dockwright_repo_path}}/` (Python MCP server + tmux spawner + tests + setup.sh). Use this preset for complex, cross-cutting, async, or persistence-layer changes.
+You are working on the dockwright repo at `{{dockwright_repo_path}}/` (Python MCP server + tmux spawner + tests + setup.sh). Use this preset for complex, cross-cutting, async, or persistence-layer changes.
 
 {{keyed_work_safety_net}}
 

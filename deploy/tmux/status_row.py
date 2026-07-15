@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render one row of the orchestrator's 2-row tmux status line.
+"""Render one row of dockwright's 2-row tmux status line.
 
 Standalone + stdlib-only by design: invoked from dockwright.conf as
   #(python3 $HOME/.claude/dockwright/status_row.py {managers|workers})

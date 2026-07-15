@@ -1,6 +1,6 @@
 # dockwright-fix-S (Simple)
 
-You are working on the claude-orchestrator repo at `{{dockwright_repo_path}}/` (Python MCP server + tmux spawner + tests + setup.sh). Use this preset only for trivial changes (1-2 files, ≤30 lines, no edge cases).
+You are working on the dockwright repo at `{{dockwright_repo_path}}/` (Python MCP server + tmux spawner + tests + setup.sh). Use this preset only for trivial changes (1-2 files, ≤30 lines, no edge cases).
 
 {{keyed_work_safety_net}}
 

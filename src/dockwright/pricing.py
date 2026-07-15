@@ -1,4 +1,4 @@
-"""Per-model token pricing for the orchestrator spend meter.
+"""Per-model token pricing for the dockwright spend meter.
 
 Near-pure (one optional small config read) and FastMCP-free so it stays cheap
 to import on the hook path. Rates are USD per million tokens, from the

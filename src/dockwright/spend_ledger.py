@@ -1,6 +1,6 @@
 """Durable token-spend ledger: one JSONL line per finished spend period.
 
-Capture-side counterpart of `orchestrator spend-report`. Every path that drops
+Capture-side counterpart of `dockwright spend-report`. Every path that drops
 a spend-carrying session record (session_end unlink, /clear rotation, dead-pid
 prunes, resume reclaiming an autoclosed record) appends here, so spend survives
 the closed/ 7-day prune. Headless env-stripped `claude -p` runs land here too,

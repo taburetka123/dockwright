@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-shot scan for stale orchestrator state.
+"""One-shot scan for stale dockwright state.
 
 STDLIB-ONLY BY DESIGN: this file doubles as a standalone deployed script
 (~/.claude/scripts/stale_monitor.py, copied by setup.sh) and a package module
@@ -2106,7 +2106,7 @@ def main(manager_name: str | None = None) -> int:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="One-shot scan for stale orchestrator state.")
+    parser = argparse.ArgumentParser(description="One-shot scan for stale dockwright state.")
     parser.add_argument(
         "--manager",
         default=None,

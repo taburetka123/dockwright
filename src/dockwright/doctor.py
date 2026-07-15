@@ -1,4 +1,4 @@
-"""Verify the orchestrator's environment wiring is canonical: explicit venv-binary path
+"""Verify dockwright's environment wiring is canonical: explicit venv-binary path
 everywhere (hooks + Claude/Codex MCP), no Homebrew editable duplicate, venv import OK.
 `dockwright doctor` is the manager's post-deploy validator and setup.sh's fail-loud gate.
 """
@@ -44,7 +44,7 @@ def check_hooks_abspath(settings: dict, expected_bin: str, label: str) -> Check:
     bad = [c for c in _hook_commands(settings)
            if env_install.orch_subcommand(c) is not None and expected_bin not in c]
     return Check(f"hooks:{label}", not bad,
-                 f"non-abs orchestrator hooks: {bad}" if bad else "all orchestrator hooks use abspath")
+                 f"non-abs dockwright hooks: {bad}" if bad else "all dockwright hooks use abspath")
 
 
 def check_no_brew_editable(brew_prefix, dist_name: str) -> Check:
@@ -100,7 +100,7 @@ def check_compose_fresh(core_dir, out_dir, overlay_dir=None) -> Check:
 
 
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(description="Verify canonical orchestrator env wiring.")
+    p = argparse.ArgumentParser(description="Verify canonical dockwright env wiring.")
     p.add_argument("--orch-bin", required=True)
     p.add_argument("--claude-json", type=Path)
     p.add_argument("--settings", type=Path)

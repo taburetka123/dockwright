@@ -1,6 +1,6 @@
 """Compose deployed agent files: core + overlay drop-ins + config vars.
 
-The OSS-split compose seam (Step 2). setup.sh and `orchestrator compose`
+The OSS-split compose seam (Step 2). setup.sh and `dockwright compose`
 render ~/.claude/agents/*.md from deploy/agents/*.md instead of cp.
 
 Semantics:

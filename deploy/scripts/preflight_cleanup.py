@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-shot orchestrator hygiene at /manager startup.
+"""One-shot dockwright hygiene at /manager startup.
 
 Prunes:
   - handoffs/<id>.json older than 1h with consumed_at == null  (aborted recreations)

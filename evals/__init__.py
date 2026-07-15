@@ -1,1 +1,1 @@
-"""Offline eval harness for the orchestrator's code-review verifier."""
+"""Offline eval harness for dockwright's code-review verifier."""

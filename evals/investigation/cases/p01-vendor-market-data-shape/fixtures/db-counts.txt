@@ -1,0 +1,11 @@
+staging> SELECT COUNT(*) FROM supplier_sites;
+  5417
+staging> SELECT COUNT(*) FROM supplier_sites WHERE market IS NOT NULL;
+  0
+staging> SELECT COUNT(*) FROM supplier_to_regions;
+  5417
+staging> SELECT supplier_id, region_id FROM supplier_to_regions LIMIT 2;
+  v-00017 | RGN-A
+  v-00017 | RGN-B
+staging> -- MARKET column added 2026-07-10 by TKT-8501 migration; grep of all writers:
+staging> -- no code path writes supplier_sites.MARKET (0 INSERT/UPDATE references repo-wide)

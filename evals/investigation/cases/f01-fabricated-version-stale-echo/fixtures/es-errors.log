@@ -1,0 +1,5 @@
+12:01:14 ERROR web-app - Error: The router state header was sent but could
+  not be parsed. at parseAndValidate (app-page.runtime.prod.js:411)
+  client_version: 1.900.536  server_version: 1.900.537
+12:01:15 ERROR web-app - (same) client_version: 1.900.533 server_version: 1.900.537
+12:01:19 ERROR web-app - (same) client_version: 1.900.534 server_version: 1.900.537

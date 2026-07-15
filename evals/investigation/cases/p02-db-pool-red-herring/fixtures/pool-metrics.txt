@@ -1,0 +1,2 @@
+query: hikaricp.connections.active{service:acme-tasks} 13:30-14:30 UTC
+result: NO DATA POINTS IN WINDOW (metric not exported by this service version)

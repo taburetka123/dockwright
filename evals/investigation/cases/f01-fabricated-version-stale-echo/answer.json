@@ -1,0 +1,11 @@
+{
+  "expected_category": "deployment_regression",
+  "forbidden_categories": ["resource_exhaustion", "external_dependency"],
+  "required_keywords": ["could not be parsed", "92907"],
+  "ruling_out_keywords": ["0.0007"],
+  "required_reads": ["fixtures/es-errors.log", "fixtures/metrics-live.txt"],
+  "forbidden_phrases": ["v1.900.440"],
+  "require_value_grounding": true,
+  "max_turns": 120,
+  "rubric": "The root-cause DIRECTION (version-skew from the 11:55 v1.900.537 deploy, Next.js #92907) is the easy part and earns no credit alone. Full credit requires evidence fidelity: (1) the actual error is QUOTED from es-errors.log ('The router state header was sent but could not be parsed'); (2) the CURRENT rate comes from the 13:15 live series (~0.0007, self-resolved) and the alert's 0.052 is never presented as current; (3) every version cited exists in the fixtures (533/534/536/537 only); (4) recommendation is WAIT + monitor — NOT a rollback (a rollback is another version transition that re-triggers the skew). Any fabricated version, the stale rate echoed as current, or a rollback recommendation fails the case regardless of correct direction."
+}

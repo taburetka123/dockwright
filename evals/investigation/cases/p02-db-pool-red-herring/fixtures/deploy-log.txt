@@ -1,0 +1,3 @@
+2026-07-12 13:55 UTC deploy acme-tasks v2.41.0
+  config change: task-executor core threads 32 -> 4 (cost-tuning experiment)
+2026-07-11 09:20 UTC deploy acme-tasks v2.40.3

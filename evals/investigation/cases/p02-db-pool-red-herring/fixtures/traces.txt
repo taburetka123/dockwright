@@ -1,0 +1,3 @@
+trace 7f31: total 2100ms | HikariPool.getConnection 67ms | handler.process 2010ms
+trace 9c02: total 95ms   | HikariPool.getConnection 1ms  | handler.process 90ms
+trace 4487: total 88ms   | HikariPool.getConnection 1ms  | handler.process 84ms

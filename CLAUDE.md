@@ -6,6 +6,7 @@ Manager/worker orchestration for Claude Code and Codex over tmux: an MCP server,
 
 - `src/dockwright/` — the Python package: `mcp_server.py` (MCP tool surface), `hooks.py` (SessionStart/Stop/SessionEnd + nested detection), `spawner.py`, `terminal.py` (tmux driver), `stale_monitor.py`, CLI dispatcher `__main__.py`.
 - `deploy/` — everything `setup.sh` copies into `~/.claude` (and `~/.codex`): `agents/*.core.md`, `commands/`, `skills/`, `scripts/`, `presets/`, `tmux/`, `loops-registry.md`.
+- `publish/` — public-repo assets sourced at export time by the dockwright-publish skill: `publish/README.md` is the source of truth for the PUBLIC repo's README (edit it here, ships on every export). This repo's root `README.md` is dockwright-dev's own and never ships.
 - `setup.sh` — installer/deployer. Refuses to run from a linked worktree (self-anchors to the main clone).
 - `tests/` + `evals/tests/` — pytest suites. `docs/` — design docs and specs (dev repo only; not part of the public export).
 
@@ -27,6 +28,7 @@ Manager/worker orchestration for Claude Code and Codex over tmux: an MCP server,
 | `src/dockwright/mcp_server.py` | manager recreate (`/recreate-manager`) — the running MCP server process caches the module |
 | `deploy/**` (agents, commands, skills, scripts, presets, tmux conf) | `./setup.sh` from the main clone |
 | hook wiring (`deploy/settings.snippet.json`) or MCP registration (`claude mcp add`, done by setup) | `./setup.sh` |
+| `evals/investigation/` cases or harness | nothing to deploy — run on demand: `python -m evals.investigation.run_eval` |
 
 `stale_monitor.py` is dual-homed: it lives in `src/` but also ships as a standalone copy to `~/.claude/scripts/` — changing it needs `setup.sh`, and it must stay stdlib-only.
 

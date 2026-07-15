@@ -1,4 +1,4 @@
-"""Install Codex skill wrappers from orchestrator slash-command markdown."""
+"""Install Codex skill wrappers from dockwright slash-command markdown."""
 
 from __future__ import annotations
 

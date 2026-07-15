@@ -1,0 +1,3 @@
+# transient dry-run / ad-hoc artifacts — committed runs are named by model
+traces/dry-*
+results/dry-*

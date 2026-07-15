@@ -7,7 +7,7 @@
 set -e
 
 cat <<'EOF'
-==== claude-orchestrator integration test ====
+==== dockwright integration test ====
 
 This is a manual checklist. Each step opens a new tab or types into an
 existing one. Verify the expected behavior at each step.

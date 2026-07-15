@@ -42,7 +42,7 @@ def test_hooks_notify_suppressed_under_pytest(no_live_tmux):
 
 def test_hooks_notify_invokes_real_osascript_outside_pytest(monkeypatch):
     """Production-behavior pin: outside pytest the helper really requests a
-    'display notification … "orchestrator"' via osascript (argv recorded by a
+    'display notification … "dockwright"' via osascript (argv recorded by a
     stub — nothing executes)."""
     calls = []
     monkeypatch.setattr(subprocess, "run",
@@ -52,4 +52,4 @@ def test_hooks_notify_invokes_real_osascript_outside_pytest(monkeypatch):
     assert len(calls) == 1
     assert calls[0][0] == "osascript"
     assert "display notification" in calls[0][2]
-    assert 'with title "orchestrator"' in calls[0][2]
+    assert 'with title "dockwright"' in calls[0][2]
