@@ -119,5 +119,9 @@ def test_doctor_compose_fresh_and_stale(tmp_path):
 def test_doctor_main_runs_compose_check_only_with_flag(tmp_path, capsys):
     """No --compose-out-dir → no compose:fresh line (hermetic ad-hoc doctor)."""
     orch_bin = tmp_path / "orch"
-    doctor.main(["--orch-bin", str(orch_bin)])
+    doctor.main(["--orch-bin", str(orch_bin),
+                 "--claude-json", str(tmp_path / "claude.json"),
+                 "--settings", str(tmp_path / "settings.json"),
+                 "--codex-hooks", str(tmp_path / "codex-hooks.json"),
+                 "--codex-config", str(tmp_path / "codex-config.toml")])
     assert "compose:fresh" not in capsys.readouterr().out

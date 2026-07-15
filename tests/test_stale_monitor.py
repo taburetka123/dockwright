@@ -2306,7 +2306,8 @@ def _flips(stale):
 
 def _launch_calls(calls):
     """Recovery-manager spawns, as (argv, kwargs) — argv is the driver.spawn
-    argv list (["zsh", "-ic", inner]) so launches[i][0][-1] is still `inner`."""
+    argv list ([_interactive_shell(), "-ic", inner]) so launches[i][0][-1] is
+    still `inner`."""
     return [(c[1]["argv"], c[1]) for c in calls if c[0] == "spawn"]
 
 
@@ -4124,3 +4125,16 @@ def test_recovery_flush_unburns_orphan_ladder_without_resetting_clock(
 def test_orphan_session_name_matches_terminal_constant(stale):
     from dockwright.terminal import WORKERS_OS_WINDOW_CLASS
     assert stale.WORKERS_SESSION_NAME == WORKERS_OS_WINDOW_CLASS
+
+
+def test_interactive_shell_duplicate_no_zsh_falls_back_to_bash(stale, monkeypatch):
+    monkeypatch.setenv("SHELL", "/usr/bin/fish")
+    monkeypatch.setattr(stale.shutil, "which",
+                        lambda cmd: {"bash": "/usr/bin/bash"}.get(cmd))
+    assert stale._interactive_shell() == "/usr/bin/bash"
+
+
+def test_awake_seconds_duplicate_works_without_clock_uptime_raw(stale, monkeypatch):
+    monkeypatch.delattr(time, "CLOCK_UPTIME_RAW", raising=False)
+    v = stale._awake_seconds()
+    assert isinstance(v, float) and v > 0.0

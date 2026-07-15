@@ -5504,6 +5504,28 @@ def test_prune_pending_sweeps_window_sidecar_orphans(fresh_orchestrator_dir):
     assert not stale.exists() and fresh_p.exists()
 
 
+def test_spawn_path_sweeps_expired_pending_litter(fresh_orchestrator_dir, monkeypatch):
+    # Failed spawns leave .pending pairs for late registration; the 24h TTL
+    # reap used to run only on rare cold paths (list_closed_workers /
+    # pipeline_status), so on a spawn-only fleet the litter never cleared
+    # (VM E2E L-9). The spawn path is the pendings' write site — it sweeps.
+    monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
+    _patch_spawn_worker_tab(monkeypatch)
+    paths.ASSIGNMENTS_PENDING.mkdir(parents=True, exist_ok=True)
+    stale_json = paths.pending_assignment_path("aid-dead-spawn")
+    stale_window = paths.pending_window_path("aid-dead-spawn")
+    stale_json.write_text("{}")
+    stale_window.write_text("777")
+    _age(stale_json, 2)
+    _age(stale_window, 2)
+    result = _asyncio.run(spawn_worker_impl(
+        initial_prompt="task", name="sweeper", cwd="/tmp/x",
+        _registration_timeout_sec=0.2, _poll_interval=0.01))
+    assert not stale_json.exists() and not stale_window.exists()
+    # The spawn's OWN fresh pending pair must survive its no_register outcome.
+    assert paths.pending_assignment_path(result["assignment_id"]).exists()
+
+
 # --- Review-fix regressions (code-review round 1) ---
 
 def test_folds_tolerate_corrupted_stamp_lines(fresh_orchestrator_dir):

@@ -9,6 +9,17 @@ from .state import _pid_alive
 from .terminal import get_driver
 
 
+def _awake_seconds() -> float:
+    """Monotonic seconds that PAUSE during system sleep. macOS: CLOCK_UPTIME_RAW
+    (CLOCK_MONOTONIC there keeps ticking through sleep). Linux has no
+    CLOCK_UPTIME_RAW; time.monotonic() is CLOCK_MONOTONIC, which excludes
+    suspend — the same awake-only semantics."""
+    clk = getattr(time, "CLOCK_UPTIME_RAW", None)
+    if clk is not None:
+        return time.clock_gettime(clk)
+    return time.monotonic()
+
+
 MANAGER_TAB_COLOR = ("#aa0066", "#440022")
 WORKER_TAB_COLOR_IDLE = ("#444444", "#222222")
 WORKER_TAB_COLOR_BUSY = ("#aa8800", "#443300")
@@ -418,6 +429,28 @@ def _is_orchestrator_session() -> bool:
         return False
     return os.environ.get("CLAUDE_AGENT") in ("manager", "worker")
 
+def _emit_session_context(sid: str, agent: str) -> None:
+    """SessionStart stdout → Claude Code injects it as session context. This is
+    how a session learns its sid WITHOUT running a shell command: the old
+    `echo ${CLAUDE_CODE_SESSION_ID:-$CODEX_THREAD_ID}` template instruction
+    tripped the permission system's "Contains expansion" guard — which no
+    allowlist can cover — deterministically stalling headless workers on their
+    first turn. Codex mirrors the same hook wiring but its hook-stdout contract
+    is not Claude's, and codex spawns ride fixed non-interactive approvals —
+    skip there."""
+    if os.environ.get("CLAUDE_WORKER_RUNTIME") == "codex":
+        return
+    if agent == "worker":
+        line = (f"dockwright: your claude_sid is {sid} — pass it as claude_sid "
+                "to ask_manager / worker_done / artifact_put.")
+    else:
+        line = (f"dockwright: your session id is {sid} — pass it as manager_sid "
+                "to spawn_worker / list_workers / list_pending_questions.")
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": line,
+    }}))
+
 def session_start() -> None:
     if not _is_orchestrator_session():
         return
@@ -581,6 +614,7 @@ def session_start() -> None:
     if agent == "worker" and existing is None and not record.get("nested"):
         _claim_pending_assignment(sid, name)
         _apply_captured_window_id(sid, record)
+    _emit_session_context(sid, agent)
     if record.get("nested"):
         # No tab of its own — painting would retitle the parent's tab.
         return
@@ -639,8 +673,8 @@ def stop_hook() -> None:
         # can find the subagents dir without re-deriving the cwd slug.
         record["transcript_path"] = str(log)
     # Paired uptime stamp so stale_monitor's idle-elapsed math survives laptop
-    # sleep — wall-clock keeps ticking through sleep, CLOCK_UPTIME_RAW doesn't.
-    record["last_turn_at_uptime"] = time.clock_gettime(time.CLOCK_UPTIME_RAW)
+    # sleep — wall-clock keeps ticking through sleep, the awake clock doesn't.
+    record["last_turn_at_uptime"] = _awake_seconds()
     record["state"] = "idle"
     state.write_json_atomic(active_path, record)
     if record.get("nested"):

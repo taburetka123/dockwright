@@ -2447,3 +2447,59 @@ def test_session_start_records_resolved_session_pid(fresh, monkeypatch):
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "s1", "cwd": "/x"})))
     session_start()
     assert state.read_json(fresh / "active" / "s1.json")["pid"] == 590
+
+
+def test_awake_seconds_works_without_clock_uptime_raw(monkeypatch):
+    # Linux has no time.CLOCK_UPTIME_RAW — the helper must fall back, not raise.
+    monkeypatch.delattr(time, "CLOCK_UPTIME_RAW", raising=False)
+    v = hooks._awake_seconds()
+    assert isinstance(v, float) and v > 0.0
+
+
+def test_stop_hook_stamps_uptime_without_clock_uptime_raw(fresh, monkeypatch):
+    # The Stop hook died on Linux at record["last_turn_at_uptime"] (L-3) —
+    # registration then turn-end must succeed with the macOS clock deleted.
+    monkeypatch.delattr(time, "CLOCK_UPTIME_RAW", raising=False)
+    monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("CLAUDE_WORKER_NAME", "alpha")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "s1", "cwd": "/x"})))
+    session_start()
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "s1"})))
+    stop_hook()
+    rec = json.loads((paths.ACTIVE / "s1.json").read_text())
+    assert isinstance(rec["last_turn_at_uptime"], float)
+    assert rec["state"] == "idle"
+
+
+def test_session_start_emits_worker_sid_context(fresh, monkeypatch, capsys):
+    monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("CLAUDE_WORKER_NAME", "alpha")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "s1", "cwd": "/x"})))
+    session_start()
+    payload = json.loads(capsys.readouterr().out)
+    ctx = payload["hookSpecificOutput"]
+    assert ctx["hookEventName"] == "SessionStart"
+    assert "your claude_sid is s1" in ctx["additionalContext"]
+    assert "worker_done" in ctx["additionalContext"]
+
+
+def test_session_start_emits_manager_sid_wording(fresh, monkeypatch, capsys):
+    monkeypatch.setenv("CLAUDE_AGENT", "manager")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "m1", "cwd": "/x"})))
+    session_start()
+    payload = json.loads(capsys.readouterr().out)
+    ctx = payload["hookSpecificOutput"]
+    assert "your session id is m1" in ctx["additionalContext"]
+    assert "manager_sid" in ctx["additionalContext"]
+    assert "worker_done" not in ctx["additionalContext"]
+
+
+def test_session_start_codex_worker_emits_no_context(fresh, monkeypatch, capsys):
+    # Codex mirrors the same hook wiring (setup.sh merges the snippet into
+    # ~/.codex/hooks.json) but its hook-stdout contract is not Claude's.
+    monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("CLAUDE_WORKER_NAME", "alpha")
+    monkeypatch.setenv("CLAUDE_WORKER_RUNTIME", "codex")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "s1", "cwd": "/x"})))
+    session_start()
+    assert capsys.readouterr().out == ""

@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -166,6 +167,10 @@ def _gardener_installer(scripts_dir: Path) -> Path:
 
 
 def enable_gardener(lane: str, *, settings_path: Path, installer_path: Path, run) -> int:
+    if shutil.which("launchctl") is None:
+        print("ERROR: gardener loops are scheduled via launchd (macOS-only); "
+              "launchctl not found on this system.", file=sys.stderr)
+        return 2
     if not installer_path.is_file():
         print(f"ERROR: {installer_path} not found — run setup.sh first.", file=sys.stderr)
         return 2
@@ -179,8 +184,13 @@ def enable_gardener(lane: str, *, settings_path: Path, installer_path: Path, run
 
 
 def disable_gardener(lane: str, *, launch_agents_dir: Path, label_prefix: str, run, uid: int) -> int:
+    launchctl_available = shutil.which("launchctl") is not None
+    if not launchctl_available:
+        print("gardener disable: launchctl not found — removing plist files only.",
+              file=sys.stderr)
     for label in _gardener_labels(lane, label_prefix):
-        run(["launchctl", "bootout", f"gui/{uid}/{label}"])   # best-effort
+        if launchctl_available:
+            run(["launchctl", "bootout", f"gui/{uid}/{label}"])   # best-effort
         (launch_agents_dir / f"{label}.plist").unlink(missing_ok=True)
     return 0
 

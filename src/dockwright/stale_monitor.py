@@ -187,6 +187,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -200,6 +201,18 @@ try:
     from dockwright.terminal import get_driver as _get_driver
 except Exception:  # pragma: no cover - venv editable install expected in prod
     _get_driver = None
+
+
+def _awake_seconds() -> float:
+    """Duplicated from hooks._awake_seconds — this file is standalone/stdlib-only.
+    Monotonic seconds that PAUSE during system sleep. macOS: CLOCK_UPTIME_RAW
+    (CLOCK_MONOTONIC there keeps ticking through sleep). Linux has no
+    CLOCK_UPTIME_RAW; time.monotonic() is CLOCK_MONOTONIC, which excludes
+    suspend — the same awake-only semantics."""
+    clk = getattr(time, "CLOCK_UPTIME_RAW", None)
+    if clk is not None:
+        return time.clock_gettime(clk)
+    return time.monotonic()
 
 
 def _env_positive_int(name: str, default: int) -> int:
@@ -689,6 +702,24 @@ def _ledger_banner_event(event: str, banner: str, source: str, now: int,
     next_emitted[key] = now
 
 
+def _interactive_shell() -> str:
+    """Duplicated from spawner._interactive_shell — this file is standalone/stdlib-only.
+    Shell for the spawn `-ic` argv. The inner command uses POSIX `K=v cmd`
+    env-prefix syntax, so an exotic $SHELL (fish, nushell) can't run it —
+    honor $SHELL only when it's zsh/bash; otherwise fall down a fixed
+    POSIX-family order. `-i` is load-bearing: the interactive rc is what puts
+    the user's `claude`/`codex` on PATH. Stock Ubuntu ships no zsh — a
+    hardcoded zsh argv made every spawn die at exec (empty dead pane)."""
+    sh = os.environ.get("SHELL", "")
+    if os.path.basename(sh) in ("zsh", "bash") and shutil.which(sh):
+        return sh
+    for cand in ("zsh", "bash"):
+        found = shutil.which(cand)
+        if found:
+            return found
+    return "sh"
+
+
 def _launch_recovery_manager(mgr_record: dict, mgr_sid: str, new_letter: str) -> str | None:
     """Open a fresh window on the flipped account running the thin recovery
     command. The new session does the takeover itself (design A3-v2: bash is
@@ -704,7 +735,7 @@ def _launch_recovery_manager(mgr_record: dict, mgr_sid: str, new_letter: str) ->
         f"{_account_config_prefix(new_letter)}"
         f"CLAUDE_AGENT=manager CLAUDE_WORKER_NAME={shlex.quote(name)} "
         # Manager lane is pinned (orch-audit model-allocation): never inherit
-        # the user's interactive model default. Quoted so zsh -ic can't glob [1m].
+        # the user's interactive model default. Quoted so the -ic shell can't glob [1m].
         f"claude --model {shlex.quote('opus[1m]')} "
         f"{shlex.quote(f'/manager-takeover-recovery {mgr_sid}')}"
     )
@@ -714,7 +745,7 @@ def _launch_recovery_manager(mgr_record: dict, mgr_sid: str, new_letter: str) ->
     try:
         return asyncio.run(asyncio.wait_for(
             _get_driver().spawn(
-                cwd=cwd, title="manager (recovery)", argv=["zsh", "-ic", inner],
+                cwd=cwd, title="manager (recovery)", argv=[_interactive_shell(), "-ic", inner],
                 route_to_manager_session=True),
             timeout=10)) or None
     except Exception as e:
@@ -1358,9 +1389,10 @@ def _outbox_oldest_ts(manager_name: str) -> float | None:
 def _compute_idle_elapsed_sec(record: dict, current_uptime: float, now: int) -> int | None:
     """Seconds since an idle worker's last turn, sleep-correctly.
 
-    Prefer uptime delta (CLOCK_UPTIME_RAW): macOS pauses it during laptop
-    sleep, so an 8h sleep doesn't burn the worker's 2h idle grace. Wall-clock
-    keeps ticking through sleep and would falsely reap a freshly-idled worker.
+    Prefer awake-clock delta (CLOCK_UPTIME_RAW on macOS, CLOCK_MONOTONIC on
+    Linux — both pause during sleep/suspend), so an 8h sleep doesn't burn the
+    worker's 2h idle grace. Wall-clock keeps ticking through sleep and would
+    falsely reap a freshly-idled worker.
 
     Wall-clock fallback when (a) the record predates the fix and has no
     last_turn_at_uptime field, or (b) reboot reset current_uptime below the
@@ -1545,7 +1577,7 @@ def main(manager_name: str | None = None) -> int:
     else:
         should_run_autoclose = True
         next_emitted["last_autoclose_run"] = now
-    current_uptime = time.clock_gettime(time.CLOCK_UPTIME_RAW)
+    current_uptime = _awake_seconds()
     # One pointer read per scan: every unstamped record this scan resolves its
     # bricked-account against the SAME letter, so a mid-scan flip can't cascade
     # — records seen after the flip still resolve to the pre-flip letter, and

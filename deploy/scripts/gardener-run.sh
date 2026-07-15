@@ -365,9 +365,10 @@ else
   TMUX_HEAD=(new-session -d -s claude-workers)
 fi
 INNER_CMD="cd $(printf '%q' "$GARDENER_CWD") && env -u CLAUDE_AGENT -u CLAUDE_WORKER_NAME -u CLAUDE_PARENT_MANAGER -u CLAUDE_DOMAIN claude --model claude-sonnet-5 --settings $(printf '%q' "$SETTINGS_FILE") \"\$(cat $(printf '%q' "$PROMPT_FILE"))\""
+SPAWN_SHELL="$(command -v zsh || command -v bash || echo sh)"
 WINDOW_ID=$(tmux -L "$TMUX_SOCK" ${FFLAG[@]+"${FFLAG[@]}"} "${TMUX_HEAD[@]}" \
   -n "🌱 gardener $RUN_ID" -c "$GARDENER_CWD" -P -F '#{pane_id}' -- \
-  zsh -ic "$INNER_CMD" 2>>"$RUN_LOG")
+  "$SPAWN_SHELL" -ic "$INNER_CMD" 2>>"$RUN_LOG")
 if [ -z "$WINDOW_ID" ]; then
   run_log "error" "tmux launch failed"
   ledger_append run_end run_id="$RUN_ID" status="error" audit="skipped" lane="$LANE" detail="tmux-launch-failed"

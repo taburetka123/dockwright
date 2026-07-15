@@ -1,4 +1,5 @@
 {
+  "enableAllProjectMcpServers": true,
   "remoteControlAtStartup": false,
   "disableRemoteControl": true,
   "hooks": {
@@ -12,6 +13,11 @@
     ]
   },
   "permissions": {
+    "allow": [
+      "mcp__dockwright__worker_done",
+      "mcp__dockwright__ask_manager",
+      "Bash(printenv:*)"
+    ],
     "deny": [
       "Write",
       "Edit",

@@ -105,7 +105,7 @@ mv "$HANDOFF_PATH.tmp" "$HANDOFF_PATH"
 
 CWD=$(pwd)
 # Manager lane is pinned (orch-audit model-allocation): never inherit the
-# user's interactive model default. Single-quoted so zsh -ic can't glob [1m].
+# user's interactive model default. Single-quoted so the -ic shell can't glob [1m].
 RUNTIME_CMD="claude --model 'opus[1m]' '/manager-resume $HANDOFF_ID'"
 
 # Login model: the recreated manager rides the active pointer. a -> default
@@ -142,9 +142,10 @@ if tmux -L "$TMUX_SOCK" has-session -t mgr 2>/dev/null; then
 else
     TMUX_HEAD=(new-session -d -s mgr)
 fi
+SPAWN_SHELL="$(command -v zsh || command -v bash || echo sh)"
 WINDOW_ID=$(tmux -L "$TMUX_SOCK" ${FFLAG[@]+"${FFLAG[@]}"} "${TMUX_HEAD[@]}" \
     -n "manager (incoming)" -c "$CWD" -P -F '#{pane_id}' -- \
-    zsh -ic "${CONFIG_PREFIX}CLAUDE_AGENT=manager CLAUDE_WORKER_NAME=manager $RUNTIME_CMD")
+    "$SPAWN_SHELL" -ic "${CONFIG_PREFIX}CLAUDE_AGENT=manager CLAUDE_WORKER_NAME=manager $RUNTIME_CMD")
 
 echo "handoff_id: $HANDOFF_ID"
 echo "handoff_path: $HANDOFF_PATH"

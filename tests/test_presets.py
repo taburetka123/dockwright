@@ -107,3 +107,51 @@ def test_manager_agent_wires_verifier_preset_on_verifier_spawns():
     assert "~/.claude/dockwright/presets/verifier-settings.json" not in text
     assert "~/.claude/orchestrator/presets/verifier-settings.json" not in text
     assert "~/.claude/presets/verifier-settings.json" not in text
+
+
+HEADLESS_PRESET = PRESETS / "worker-headless-settings.json"
+
+
+def test_headless_preset_reasserts_spawner_settings_keys():
+    # A caller --settings REPLACES spawn_worker's own settings flag (last-wins),
+    # so the preset must re-assert all three keys itself; dropping
+    # enableAllProjectMcpServers would reintroduce the pre-registration
+    # "N new MCP servers found" startup stall the preset exists to kill.
+    settings = json.loads(HEADLESS_PRESET.read_text())
+    assert settings.get("enableAllProjectMcpServers") is True
+    assert settings.get("remoteControlAtStartup") is False
+    assert settings.get("disableRemoteControl") is True
+
+
+def test_headless_preset_allows_worker_protocol_tools():
+    perms = json.loads(HEADLESS_PRESET.read_text())["permissions"]
+    assert perms.get("defaultMode") == "acceptEdits"
+    allow = perms["allow"]
+    for rule in (
+        "mcp__dockwright__worker_done",
+        "mcp__dockwright__ask_manager",
+        "mcp__dockwright__artifact_put",
+        "Bash(printenv:*)",
+    ):
+        assert rule in allow, f"headless preset must allow {rule}"
+
+
+def test_verifier_preset_allows_worker_protocol_tools():
+    settings = json.loads(VERIFIER_PRESET.read_text())
+    allow = settings["permissions"]["allow"]
+    for rule in ("mcp__dockwright__worker_done", "mcp__dockwright__ask_manager",
+                 "Bash(printenv:*)"):
+        assert rule in allow, f"verifier preset must allow {rule}"
+    assert settings.get("enableAllProjectMcpServers") is True
+    # The read-only construction must survive the additions.
+    deny = settings["permissions"]["deny"]
+    for tool in ("Write", "Edit", "NotebookEdit"):
+        assert tool in deny
+
+
+def test_headless_preset_path_var_defined_and_wired():
+    vars_toml = (REPO_ROOT / "deploy" / "agents" / "vars.defaults.toml").read_text()
+    assert ("worker_headless_settings_path = "
+            "'<absolute-home>/.claude/dockwright/presets/worker-headless-settings.json'") in vars_toml
+    core = (REPO_ROOT / "deploy" / "agents" / "manager.core.md").read_text()
+    assert "{{worker_headless_settings_path}}" in core

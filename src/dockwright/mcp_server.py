@@ -2252,6 +2252,7 @@ async def spawn_worker_impl(
         print(f"spawn_worker: {manager_resolution_warning}", file=sys.stderr)
     if parent_manager_name:
         env = {**(env or {}), "CLAUDE_PARENT_MANAGER": parent_manager_name}
+    _prune_stale_assignments()      # opportunistic, cold path — spawn is the pendings' write site
     # Durable ownership record:
     # pending file written pre-launch, claimed by the worker's SessionStart hook
     # via the env-carried id. Resume/promote/replacement lanes never set the id.

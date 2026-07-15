@@ -297,7 +297,7 @@ Prefer done events over Stop-derived `last_summary` when both fire — done is t
 
 Harvest a done event BEFORE sending any follow-up to that worker: every `send_manager_to_worker` starts a new tasking episode, and `wait_for_worker` ignores done events older than your latest send (minus a 2s grace) — so a nudge sent over an unharvested done means the wait blocks until the worker reports again, instead of returning the stale-by-then summary.
 
-When spawning a new worker, always end the initial prompt with: "When done, call `worker_done(claude_sid, summary)` — run `echo ${CLAUDE_CODE_SESSION_ID:-$CODEX_THREAD_ID}` to get your claude_sid." `send_manager_to_worker` follow-ups should do the same.
+When spawning a new worker, always end the initial prompt with: "When done, call `worker_done(claude_sid, summary)` — your claude_sid is injected into your session context at start (the `dockwright: your claude_sid is …` line); if it isn't visible, run `printenv CLAUDE_CODE_SESSION_ID` (codex: `printenv CODEX_THREAD_ID`)." `send_manager_to_worker` follow-ups should do the same.
 
 ## Account auto-switch
 
@@ -355,7 +355,7 @@ A status that signals a silently-degraded path — `queued_no_window`, `degraded
 
 ## Headless / no-human spawns: a permission mode that cannot stall
 
-A fresh Claude worker booted into manual/default permission mode where no human sits at the terminal (a headless VM, an unattended autonomous run) stalls minutes-to-indefinitely on EVERY gated command — approval prompts nobody will click — and the stall then reads as "stuck", feeding exactly the bad kill above. Spawn such workers with a permission strategy that cannot stall on the task's expected commands AND is scoped to the task: a `--settings` allowlist / accept-edits preset passed via `extra_args` (the Tier-2 verifier's read-only preset is the pattern; a writing worker's allowlist must cover its full command set; Codex spawns already ride the runtime's fixed non-interactive defaults). Document the choice in the spawn decision. A blanket `--dangerously-skip-permissions` is NOT that strategy — it stays the classifier-outage workaround below, never a routine spawn mode. (Same dogfood run: a VM worker in manual mode ate 2–3-minute approval stalls per command.)
+A fresh Claude worker booted into manual/default permission mode where no human sits at the terminal (a headless VM, an unattended autonomous run) stalls minutes-to-indefinitely on EVERY gated command — approval prompts nobody will click — and the stall then reads as "stuck", feeding exactly the bad kill above. Spawn such workers with a permission strategy that cannot stall on the task's expected commands AND is scoped to the task: pass `extra_args=["--settings", "{{worker_headless_settings_path}}"]` — the shipped headless preset (accept-edits + the universal dockwright protocol allowlist: worker_done/ask_manager/artifact/pipeline tools). A writing worker whose task needs more Bash than accept-edits covers gets a task-scoped composed COPY of that preset with extra `allow` rules — two gotchas: (1) a caller `--settings` REPLACES the spawner's own settings flag (last-wins, not merged), so any composed copy must keep the preset's top-level keys (`enableAllProjectMcpServers`, the remote-control-off pair); (2) commands containing `$…` can never be allowlisted (the permission system's expansion guard) — keep prompts expansion-free (`printenv`, not `echo $VAR`). Codex spawns already ride the runtime's fixed non-interactive defaults. Document the choice in the spawn decision. A blanket `--dangerously-skip-permissions` is NOT that strategy — it stays the classifier-outage workaround below, never a routine spawn mode. (Same dogfood run: a VM worker in manual mode ate 2–3-minute approval stalls per command.)
 
 ## Bash safety-classifier outage — spawn workers with `--dangerously-skip-permissions`
 
@@ -467,7 +467,7 @@ If you're choosing between "send instruction to existing worker" vs "spawn a new
 
 For task-keyed dispatches there's a third option: **resume a closed worker** with prior context for the same task — see "Resume-first for task-keyed dispatches" below.
 
-Whichever you pick, end the prompt/instruction with: "When done, call `worker_done(claude_sid, summary)` — run `echo ${CLAUDE_CODE_SESSION_ID:-$CODEX_THREAD_ID}` to get your claude_sid." Without that, the worker finishes quietly and you only find out via the turn-ends monitor's `FINISHED_SILENTLY` line, ~2min late.
+Whichever you pick, end the prompt/instruction with: "When done, call `worker_done(claude_sid, summary)` — your claude_sid is injected into your session context at start (the `dockwright: your claude_sid is …` line); if it isn't visible, run `printenv CLAUDE_CODE_SESSION_ID` (codex: `printenv CODEX_THREAD_ID`)." Without that, the worker finishes quietly and you only find out via the turn-ends monitor's `FINISHED_SILENTLY` line, ~2min late.
 
 <!-- overlay: pr-dispatch-obligation -->
 ## Resume-first for task-keyed dispatches

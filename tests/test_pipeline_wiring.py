@@ -91,6 +91,14 @@ def _wire_selffix(tmp_path):
     return sp
 
 
+@pytest.fixture(autouse=True)
+def _launchctl_present_by_default(monkeypatch):
+    # The platform gate keys on launchctl presence; pin it truthy so the
+    # pre-existing enable/disable behavior tests run identically on Linux CI.
+    monkeypatch.setattr(pw.shutil, "which",
+                        lambda cmd: "/bin/launchctl" if cmd == "launchctl" else None)
+
+
 def test_enable_gardener_refuses_without_selffix_for_digest(tmp_path):
     sp = _settings(tmp_path)   # selffix NOT wired
     installer = tmp_path / "gardener-install.sh"
@@ -174,3 +182,31 @@ def test_dispatch_gardener_routes_to_pipeline_wiring(monkeypatch):
         m.main()
     assert ei.value.code == 0
     assert called["argv"] == ["enable", "--lane", "frontier"]
+
+
+def test_enable_gardener_errors_without_launchctl(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(pw.shutil, "which", lambda cmd: None)
+    installer = tmp_path / "gardener-install.sh"
+    installer.write_text("#!/bin/bash\n")
+    calls = []
+    rc = pw.enable_gardener("frontier", settings_path=tmp_path / "settings.json",
+                            installer_path=installer,
+                            run=lambda cmd: calls.append(cmd) or 0)
+    assert rc == 2
+    assert calls == []                      # no installer side effects
+    assert "launchd" in capsys.readouterr().err
+
+
+def test_disable_gardener_without_launchctl_unlinks_plists_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(pw.shutil, "which", lambda cmd: None)
+    la = tmp_path / "LaunchAgents"
+    la.mkdir()
+    for label in pw._gardener_labels("all", "com.dockwright"):
+        (la / f"{label}.plist").write_text("<plist/>")
+    calls = []
+    rc = pw.disable_gardener("all", launch_agents_dir=la,
+                             label_prefix="com.dockwright",
+                             run=lambda cmd: calls.append(cmd) or 0, uid=501)
+    assert rc == 0
+    assert calls == []                      # launchctl never invoked
+    assert not list(la.glob("*.plist"))     # cleanup still happened
