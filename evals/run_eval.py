@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline eval harness for the orchestrator's code-review verifier.
+"""Offline eval harness for dockwright's code-review verifier.
 
 Feeds each labeled diff in evals/dataset/ to the verifier (a headless
 `claude -p` reproduction of the production Tier-2 verifier binding, run

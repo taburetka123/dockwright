@@ -1,0 +1,2 @@
+CloudWatch SQS metrics lag ~5 minutes; a depth datapoint reflects the queue
+several minutes earlier, not at alert-evaluation time.

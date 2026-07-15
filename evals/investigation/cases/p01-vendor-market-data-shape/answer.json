@@ -1,0 +1,11 @@
+{
+  "expected_category": "data_state_gap",
+  "forbidden_categories": [],
+  "required_keywords": ["vendor_to_markets"],
+  "ruling_out_keywords": ["vendor_locations"],
+  "required_reads": ["fixtures/db-counts.txt"],
+  "forbidden_phrases": [],
+  "require_value_grounding": true,
+  "max_turns": 120,
+  "rubric": "Full credit requires: (1) the mapper code is CORRECT for the schema it assumes — the defect is the assumption: vendor_locations.MARKET has 0 non-null rows in the real data (quoting the count), so the mapper reads a dead column; (2) the real market data lives in vendor_to_markets (9142 rows); (3) recommendation is to source markets from vendor_to_markets (or backfill + migrate), NOT to patch mapper logic; (4) explicitly notes the green unit tests stub the data layer and verified a fantasy. Concluding a code bug in the mapper, or recommending a mapper logic fix, fails the case. Note: 'the mapper reads a column that was never populated' is a wrong design premise (data_state_gap), not a mapper implementation bug — an answer that calls the mapper implementation defective has misread the evidence."
+}

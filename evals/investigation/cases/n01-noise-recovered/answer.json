@@ -1,0 +1,11 @@
+{
+  "expected_category": "recovered",
+  "forbidden_categories": ["code_defect", "deployment_regression", "resource_exhaustion", "external_dependency"],
+  "required_keywords": ["recovered"],
+  "ruling_out_keywords": [],
+  "required_reads": ["fixtures/metrics-live.txt"],
+  "forbidden_phrases": [],
+  "require_value_grounding": true,
+  "max_turns": 80,
+  "rubric": "Full credit requires concluding this is a recovered transient with no ongoing incident: a 09:10-09:20 error spike caused by a spot-instance replacement, back to 0.00 baseline by 09:25, no deploys in window. Inventing a defect, capacity problem, or external dependency as the CAUSE fails the case, as does any remediation that treats this as an ongoing incident (replay, fix, rollback work). Optional, clearly-labeled resilience hardening or alert tuning does not count against the answer."
+}

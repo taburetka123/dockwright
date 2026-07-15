@@ -1,0 +1,11 @@
+{
+  "expected_category": "noise_no_incident",
+  "forbidden_categories": ["code_defect", "upstream_invariant_broken", "data_state_gap"],
+  "required_keywords": ["ApproximateNumberOfMessagesVisible", "redrive"],
+  "ruling_out_keywords": ["lag"],
+  "required_reads": ["fixtures/queue-live.txt", "fixtures/redrive-log.txt"],
+  "forbidden_phrases": [],
+  "require_value_grounding": true,
+  "max_turns": 80,
+  "rubric": "Full credit requires: (1) the LIVE queue is empty (0 visible / 0 in-flight, re-queried at 16:25) — the alert's 1,558 was a lagged CloudWatch datapoint from a planned, announced redrive batch (CHG-2214) that drained by 16:09; (2) verdict: no incident, nothing to replay; (3) the alert value is labeled as the alert-time/lagged value, never stated as the current depth. Echoing 1,558 as the current depth, proposing replay/fix work, or inventing a producer defect fails the case."
+}

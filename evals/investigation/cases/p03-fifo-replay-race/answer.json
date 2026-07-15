@@ -1,0 +1,11 @@
+{
+  "expected_category": "race_or_replay",
+  "forbidden_categories": ["code_defect"],
+  "required_keywords": ["visibility", "receiveCount"],
+  "ruling_out_keywords": ["489"],
+  "required_reads": ["fixtures/logs-30d.txt", "fixtures/queue-config.txt"],
+  "forbidden_phrases": [],
+  "require_value_grounding": true,
+  "max_turns": 120,
+  "rubric": "Full credit requires: (1) handler p99 45s exceeds the 30s visibility timeout, so SQS redelivers mid-processing and two consumers race on the same message — receiveCount=2 in all 489 cases, first-delivery row not yet committed; (2) the 2-sample null-check ticket is rejected via the 30-day data (489 chatIds), not by intuition; (3) fix: raise visibility timeout / heartbeat extension (a code null-check would mask the replay). Recommending the null-check, or concluding a handler code defect, fails."
+}

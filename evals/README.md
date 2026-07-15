@@ -1,6 +1,6 @@
 # evals — offline eval harness for the verifier
 
-Measures how well the orchestrator's code-review **verifier** catches bad
+Measures how well dockwright's code-review **verifier** catches bad
 worker output, as one quotable number. The methodology is described below, and
 each run writes its headline metric and full results to `results/latest.json`.
 

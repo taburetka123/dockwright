@@ -1,0 +1,4 @@
+queue: chat-events.fifo
+VisibilityTimeout: 30 seconds
+handler p99 processing time (30d): 45 seconds
+maxReceiveCount before DLQ: 3

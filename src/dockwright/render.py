@@ -12,7 +12,7 @@ Semantics (inherited from compose_text, unchanged):
   included). This keeps today's operator command/preset deploys byte-stable,
   since no command/preset carries {{ }} yet.
 
-The CLI mirrors `orchestrator compose`'s var-merging: the defaults layer
+The CLI mirrors `dockwright compose`'s var-merging: the defaults layer
 (<core-dir>/vars.defaults.toml) is overlaid by the operator's dockwright.toml
 [agent_vars] per-key.
 """

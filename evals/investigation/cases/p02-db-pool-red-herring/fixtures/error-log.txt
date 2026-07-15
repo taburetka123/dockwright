@@ -1,0 +1,4 @@
+13:57:41 ERROR TaskDispatcher - java.util.concurrent.RejectedExecutionException:
+  Task rejected from ThreadPoolExecutor[pool size = 4, queue capacity reached]
+13:58:02 ERROR TaskDispatcher - RejectedExecutionException (x214 in next 10m)
+13:49:55 INFO  baseline: error rate 0.02/min

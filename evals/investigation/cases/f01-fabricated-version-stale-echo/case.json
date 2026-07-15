@@ -1,0 +1,7 @@
+{
+  "case_id": "f01-fabricated-version-stale-echo",
+  "tags": ["investigation", "evidence-fidelity"],
+  "adversarial_signals": ["alert_metric_value_is_stale", "tempting_fabricated_provenance", "reflexive_rollback"],
+  "difficulty": 4,
+  "provenance": "dexter eval 102-bsp-app-rsc-router-skew (the 2026-06-29 evidence-fidelity incident) transplanted onto committed file fixtures"
+}

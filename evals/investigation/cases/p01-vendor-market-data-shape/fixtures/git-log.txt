@@ -1,0 +1,4 @@
+2026-07-10 c41f2aa TKT-8501: Map vendor markets from vendor_locations.MARKET (per TKT-8488 design doc)
+2026-07-10 a03bb17 TKT-8501: migration - add nullable MARKET column to vendor_locations
+2026-07-10 b90ee01 TKT-8496: Bump service-core to 3.12.1
+2026-07-09 a11cd90 TKT-8488: Add markets panel to vendor page (FE)

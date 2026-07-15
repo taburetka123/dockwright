@@ -63,7 +63,7 @@ fi
 # render, codex agent mirror + skill wrappers). A normal install builds one in
 # .venv and re-points RENDER_BIN at it below. In FILES_ONLY mode there is no
 # build, so the transforms are skipped UNLESS DOCKWRIGHT_ORCH_BIN names a
-# prebuilt binary (e.g. a worktree's .venv/bin/orchestrator) — that override is
+# prebuilt binary (e.g. a worktree's .venv/bin/dockwright) — that override is
 # what lets the byte-equivalence gate render fully from a worktree.
 RENDER_BIN="${DOCKWRIGHT_ORCH_BIN:-}"
 
@@ -290,7 +290,7 @@ cp "$REPO_DIR/deploy/scripts/"*.cjs "$CLAUDE_DIR/scripts/" 2>/dev/null || true
 # shipping to ~/.claude/scripts/ as a standalone stdlib-only script.
 cp "$REPO_DIR/src/dockwright/stale_monitor.py" "$CLAUDE_DIR/scripts/stale_monitor.py"
 chmod +x "$CLAUDE_DIR/scripts/"*.py "$CLAUDE_DIR/scripts/"*.sh
-echo "→ Installed orchestrator helper scripts to $CLAUDE_DIR/scripts/"
+echo "→ Installed dockwright helper scripts to $CLAUDE_DIR/scripts/"
 
 # 4b*. Stamp deployed script copies (.py/.sh ONLY — .md is exempt, a header line
 # would enter agent/command context and agents already carry the compose-stamp
@@ -415,16 +415,16 @@ else
     echo "→ codex not on PATH — skipping Codex MCP registration"
 fi
 
-# 6. Wire orchestrator hooks (explicit path) into Claude + Codex
+# 6. Wire dockwright hooks (explicit path) into Claude + Codex
 SETTINGS="$CLAUDE_DIR/settings.json"
 SNIPPET="$REPO_DIR/deploy/settings.snippet.json"
 "$DOCKWRIGHT_BIN" install-hooks --target "$SETTINGS" --snippet "$SNIPPET" --orch-bin "$DOCKWRIGHT_BIN" --mode claude
-echo "→ Wired orchestrator hooks into $SETTINGS (explicit path)"
+echo "→ Wired dockwright hooks into $SETTINGS (explicit path)"
 
 if [ "$CODEX_PRESENT" = "1" ]; then
     mkdir -p "$CODEX_DIR"
     "$DOCKWRIGHT_BIN" install-hooks --target "$CODEX_DIR/hooks.json" --snippet "$SNIPPET" --orch-bin "$DOCKWRIGHT_BIN" --mode codex
-    echo "→ Wired orchestrator hooks into $CODEX_DIR/hooks.json (explicit path)"
+    echo "→ Wired dockwright hooks into $CODEX_DIR/hooks.json (explicit path)"
 fi
 fi
 

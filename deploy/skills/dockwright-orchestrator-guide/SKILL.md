@@ -15,7 +15,7 @@ The **architect** (multi-repo ticket pipeline) is an **optional separate compone
 
 ## Keep this skill in sync with the tool
 
-**If you modify claude-orchestrator, you must also update this skill in the same change.**
+**If you modify dockwright, you must also update this skill in the same change.**
 
 Triggers for an update pass: MCP tools added/removed/changed signatures; hooks behavior changed; file-protocol changes (new dirs under the state root, renamed record fields); new `CLAUDE_*` env contract; items moving on/off the "What it can't do" list; breaking UX changes in the slash commands; new failure mode + workaround discovered. Stale skills are worse than no skill — they mislead.
 
@@ -270,6 +270,6 @@ The manager notebook is the durable agenda for planned/conditional fleet-scoped 
 
 ## How this differs from in-process `Agent` subagents
 
-The Claude Code `Agent` tool spawns subagents *within* one session — same process, results return into the parent's context, gone at session end. claude-orchestrator spawns **separate CLI processes** in **separate tmux windows**: own context windows, own transcripts (`~/.claude/projects/` / `~/.codex/sessions/`), survive the manager, human-readable scrollback, resumable after close. Trade-off: filesystem comms (~500ms answer poll, ~2–5s monitor latency) and no shared memory.
+The Claude Code `Agent` tool spawns subagents *within* one session — same process, results return into the parent's context, gone at session end. dockwright spawns **separate CLI processes** in **separate tmux windows**: own context windows, own transcripts (`~/.claude/projects/` / `~/.codex/sessions/`), survive the manager, human-readable scrollback, resumable after close. Trade-off: filesystem comms (~500ms answer poll, ~2–5s monitor latency) and no shared memory.
 
 Use `Agent` for "search 5 things in parallel right now". Use the orchestrator for "hours of independent work running in tabs while I do other things".

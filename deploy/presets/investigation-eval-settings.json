@@ -1,0 +1,24 @@
+{
+  "remoteControlAtStartup": false,
+  "disableRemoteControl": true,
+  "permissions": {
+    "deny": [
+      "Write",
+      "Edit",
+      "NotebookEdit",
+      "WebFetch",
+      "WebSearch",
+      "Bash(curl:*)",
+      "Bash(time curl:*)",
+      "Bash(wget:*)",
+      "Bash(gh:*)",
+      "Bash(npm:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git rebase:*)",
+      "Bash(git reset:*)",
+      "Bash(git checkout:*)",
+      "Bash(rm:*)"
+    ]
+  }
+}

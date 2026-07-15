@@ -1,4 +1,4 @@
-"""Template + idempotently merge orchestrator hooks into a settings/hooks JSON file.
+"""Template + idempotently merge dockwright hooks into a settings/hooks JSON file.
 
 The committed settings.snippet.json carries an @@DOCKWRIGHT_BIN@@ placeholder in every
 hook command; setup.sh substitutes the absolute venv-binary path at install time so hooks
@@ -229,14 +229,14 @@ def merge_settings_file(target, snippet_path, orch_bin: str, mode: str) -> None:
 
 
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(description="Render + merge orchestrator hooks into a settings file.")
+    p = argparse.ArgumentParser(description="Render + merge dockwright hooks into a settings file.")
     p.add_argument("--target", type=Path, required=True)
     p.add_argument("--snippet", type=Path, required=True)
     p.add_argument("--orch-bin", required=True)
     p.add_argument("--mode", choices=("claude", "codex"), required=True)
     args = p.parse_args(argv)
     merge_settings_file(args.target, args.snippet, args.orch_bin, args.mode)
-    print(f"Merged orchestrator hooks into {args.target} (mode={args.mode})")
+    print(f"Merged dockwright hooks into {args.target} (mode={args.mode})")
     return 0
 
 

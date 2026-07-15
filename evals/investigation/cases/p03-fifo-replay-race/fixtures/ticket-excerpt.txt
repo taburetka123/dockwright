@@ -1,0 +1,3 @@
+BUG: ChatNotFoundException in ChatEventHandler (2 examples attached:
+chat 8912ac, chat 77b3f0). Proposal: null-check chat before lookup and
+return early. Severity: medium.
