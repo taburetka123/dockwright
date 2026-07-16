@@ -102,5 +102,6 @@ def test_no_platform_split_stat_probes_in_deploy():
         if "stat -f" in text or "stat -c" in text:
             offenders.append(str(path.relative_to(REPO)))
     assert not offenders, (
-        f"platform-split stat probes found (use `date -r <path> +%s`; see "
-        f"docs/superpowers/specs/2026-07-16-rc3-linux-fixes-design.md): {offenders}")
+        f"platform-split stat probes found (GNU `stat -f`/`stat -c` breaks "
+        f"across macOS/Linux; use the portable `date -r <path> +%s` form "
+        f"instead): {offenders}")
