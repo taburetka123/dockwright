@@ -84,6 +84,24 @@ echo "→ Enabling selffix debug logging (trigger.log denominator, PRD §6)"
 mkdir -p "$HOMEDIR/.claude/dockwright/selffix"
 touch "$HOMEDIR/.claude/dockwright/selffix/debug"
 
+# Labels whose launchd job never became visible after bootstrap. Initialized
+# unconditionally — set -u would kill the happy path at the final check
+# otherwise (same hazard as the frontier vars above). Non-empty at the end
+# means the enable FAILED and this script exits non-zero (macOS E2E finding
+# N-7 — the launchctl analog of the Linux L-10 honesty fix).
+FAILED_LABELS=""
+
+# launchctl list can lag a just-bootstrapped job (observed false WARN):
+# try-first, up to 2 retries, so the happy path pays no sleep.
+gardener_job_visible() {  # $1 = launchd label
+  local i
+  for i in 1 2 3; do
+    launchctl list "$1" >/dev/null 2>&1 && return 0
+    [ "$i" -lt 3 ] && sleep 1
+  done
+  return 1
+}
+
 # --- Digest loop install body (lane-gated) ----------------------------------
 if [ "$INSTALL_DIGEST" = "1" ]; then
 if [ ! -x "$GATE_PATH" ] && [ ! -f "$GATE_PATH" ]; then
@@ -133,14 +151,16 @@ EOF
 
 echo "→ (Re)loading launchd job $PLIST_LABEL"
 launchctl bootout "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null || true
-# || true: under set -e a bootstrap failure would abort before the explicit
-# warn branch below ever runs (verifier finding on #58).
-launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" || true
-sleep 1  # launchctl list can lag a just-bootstrapped job (observed false WARN)
-if launchctl list "$PLIST_LABEL" >/dev/null 2>&1; then
+# rc captured, not discarded: under set -e a raw bootstrap failure would abort
+# before the visibility check below (verifier finding on #58). Visibility —
+# not this rc — is the arbiter of "armed".
+BOOTSTRAP_RC=0
+launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" || BOOTSTRAP_RC=$?
+if gardener_job_visible "$PLIST_LABEL"; then
   echo "→ Loaded: $PLIST_LABEL (hourly)"
 else
-  echo "WARN: $PLIST_LABEL not visible in launchctl list after bootstrap — check $PLIST_PATH" >&2
+  echo "WARN: $PLIST_LABEL not visible in launchctl list after bootstrap (bootstrap rc=$BOOTSTRAP_RC) — check $PLIST_PATH" >&2
+  FAILED_LABELS="$FAILED_LABELS $PLIST_LABEL"
 fi
 fi
 
@@ -197,13 +217,23 @@ EOF
 
 echo "→ (Re)loading launchd job $FRONTIER_LABEL"
 launchctl bootout "gui/$(id -u)/$FRONTIER_LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$FRONTIER_PLIST" || true
-sleep 1
-if launchctl list "$FRONTIER_LABEL" >/dev/null 2>&1; then
+BOOTSTRAP_RC=0
+launchctl bootstrap "gui/$(id -u)" "$FRONTIER_PLIST" || BOOTSTRAP_RC=$?
+if gardener_job_visible "$FRONTIER_LABEL"; then
   echo "→ Loaded: $FRONTIER_LABEL (daily tick)"
 else
-  echo "WARN: $FRONTIER_LABEL not visible in launchctl list after bootstrap — check $FRONTIER_PLIST" >&2
+  echo "WARN: $FRONTIER_LABEL not visible in launchctl list after bootstrap (bootstrap rc=$BOOTSTRAP_RC) — check $FRONTIER_PLIST" >&2
+  FAILED_LABELS="$FAILED_LABELS $FRONTIER_LABEL"
 fi
+fi
+
+# Any lane that never became visible = the enable FAILED. Exit non-zero so
+# `dockwright gardener enable` (which prints "gardener enabled" only on rc 0)
+# can never report success with nothing armed.
+if [ -n "$FAILED_LABELS" ]; then
+  echo "ERROR: gardener NOT armed — job(s) not visible in launchd after bootstrap:$FAILED_LABELS" >&2
+  echo "  Plist file(s) were written; 'dockwright gardener disable' removes them cleanly." >&2
+  exit 1
 fi
 
 # --- Summary (per-lane; only installed lanes described, no unbound var) ------

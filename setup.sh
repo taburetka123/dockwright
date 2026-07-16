@@ -98,6 +98,38 @@ fi
 # homebrew cleanup. The file TRANSFORMS below (compose, render, codex mirror)
 # are gated on RENDER_BIN instead, so DOCKWRIGHT_ORCH_BIN can drive them here.
 if [ "${DOCKWRIGHT_SETUP_FILES_ONLY:-}" != "1" ]; then
+# 0. Fail fast on a python that can't build the venv. A fresh macOS ships CLT
+# python 3.9 and dies at `pip install -e` with a raw PEP-660 error and no hint
+# (macOS E2E finding I-1). Presence first: a python-less box must error cleanly
+# before any pyproject parsing. The floor comes from pyproject's requires-python
+# so this check can never drift from the packaging contract. FILES_ONLY skips
+# venv/pip entirely, so the whole check is gated with it (the S6 sandbox pins
+# PATH to the CLT python deliberately).
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "ERROR: python3 not found on PATH — dockwright needs Python to install." >&2
+    echo "  macOS:  brew install python@3.13   (then open a new shell so \$(brew --prefix)/bin is on PATH)" >&2
+    echo "  Linux:  install python3.13 (e.g. apt/dnf package, or pyenv) and ensure 'python3' is on PATH." >&2
+    exit 1
+fi
+MIN_PY="$(sed -n 's/^requires-python *= *">= *\([0-9][0-9.]*\) *[",].*/\1/p' "$REPO_DIR/pyproject.toml" 2>/dev/null | head -1 || true)"
+MIN_PY="${MIN_PY:-3.11}"
+python_meets_min() {  # $1 = python executable; true iff it exists, runs, and is >= MIN_PY
+    "$1" -c "import sys; sys.exit(0 if sys.version_info >= tuple(int(x) for x in '$MIN_PY'.split('.')) else 1)" 2>/dev/null
+}
+if ! python_meets_min python3; then
+    echo "ERROR: dockwright requires Python >= $MIN_PY; found: $(python3 --version 2>&1) at $(command -v python3)." >&2
+    echo "  macOS:  brew install python@3.13   (then open a new shell so \$(brew --prefix)/bin is on PATH)" >&2
+    echo "  Linux:  install python3.13 (e.g. apt/dnf package, or pyenv) and ensure 'python3' on PATH resolves to it." >&2
+    exit 1
+fi
+# A .venv built by an older python — or whose interpreter broke (brew python
+# upgrade, half-finished create) — makes every re-run fail identically with no
+# hint; recovery used to require knowing `rm -rf .venv` (macOS E2E finding
+# N-6). The venv is a build artifact this script itself creates: recreate it.
+if [ -d "$REPO_DIR/.venv" ] && ! python_meets_min "$REPO_DIR/.venv/bin/python"; then
+    echo "→ Existing .venv is stale or broken (python missing or < $MIN_PY) — recreating"
+    rm -rf "$REPO_DIR/.venv"
+fi
 # 1. Install the Python package
 if [ ! -d "$REPO_DIR/.venv" ]; then
     echo "→ Creating .venv"
