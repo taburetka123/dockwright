@@ -1,0 +1,19 @@
+{
+  "enableAllProjectMcpServers": true,
+  "remoteControlAtStartup": false,
+  "disableRemoteControl": true,
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "mcp__dockwright__worker_done",
+      "mcp__dockwright__ask_manager",
+      "mcp__dockwright__artifact_put",
+      "mcp__dockwright__artifact_get",
+      "mcp__dockwright__artifact_list",
+      "mcp__dockwright__artifact_view",
+      "mcp__dockwright__pipeline_event",
+      "mcp__dockwright__pipeline_status",
+      "Bash(printenv:*)"
+    ]
+  }
+}

@@ -123,6 +123,19 @@ def worker_home() -> Path:
     return config.worker_home_default()
 
 
+def ensure_worker_home() -> Path:
+    """worker_home(), created (mkdir -p) so a bare spawn_worker never falls back
+    to the manager's cwd on a fresh install. Fail-open: a mkdir failure
+    (permissions, or a parent that's a regular file) is swallowed — the caller's
+    own is_dir() check then decides, preserving the pre-fix fallback."""
+    home = worker_home()
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return home
+
+
 DEFAULT_DOMAIN = "general"
 
 # Env vars the orchestrator stamps on (or reads from) its own manager/worker

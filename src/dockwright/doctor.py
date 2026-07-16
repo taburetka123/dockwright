@@ -12,7 +12,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import compose, env_install, homebrew_cleanup
+from . import compose, config, env_install, homebrew_cleanup
 
 
 @dataclass
@@ -99,13 +99,23 @@ def check_compose_fresh(core_dir, out_dir, overlay_dir=None) -> Check:
                  "; ".join(problems) if problems else "deployed agents match recompose")
 
 
+def _default_orch_bin() -> str:
+    """The console script beside the running interpreter — identical to the
+    $DOCKWRIGHT_BIN setup.sh passes, so a bare `dockwright doctor` (README) and
+    the setup.sh invocation verify the same wiring."""
+    return str(Path(sys.executable).parent / "dockwright")
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Verify canonical dockwright env wiring.")
-    p.add_argument("--orch-bin", required=True)
-    p.add_argument("--claude-json", type=Path)
-    p.add_argument("--settings", type=Path)
-    p.add_argument("--codex-hooks", type=Path)
-    p.add_argument("--codex-config", type=Path)
+    p.add_argument("--orch-bin", default=_default_orch_bin())
+    p.add_argument("--claude-json", type=Path, default=Path.home() / ".claude.json")
+    p.add_argument("--settings", type=Path,
+                   default=config.claude_config_home() / "settings.json")
+    p.add_argument("--codex-hooks", type=Path,
+                   default=Path.home() / ".codex" / "hooks.json")
+    p.add_argument("--codex-config", type=Path,
+                   default=Path.home() / ".codex" / "config.toml")
     p.add_argument("--brew-prefix", type=Path, default=Path("/opt/homebrew"))
     p.add_argument("--dist-name", default="dockwright")
     p.add_argument("--server-name", default="dockwright")

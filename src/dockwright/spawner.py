@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import shlex
+import shutil
 import subprocess
 import time
 from datetime import datetime
@@ -679,6 +680,23 @@ def _codex_worker_prompt(initial_prompt: str) -> str:
     return f"{CODEX_WORKER_BOOTSTRAP_PROMPT}\n\nTask:\n{initial_prompt}"
 
 
+def _interactive_shell() -> str:
+    """Shell for the spawn `-ic` argv. The inner command uses POSIX `K=v cmd`
+    env-prefix syntax, so an exotic $SHELL (fish, nushell) can't run it —
+    honor $SHELL only when it's zsh/bash; otherwise fall down a fixed
+    POSIX-family order. `-i` is load-bearing: the interactive rc is what puts
+    the user's `claude`/`codex` on PATH. Stock Ubuntu ships no zsh — a
+    hardcoded zsh argv made every spawn die at exec (empty dead pane)."""
+    sh = os.environ.get("SHELL", "")
+    if os.path.basename(sh) in ("zsh", "bash") and shutil.which(sh):
+        return sh
+    for cand in ("zsh", "bash"):
+        found = shutil.which(cand)
+        if found:
+            return found
+    return "sh"
+
+
 def _runtime_command(
     runtime: str,
     initial_prompt: str,
@@ -845,7 +863,7 @@ async def spawn_worker_tab(
     )
     title = tab_title if tab_title is not None else name
     window_id = await get_driver().spawn(
-        cwd=cwd, title=title, argv=["zsh", "-ic", inner_cmd],
+        cwd=cwd, title=title, argv=[_interactive_shell(), "-ic", inner_cmd],
         route_to_workers_window=route_to_workers_window,
         route_to_manager_session=(agent == "manager"),
         target_window_match=target_window_match,

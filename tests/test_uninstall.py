@@ -64,7 +64,7 @@ def test_strip_preserves_foreign_hooks_matcher_and_top_level_keys():
             "PreToolUse": [foreign_block],
             "Stop": [{"hooks": [
                 _hook(f"bash -c '$PPID {ABS} stop'"),
-                _hook("bash /U/.claude/scripts/selffix-trigger.sh", timeout=10),
+                _hook("bash /U/.claude/scripts/native-hook.sh", timeout=10),
             ]}],
         },
     }
@@ -73,7 +73,7 @@ def test_strip_preserves_foreign_hooks_matcher_and_top_level_keys():
     assert out["statusLine"] == {"command": "x"}
     assert out["hooks"]["PreToolUse"] == [foreign_block]
     stop_cmds = [h["command"] for b in out["hooks"]["Stop"] for h in b["hooks"]]
-    assert stop_cmds == ["bash /U/.claude/scripts/selffix-trigger.sh"]
+    assert stop_cmds == ["bash /U/.claude/scripts/native-hook.sh"]
 
 def test_strip_is_idempotent_and_does_not_mutate_input():
     settings = {"hooks": {"Stop": [{"hooks": [_hook(f"bash -c '$PPID {ABS} stop'")]},
@@ -540,3 +540,15 @@ def test_uninstall_removes_both_homes_and_compat_symlinks(tmp_path, monkeypatch)
     # operator overlay content kept (the compat symlink points at kept content)
     assert (overlay / "commands").exists()
     assert not (claude / "statusline-command.sh").exists()  # deployed, removed
+
+
+def test_strip_removes_selffix_sessionend_hook():
+    foreign = _hook("bash /other/native-hook.sh")          # genuinely foreign → survives
+    settings = {"hooks": {"SessionEnd": [
+        {"hooks": [foreign]},
+        {"hooks": [_hook("bash /home/u/.claude/scripts/selffix-trigger.sh", timeout=30)]},
+    ]}}
+    out = un.strip_orchestrator_hooks(settings, None, [])
+    cmds = [h["command"] for b in out.get("hooks", {}).get("SessionEnd", []) for h in b["hooks"]]
+    assert cmds == ["bash /other/native-hook.sh"]           # foreign survives, selffix stripped
+    assert not any("selffix-trigger.sh" in c for c in cmds)

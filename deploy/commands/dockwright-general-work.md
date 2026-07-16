@@ -23,4 +23,4 @@ Do NOT:
 - Skip or silently collapse the {{dev_chain_name}} chain for "small" tasks — no size carve-out; if you drop a step anyway, enumerate each dropped step + one-line reason in `worker_done` AND the PR body.
 - Remove your own worktree — a session that deletes its own cwd breaks every subsequent hook.
 
-When done, call `worker_done(claude_sid, summary)` — run `echo ${CLAUDE_CODE_SESSION_ID:-$CODEX_THREAD_ID}` to get your claude_sid.
+When done, call `worker_done(claude_sid, summary)` — your claude_sid is injected into your session context at start (the `dockwright: your claude_sid is …` line); if it isn't visible, run `printenv CLAUDE_CODE_SESSION_ID` (codex: `printenv CODEX_THREAD_ID`).

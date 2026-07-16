@@ -185,3 +185,12 @@ def test_no_codex_with_render_bin_still_skips_codex_dir(tmp_path):
     assert (claude_dir / "commands" / "dockwright-general-work.md").exists()
     # …codex side entirely untouched.
     assert not codex_dir.exists()
+
+
+def test_files_only_does_not_create_worker_home(tmp_path):
+    # The worker-home step is FILES_ONLY-gated; a sandbox run must not mkdir any
+    # worker home. Point the config at a sentinel under tmp and assert absence.
+    marker = tmp_path / "sentinel-worker-home"
+    claude_dir, _ = run_sandboxed_setup(
+        tmp_path, {"CLAUDE_ORCH_WORKER_HOME": str(marker)})
+    assert not marker.exists()

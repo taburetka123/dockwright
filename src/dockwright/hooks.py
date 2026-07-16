@@ -9,6 +9,17 @@ from .state import _pid_alive
 from .terminal import get_driver
 
 
+def _awake_seconds() -> float:
+    """Monotonic seconds that PAUSE during system sleep. macOS: CLOCK_UPTIME_RAW
+    (CLOCK_MONOTONIC there keeps ticking through sleep). Linux has no
+    CLOCK_UPTIME_RAW; time.monotonic() is CLOCK_MONOTONIC, which excludes
+    suspend — the same awake-only semantics."""
+    clk = getattr(time, "CLOCK_UPTIME_RAW", None)
+    if clk is not None:
+        return time.clock_gettime(clk)
+    return time.monotonic()
+
+
 MANAGER_TAB_COLOR = ("#aa0066", "#440022")
 WORKER_TAB_COLOR_IDLE = ("#444444", "#222222")
 WORKER_TAB_COLOR_BUSY = ("#aa8800", "#443300")
@@ -126,21 +137,38 @@ def _apply_captured_window_id(sid: str, record: dict) -> None:
         return
 
 
-def _ancestor_pids(start_pid: int, max_hops: int = 15) -> set:
-    """Strict process-ancestors of start_pid, walked ppid-by-ppid.
+def _iter_ancestors(start_pid: int, max_hops: int = 15):
+    """Lazy strict process-ancestors of start_pid, walk order (parent first).
 
-    Stops at pid 1, a self-loop, a cycle, or any lookup failure — best-effort
-    by design, the caller treats a short walk as "no match"."""
+    Same semantics as _ancestor_chain (exclusive, cycle/failure-stopping) but
+    yields on demand: a caller that only needs the nearest match (e.g.
+    _resolve_session_pid) can stop as soon as it finds one instead of paying
+    for the full walk's `ps` calls up front."""
     from .identity import _ppid_of
-    ancestors: set = set()
+    seen: set = set()
     cursor = start_pid
     for _ in range(max_hops):
         parent = _ppid_of(cursor)
-        if parent is None or parent <= 1 or parent == cursor or parent in ancestors:
+        if parent is None or parent <= 1 or parent == cursor or parent in seen:
             break
-        ancestors.add(parent)
+        yield parent
+        seen.add(parent)
         cursor = parent
-    return ancestors
+
+
+def _ancestor_chain(start_pid: int, max_hops: int = 15) -> list:
+    """Strict process-ancestors of start_pid in walk order (parent first).
+
+    Excludes start_pid itself — _ancestor_pids consumers (nested detection)
+    rely on the exclusive semantics. Stops at pid 1, a self-loop, a cycle, or
+    any lookup failure — best-effort by design, callers treat a short walk as
+    "no match"."""
+    return list(_iter_ancestors(start_pid, max_hops))
+
+
+def _ancestor_pids(start_pid: int, max_hops: int = 15) -> set:
+    """Strict process-ancestors of start_pid, walked ppid-by-ppid."""
+    return set(_ancestor_chain(start_pid, max_hops))
 
 
 def _pid_looks_like_session(pid: int) -> bool:
@@ -163,6 +191,31 @@ def _pid_looks_like_session(pid: int) -> bool:
         return _looks_like_session(result.stdout.strip())
     except Exception:
         return False
+
+
+def _resolve_session_pid() -> int:
+    """Pid of the long-lived claude/codex CLI process owning this session.
+
+    On macOS the hook wrapper's $PPID (CLAUDE_PARENT_PID) IS the claude
+    process. On Linux, claude's hook runner interposes a short-lived
+    intermediate (`/bin/sh -c …` on 2.1.210), so the captured pid dies within
+    seconds of registration — and recording it made every prune-bearing fleet
+    call reap the record. Resolve the NEAREST ancestor whose process is a
+    claude/codex session instead, walking from the captured pid and falling
+    back to our own live chain when the intermediate is already gone. Nearest
+    (not farthest) match keeps a nested `claude -p` child resolving to its OWN
+    claude — /clear-rotation supersede and nested detection both key on it.
+    No session on either chain → the captured pid (old behavior; the prune's
+    pane-liveness gate covers that residual)."""
+    raw = os.environ.get("CLAUDE_PARENT_PID", "")
+    captured = int(raw) if raw.isdigit() else os.getppid()
+    for start in dict.fromkeys((captured, os.getppid())):
+        if _pid_looks_like_session(start):
+            return start
+        for pid in _iter_ancestors(start):
+            if _pid_looks_like_session(pid):
+                return pid
+    return captured
 
 
 def _proc_argv(pid: int) -> list | None:
@@ -376,6 +429,28 @@ def _is_orchestrator_session() -> bool:
         return False
     return os.environ.get("CLAUDE_AGENT") in ("manager", "worker")
 
+def _emit_session_context(sid: str, agent: str) -> None:
+    """SessionStart stdout → Claude Code injects it as session context. This is
+    how a session learns its sid WITHOUT running a shell command: the old
+    `echo ${CLAUDE_CODE_SESSION_ID:-$CODEX_THREAD_ID}` template instruction
+    tripped the permission system's "Contains expansion" guard — which no
+    allowlist can cover — deterministically stalling headless workers on their
+    first turn. Codex mirrors the same hook wiring but its hook-stdout contract
+    is not Claude's, and codex spawns ride fixed non-interactive approvals —
+    skip there."""
+    if os.environ.get("CLAUDE_WORKER_RUNTIME") == "codex":
+        return
+    if agent == "worker":
+        line = (f"dockwright: your claude_sid is {sid} — pass it as claude_sid "
+                "to ask_manager / worker_done / artifact_put.")
+    else:
+        line = (f"dockwright: your session id is {sid} — pass it as manager_sid "
+                "to spawn_worker / list_workers / list_pending_questions.")
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "SessionStart",
+        "additionalContext": line,
+    }}))
+
 def session_start() -> None:
     if not _is_orchestrator_session():
         return
@@ -386,7 +461,7 @@ def session_start() -> None:
         return
     agent = os.environ["CLAUDE_AGENT"]
     iterm_sid = os.environ.get("CLAUDE_ITERM_SID") or get_driver().current_pane_id() or ""
-    cli_pid = int(os.environ.get("CLAUDE_PARENT_PID", os.getppid()))
+    cli_pid = _resolve_session_pid()
     paths.ensure_dirs()
     existing = state.read_json(paths.ACTIVE / f"{sid}.json")
     if existing is not None and existing.get("name") and existing.get("agent") == agent:
@@ -539,6 +614,7 @@ def session_start() -> None:
     if agent == "worker" and existing is None and not record.get("nested"):
         _claim_pending_assignment(sid, name)
         _apply_captured_window_id(sid, record)
+    _emit_session_context(sid, agent)
     if record.get("nested"):
         # No tab of its own — painting would retitle the parent's tab.
         return
@@ -597,8 +673,8 @@ def stop_hook() -> None:
         # can find the subagents dir without re-deriving the cwd slug.
         record["transcript_path"] = str(log)
     # Paired uptime stamp so stale_monitor's idle-elapsed math survives laptop
-    # sleep — wall-clock keeps ticking through sleep, CLOCK_UPTIME_RAW doesn't.
-    record["last_turn_at_uptime"] = time.clock_gettime(time.CLOCK_UPTIME_RAW)
+    # sleep — wall-clock keeps ticking through sleep, the awake clock doesn't.
+    record["last_turn_at_uptime"] = _awake_seconds()
     record["state"] = "idle"
     state.write_json_atomic(active_path, record)
     if record.get("nested"):

@@ -187,6 +187,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -200,6 +201,18 @@ try:
     from dockwright.terminal import get_driver as _get_driver
 except Exception:  # pragma: no cover - venv editable install expected in prod
     _get_driver = None
+
+
+def _awake_seconds() -> float:
+    """Duplicated from hooks._awake_seconds — this file is standalone/stdlib-only.
+    Monotonic seconds that PAUSE during system sleep. macOS: CLOCK_UPTIME_RAW
+    (CLOCK_MONOTONIC there keeps ticking through sleep). Linux has no
+    CLOCK_UPTIME_RAW; time.monotonic() is CLOCK_MONOTONIC, which excludes
+    suspend — the same awake-only semantics."""
+    clk = getattr(time, "CLOCK_UPTIME_RAW", None)
+    if clk is not None:
+        return time.clock_gettime(clk)
+    return time.monotonic()
 
 
 def _env_positive_int(name: str, default: int) -> int:
@@ -220,6 +233,15 @@ except ValueError:
     _IDLE_HOURS = 2.0
 IDLE_THRESHOLD_SEC = int(_IDLE_HOURS * 3600)
 AUTOCLOSE_CADENCE_SEC = 3600
+# Orphan-window alarm: a pane in the workers tmux session with no backing
+# active record — the report-only sweep's "orphan terminal window" — pages on
+# the doubling ladder once continuously orphan past the grace (the VM-E2E
+# ghost sat invisible for 22 minutes). Spawn-in-flight windows are protected
+# by their assignments/.pending/*.window sidecar until the SessionStart claim
+# consumes it. Session name is a literal (standalone script);
+# test_stale_monitor pins it to terminal.WORKERS_OS_WINDOW_CLASS.
+WORKERS_SESSION_NAME = "claude-workers"
+ORPHAN_GRACE_SEC = _env_positive_int("CLAUDE_ORCH_ORPHAN_GRACE_SEC", 120)
 
 HOME = Path(os.environ.get("HOME", ""))
 
@@ -238,6 +260,7 @@ _LEGACY_ROOT = HOME / ".claude" / "orchestrator"  # deprecated, one release
 ACTIVE = ROOT / "active"
 QUESTIONS = ROOT / "questions"
 CLOSED = ROOT / "closed"
+ASSIGNMENTS_PENDING = ROOT / "assignments" / ".pending"
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
 CODEX_SESSIONS = HOME / ".codex" / "sessions"
 # entries must be lowercase — matched against text.lower(). RATE_LIMIT_SIGNATURES
@@ -679,6 +702,24 @@ def _ledger_banner_event(event: str, banner: str, source: str, now: int,
     next_emitted[key] = now
 
 
+def _interactive_shell() -> str:
+    """Duplicated from spawner._interactive_shell — this file is standalone/stdlib-only.
+    Shell for the spawn `-ic` argv. The inner command uses POSIX `K=v cmd`
+    env-prefix syntax, so an exotic $SHELL (fish, nushell) can't run it —
+    honor $SHELL only when it's zsh/bash; otherwise fall down a fixed
+    POSIX-family order. `-i` is load-bearing: the interactive rc is what puts
+    the user's `claude`/`codex` on PATH. Stock Ubuntu ships no zsh — a
+    hardcoded zsh argv made every spawn die at exec (empty dead pane)."""
+    sh = os.environ.get("SHELL", "")
+    if os.path.basename(sh) in ("zsh", "bash") and shutil.which(sh):
+        return sh
+    for cand in ("zsh", "bash"):
+        found = shutil.which(cand)
+        if found:
+            return found
+    return "sh"
+
+
 def _launch_recovery_manager(mgr_record: dict, mgr_sid: str, new_letter: str) -> str | None:
     """Open a fresh window on the flipped account running the thin recovery
     command. The new session does the takeover itself (design A3-v2: bash is
@@ -694,7 +735,7 @@ def _launch_recovery_manager(mgr_record: dict, mgr_sid: str, new_letter: str) ->
         f"{_account_config_prefix(new_letter)}"
         f"CLAUDE_AGENT=manager CLAUDE_WORKER_NAME={shlex.quote(name)} "
         # Manager lane is pinned (orch-audit model-allocation): never inherit
-        # the user's interactive model default. Quoted so zsh -ic can't glob [1m].
+        # the user's interactive model default. Quoted so the -ic shell can't glob [1m].
         f"claude --model {shlex.quote('opus[1m]')} "
         f"{shlex.quote(f'/manager-takeover-recovery {mgr_sid}')}"
     )
@@ -704,7 +745,7 @@ def _launch_recovery_manager(mgr_record: dict, mgr_sid: str, new_letter: str) ->
     try:
         return asyncio.run(asyncio.wait_for(
             _get_driver().spawn(
-                cwd=cwd, title="manager (recovery)", argv=["zsh", "-ic", inner],
+                cwd=cwd, title="manager (recovery)", argv=[_interactive_shell(), "-ic", inner],
                 route_to_manager_session=True),
             timeout=10)) or None
     except Exception as e:
@@ -1348,9 +1389,10 @@ def _outbox_oldest_ts(manager_name: str) -> float | None:
 def _compute_idle_elapsed_sec(record: dict, current_uptime: float, now: int) -> int | None:
     """Seconds since an idle worker's last turn, sleep-correctly.
 
-    Prefer uptime delta (CLOCK_UPTIME_RAW): macOS pauses it during laptop
-    sleep, so an 8h sleep doesn't burn the worker's 2h idle grace. Wall-clock
-    keeps ticking through sleep and would falsely reap a freshly-idled worker.
+    Prefer awake-clock delta (CLOCK_UPTIME_RAW on macOS, CLOCK_MONOTONIC on
+    Linux — both pause during sleep/suspend), so an 8h sleep doesn't burn the
+    worker's 2h idle grace. Wall-clock keeps ticking through sleep and would
+    falsely reap a freshly-idled worker.
 
     Wall-clock fallback when (a) the record predates the fix and has no
     last_turn_at_uptime field, or (b) reboot reset current_uptime below the
@@ -1405,6 +1447,102 @@ def _autoclose_idle_worker(record_path: Path, record: dict, elapsed_sec: int) ->
     return f"AUTOCLOSED {name} idle {elapsed_sec // 60}min"
 
 
+def _scan_orphan_windows(now: int, emitted: dict, next_emitted: dict, emit) -> None:
+    """Page ORPHAN_WINDOW for workers-session panes with no backing record.
+
+    Protection is FLEET-GLOBAL regardless of --manager scoping (orphan-ness is
+    a fleet property): every active record's window id, closed records with a
+    pending question (sweep's invariant), and spawn-in-flight .window sidecars.
+    Fail-safe: one non-nested worker record with an EMPTY window id makes pane
+    attribution unreliable — skip the whole scan (stderr note) rather than
+    false-page; nested records carry window_id="" by design and don't count.
+    Crash-proof: driver absent or unanswerable → no scan, never a raise."""
+    if _get_driver is None:
+        return
+    try:
+        os_windows = _get_driver().ls()
+    except Exception:
+        return
+    if os_windows is None:
+        return
+    candidates: dict = {}
+    for osw in os_windows:
+        if not isinstance(osw, dict) or osw.get("wm_class") != WORKERS_SESSION_NAME:
+            continue
+        tabs = osw.get("tabs")
+        if not isinstance(tabs, list):
+            continue
+        for tab in tabs:
+            if not isinstance(tab, dict):
+                continue
+            windows = tab.get("windows")
+            if not isinstance(windows, list):
+                continue
+            for win in windows:
+                if isinstance(win, dict) and win.get("id") is not None:
+                    candidates[str(win["id"])] = str(tab.get("title") or "?")
+    if not candidates:
+        return
+    protected: set = set()
+    if ACTIVE.is_dir():
+        for p in ACTIVE.iterdir():
+            if p.suffix != ".json":
+                continue
+            record = _load(p)
+            if record is None:
+                continue
+            wid = record.get("window_id") or record.get("iterm_sid") or ""
+            if wid:
+                protected.add(str(wid))
+            elif record.get("agent") == "worker" and not record.get("nested"):
+                print(f"stale_monitor: orphan scan skipped (worker "
+                      f"{record.get('name')} has no window id — pane "
+                      f"attribution unreliable)", file=sys.stderr)
+                return
+    if CLOSED.is_dir():
+        pending_sids = _pending_question_sids()
+        for p in CLOSED.iterdir():
+            if p.suffix != ".json":
+                continue
+            record = _load(p)
+            if record is None or record.get("claude_sid") not in pending_sids:
+                continue
+            wid = record.get("window_id") or record.get("iterm_sid") or ""
+            if wid:
+                protected.add(str(wid))
+    if ASSIGNMENTS_PENDING.is_dir():
+        for sidecar in ASSIGNMENTS_PENDING.glob("*.window"):
+            try:
+                wid = sidecar.read_text().strip()
+            except OSError:
+                continue
+            if wid:
+                protected.add(wid)
+    base_min = max(1, ORPHAN_GRACE_SEC // 60)
+    for pane_id, title in candidates.items():
+        if pane_id in protected:
+            continue          # key (if any) not carried forward → clock resets
+        key = f"orphan:{pane_id}"
+        prev = emitted.get(key)
+        prev = prev if isinstance(prev, dict) else {}
+        first_seen = prev.get("first_seen")
+        if not isinstance(first_seen, (int, float)):
+            first_seen = now
+        paged = prev.get("paged")
+        paged = paged if isinstance(paged, int) else 0
+        entry = {"first_seen": first_seen, "paged": paged}
+        elapsed = int(now - first_seen)
+        if elapsed >= ORPHAN_GRACE_SEC:
+            threshold = _highest_threshold(max(elapsed // 60, base_min), base_min)
+            if threshold is not None and threshold > paged:
+                entry["paged"] = threshold
+                emit("orphan-window", pane_id,
+                     f"ORPHAN_WINDOW {pane_id} tab={title!r} ({elapsed // 60}min) "
+                     f"— no backing active record",
+                     key)
+        next_emitted[key] = entry
+
+
 def main(manager_name: str | None = None) -> int:
     now = int(time.time())
     emitted_state_path = _emitted_state_path(manager_name)
@@ -1439,7 +1577,7 @@ def main(manager_name: str | None = None) -> int:
     else:
         should_run_autoclose = True
         next_emitted["last_autoclose_run"] = now
-    current_uptime = time.clock_gettime(time.CLOCK_UPTIME_RAW)
+    current_uptime = _awake_seconds()
     # One pointer read per scan: every unstamped record this scan resolves its
     # bricked-account against the SAME letter, so a mid-scan flip can't cascade
     # — records seen after the flip still resolve to the pre-flip letter, and
@@ -2001,6 +2139,7 @@ def main(manager_name: str | None = None) -> int:
                         emit("question", record.get("worker_name", ""),
                              f"STALE_QUESTION {qid} worker={record.get('worker_name', '')} ({elapsed_min}min)",
                              key)
+    _scan_orphan_windows(now, emitted, next_emitted, emit)
     pruned_cache = {s: p for s, p in codex_log_cache.items() if s in seen_codex_sids}
     if pruned_cache:
         next_emitted["codex_log_cache"] = pruned_cache
@@ -2062,11 +2201,20 @@ def main(manager_name: str | None = None) -> int:
                 rollup = _build_rollup_line(buffer or {}, manager_name, now)
                 # Un-burn the rungs whose lines only ever reached the buffer:
                 # dropping the dedup key re-fires the same crossing live on the
-                # next scan instead of waiting for the next doubling.
+                # next scan instead of waiting for the next doubling. Dict-valued
+                # ladders (orphan:<pane>) keep their own first_seen clock inside
+                # that same entry — popping the whole dict would erase it and
+                # restart the grace window from scratch, so only their "paged"
+                # rung resets in place; int-valued STALE_* keys still pop outright.
                 suppressed = (buffer or {}).get("suppressed_keys")
                 if isinstance(suppressed, list):
                     for suppressed_key in suppressed:
-                        if isinstance(suppressed_key, str):
+                        if not isinstance(suppressed_key, str):
+                            continue
+                        entry = next_emitted.get(suppressed_key)
+                        if isinstance(entry, dict) and "paged" in entry:
+                            entry["paged"] = 0
+                        else:
                             next_emitted.pop(suppressed_key, None)
                 flag_path.unlink(missing_ok=True)
                 print(rollup)

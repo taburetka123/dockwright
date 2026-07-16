@@ -6,7 +6,7 @@ import subprocess
 import sys
 import time
 import pytest
-from dockwright import paths, state
+from dockwright import hooks, paths, state
 from dockwright.hooks import (
     session_start, user_prompt_submit, stop_hook, session_end,
     _set_tab_color, _set_tab_title, MANAGER_TAB_COLOR,
@@ -30,6 +30,16 @@ def fresh(tmp_path, monkeypatch):
     monkeypatch.delenv("CLAUDE_ASSIGNMENT_ID", raising=False)
     paths.ensure_dirs()
     yield tmp_path
+
+@pytest.fixture(autouse=True)
+def _no_process_tree_probes(monkeypatch):
+    """session_start resolves the session pid by walking the real process tree.
+    Neutralized file-wide: the walk finds nothing and falls back to the captured
+    pid — the exact pre-resolver behavior every existing test was written
+    against (and no per-test ps subprocess). Resolver tests re-patch these."""
+    from dockwright import identity
+    monkeypatch.setattr(identity, "_ppid_of", lambda pid: None)
+    monkeypatch.setattr(hooks, "_pid_looks_like_session", lambda pid: False)
 
 def test_session_start_skips_when_no_env(fresh, monkeypatch, capsys):
     monkeypatch.delenv("CLAUDE_AGENT", raising=False)
@@ -1485,6 +1495,10 @@ def test_nested_session_start_skips_tab_paint(fresh, monkeypatch):
     calls = _capture_tab_calls(monkeypatch)
     monkeypatch.setattr("dockwright.hooks._ancestor_pids", lambda pid: {4242})
     monkeypatch.setattr("dockwright.hooks._pid_looks_like_session", lambda pid: True)
+    # pid 4242 is the real ancestor process this test's nested detection walks
+    # to — it's alive by construction, which also keeps the name-collision
+    # prune off the live-panes subprocess path so `calls` stays tab-paints-only.
+    monkeypatch.setattr("dockwright.registry._pid_alive", lambda pid: True)
     monkeypatch.setenv("TMUX_PANE", "175")
     monkeypatch.setenv("CLAUDE_AGENT", "worker")
     monkeypatch.setenv("CLAUDE_WORKER_NAME", "parent-worker")
@@ -2351,3 +2365,141 @@ def test_session_start_claude_p_ancestry_lane_still_fires(fresh, monkeypatch):
     assert record["nested"] is True
     assert record["nested_parent_sid"] == "parent-sid"
     assert record["agent_id"] is None
+
+def test_resolve_session_pid_captured_is_session(monkeypatch):
+    # macOS shape: the hook wrapper's $PPID IS the claude process.
+    monkeypatch.setenv("CLAUDE_PARENT_PID", "500")
+    monkeypatch.setattr(hooks, "_pid_looks_like_session", lambda pid: pid == 500)
+    assert hooks._resolve_session_pid() == 500
+
+
+def test_resolve_session_pid_walks_past_live_intermediate(monkeypatch):
+    # Linux shape: $PPID is a live sh-shaped intermediate whose parent is claude.
+    from dockwright import identity
+    monkeypatch.setenv("CLAUDE_PARENT_PID", "600")
+    monkeypatch.setattr(identity, "_ppid_of", {600: 590, 590: 1}.get)
+    monkeypatch.setattr(hooks, "_pid_looks_like_session", lambda pid: pid == 590)
+    assert hooks._resolve_session_pid() == 590
+
+
+def test_resolve_session_pid_dead_intermediate_falls_back_to_own_chain(monkeypatch):
+    # The captured pid is already gone; the hook's own live ancestry still
+    # reaches the claude process.
+    from dockwright import identity
+    monkeypatch.setenv("CLAUDE_PARENT_PID", "600")
+    self_parent = os.getppid()
+    monkeypatch.setattr(identity, "_ppid_of", {self_parent: 700, 700: 1}.get)
+    monkeypatch.setattr(hooks, "_pid_looks_like_session", lambda pid: pid == 700)
+    assert hooks._resolve_session_pid() == 700
+
+
+def test_resolve_session_pid_nearest_session_wins(monkeypatch):
+    # Nested `claude -p` child: both the child (590) and the outer session
+    # (400) are ancestors — nearest must win, or /clear-rotation supersede and
+    # nested detection would key on the wrong session.
+    from dockwright import identity
+    monkeypatch.setenv("CLAUDE_PARENT_PID", "600")
+    monkeypatch.setattr(identity, "_ppid_of",
+                        {600: 590, 590: 500, 500: 400, 400: 1}.get)
+    monkeypatch.setattr(hooks, "_pid_looks_like_session",
+                        lambda pid: pid in (590, 400))
+    assert hooks._resolve_session_pid() == 590
+
+
+def test_resolve_session_pid_skips_ancestor_walk_when_start_matches(monkeypatch):
+    # start itself already satisfies the session check — the ancestor walk
+    # must stay lazy and never fire a single ps-backed _ppid_of lookup.
+    from dockwright import identity
+
+    def _boom(pid):
+        raise AssertionError("must not walk ancestors when start already matches")
+
+    monkeypatch.setenv("CLAUDE_PARENT_PID", "500")
+    monkeypatch.setattr(identity, "_ppid_of", _boom)
+    monkeypatch.setattr(hooks, "_pid_looks_like_session", lambda pid: pid == 500)
+    assert hooks._resolve_session_pid() == 500
+
+
+def test_resolve_session_pid_no_session_returns_captured(monkeypatch):
+    from dockwright import identity
+    monkeypatch.setenv("CLAUDE_PARENT_PID", "600")
+    monkeypatch.setattr(identity, "_ppid_of", lambda pid: None)
+    monkeypatch.setattr(hooks, "_pid_looks_like_session", lambda pid: False)
+    assert hooks._resolve_session_pid() == 600
+
+
+def test_ancestor_chain_is_strict_and_ordered(monkeypatch):
+    # Excludes start; parent-first order; stops on cycle.
+    from dockwright import identity
+    monkeypatch.setattr(identity, "_ppid_of", {10: 9, 9: 8, 8: 9}.get)
+    assert hooks._ancestor_chain(10) == [9, 8]
+
+
+def test_session_start_records_resolved_session_pid(fresh, monkeypatch):
+    # Integration: the record's pid is the resolved claude ancestor, not the
+    # raw captured $PPID — the Linux ghost-worker root cause.
+    from dockwright import identity
+    monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("CLAUDE_WORKER_NAME", "alpha")
+    monkeypatch.setenv("CLAUDE_PARENT_PID", "600")
+    monkeypatch.setattr(identity, "_ppid_of", {600: 590, 590: 1}.get)
+    monkeypatch.setattr(hooks, "_pid_looks_like_session", lambda pid: pid == 590)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "s1", "cwd": "/x"})))
+    session_start()
+    assert state.read_json(fresh / "active" / "s1.json")["pid"] == 590
+
+
+def test_awake_seconds_works_without_clock_uptime_raw(monkeypatch):
+    # Linux has no time.CLOCK_UPTIME_RAW — the helper must fall back, not raise.
+    monkeypatch.delattr(time, "CLOCK_UPTIME_RAW", raising=False)
+    v = hooks._awake_seconds()
+    assert isinstance(v, float) and v > 0.0
+
+
+def test_stop_hook_stamps_uptime_without_clock_uptime_raw(fresh, monkeypatch):
+    # The Stop hook died on Linux at record["last_turn_at_uptime"] (L-3) —
+    # registration then turn-end must succeed with the macOS clock deleted.
+    monkeypatch.delattr(time, "CLOCK_UPTIME_RAW", raising=False)
+    monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("CLAUDE_WORKER_NAME", "alpha")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "s1", "cwd": "/x"})))
+    session_start()
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "s1"})))
+    stop_hook()
+    rec = json.loads((paths.ACTIVE / "s1.json").read_text())
+    assert isinstance(rec["last_turn_at_uptime"], float)
+    assert rec["state"] == "idle"
+
+
+def test_session_start_emits_worker_sid_context(fresh, monkeypatch, capsys):
+    monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("CLAUDE_WORKER_NAME", "alpha")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "s1", "cwd": "/x"})))
+    session_start()
+    payload = json.loads(capsys.readouterr().out)
+    ctx = payload["hookSpecificOutput"]
+    assert ctx["hookEventName"] == "SessionStart"
+    assert "your claude_sid is s1" in ctx["additionalContext"]
+    assert "worker_done" in ctx["additionalContext"]
+
+
+def test_session_start_emits_manager_sid_wording(fresh, monkeypatch, capsys):
+    monkeypatch.setenv("CLAUDE_AGENT", "manager")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "m1", "cwd": "/x"})))
+    session_start()
+    payload = json.loads(capsys.readouterr().out)
+    ctx = payload["hookSpecificOutput"]
+    assert "your session id is m1" in ctx["additionalContext"]
+    assert "manager_sid" in ctx["additionalContext"]
+    assert "worker_done" not in ctx["additionalContext"]
+
+
+def test_session_start_codex_worker_emits_no_context(fresh, monkeypatch, capsys):
+    # Codex mirrors the same hook wiring (setup.sh merges the snippet into
+    # ~/.codex/hooks.json) but its hook-stdout contract is not Claude's.
+    monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("CLAUDE_WORKER_NAME", "alpha")
+    monkeypatch.setenv("CLAUDE_WORKER_RUNTIME", "codex")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "s1", "cwd": "/x"})))
+    session_start()
+    assert capsys.readouterr().out == ""

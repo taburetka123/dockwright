@@ -114,3 +114,33 @@ def test_read_events_tolerates_malformed_lines(ledger):
 
 def test_read_events_missing_file_returns_empty(ledger):
     assert spend_ledger.read_events() == []
+
+
+def test_append_drop_event_prune_source_writes_zero_spend_line(ledger):
+    # A prune UNLINKS the record with no other durable trace — the ledger
+    # line is the only forensics a reaped session gets (the M-2 ghost-worker
+    # incident left nothing), so prune sources append even at zero spend.
+    spend_ledger.append_drop_event(_record(spend=None), "prune")
+    entry = json.loads(ledger.read_text())
+    assert entry["source"] == "prune"
+    assert entry["spend"] == {}
+    assert entry["sid"] == "sid-1"
+
+
+def test_append_drop_event_preflight_prune_source_writes_zero_spend_line(ledger):
+    record = _record()
+    record.pop("spend")
+    spend_ledger.append_drop_event(record, "preflight_prune")
+    assert json.loads(ledger.read_text())["spend"] == {}
+
+
+def test_append_drop_event_prune_source_still_skips_non_dict_record(ledger):
+    spend_ledger.append_drop_event(None, "prune")
+    assert not ledger.exists()
+
+
+def test_read_events_keeps_zero_spend_lines(ledger):
+    spend_ledger.append_drop_event(_record(spend=None), "prune")
+    events = spend_ledger.read_events()
+    assert len(events) == 1
+    assert events[0]["spend"] == {}

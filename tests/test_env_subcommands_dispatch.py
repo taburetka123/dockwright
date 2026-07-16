@@ -8,6 +8,7 @@ from dockwright import __main__ as m
     ("uninstall", "uninstall"),
     ("migrate-state", "migrate"),
     ("manager", "manager_launch"),
+    ("ensure-worker-home", "ensure_worker_home"),
 ])
 def test_dispatch_routes_to_module_main(monkeypatch, cmd, modattr):
     import importlib
