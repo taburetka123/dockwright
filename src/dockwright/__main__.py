@@ -78,6 +78,9 @@ def main() -> None:
     elif cmd == "gardener":
         from .pipeline_wiring import gardener_main
         sys.exit(gardener_main(sys.argv[2:]))
+    elif cmd == "finalize-presets":
+        from .presets import main as finalize_presets_main
+        sys.exit(finalize_presets_main(sys.argv[2:]))
     else:
         print(f"Unknown subcommand: {cmd}", file=sys.stderr)
         sys.exit(2)

@@ -371,9 +371,8 @@ echo "→ Installed status_row.py to $CLAUDE_DIR/dockwright/status_row.py"
 mkdir -p "$CLAUDE_DIR/dockwright/presets"
 rsync -a --delete "$REPO_DIR/deploy/presets/" "$CLAUDE_DIR/dockwright/presets/"
 # .md presets carry the deploy-time {{vars}} seam — render them over the verbatim
-# rsync copies (var-free presets render byte-identically; .json settings fixtures
-# stay verbatim). Skipped without a render binary — the rsync copies are then the
-# verbatim fallback.
+# rsync copies (var-free presets render byte-identically). Skipped without a
+# render binary — the rsync copies are then the raw fallback.
 if [ -n "$RENDER_BIN" ]; then
     "$RENDER_BIN" render --src "$REPO_DIR/deploy/presets" --out "$CLAUDE_DIR/dockwright/presets" --glob '*.md'
 fi
@@ -384,6 +383,17 @@ echo "→ Installed worker-spawn presets to $CLAUDE_DIR/dockwright/presets/"
 if [ -d "$OVERLAY_DIR/presets" ]; then
     cp "$OVERLAY_DIR/presets/"* "$CLAUDE_DIR/dockwright/presets/"
     echo "→ Installed overlay presets to $CLAUDE_DIR/dockwright/presets/"
+fi
+
+# Finalize the headless worker preset: inject operator-absolute
+# permissions.additionalDirectories resolved from dockwright.toml [paths]
+# (repo_roots + worktree_roots + worker_home). Tilde in settings values is
+# undocumented, so the shipped fixture stays generic and the deployed copy
+# gets absolute paths here. Runs AFTER the overlay copy: an operator preset
+# that already pins the key (even []) is respected — inject-only-if-absent —
+# while one overlaid merely for extra allow rules still gets the fix.
+if [ -n "$RENDER_BIN" ]; then
+    "$RENDER_BIN" finalize-presets --file "$CLAUDE_DIR/dockwright/presets/worker-headless-settings.json"
 fi
 
 # 4d. Ensure the manager notebook dirs exist (planned/conditional-work agenda,

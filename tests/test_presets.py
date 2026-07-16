@@ -155,3 +155,29 @@ def test_headless_preset_path_var_defined_and_wired():
             "'<absolute-home>/.claude/dockwright/presets/worker-headless-settings.json'") in vars_toml
     core = (REPO_ROOT / "deploy" / "agents" / "manager.core.md").read_text()
     assert "{{worker_headless_settings_path}}" in core
+
+
+SETUP_SH = REPO_ROOT / "setup.sh"
+
+
+def test_setup_finalizes_headless_preset_after_overlay():
+    text = SETUP_SH.read_text()
+    finalize = text.index("finalize-presets")
+    overlay_copy = text.index('cp "$OVERLAY_DIR/presets/"')
+    rsync_presets = text.index('rsync -a --delete "$REPO_DIR/deploy/presets/"')
+    # Order: rsync fixture → overlay copy → finalize. Finalize AFTER overlay so
+    # an operator preset lacking the key still gets the injection, while one
+    # that pins it (even []) is respected (finalize is inject-only-if-absent).
+    assert rsync_presets < overlay_copy < finalize
+    assert 'finalize-presets --file "$CLAUDE_DIR/dockwright/presets/worker-headless-settings.json"' in text
+    # The old "fixtures stay verbatim" comment is false once finalize exists.
+    assert "stay verbatim" not in text
+
+
+def test_manager_core_documents_additional_directories_gotcha():
+    core = (REPO_ROOT / "deploy" / "agents" / "manager.core.md").read_text()
+    idx = core.index("{{worker_headless_settings_path}}")
+    window = core[idx:idx + 2500]
+    assert "additionalDirectories" in window, (
+        "headless-spawn rule must name the directory-access gate and require "
+        "composed preset copies to keep permissions.additionalDirectories")
