@@ -119,13 +119,13 @@ name: selffix
 label: none
 hook_command: selffix-trigger.sh
 status: pending-install
-status_why: ships pending-install; the operator flips it live via [loops.status_overrides] in dockwright.toml once setup.sh has wired the SessionEnd hook
+status_why: ships pending-install; opt in on a fresh install with `dockwright selffix enable` (wires the SessionEnd hook), then flip live via [loops.status_overrides] in dockwright.toml
 trigger: ~/.claude/settings.json SessionEnd hook
 gate: embedded Python signal detect (HIGH only: configured [gardener] high_skills, gh pr create, >=5 edits, agent=manager, pushback>=1 EN+RU, harsh-language EN+RU), 60-min dedup hash, findings-exist skip, 14d prune; limit-brick check enqueues to ~/.claude/dockwright/selffix/retry/ instead of spawning; [modules] gardener=false no-ops the trigger (module-off)
 run_contract: nohup selffix-run.sh → claude -p "/dockwright-selffix …", env-stripped, 25m TERM→KILL watchdog; takes the shared run-lock; failed runs (non-zero exit / <200B stub / lock-timeout) enqueue ONE durable retry consumed by the gardener-gate tick
 permissions_mode: user-default; skill contract is stdout-only (never Write/Edit)
 ledger_path: ~/.claude/dockwright/selffix/trigger.log
-kill_switch: none (remove the settings.json hook line; queued retries in ~/.claude/dockwright/selffix/retry/ still drain via the gardener tick — also touch ~/.claude/dockwright/gardener-stop or empty the queue for a full stop)
+kill_switch: `dockwright selffix disable` (removes the settings.json hook line); queued retries in ~/.claude/dockwright/selffix/retry/ still drain via the gardener tick — also touch ~/.claude/dockwright/gardener-stop or empty the queue for a full stop
 runtime_program_path: ~/.claude/scripts/selffix-trigger.sh
 source_path: deploy/scripts/selffix-trigger.sh
 deploy_mechanism: setup.sh cp (deploy/scripts/*.sh → ~/.claude/scripts/)
@@ -141,7 +141,7 @@ last_verified: 2026-06-13
 name: gardener-gate
 label: {prefix}.gardener-gate
 status: pending-install
-status_why: ships pending-install; the operator flips it live via [loops.status_overrides] in dockwright.toml once gardener-install.sh has run
+status_why: ships pending-install; opt in with `dockwright gardener enable` (installs the launchd gate; needs selffix enabled), then flip live via [loops.status_overrides] in dockwright.toml
 trigger: launchd StartInterval 3600 (no wake catch-up)
 gate: gardener_gate.py — [modules] gardener=false no-ops the gate (module-off) → stop file → shared run-lock pre-check → selffix retry pre-step (one queued retro per tick, retry-once, deferred while limit-bricked; gardener-stop pauses retry consumption too; a retry-spawning tick defers a due digest to the next tick) → 6h cooldown → 3/week cap → K=8 unreviewed-findings accumulation → 7d floor
 run_contract: visible tmux window via gardener-run.sh; digest-only writes; 30m join + 15m grace, never kills the tab; takes the shared run-lock atomically
@@ -163,7 +163,7 @@ last_verified: 2026-06-13
 name: gardener-frontier
 label: {prefix}.gardener-frontier
 status: pending-install
-status_why: ships pending-install; the operator flips it live via [loops.status_overrides] in dockwright.toml once gardener-install.sh has run
+status_why: ships pending-install; opt in with `dockwright gardener enable --lane frontier` (or --lane all), then flip live via [loops.status_overrides] in dockwright.toml
 trigger: launchd StartInterval 86400 (daily tick)
 gate: frontier_gate.py — [modules] gardener=false no-ops the gate (module-off) → stop file → shared run-lock → 48h retry cooldown → armed marker (first run is a human decision; installer arms run #0) → 7d interval due
 run_contract: gardener-run.sh --lane frontier (shared run mechanism: tmux spawn, watchdog, write-guard, audit, postrun); web-heavy research sweep via /dockwright-gardener-frontier; takes the shared run-lock

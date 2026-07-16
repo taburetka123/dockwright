@@ -19,21 +19,58 @@ from .spend_ledger import append_drop_event
 _MAX_OS_PID = 0x7FFFFFFF
 
 
+def _live_pane_ids() -> "set | None":
+    """Pane ids currently alive on the orchestrator tmux server, or None when
+    tmux cannot answer (error/timeout — distinct from an empty/absent server,
+    which is the empty set). One list-panes subprocess per call; the prune
+    fetches lazily, only when a dead-pid record still holds a window claim."""
+    try:
+        from .terminal import get_driver
+        os_windows = get_driver().ls()
+    except Exception:
+        return None
+    if os_windows is None:
+        return None
+    ids: set = set()
+    for osw in os_windows:
+        if not isinstance(osw, dict):
+            continue
+        tabs = osw.get("tabs")
+        if not isinstance(tabs, list):
+            continue
+        for tab in tabs:
+            windows = tab.get("windows") if isinstance(tab, dict) else None
+            if not isinstance(windows, list):
+                continue
+            for win in windows:
+                if isinstance(win, dict) and win.get("id") is not None:
+                    ids.add(str(win["id"]))
+    return ids
+
+
 def _prune_stale_active_records() -> None:
-    """Drop active/<sid>.json records whose pid is no longer alive.
+    """Drop active/<sid>.json records whose pid is dead AND whose terminal
+    pane is gone.
 
     A tab closed via SIGHUP kills the process before SessionEnd hooks can run,
     leaving an orphan record that blocks future name-collision checks.
 
-    Deliberately weaker than preflight_cleanup._prune_active: no per-record
-    `ps` command-line check here (subprocess latency on MCP request paths).
-    The shared invariant both keep: deletion requires an in-OS-range positive
-    int pid that os.kill(pid, 0) says is dead — a non-positive or out-of-range
-    pid can't prove the session dead, so such records are left for preflight
-    to surface as odd-looking.
+    The pane gate exists because a dead recorded pid does NOT prove the
+    session dead: Linux hook runners hand SessionStart a short-lived
+    intermediate $PPID (the VM-E2E ghost-worker incident), and pids recycle.
+    A record whose pane is still alive is kept; when tmux cannot answer, the
+    window-bearing candidates are kept too — deferral is free, deletion is
+    not. Windowless records keep the pid-only bar. The pane set is fetched
+    lazily (zero subprocess calls in the common all-pids-alive pass — this
+    runs on MCP request paths AND on every SessionStart hook via
+    _resolve_unique_name, under the hook's 5s budget). Deletion still
+    requires an in-OS-range positive int pid that os.kill(pid, 0) says is
+    dead; anything else odd is left for preflight to surface.
     """
     if not paths.ACTIVE.is_dir():
         return
+    live_panes: "set | None" = None
+    panes_fetched = False
     for record_path in paths.ACTIVE.iterdir():
         if record_path.suffix != ".json":
             continue
@@ -43,6 +80,13 @@ def _prune_stale_active_records() -> None:
         pid = record.get("pid")
         if not isinstance(pid, int) or pid <= 0 or pid > _MAX_OS_PID or _pid_alive(pid):
             continue
+        window_id = state.window_id_of(record)
+        if window_id:
+            if not panes_fetched:
+                live_panes = _live_pane_ids()
+                panes_fetched = True
+            if live_panes is None or str(window_id) in live_panes:
+                continue
         sid = record.get("claude_sid")
         append_drop_event(record, "prune")
         record_path.unlink(missing_ok=True)

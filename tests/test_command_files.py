@@ -25,6 +25,7 @@ SKILLS = REPO_ROOT / "deploy" / "skills"
 SCRIPTS = REPO_ROOT / "deploy" / "scripts"
 PRESETS = REPO_ROOT / "deploy" / "presets"
 AGENTS = REPO_ROOT / "deploy" / "agents"
+DEPLOY = REPO_ROOT / "deploy"
 
 
 def _frontmatter_name(text: str) -> str | None:
@@ -292,3 +293,21 @@ def test_edited_command_preset_has_no_unbound_vars_with_defaults(path):
         f"{path.name}: {sorted(set(unbound))} left unbound under a defaults-only "
         "render — every {{var}} used in a shipped command/preset needs a generic "
         "default in deploy/agents/vars.defaults.toml")
+
+
+@pytest.mark.parametrize("relpath", [
+    "agents/manager.core.md",
+    "agents/worker.core.md",
+    "commands/dockwright-general-work.md",
+    "commands/manager-takeover-recovery.md",
+])
+def test_headless_lanes_have_no_expansion_sid_recipes(relpath):
+    # Claude Code's "Contains expansion" permission guard fires on any `$…`
+    # command and no allowlist can cover it — a headless session instructed to
+    # run one stalls deterministically (VM E2E L-2). These four files are the
+    # machine-driven lanes; interactive manager boot commands are exempt (F-2).
+    text = (DEPLOY / relpath).read_text()
+    assert "${CLAUDE_CODE_SESSION_ID" not in text
+    assert "echo $CLAUDE_CODE_SESSION_ID" not in text
+    assert 'grep -l "\\"name\\": \\"$CLAUDE_WORKER_NAME\\""' not in text
+    assert "printenv" in text  # the sanctioned expansion-free fallback

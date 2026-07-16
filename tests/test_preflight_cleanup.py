@@ -23,6 +23,7 @@ def _load_preflight():
 def preflight(tmp_path, monkeypatch):
     mod = _load_preflight()
     monkeypatch.setattr(mod, "ROOT", tmp_path)
+    monkeypatch.setattr(mod, "SPEND_LEDGER", tmp_path / "spend-ledger.jsonl")
     monkeypatch.setattr(mod, "ACTIVE", tmp_path / "active")
     monkeypatch.setattr(mod, "HANDOFFS", tmp_path / "handoffs")
     monkeypatch.setattr(mod, "DONE", tmp_path / "done")
@@ -414,3 +415,77 @@ def test_root_falls_back_to_legacy_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     mod = _load_preflight()
     assert mod.ROOT == tmp_path / ".claude" / "orchestrator"
+
+
+def test_prune_active_keeps_dead_pid_with_live_pane(preflight, tmp_path, monkeypatch):
+    monkeypatch.setattr(preflight, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(preflight, "_live_pane_ids", lambda: {"%7"})
+    (tmp_path / "active" / "s1.json").write_text(json.dumps(
+        {"claude_sid": "s1", "name": "alpha", "pid": 4242, "window_id": "%7"}))
+    pruned, kept_odd = preflight._prune_active()
+    assert pruned == []
+    assert (tmp_path / "active" / "s1.json").exists()
+    assert any("live pane" in item for item in kept_odd)
+
+
+def test_prune_active_reaps_dead_pid_absent_pane_with_ledger_line(preflight, tmp_path, monkeypatch):
+    monkeypatch.setattr(preflight, "SPEND_LEDGER", tmp_path / "spend-ledger.jsonl")
+    monkeypatch.setattr(preflight, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(preflight, "_live_pane_ids", lambda: set())
+    (tmp_path / "active" / "s1.json").write_text(json.dumps(
+        {"claude_sid": "s1", "name": "alpha", "pid": 4242, "window_id": "%7"}))
+    pruned, kept_odd = preflight._prune_active()
+    assert pruned == ["alpha"]
+    assert not (tmp_path / "active" / "s1.json").exists()
+    entry = json.loads((tmp_path / "spend-ledger.jsonl").read_text())
+    assert entry["source"] == "preflight_prune"
+    assert entry["spend"] == {}
+
+
+def test_prune_active_keeps_dead_pid_when_tmux_unanswerable(preflight, tmp_path, monkeypatch):
+    monkeypatch.setattr(preflight, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(preflight, "_live_pane_ids", lambda: None)
+    (tmp_path / "active" / "s1.json").write_text(json.dumps(
+        {"claude_sid": "s1", "name": "alpha", "pid": 4242, "window_id": "%7"}))
+    pruned, kept_odd = preflight._prune_active()
+    assert pruned == []
+    assert (tmp_path / "active" / "s1.json").exists()
+    assert kept_odd  # surfaced, not silently kept
+
+
+def test_prune_active_windowless_dead_pid_still_reaps(preflight, tmp_path, monkeypatch):
+    monkeypatch.setattr(preflight, "SPEND_LEDGER", tmp_path / "spend-ledger.jsonl")
+    monkeypatch.setattr(preflight, "_pid_alive", lambda pid: False)
+    def _boom():
+        raise AssertionError("pane set must not be fetched for windowless records")
+    monkeypatch.setattr(preflight, "_live_pane_ids", _boom)
+    (tmp_path / "active" / "s1.json").write_text(json.dumps(
+        {"claude_sid": "s1", "name": "alpha", "pid": 4242}))
+    pruned, _ = preflight._prune_active()
+    assert pruned == ["alpha"]
+
+
+def test_live_pane_ids_no_server_is_empty_set(preflight, monkeypatch):
+    import subprocess as sp
+    def fake_run(args, **kwargs):
+        return sp.CompletedProcess(args, returncode=1, stdout="",
+                                   stderr="no server running on /tmp/...")
+    monkeypatch.setattr(preflight.subprocess, "run", fake_run)
+    assert preflight._live_pane_ids() == set()
+
+
+def test_live_pane_ids_error_is_none(preflight, monkeypatch):
+    import subprocess as sp
+    def fake_run(args, **kwargs):
+        return sp.CompletedProcess(args, returncode=1, stdout="", stderr="boom")
+    monkeypatch.setattr(preflight.subprocess, "run", fake_run)
+    assert preflight._live_pane_ids() is None
+
+
+def test_live_pane_ids_parses_pane_lines(preflight, monkeypatch):
+    import subprocess as sp
+    def fake_run(args, **kwargs):
+        assert args[:2] == ["tmux", "-L"]
+        return sp.CompletedProcess(args, returncode=0, stdout="%1\n%2\n", stderr="")
+    monkeypatch.setattr(preflight.subprocess, "run", fake_run)
+    assert preflight._live_pane_ids() == {"%1", "%2"}

@@ -37,6 +37,7 @@ LEGACY_MCP_SERVER_NAME = "claude-orchestrator"   # one-release: uninstall both
 PROVENANCE_MARKER = "# deployed-from: dockwright@"
 LEGACY_PROVENANCE_MARKER = "# deployed-from: claude-orchestrator@"
 CANON_GUARD_MARKER = "canon-edit-guard.sh"
+SELFFIX_TRIGGER_MARKER = "selffix-trigger.sh"
 
 _BIN_RE = re.compile(
     r"(\S*(?:dockwright|orchestrator))\s+(?:"
@@ -112,7 +113,7 @@ def strip_orchestrator_hooks(settings: dict, snippet: dict | None,
             return True
         if any(orch_owned_subcommand(cmd, b) is not None for b in bins):
             return True
-        if cmd in our_foreign or CANON_GUARD_MARKER in cmd:
+        if cmd in our_foreign or CANON_GUARD_MARKER in cmd or SELFFIX_TRIGGER_MARKER in cmd:
             return True
         return False
 

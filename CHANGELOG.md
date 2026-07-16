@@ -3,6 +3,16 @@
 User-facing release notes for dockwright. Entries describe what an adopter
 gets, not internal development history.
 
+## v1.2.0 — 2026-07-16
+
+- **Linux is now a first-class install target.** Fresh-Linux installs work end-to-end: worker spawn picks a portable interactive shell instead of hardcoded `zsh`; the macOS-only awake-clock call is guarded with a portable fallback; the session id reaches workers via SessionStart context injection instead of a shell echo that tripped expansion guards; and the GNU-incompatible `stat` mtime probe was replaced with the portable `date -r` form.
+- **Deterministic Linux ghost-worker reap fixed** (5-part). Session registration resolves the real claude/codex session pid past Linux's short-lived hook intermediate; stale-record prunes only delete a dead-pid record when its tmux pane is gone too; `worker_done` self-heals from the claimed assignment when the active record was reaped, so a finished worker's completion signal still lands; pruned records always leave a forensic spend-ledger line; and the stale monitor pages `ORPHAN_WINDOW` for worker panes with no backing record.
+- **Fresh-install hardening.** `setup.sh` creates the worker home directory (new `dockwright ensure-worker-home`), so a bare `spawn_worker` no longer falls back to the manager's cwd; setup fails fast on a missing or too-old `python3`; a stale or broken `.venv` is recreated instead of silently reused.
+- **Headless worker permission preset.** Ships a scoped settings preset for headless/no-human worker spawns — protocol MCP tools allowed, config-derived `additionalDirectories` injected by the new `finalize-presets` setup step — instead of blanket permission-skipping.
+- **Self-improvement pipeline opt-in CLI.** New `dockwright selffix enable|disable` (wires/removes the SessionEnd retrospective hook) and `dockwright gardener enable|disable [--lane digest|frontier|all]`, replacing hand-editing settings.json. The gardener digest lane refuses to enable without selffix; enable is gated on `launchctl` availability and exits non-zero when the launchd bootstrap fails; uninstall strips the selffix hook.
+- **Manager guidance hardening.** Evidence before any worker kill (capture the pane first — a live pane with no record is a registration failure to root-cause, not a session to kill); headless spawns must use scoped permission presets; never pre-downgrade a model dispatch to dodge a safeguard flag — the runtime auto-fallback is the correct outcome.
+- **CLI polish.** Bare `dockwright doctor` works (arguments defaulted); expired pending assignments are swept on the spawn path.
+
 ## v1.1.0 — 2026-07-15
 
 - **Offline investigation evals harness** (`evals/investigation/`) — regression evals for the investigation behavior stack: 6 committed file-fixture incident cases (fabricated-evidence, stale-metric echo, red-herring, data-shape traps, plus abstention cases), scored by deterministic gates and an LLM judge. Run with `python -m evals.investigation.run_eval` (`--dry-run` costs $0); point it at your own investigation skill via `DOCKWRIGHT_INVESTIGATE_SKILL`.

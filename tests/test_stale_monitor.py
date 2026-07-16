@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,8 @@ def stale(tmp_path, monkeypatch):
     # resolved GLOBAL (no --manager) path under the name the existing tests use,
     # tied to the real resolver so a naming change can't silently desync the tests.
     monkeypatch.setattr(mod, "EMITTED_STATE", mod._emitted_state_path(None), raising=False)
+    monkeypatch.setattr(mod, "ASSIGNMENTS_PENDING",
+                        tmp_path / "assignments" / ".pending", raising=False)
     # Squash IDLE threshold so tests can use small elapsed values.
     monkeypatch.setattr(mod, "IDLE_THRESHOLD_SEC", 100)
     for d in ("active", "questions", "closed"):
@@ -2303,7 +2306,8 @@ def _flips(stale):
 
 def _launch_calls(calls):
     """Recovery-manager spawns, as (argv, kwargs) — argv is the driver.spawn
-    argv list (["zsh", "-ic", inner]) so launches[i][0][-1] is still `inner`."""
+    argv list ([_interactive_shell(), "-ic", inner]) so launches[i][0][-1] is
+    still `inner`."""
     return [(c[1]["argv"], c[1]) for c in calls if c[0] == "spawn"]
 
 
@@ -3931,3 +3935,206 @@ def test_count_unseen_done_counts_genuinely_unseen(stale, tmp_path, monkeypatch)
     done_dir.mkdir(parents=True)
     (done_dir / "e1.json").write_text("{}")
     assert stale._count_unseen_done_events("mgr-A") == 1
+
+
+# ---- orphan-window alarm -------------------------------------------------
+
+def _ls_shape(panes):
+    """Parsed-driver shape: [(session, window_title, pane_id), ...] →
+    [{'wm_class': s, 'tabs': [{'title': t, 'windows': [{'id': p}]}]}]"""
+    sessions = {}
+    for session, title, pane in panes:
+        sessions.setdefault(session, []).append(
+            {"title": title, "windows": [{"id": pane}]})
+    return [{"wm_class": s, "tabs": tabs} for s, tabs in sessions.items()]
+
+
+def _arm_driver(stale, monkeypatch, panes):
+    driver = types.SimpleNamespace(ls=lambda: _ls_shape(panes))
+    monkeypatch.setattr(stale, "_get_driver", lambda: driver)
+
+
+def _seed_orphan_state(stale, pane_id, first_seen, paged=0, manager_name=None):
+    state_path = stale._emitted_state_path(manager_name)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(
+        {f"orphan:{pane_id}": {"first_seen": first_seen, "paged": paged}}))
+
+
+def test_orphan_window_pages_after_grace(stale, monkeypatch, capsys):
+    _arm_driver(stale, monkeypatch, [("claude-workers", "dead-worker", "%5")])
+    _seed_orphan_state(stale, "%5", time.time() - 130)
+    stale.main()
+    out = capsys.readouterr().out
+    assert "ORPHAN_WINDOW %5" in out
+    assert "no backing active record" in out
+
+
+def test_orphan_window_quiet_within_grace(stale, monkeypatch, capsys):
+    _arm_driver(stale, monkeypatch, [("claude-workers", "w", "%5")])
+    stale.main()
+    assert "ORPHAN_WINDOW" not in capsys.readouterr().out
+    # first_seen tracked so a later scan can page
+    emitted = json.loads(stale._emitted_state_path(None).read_text())
+    assert "orphan:%5" in emitted
+
+
+def test_orphan_window_protected_by_active_record(stale, tmp_path, monkeypatch, capsys):
+    _arm_driver(stale, monkeypatch, [("claude-workers", "w", "%5")])
+    (tmp_path / "active" / "s1.json").write_text(json.dumps(
+        {"claude_sid": "s1", "agent": "worker", "name": "alpha",
+         "state": "idle", "window_id": "%5"}))
+    _seed_orphan_state(stale, "%5", time.time() - 700)
+    stale.main()
+    assert "ORPHAN_WINDOW" not in capsys.readouterr().out
+
+
+def test_orphan_window_protected_by_legacy_iterm_sid(stale, tmp_path, monkeypatch, capsys):
+    _arm_driver(stale, monkeypatch, [("claude-workers", "w", "%5")])
+    (tmp_path / "active" / "s1.json").write_text(json.dumps(
+        {"claude_sid": "s1", "agent": "worker", "name": "alpha",
+         "state": "idle", "iterm_sid": "%5"}))
+    _seed_orphan_state(stale, "%5", time.time() - 700)
+    stale.main()
+    assert "ORPHAN_WINDOW" not in capsys.readouterr().out
+
+
+def test_orphan_window_protected_by_pending_spawn_sidecar(stale, tmp_path, monkeypatch, capsys):
+    _arm_driver(stale, monkeypatch, [("claude-workers", "w", "%5")])
+    pending = tmp_path / "assignments" / ".pending"
+    pending.mkdir(parents=True)
+    (pending / "a-1.window").write_text("%5\n")
+    _seed_orphan_state(stale, "%5", time.time() - 700)
+    stale.main()
+    assert "ORPHAN_WINDOW" not in capsys.readouterr().out
+
+
+def test_orphan_window_protected_by_closed_record_with_pending_question(
+        stale, tmp_path, monkeypatch, capsys):
+    _arm_driver(stale, monkeypatch, [("claude-workers", "w", "%5")])
+    (tmp_path / "closed" / "s1.json").write_text(json.dumps(
+        {"claude_sid": "s1", "name": "alpha", "window_id": "%5"}))
+    (tmp_path / "questions").mkdir(exist_ok=True)
+    (tmp_path / "questions" / "q1.json").write_text(json.dumps(
+        {"question_id": "q1", "worker_sid": "s1", "question": "?",
+         "asked_at": time.time()}))
+    _seed_orphan_state(stale, "%5", time.time() - 700)
+    stale.main()
+    assert "ORPHAN_WINDOW" not in capsys.readouterr().out
+
+
+def test_orphan_scan_skips_when_a_worker_lacks_window_id(
+        stale, tmp_path, monkeypatch, capsys):
+    # One capture-failed worker makes pane attribution unreliable fleet-wide:
+    # never false-page, skip the whole scan (stderr note).
+    _arm_driver(stale, monkeypatch, [("claude-workers", "w", "%5")])
+    (tmp_path / "active" / "s1.json").write_text(json.dumps(
+        {"claude_sid": "s1", "agent": "worker", "name": "alpha",
+         "state": "idle", "window_id": ""}))
+    _seed_orphan_state(stale, "%5", time.time() - 700)
+    stale.main()
+    captured = capsys.readouterr()
+    assert "ORPHAN_WINDOW" not in captured.out
+    assert "orphan scan skipped" in captured.err
+
+
+def test_orphan_scan_ignores_windowless_nested_records(
+        stale, tmp_path, monkeypatch, capsys):
+    # Nested records carry window_id="" by design and own no worker window —
+    # they must not disable the alarm.
+    _arm_driver(stale, monkeypatch, [("claude-workers", "w", "%5")])
+    (tmp_path / "active" / "s1.json").write_text(json.dumps(
+        {"claude_sid": "s1", "agent": "worker", "name": "nested-x",
+         "state": "idle", "window_id": "", "nested": True}))
+    _seed_orphan_state(stale, "%5", time.time() - 130)
+    stale.main()
+    assert "ORPHAN_WINDOW %5" in capsys.readouterr().out
+
+
+def test_orphan_window_ladder_dedups_and_repages(stale, monkeypatch, capsys):
+    _arm_driver(stale, monkeypatch, [("claude-workers", "w", "%5")])
+    # Paged at the 2min rung already; 2.5min elapsed → same rung → quiet.
+    _seed_orphan_state(stale, "%5", time.time() - 150, paged=2)
+    stale.main()
+    assert "ORPHAN_WINDOW" not in capsys.readouterr().out
+    # 4.5min elapsed → 4min rung > paged 2 → re-page.
+    _seed_orphan_state(stale, "%5", time.time() - 270, paged=2)
+    stale.main()
+    assert "ORPHAN_WINDOW %5" in capsys.readouterr().out
+
+
+def test_orphan_state_key_dropped_when_pane_disappears(stale, monkeypatch, capsys):
+    _arm_driver(stale, monkeypatch, [])
+    _seed_orphan_state(stale, "%5", time.time() - 700, paged=2)
+    stale.main()
+    emitted = json.loads(stale._emitted_state_path(None).read_text())
+    assert "orphan:%5" not in emitted
+
+
+def test_orphan_scan_survives_driver_none_and_ls_none(stale, monkeypatch, capsys):
+    monkeypatch.setattr(stale, "_get_driver", None)
+    assert stale.main() == 0
+    monkeypatch.setattr(stale, "_get_driver",
+                        lambda: types.SimpleNamespace(ls=lambda: None))
+    assert stale.main() == 0
+
+
+def test_orphan_protection_is_fleet_global_in_scoped_runs(
+        stale, tmp_path, monkeypatch, capsys):
+    # Another manager's worker record still protects its pane in a scoped scan.
+    _arm_driver(stale, monkeypatch, [("claude-workers", "w", "%5")])
+    (tmp_path / "active" / "s1.json").write_text(json.dumps(
+        {"claude_sid": "s1", "agent": "worker", "name": "alpha", "state": "idle",
+         "window_id": "%5", "parent_manager_name": "other-mgr"}))
+    # Seed the SCOPED emitted-state file the scan under test actually reads
+    # (manager_name="my-mgr") — seeding the global file here would leave the
+    # scoped scan with no first_seen, so it'd start its own clock at "now"
+    # and stay quiet within grace regardless of protection, proving nothing.
+    _seed_orphan_state(stale, "%5", time.time() - 700, manager_name="my-mgr")
+    stale.main(manager_name="my-mgr")
+    assert "ORPHAN_WINDOW" not in capsys.readouterr().out
+
+
+def test_recovery_flush_unburns_orphan_ladder_without_resetting_clock(
+        stale, tmp_path, monkeypatch, capsys):
+    # A manager recovering from a limited stretch un-burns the dedup keys
+    # whose lines only ever reached the buffer. For a dict-valued orphan
+    # ladder, that must reset just the "paged" rung in place — popping the
+    # whole entry would also erase first_seen and restart the grace window.
+    _arm_driver(stale, monkeypatch, [("claude-workers", "w", "%5")])
+    first_seen = time.time() - 700
+    stale._emitted_state_path("mgr-A").write_text(json.dumps({
+        "orphan:%5": {"first_seen": first_seen, "paged": 2},
+        "limited_buffer": {
+            "since": first_seen, "stalled_names": [], "nudged": 0,
+            "resumed": 0, "questions": 0, "autoclosed": 0,
+            "suppressed_keys": ["orphan:%5"]},
+    }))
+    (tmp_path / ".manager-limited-mgr-A").touch()
+
+    stale.main(manager_name="mgr-A")
+
+    emitted = json.loads(stale._emitted_state_path("mgr-A").read_text())
+    entry = emitted["orphan:%5"]
+    assert entry["first_seen"] == first_seen, (
+        "un-burn must preserve the ladder's original first_seen — popping "
+        "the whole dict restarts the grace window instead of re-arming")
+    assert entry["paged"] == 0
+
+
+def test_orphan_session_name_matches_terminal_constant(stale):
+    from dockwright.terminal import WORKERS_OS_WINDOW_CLASS
+    assert stale.WORKERS_SESSION_NAME == WORKERS_OS_WINDOW_CLASS
+
+
+def test_interactive_shell_duplicate_no_zsh_falls_back_to_bash(stale, monkeypatch):
+    monkeypatch.setenv("SHELL", "/usr/bin/fish")
+    monkeypatch.setattr(stale.shutil, "which",
+                        lambda cmd: {"bash": "/usr/bin/bash"}.get(cmd))
+    assert stale._interactive_shell() == "/usr/bin/bash"
+
+
+def test_awake_seconds_duplicate_works_without_clock_uptime_raw(stale, monkeypatch):
+    monkeypatch.delattr(time, "CLOCK_UPTIME_RAW", raising=False)
+    v = stale._awake_seconds()
+    assert isinstance(v, float) and v > 0.0

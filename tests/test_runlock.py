@@ -147,3 +147,20 @@ def test_exit_trap_pattern_releases(lock):
     r = _bash(f'trap runlock_release EXIT; runlock_acquire "{lock}" try')
     assert r.returncode == 0
     assert not lock.exists()
+
+
+def test_dir_age_correct_under_gnu_stat_personality(lock, tmp_path):
+    # N-1 sibling: on GNU coreutils the old BSD-first probe poisoned $mtime,
+    # _runlock_dir_age printed nothing, and the over-age steal branch became
+    # unreachable — a wedged holder then blocked selffix/gardener forever.
+    from tests.stat_shims import write_gnu_stat_shim
+    _hold(lock, os.getpid(), age_sec=7300)
+    env = dict(os.environ)
+    env["PATH"] = f"{write_gnu_stat_shim(tmp_path / 'shims')}:{env['PATH']}"
+    r = subprocess.run(
+        ["bash", "-c", f'source "{RUNLOCK}"\nRUNLOCK_DIR="{lock}"\n_runlock_dir_age'],
+        capture_output=True, text=True, env=env, timeout=30,
+    )
+    age = r.stdout.strip()
+    assert age.isdigit(), f"age not a number: stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert 7200 <= int(age) <= 7400

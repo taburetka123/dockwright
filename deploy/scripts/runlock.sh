@@ -52,7 +52,7 @@ _runlock_holder_pid() { cat "$RUNLOCK_DIR/pid" 2>/dev/null; }
 
 _runlock_dir_age() {
   local mtime
-  mtime=$(stat -f %m "$RUNLOCK_DIR" 2>/dev/null || stat -c %Y "$RUNLOCK_DIR" 2>/dev/null)
+  mtime=$(date -r "$RUNLOCK_DIR" +%s 2>/dev/null)
   if [ -z "$mtime" ]; then echo 0; return; fi
   echo $(( $(date +%s) - mtime ))
 }
