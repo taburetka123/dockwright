@@ -6,7 +6,7 @@ import subprocess
 import sys
 import time
 import pytest
-from dockwright import hooks, paths, state
+from dockwright import config, hooks, paths, state
 from dockwright.hooks import (
     session_start, user_prompt_submit, stop_hook, session_end,
     _set_tab_color, _set_tab_title, MANAGER_TAB_COLOR,
@@ -22,6 +22,7 @@ def fresh(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "ANSWERS", tmp_path / "answers")
     monkeypatch.setattr(paths, "DONE", tmp_path / "done")
     monkeypatch.setattr(paths, "CLOSED", tmp_path / "closed")
+    monkeypatch.setattr(paths, "HANDOFFS", tmp_path / "handoffs")
     monkeypatch.setattr(paths, "TURN_ENDS", tmp_path / "turn-ends")
     monkeypatch.setattr(paths, "ARTIFACTS", tmp_path / "artifacts")
     monkeypatch.setattr(paths, "ASSIGNMENTS", tmp_path / "assignments")
@@ -30,6 +31,15 @@ def fresh(tmp_path, monkeypatch):
     monkeypatch.delenv("CLAUDE_ASSIGNMENT_ID", raising=False)
     paths.ensure_dirs()
     yield tmp_path
+
+
+def _install_two_pool(monkeypatch, tmp_path):
+    """The default pool is single-account; tests that stamp/validate account 'b'
+    need it registered, so install the two-account registry explicitly."""
+    cfg = tmp_path / "two-pool.toml"
+    cfg.write_text('[accounts]\ndefault = "a"\n'
+                   '[[accounts.pool]]\nname = "a"\n[[accounts.pool]]\nname = "b"\n')
+    monkeypatch.setenv(config.ENV_CONFIG_PATH, str(cfg))
 
 @pytest.fixture(autouse=True)
 def _no_process_tree_probes(monkeypatch):
@@ -211,6 +221,7 @@ def test_session_start_agent_change_re_registers(fresh, monkeypatch):
 
 def test_session_start_stamps_account_from_env(fresh, monkeypatch):
     """CLAUDE_ORCH_ACCOUNT=b in env → fresh registration → record["account"] == "b"."""
+    _install_two_pool(monkeypatch, fresh)
     monkeypatch.setenv("CLAUDE_AGENT", "worker")
     monkeypatch.setenv("CLAUDE_WORKER_NAME", "task-acct")
     monkeypatch.setenv("CLAUDE_ORCH_ACCOUNT", "b")
@@ -232,7 +243,7 @@ def test_session_start_account_none_without_env(fresh, monkeypatch):
 
 
 def test_session_start_account_invalid_env_stamps_none(fresh, monkeypatch):
-    """CLAUDE_ORCH_ACCOUNT outside the a|b whitelist → fresh registration → record["account"] is None."""
+    """CLAUDE_ORCH_ACCOUNT outside the registry whitelist → fresh registration → record["account"] is None."""
     monkeypatch.setenv("CLAUDE_AGENT", "worker")
     monkeypatch.setenv("CLAUDE_WORKER_NAME", "task-bad-acct")
     monkeypatch.setenv("CLAUDE_ORCH_ACCOUNT", "xyz")
@@ -245,6 +256,7 @@ def test_session_start_account_invalid_env_stamps_none(fresh, monkeypatch):
 def test_session_start_resume_refreshes_account_only_when_env_present(fresh, monkeypatch):
     """Re-fire with CLAUDE_ORCH_ACCOUNT=b updates record["account"];
     re-fire without the env var leaves the stamped value intact."""
+    _install_two_pool(monkeypatch, fresh)
     monkeypatch.setenv("CLAUDE_AGENT", "worker")
     monkeypatch.setenv("CLAUDE_WORKER_NAME", "task-resume-acct")
     # Pre-write an active record with account="a"
@@ -1850,6 +1862,114 @@ def test_nested_manager_ghost_session_end_does_not_flag(orphan_env, monkeypatch)
     assert not paths.ORPHANS.exists() or list(paths.ORPHANS.iterdir()) == []
 
 
+def _write_handoff(handoffs_dir, from_sid="mgr-1", prepared_age_sec=60.0, body=None):
+    handoffs_dir.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    path = handoffs_dir / "h1.json"
+    if body is None:
+        body = {"handoff_id": "h1", "from_sid": from_sid,
+                 "prepared_at": now - prepared_age_sec, "consumed_at": None,
+                 "trigger_reason": "manual"}
+    path.write_text(json.dumps(body) if not isinstance(body, str) else body)
+    os.utime(path, (now - prepared_age_sec, now - prepared_age_sec))
+    return path
+
+
+def test_session_end_fresh_handoff_suppresses_flag_and_notification(orphan_env, monkeypatch, fresh):
+    """A recreate/recycle handoff prepared by THIS manager sid within the
+    window is an intentional handoff — neither the orphan flag nor the macOS
+    notification may fire (engineer screenshot 2026-07-16)."""
+    from dockwright import hooks
+    notifications = []
+    monkeypatch.setattr(hooks, "_notify_macos", notifications.append)
+    monkeypatch.setattr(paths, "HANDOFFS", fresh / "handoffs")
+    _write_handoff(fresh / "handoffs", from_sid="mgr-1", prepared_age_sec=60)
+    _write_manager()
+    _write_worker("w1", "grumpy-yak")
+    _end_session(monkeypatch, reason="clear")
+    assert state.read_json(paths.ORPHANS / "grumpy-yak.json") is None
+    assert notifications == []
+
+
+def test_session_end_stale_handoff_does_not_suppress(orphan_env, monkeypatch, fresh):
+    """A handoff older than HANDOFF_SUPPRESS_SEC proves nothing about THIS
+    death — a manager that prepared a handoff, failed to recreate, and died
+    an hour later must still alarm."""
+    from dockwright import hooks
+    notifications = []
+    monkeypatch.setattr(hooks, "_notify_macos", notifications.append)
+    monkeypatch.setattr(paths, "HANDOFFS", fresh / "handoffs")
+    _write_handoff(fresh / "handoffs", from_sid="mgr-1",
+                   prepared_age_sec=hooks.HANDOFF_SUPPRESS_SEC + 60)
+    _write_manager()
+    _write_worker("w1", "grumpy-yak")
+    _end_session(monkeypatch)
+    assert state.read_json(paths.ORPHANS / "grumpy-yak.json") is not None
+    assert len(notifications) == 1
+
+
+def test_session_end_stale_prepared_at_with_fresh_mtime_does_not_suppress(orphan_env, monkeypatch, fresh):
+    """A consumed_at rewrite bumps the handoff file's mtime long after
+    prepare — the mtime prefilter then passes, and only the payload-level
+    prepared_at check stands between a >30min-old handoff and a wrongly
+    suppressed alarm."""
+    from dockwright import hooks
+    notifications = []
+    monkeypatch.setattr(hooks, "_notify_macos", notifications.append)
+    monkeypatch.setattr(paths, "HANDOFFS", fresh / "handoffs")
+    stale_prepared = time.time() - hooks.HANDOFF_SUPPRESS_SEC - 60
+    _write_handoff(fresh / "handoffs", from_sid="mgr-1", prepared_age_sec=0,
+                   body={"handoff_id": "h1", "from_sid": "mgr-1",
+                         "prepared_at": stale_prepared,
+                         "consumed_at": time.time(), "trigger_reason": "manual"})
+    _write_manager()
+    _write_worker("w1", "grumpy-yak")
+    _end_session(monkeypatch)
+    assert state.read_json(paths.ORPHANS / "grumpy-yak.json") is not None
+    assert len(notifications) == 1
+
+
+def test_session_end_other_sids_handoff_does_not_suppress(orphan_env, monkeypatch, fresh):
+    """A fresh handoff prepared by a DIFFERENT manager must not shield this one."""
+    from dockwright import hooks
+    notifications = []
+    monkeypatch.setattr(hooks, "_notify_macos", notifications.append)
+    monkeypatch.setattr(paths, "HANDOFFS", fresh / "handoffs")
+    _write_handoff(fresh / "handoffs", from_sid="mgr-OTHER", prepared_age_sec=60)
+    _write_manager()
+    _write_worker("w1", "grumpy-yak")
+    _end_session(monkeypatch)
+    assert state.read_json(paths.ORPHANS / "grumpy-yak.json") is not None
+    assert len(notifications) == 1
+
+
+def test_session_end_malformed_handoff_fails_toward_alarming(orphan_env, monkeypatch, fresh):
+    """Corrupt handoff JSON (fresh mtime) must not suppress — any failure in
+    the gate reads as no-handoff."""
+    from dockwright import hooks
+    notifications = []
+    monkeypatch.setattr(hooks, "_notify_macos", notifications.append)
+    monkeypatch.setattr(paths, "HANDOFFS", fresh / "handoffs")
+    _write_handoff(fresh / "handoffs", body="{not json")
+    _write_manager()
+    _write_worker("w1", "grumpy-yak")
+    _end_session(monkeypatch)
+    assert state.read_json(paths.ORPHANS / "grumpy-yak.json") is not None
+    assert len(notifications) == 1
+
+
+def test_session_end_missing_handoffs_dir_does_not_suppress(orphan_env, monkeypatch, fresh):
+    from dockwright import hooks
+    notifications = []
+    monkeypatch.setattr(hooks, "_notify_macos", notifications.append)
+    monkeypatch.setattr(paths, "HANDOFFS", fresh / "handoffs-nonexistent")
+    _write_manager()
+    _write_worker("w1", "grumpy-yak")
+    _end_session(monkeypatch)
+    assert state.read_json(paths.ORPHANS / "grumpy-yak.json") is not None
+    assert len(notifications) == 1
+
+
 def _spend_dict(out=500):
     return {"turns": 2, "out_tokens": out, "in_tokens": 10,
             "cache_read_tokens": 100, "last_turn_out": out, "last_msg_id": "m"}
@@ -2503,3 +2623,69 @@ def test_session_start_codex_worker_emits_no_context(fresh, monkeypatch, capsys)
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "s1", "cwd": "/x"})))
     session_start()
     assert capsys.readouterr().out == ""
+
+
+# --- L-4: env-less lanes (claude + /manager fallback; `dockwright manager`
+# proper) never set CLAUDE_AGENT, but become_manager DID register a record.
+# session_end must gate on the record, not the env alone.
+
+def test_session_end_envless_manager_record_runs_manager_leg(fresh, monkeypatch):
+    monkeypatch.delenv("CLAUDE_AGENT", raising=False)
+    distills = []
+    monkeypatch.setattr(hooks, "_maybe_distill_on_session_end",
+                        lambda sid, rec: distills.append(sid))
+    orphan_flags = []
+    monkeypatch.setattr(hooks, "_flag_orphaned_workers",
+                        lambda sid, rec, reason: orphan_flags.append(sid))
+    state.write_json_atomic(fresh / "active" / "m1.json", {
+        "claude_sid": "m1", "agent": "manager", "name": "lucky-werewolf",
+        "cwd": "/x", "iterm_sid": "i1", "pid": 1, "started_at": 0,
+        "domain": "general",
+    })
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "m1"})))
+    session_end()
+    assert not (fresh / "active" / "m1.json").exists(), "record must be cleaned up"
+    assert distills == ["m1"], "fallback distill must fire for the env-less manager"
+    assert orphan_flags == ["m1"], "orphan flagging must run for the env-less manager"
+
+
+def test_session_end_envless_worker_record_archives(fresh, monkeypatch):
+    monkeypatch.delenv("CLAUDE_AGENT", raising=False)
+    state.write_json_atomic(fresh / "active" / "w1.json", {
+        "claude_sid": "w1", "agent": "worker", "name": "alpha", "cwd": "/x",
+        "iterm_sid": "i1", "pid": 1, "started_at": 12345.0,
+    })
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "w1"})))
+    session_end()
+    assert not (fresh / "active" / "w1.json").exists()
+    closed = json.loads((fresh / "closed" / "w1.json").read_text())
+    assert closed["closed_reason"] == "session_end"
+
+
+def test_session_end_distill_sentinel_beats_record_gate(fresh, monkeypatch):
+    """Defense in depth: a distill child must stay on the headless path even
+    if a record somehow exists for its sid (fan-out guard)."""
+    monkeypatch.delenv("CLAUDE_AGENT", raising=False)
+    monkeypatch.setenv(paths.DISTILL_ENV_SENTINEL, "1")
+    state.write_json_atomic(fresh / "active" / "d1.json", {
+        "claude_sid": "d1", "agent": "manager", "name": "ghost", "cwd": "/x",
+        "iterm_sid": "i1", "pid": 1, "started_at": 0, "domain": "general",
+    })
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "d1"})))
+    session_end()
+    assert (fresh / "active" / "d1.json").exists(), "distill child must not touch records"
+
+
+def test_session_end_headless_spend_uses_passed_payload(fresh, monkeypatch):
+    """The stdin payload is read ONCE in session_end and passed through —
+    _capture_tagged_headless_spend must see the real session_id/transcript."""
+    monkeypatch.delenv("CLAUDE_AGENT", raising=False)
+    monkeypatch.setenv("CLAUDE_SPEND_CLASS", "distill")
+    events = []
+    from dockwright import spend_ledger
+    monkeypatch.setattr(spend_ledger, "append_headless_event",
+                        lambda cls, sid, path: events.append((cls, sid, path)))
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(
+        {"session_id": "h1", "transcript_path": "/t/h1.jsonl"})))
+    session_end()
+    assert events == [("distill", "h1", "/t/h1.jsonl")]

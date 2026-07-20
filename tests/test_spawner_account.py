@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from dockwright import paths, spawner
+from dockwright import config, paths, spawner
 
 
 # ---------------------------------------------------------------------------
@@ -29,6 +29,13 @@ def sp(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "ACCOUNT_STATE", tmp_path / "account-state.json")
     monkeypatch.setattr(paths, "SPAWN_COUNTER", tmp_path / "spawn-counter.json")
     monkeypatch.setattr(paths, "ACCOUNT_USAGE", tmp_path / "usage")
+    # This file's pinned a/b sequences predate the single-account default pool,
+    # so install the two-account registry explicitly to keep them load-bearing.
+    cfg = tmp_path / "two-pool.toml"
+    cfg.write_text(
+        '[accounts]\ndefault = "a"\n'
+        '[[accounts.pool]]\nname = "a"\n[[accounts.pool]]\nname = "b"\n')
+    monkeypatch.setenv(config.ENV_CONFIG_PATH, str(cfg))
     # Env weight overrides cleared so tests rely on defaults
     monkeypatch.delenv("CLAUDE_ORCH_ACCOUNT_WEIGHT_A", raising=False)
     monkeypatch.delenv("CLAUDE_ORCH_ACCOUNT_WEIGHT_B", raising=False)

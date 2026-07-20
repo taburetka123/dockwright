@@ -717,6 +717,43 @@ class TestEvaluate:
         assert _outcomes(postrun) == []
 
 
+class TestConfigTomlStr:
+    def test_config_toml_str_reads_key(self, postrun, tmp_path, monkeypatch):
+        cfg = tmp_path / "dockwright.toml"
+        cfg.write_text("[evals]\ninvestigate_skill = '~/x/SKILL.md'\n")
+        monkeypatch.setenv("DOCKWRIGHT_CONFIG", str(cfg))
+        assert postrun.config_toml_str("evals", "investigate_skill") == "~/x/SKILL.md"
+        assert postrun.config_toml_str("evals", "missing") == ""
+        assert postrun.config_toml_str("nope", "x") == ""
+
+    def test_config_toml_str_no_config(self, postrun, monkeypatch, tmp_path):
+        monkeypatch.setenv("DOCKWRIGHT_CONFIG", str(tmp_path / "absent.toml"))
+        assert postrun.config_toml_str("evals", "investigate_skill") == ""
+
+    def test_dockwright_repo_still_resolves_via_config_toml_str(self, postrun, tmp_path, monkeypatch):
+        cfg = tmp_path / "dockwright.toml"
+        cfg.write_text('[paths]\ndockwright_repo = "~/repo"\n')
+        monkeypatch.setenv("DOCKWRIGHT_CONFIG", str(cfg))
+        assert postrun._dockwright_repo() == str(Path("~/repo").expanduser())
+
+
+class TestDecideAppliedRev:
+    def test_decide_records_applied_rev(self, postrun):
+        path = _write_proposal(postrun)
+        rc = postrun.decide(str(path), "accept", "ok", applied_rev=["/r=abc123"])
+        assert rc == 0
+        events = _ledger_events(postrun)
+        dec = [e for e in events if e["type"] == "decision"][-1]
+        assert dec["applied_rev"] == "/r=abc123"
+
+    def test_decide_applied_rev_defaults_empty(self, postrun):
+        path = _write_proposal(postrun)
+        postrun.decide(str(path), "accept", "ok")
+        events = _ledger_events(postrun)
+        dec = [e for e in events if e["type"] == "decision"][-1]
+        assert dec["applied_rev"] == ""
+
+
 class TestHomeFallback:
     def test_prefers_dockwright_homes(self, tmp_path, monkeypatch):
         claude = tmp_path / ".claude"

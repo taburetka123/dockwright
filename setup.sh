@@ -79,7 +79,17 @@ DEPLOY_SHA_SHORT="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || ech
 DEPLOY_BRANCH="$(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
 DEPLOY_DIRTY=0
 [ -n "$(git -C "$REPO_DIR" status --porcelain 2>/dev/null)" ] && DEPLOY_DIRTY=1
-if [ "$DEPLOY_BRANCH" != "main" ] || [ "$DEPLOY_DIRTY" = "1" ]; then
+# A detached checkout reads as branch 'HEAD'. A CLEAN checkout of an exact tag
+# is the normal release-install case (E2E L-8) — informational, not a warning.
+DEPLOY_TAG=""
+if [ "$DEPLOY_BRANCH" = "HEAD" ]; then
+    DEPLOY_TAG="$(git -C "$REPO_DIR" describe --tags --exact-match HEAD 2>/dev/null || true)"
+fi
+if [ -n "$DEPLOY_TAG" ] && [ "$DEPLOY_DIRTY" = "0" ]; then
+    echo "→ Deploying from release tag '$DEPLOY_TAG' ($DEPLOY_SHA_SHORT)"
+elif [ "$DEPLOY_BRANCH" = "HEAD" ]; then
+    echo "⚠️  WARNING: deploying from detached HEAD ($DEPLOY_SHA_SHORT, dirty=$DEPLOY_DIRTY) — the live surface will diverge from main; re-run setup.sh from clean main to converge." >&2
+elif [ "$DEPLOY_BRANCH" != "main" ] || [ "$DEPLOY_DIRTY" = "1" ]; then
     echo "⚠️  WARNING: deploying from branch '$DEPLOY_BRANCH' (dirty=$DEPLOY_DIRTY) — the live surface will diverge from main; re-run setup.sh from clean main to converge." >&2
 fi
 if [ -f "$DEPLOY_STAMP" ]; then
@@ -488,6 +498,19 @@ echo "→ Stamped deploy provenance to $DEPLOY_STAMP (sha=$DEPLOY_SHA branch=$DE
 # FILES_ONLY (S6 sandbox) skips doctor (needs $DOCKWRIGHT_BIN + the wired config it
 # verifies) and the overlay setup.d runner below.
 if [ "${DOCKWRIGHT_SETUP_FILES_ONLY:-}" != "1" ]; then
+# Reconcile already-provisioned pool-account config-dir farms (symlink heal +
+# .claude.json MCP refresh) so existing installs converge on every deploy, not
+# only on the next spawn of that account. Never provisions new farms; drift is
+# reported, never fatal (the verb exits 0 under this script's set -e).
+echo "→ Reconciling pool-account config-dir farms (accounts-sync)…"
+"$DOCKWRIGHT_BIN" accounts-sync
+
+# Refresh the account-registry snapshot consumed by the standalone
+# stale_monitor + bootstrap-recreate (they cannot import the package). Closes
+# the deploy gap where a newly deployed monitor with no snapshot would fall
+# back to the legacy a/b pair.
+"$DOCKWRIGHT_BIN" write-registry-snapshot || true
+
 # Ensure the default/configured worker home exists so a bare spawn_worker never
 # falls back to the manager's (untrusted) cwd on a fresh install (fix M-1). NOT
 # RENDER_BIN-gated: the S6 sandbox sets DOCKWRIGHT_ORCH_BIN but neither HOME nor

@@ -1,11 +1,11 @@
 """Deploy-time injection of permissions.additionalDirectories into the
 DEPLOYED worker-headless preset (E2E rc.2 N-3).
 
-Why deploy-time and absolute: acceptEdits is documented to auto-accept edits
-in additionalDirectories, but tilde expansion in the settings VALUE is
-undocumented — so the shipped fixture stays generic and setup.sh resolves the
-operator's [paths] code roots to absolute paths at deploy. An operator-set
-key (even []) is intent and must survive verbatim.
+Why deploy-time and absolute: the preset's permission mode is documented to
+auto-accept edits in additionalDirectories, but tilde expansion in the settings
+VALUE is undocumented — so the shipped fixture stays generic and setup.sh
+resolves the operator's [paths] code roots to absolute paths at deploy. An
+operator-set key (even []) is intent and must survive verbatim.
 """
 import json
 import os

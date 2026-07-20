@@ -14,6 +14,13 @@ Semantics:
 - `{{name}}` substitutes dockwright.toml [agent_vars] entries across the
   composed text; an unbound `{{name}}` stays literal and is reported as a
   warning, never an error.
+- `<absolute-home>` inside a var VALUE expands to the installing user's
+  absolute home (`Path.home()`, honors $HOME) at compose time. If the literal
+  token survives anywhere in composed output (core prose, a drop-in body) the
+  compose FAILS LOUD with ComposeError — a deployed agent file carrying the
+  token is exactly the broken artifact this prevents. Narrow amendment to the
+  IDENTITY GUARANTEE below: token-bearing text errors instead of passing
+  through; token-free text is untouched.
 - A drop-in naming an unknown marker FAILS LOUD (ComposeError listing the
   valid markers) — a silently misplaced overlay section would be worse.
 - IDENTITY GUARANTEE: composing a core text with no markers and no vars
@@ -50,6 +57,7 @@ from . import config
 
 MARKER_RE = re.compile(r"^<!-- overlay: ([A-Za-z0-9_-]+) -->$")
 VAR_RE = re.compile(r"\{\{([A-Za-z0-9_]+)\}\}")
+HOME_TOKEN = "<absolute-home>"
 
 STAMP_NAME = ".compose-stamp.json"
 
@@ -127,7 +135,15 @@ def compose_text(core_text: str, dropins, vars) -> tuple[str, list[str]]:
                 composed += "\n"
             composed += d.body
     if vars:
-        composed = VAR_RE.sub(lambda m: vars.get(m.group(1), m.group(0)), composed)
+        expanded = {k: v.replace(HOME_TOKEN, str(Path.home()))
+                    for k, v in vars.items()}
+        composed = VAR_RE.sub(
+            lambda m: expanded.get(m.group(1), m.group(0)), composed)
+    if HOME_TOKEN in composed:
+        raise ComposeError(
+            f"literal {HOME_TOKEN} in composed output — the token is expanded "
+            f"only inside [agent_vars] VALUES; move the path into a var, or "
+            f"write the literal absolute path instead")
     unbound = sorted({m.group(1) for m in VAR_RE.finditer(composed)})
     warnings = [f"unbound vars left literal: {unbound}"] if unbound else []
     return composed, warnings
@@ -215,6 +231,8 @@ def compose_agents(core_dir, out_dir, overlay_dir, vars) -> dict:
     stamp: dict = {
         "composed_at": time.time(),
         "core": {}, "core_sources": {}, "overlay": {},
+        # Hashed over the UNEXPANDED merged map — informational only; do not
+        # build freshness logic on it (it never moves when $HOME differs).
         "vars_sha256": hashlib.sha256(
             json.dumps(dict(sorted(merged_vars.items()))).encode()).hexdigest(),
         "core_git_sha": _git_sha(core_dir),

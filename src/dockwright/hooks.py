@@ -429,6 +429,15 @@ def _is_orchestrator_session() -> bool:
         return False
     return os.environ.get("CLAUDE_AGENT") in ("manager", "worker")
 
+def _record_is_orchestrator(record) -> bool:
+    """Registry-record fallback for env-less lanes: the `claude` + `/manager`
+    fallback boot and `dockwright manager` proper never set CLAUDE_AGENT, but
+    become_manager DID write an active record — without this fallback their
+    SessionEnd silently no-ops (no cleanup, no orphan flagging, no distill;
+    E2E L-4). Only sessions that REGISTERED get a record, so a plain human
+    session never gates in."""
+    return isinstance(record, dict) and record.get("agent") in ("manager", "worker")
+
 def _emit_session_context(sid: str, agent: str) -> None:
     """SessionStart stdout → Claude Code injects it as session context. This is
     how a session learns its sid WITHOUT running a shell command: the old
@@ -747,7 +756,7 @@ def _append_spend_drop(record, source: str) -> None:
         pass
 
 
-def _capture_tagged_headless_spend() -> None:
+def _capture_tagged_headless_spend(data: dict) -> None:
     """CLAUDE_SPEND_CLASS contract: an env-stripped headless `claude -p` (distill
     here; other bounded headless runs once their code exports the var) tags itself, and
     its SessionEnd lands whole-transcript spend in the ledger — the only capture
@@ -759,7 +768,6 @@ def _capture_tagged_headless_spend() -> None:
         spend_class = os.environ.get("CLAUDE_SPEND_CLASS")
         if not spend_class:
             return
-        data = _read_stdin_json()
         from .spend_ledger import append_headless_event
         append_headless_event(spend_class, data.get("session_id"), data.get("transcript_path"))
     except Exception:
@@ -811,6 +819,41 @@ def _live_workers_of(manager_name: str) -> list:
     return workers
 
 
+HANDOFF_SUPPRESS_SEC = 1800
+
+
+def _handoff_prepared_recently(sid: str) -> bool:
+    """True when a handoff record (prepare_handoff / prepare_recovery_handoff)
+    names `sid` as the manager being replaced and was prepared within
+    HANDOFF_SUPPRESS_SEC. Such a SessionEnd is an intentional
+    recreate/recycle/recovery handoff — workers deliberately carry across to
+    the successor, so the orphan flag+notification must not fire. If the
+    takeover then fails, the bootlite watchdog's independent scan still
+    detects and notifies (its detection reads live records, not this flag).
+    mtime prefilter only skips old files (a consumed_at rewrite bumps mtime
+    forward, never back), so it can under-filter but never over-filter.
+    Crash-proof: any failure reads as False — fail toward alarming."""
+    try:
+        cutoff = time.time() - HANDOFF_SUPPRESS_SEC
+        if not paths.HANDOFFS.is_dir():
+            return False
+        for handoff_path in paths.HANDOFFS.glob("*.json"):
+            try:
+                if handoff_path.stat().st_mtime < cutoff:
+                    continue
+            except OSError:
+                continue
+            record = state.read_json(handoff_path)
+            if not isinstance(record, dict) or record.get("from_sid") != sid:
+                continue
+            prepared_at = record.get("prepared_at")
+            if isinstance(prepared_at, (int, float)) and prepared_at >= cutoff:
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def _flag_orphaned_workers(sid: str, record: dict, reason) -> None:
     """Boot-lite event half: a manager ending while workers it parents are still
     alive leaves them unsupervised (stale monitor + autonudge die with the
@@ -822,6 +865,9 @@ def _flag_orphaned_workers(sid: str, record: dict, reason) -> None:
     and unlinks microseconds later — a SessionEnd that wins that race writes a
     spurious flag; accepted, the watchdog's healthy-sweep unlinks it on the
     next tick once the inheriting manager is live under the same name.
+    Intentional handoffs (/recreate-manager, /manager-recycle, recovery) are
+    silenced by the _handoff_prepared_recently gate — the bootlite watchdog
+    remains the failed-takeover safety net.
 
     Best-effort throughout: nothing here may break session_end."""
     try:
@@ -830,6 +876,8 @@ def _flag_orphaned_workers(sid: str, record: dict, reason) -> None:
             return
         workers = _live_workers_of(manager_name)
         if not workers:
+            return
+        if _handoff_prepared_recently(sid):
             return
         state.write_json_atomic(paths.orphan_flag_path(manager_name), {
             "manager_name": manager_name,
@@ -855,15 +903,19 @@ def _flag_orphaned_workers(sid: str, record: dict, reason) -> None:
 
 
 def session_end() -> None:
-    if not _is_orchestrator_session():
-        _capture_tagged_headless_spend()
-        return
     data = _read_stdin_json()
     sid = data.get("session_id")
+    record = state.read_json(paths.ACTIVE / f"{sid}.json") if sid else None
+    # The distill sentinel outranks BOTH gates: a distill child acting as a
+    # manager would re-distill on its own SessionEnd — infinite fan-out.
+    if _is_distill_session() or not (
+        _is_orchestrator_session() or _record_is_orchestrator(record)
+    ):
+        _capture_tagged_headless_spend(data)
+        return
     if not sid:
         return
     active_path = paths.ACTIVE / f"{sid}.json"
-    record = state.read_json(active_path)
     # Boot-lite event half — must land before the unlink below and before the
     # distill (which can be SIGKILLed mid-flight at tab-close timeout). Nested
     # manager-ghosts never flag (consistent with their lifecycle exclusion).
@@ -903,16 +955,17 @@ def session_end() -> None:
     # swallowed here; failures inside the detached child are logged to
     # distill-fallback.log by _distill_manager_session, unobserved by us.
     # The _is_distill_session check is redundant with the top-of-function
-    # _is_orchestrator_session guard, but kept explicit: a distill child must
-    # never reach _maybe_distill_on_session_end even if that guard is refactored.
+    # gate's own explicit `_is_distill_session()` first disjunct, but kept
+    # explicit here too: a distill child must never reach
+    # _maybe_distill_on_session_end even if that gate is refactored.
     # `not nested`: a nested child of a manager inherits CLAUDE_AGENT=manager;
     # letting it distill would spawn another `claude -p`, which registers
     # nested, whose SessionEnd would distill again — the same fan-out the
     # distill sentinel guards against, one layer further out.
     if (
-        os.environ.get("CLAUDE_AGENT") == "manager"
+        record is not None
+        and record.get("agent") == "manager"
         and not _is_distill_session()
-        and record is not None
         and not record.get("nested")
     ):
         try:

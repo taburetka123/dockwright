@@ -1,11 +1,48 @@
 """CLI dispatcher: `dockwright <subcommand>`."""
 import sys
 
+USAGE = """\
+Usage: dockwright <subcommand>
+
+Subcommands:
+  manager               Launch (or reattach to) the manager tmux session
+  doctor                Verify install wiring (hooks, MCP, venv)
+  init                  Write a starter dockwright.toml
+  monitor               One-shot fleet scans: questions|done|turn-ends|stale [manager-name]
+  sweep                 Prune stale orchestrator state
+  spend-report          Per-session token spend report
+  spend-cost            Price a spend report
+  distill               Distill a manager session into a memory journal
+  boot-brief            Print manager boot pointers (agent line count, memory/notebook paths)
+  selffix               Enable/disable the SessionEnd retrospective hook
+  gardener              Enable/disable the gardener loops (macOS launchd)
+  ensure-worker-home    Create + pre-trust the default worker home
+  accounts-sync         Reconcile pool-account config-dir farms (symlinks + MCP refresh)
+  write-registry-snapshot
+                        Refresh account-registry.json for standalone consumers
+  compose               Render agent files from cores + overlay
+  render                Render command/preset templates
+  finalize-presets      Render permission presets
+  install-hooks         Install Claude/Codex hook wiring
+  install-codex-skills  Mirror skills into ~/.codex
+  clean-homebrew        Remove legacy Homebrew artifacts
+  migrate-state         Migrate legacy state roots
+  assign-to-manager     Promote this session into a managed worker
+  uninstall             Remove dockwright from this machine
+
+Internal (hook/MCP plumbing — wired by setup.sh, not typed by hand):
+  mcp-server            MCP stdio server (registered via `claude mcp add`)
+  session-start | user-prompt-submit | stop | session-end
+                        Claude Code lifecycle hooks"""
+
 def main() -> None:
     if len(sys.argv) < 2:
-        print("Usage: dockwright <subcommand>", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
         sys.exit(2)
     cmd = sys.argv[1]
+    if cmd in ("--help", "-h", "help"):
+        print(USAGE)
+        sys.exit(0)
     if cmd == "mcp-server":
         from .mcp_server import main as mcp_main
         mcp_main()
@@ -72,6 +109,13 @@ def main() -> None:
     elif cmd == "ensure-worker-home":
         from .ensure_worker_home import main as ewh_main
         sys.exit(ewh_main(sys.argv[2:]))
+    elif cmd == "accounts-sync":
+        from .accounts_sync import main as accounts_sync_main
+        sys.exit(accounts_sync_main(sys.argv[2:]))
+    elif cmd == "write-registry-snapshot":
+        from .spawner import write_registry_snapshot
+        write_registry_snapshot()
+        sys.exit(0)
     elif cmd == "selffix":
         from .pipeline_wiring import selffix_main
         sys.exit(selffix_main(sys.argv[2:]))
@@ -81,8 +125,12 @@ def main() -> None:
     elif cmd == "finalize-presets":
         from .presets import main as finalize_presets_main
         sys.exit(finalize_presets_main(sys.argv[2:]))
+    elif cmd == "boot-brief":
+        from .boot_brief import main as boot_brief_main
+        sys.exit(boot_brief_main(sys.argv[2:]))
     else:
         print(f"Unknown subcommand: {cmd}", file=sys.stderr)
+        print("Run `dockwright --help` for the full list.", file=sys.stderr)
         sys.exit(2)
 
 if __name__ == "__main__":

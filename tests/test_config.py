@@ -42,9 +42,8 @@ def test_defaults_without_any_config_file(no_config):
     assert config.loop_label_prefix() == "com.dockwright"
     assert config.accounts() == [
         config.Account(name="a", config_dir=None, weight=1),
-        config.Account(name="b", config_dir=None, weight=1),
     ]
-    assert config.account_names() == ("a", "b")
+    assert config.account_names() == ("a",)
     assert config.default_account() == "a"
     assert config.account_weight("a") == 1
     assert config.account_weight("nope") == 1
@@ -112,8 +111,7 @@ def test_corrupt_toml_is_fail_open_but_load_error_reports(no_config, monkeypatch
     assert config.load() == {}
     assert config.load_error() is not None
     assert config.worker_model() == "opus[1m]"
-    assert config.accounts() == [
-        config.Account(name="a"), config.Account(name="b")]
+    assert config.accounts() == [config.Account(name="a")]
 
 
 def test_wrong_types_fall_back_per_key(no_config, monkeypatch, tmp_path):
@@ -285,8 +283,7 @@ name = "y"
 def test_malformed_pool_falls_back_whole(no_config, monkeypatch, tmp_path, pool_toml):
     p = _write(tmp_path, pool_toml)
     monkeypatch.setenv(config.ENV_CONFIG_PATH, str(p))
-    assert config.accounts() == [
-        config.Account(name="a"), config.Account(name="b")]
+    assert config.accounts() == [config.Account(name="a")]
     assert config.default_account() == "a"
 
 
@@ -320,12 +317,12 @@ def test_default_toml_parses_and_matches_code_defaults(no_config, monkeypatch, t
     assert config.worker_model() == "opus[1m]"
     assert config.manager_model() == "opus[1m]"
     assert config.distill_model() == "claude-sonnet-4-6"
+    assert config.worker_headless_preset() is True
     assert config.assign_command_hint() == "/manager-assign"
     assert config.worktree_cleanup_hint() == ""
     assert config.loop_label_prefix() == "com.dockwright"
     assert config.accounts() == [
-        config.Account(name="a", config_dir=None, weight=1),
-        config.Account(name="b", config_dir=None, weight=1)]
+        config.Account(name="a", config_dir=None, weight=1)]
     assert config.default_account() == "a"
     assert config.pricing_overrides() == {}
     assert config.overlay_dir() == home / ".claude" / "dockwright-overlay"
@@ -506,3 +503,34 @@ def test_repo_roots_override(no_config, monkeypatch, tmp_path):
     p = _write(tmp_path, '[paths]\nrepo_roots = "~/r1,~/r2"\n')
     monkeypatch.setenv(config.ENV_CONFIG_PATH, str(p))
     assert config.repo_roots() == "~/r1,~/r2"
+
+
+# --- spawn.worker_headless_preset ---
+
+def test_worker_headless_preset_default_true(monkeypatch):
+    monkeypatch.setattr(config, "load", lambda: {})
+    assert config.worker_headless_preset() is True
+
+
+def test_worker_headless_preset_false(monkeypatch):
+    monkeypatch.setattr(config, "load", lambda: {"spawn": {"worker_headless_preset": False}})
+    assert config.worker_headless_preset() is False
+
+
+def test_worker_headless_preset_non_bool_falls_back_true(monkeypatch):
+    monkeypatch.setattr(config, "load", lambda: {"spawn": {"worker_headless_preset": "no"}})
+    assert config.worker_headless_preset() is True
+
+
+# --- accounts.usage_pause_pct ---
+
+def test_usage_pause_pct(tmp_path, monkeypatch):
+    cfg = tmp_path / "dockwright.toml"
+    monkeypatch.setenv(config.ENV_CONFIG_PATH, str(cfg))
+    assert config.usage_pause_pct() is None                       # missing file
+    cfg.write_text("[accounts]\nusage_pause_pct = 72.5\n")
+    assert config.usage_pause_pct() == 72.5
+    cfg.write_text("[accounts]\nusage_pause_pct = true\n")
+    assert config.usage_pause_pct() is None                       # bool is not a number
+    cfg.write_text("[accounts]\nusage_pause_pct = -3\n")
+    assert config.usage_pause_pct() is None                       # non-positive

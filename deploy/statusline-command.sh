@@ -61,7 +61,8 @@ if echo "$input" | jq -e '.rate_limits != null' >/dev/null 2>&1; then
     if [ "$cfg_label" = "default" ]; then usage_acct="a"; else usage_acct="$cfg_label"; fi
   fi
   case "$usage_acct" in
-    a|b)
+    ""|.*|*/*) : ;;  # empty, dot-leading, or path-shaped names never touch the usage dir
+    *)
       usage_dir="$HOME/.claude/dockwright/usage"
       # deprecated, one release: honor an un-migrated install's existing usage home
       [ -d "$usage_dir" ] || { [ -d "$HOME/.claude/orchestrator/usage" ] && usage_dir="$HOME/.claude/orchestrator/usage"; }

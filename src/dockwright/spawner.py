@@ -12,12 +12,13 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Tuple
 
-from . import config, paths
+from . import config, paths, trust
 from .terminal import get_driver, WORKERS_OS_WINDOW_CLASS
 
 
@@ -87,10 +88,14 @@ def _is_num(v) -> bool:
 
 
 def _usage_pause_pct() -> float:
-    try:
-        return float(os.environ.get("CLAUDE_ORCH_USAGE_PAUSE_PCT", "88"))
-    except (ValueError, TypeError):
-        return 88.0
+    env = os.environ.get("CLAUDE_ORCH_USAGE_PAUSE_PCT")
+    if env is not None:
+        try:
+            return float(env)
+        except (ValueError, TypeError):
+            return 88.0
+    cfg = config.usage_pause_pct()
+    return cfg if cfg is not None else 88.0
 
 
 def _usage_fresh_ttl() -> float:
@@ -140,28 +145,43 @@ def _usage_is_fresh(rec, now: float) -> bool:
     return _is_num(ts) and (now - ts) < _usage_fresh_ttl()
 
 
+def _window_near(rec: dict, now: float, pct_key: str, reset_key: str,
+                 pause: float, fresh: bool) -> bool:
+    """One window's near-limit test: at/over `pause` AND either fresh, or
+    stale-but-known-hot with resets_at still in the future (carry-forward)."""
+    pct = rec.get(pct_key)
+    if not (_is_num(pct) and pct >= pause):
+        return False
+    if fresh:
+        return True
+    r = _to_epoch(rec.get(reset_key))
+    return r is not None and now < r
+
+
 def _near_limit(letter: str, now: float) -> bool:
     """True if the account is at/over the breaker threshold on EITHER window —
     fresh-and-hot, or stale-but-known-hot with the tripping window's resets_at
     still in the future (carry-forward). Missing record → False (never excludes an
-    unknown account)."""
+    unknown account). Used by the PICKER's pass-1 skip (both windows)."""
     rec = _read_usage(letter)
     if not isinstance(rec, dict):
         return False
     pause = _usage_pause_pct()
     fresh = _usage_is_fresh(rec, now)
-    for pct_key, reset_key in (
-        ("five_hour_pct", "five_hour_resets_at"),
-        ("seven_day_pct", "seven_day_resets_at"),
-    ):
-        pct = rec.get(pct_key)
-        if _is_num(pct) and pct >= pause:
-            if fresh:
-                return True
-            r = _to_epoch(rec.get(reset_key))
-            if r is not None and now < r:
-                return True
-    return False
+    return (_window_near(rec, now, "five_hour_pct", "five_hour_resets_at", pause, fresh)
+            or _window_near(rec, now, "seven_day_pct", "seven_day_resets_at", pause, fresh))
+
+
+def _near_limit_5h(letter: str, now: float) -> bool:
+    """5h-window-only near-limit — PAUSE eligibility. The full-refusal pause
+    must be bounded by the 5h reset horizon; the 7d window participates in the
+    breaker's routing preference (_near_limit) but never in a total refusal —
+    a weekly-budget hard stop was local policy, not a product invariant."""
+    rec = _read_usage(letter)
+    if not isinstance(rec, dict):
+        return False
+    return _window_near(rec, now, "five_hour_pct", "five_hour_resets_at",
+                        _usage_pause_pct(), _usage_is_fresh(rec, now))
 
 
 def _base_weights() -> "tuple[int, ...]":
@@ -212,9 +232,9 @@ def _counter_weights(now: float) -> "tuple[int, ...]":
 
     The square shifts picks toward the account with headroom much harder than
     the old linear budget-10 form (44%-vs-2% used: ~25:75 instead of 40:60),
-    and a zero-headroom account legitimately weighs 0 — the >=88% breaker and
-    pause gate own the "account is hot" semantics; no floor keeps it in
-    rotation. Weights stay un-normalized (0..10000*base): _pick_by_counter
+    and a zero-headroom account legitimately weighs 0 — the configurable
+    near-limit breaker (usage_pause_pct, default 88%) and pause gate own the
+    "account is hot" semantics; no floor keeps it in rotation. Weights stay un-normalized (0..10000*base): _pick_by_counter
     distributes any integer vector exactly proportionally over its period.
     (N>2 pools replay `(counter % total) + 1` smooth-WRR steps, so a pick costs
     up to ~N*10000*base iterations — tens of ms at N=3; the default 2-account
@@ -267,8 +287,8 @@ def _pick_account(force: bool = False) -> str | None:
     still applies. NO keychain calls — each account authenticates via its own
     per-CLAUDE_CONFIG_DIR keychain login, so there is nothing to probe.
 
-    The pool comes from the config registry (default: 'a'/'b' at 1:1). The
-    default account is the primary — it also runs the manager + interactive
+    The pool comes from the config registry (default: the single account 'a').
+    The default account is the primary — it also runs the manager + interactive
     human sessions; an even worker split keeps its headroom for the human
     rather than spending it on workers. Weights come from config, overridable
     via CLAUDE_ORCH_ACCOUNT_WEIGHT_<NAME>. When EVERY pool account has a
@@ -377,14 +397,13 @@ def _account_used_pct(letter: str):
 
 
 def _tripping_reset(letter: str, now: float):
-    """resets_at (epoch) of the window that tripped the breaker (5h before 7d), or None."""
+    """resets_at (epoch) of the 5h window that tripped the pause, or None."""
     rec = _read_usage(letter)
     if not isinstance(rec, dict):
         return None
     pause = _usage_pause_pct()
     for pct_key, reset_key in (
         ("five_hour_pct", "five_hour_resets_at"),
-        ("seven_day_pct", "seven_day_resets_at"),
     ):
         if _is_num(rec.get(pct_key)) and rec[pct_key] >= pause:
             r = _to_epoch(rec.get(reset_key))
@@ -397,9 +416,12 @@ def usage_spawn_gate(force: bool = False) -> dict:
     """Pre-spawn pause gate for WORKER spawns (called by spawn_worker_impl
     before any side effects). Returns {"status":"ok"[, "forced":True]} or a
     {"status":"paused", …} payload. Pauses ONLY when every non-bricked pool
-    account is near-limit. Pool-off, all-bricked, and force all fall through
-    to ok — the existing None→default-login→flip backstop owns those, and
-    changing them would be 'worse than today'."""
+    account is near-limit ON ITS 5h WINDOW (the 7d window biases the picker's
+    routing but never drives a total refusal). Threshold is [accounts]
+    usage_pause_pct (default 88; env CLAUDE_ORCH_USAGE_PAUSE_PCT wins).
+    Pool-off, all-bricked, and force all fall through to ok — the existing
+    None→default-login→flip backstop owns those, and changing them would be
+    'worse than today'."""
     if _active_account() is None:
         return {"status": "ok"}
     if force:
@@ -409,14 +431,17 @@ def usage_spawn_gate(force: bool = False) -> dict:
     non_bricked = [n for n in names if not _account_is_bricked(n)]
     if not non_bricked:
         return {"status": "ok"}  # all bricked → existing condition, not a pause
-    near = [n for n in non_bricked if _near_limit(n, now)]
+    near = [n for n in non_bricked if _near_limit_5h(n, now)]
     if len(near) < len(non_bricked):
         return {"status": "ok"}  # at least one selectable, non-near-limit account
     resets = [r for r in (_tripping_reset(n, now) for n in near) if r is not None]
     earliest = min(resets) if resets else None
     payload = {
         "status": "paused",
-        "reason": f"all selectable accounts >= {int(_usage_pause_pct())}% of their 5h/7d limit",
+        "reason": (f"every selectable account is at >= {int(_usage_pause_pct())}% "
+                   f"of its 5h limit"),
+        "hint": ("pass force=true to spawn_worker to bypass; "
+                 "the pause lifts when a 5h window resets"),
     }
     for n in names:
         payload[f"{n}_pct"] = _account_used_pct(n)
@@ -544,15 +569,84 @@ def _atomic_write_json(target: Path, data: dict) -> None:
             pass
 
 
+def _refresh_farm_mcp_servers(target: Path) -> None:
+    """Host-wins refresh of a healthy farm .claude.json's mcpServers: every host
+    server key overwrites/creates its farm entry (farm-only keys are preserved),
+    plus a targeted drop of the legacy 'claude-orchestrator' alias once the host
+    has dropped it — guarded on the farm carrying the current 'dockwright' key,
+    so a legacy-only farm is never stripped unhealthy. Only mcpServers is ever
+    touched; writes only on change (atomic). Best-effort: unreadable host or a
+    non-dict mcpServers shape on either side skips the refresh.
+
+    Concurrency: a live same-account claude rewrites this file WHOLESALE via
+    atomic replace (measured on-host: the inode flips on every write) and takes
+    no lock this code could share — so no lock is taken here either (it would
+    only serialize dockwright's own writers, and the guard below already
+    handles those by abort-and-retry). Instead the write is identity-guarded:
+    the tmp payload is written first, then the target's (inode, mtime_ns,
+    size) is re-checked against the pre-read snapshot immediately before the
+    rename, so ANY competing write in the read->write window aborts this
+    refresh — the live session's own state (oauthAccount, projects) always
+    wins, and the refresh retries on a later ensure. Residual exposure is the
+    stat->rename syscall gap only."""
+    host = _read_host_claude_json()
+    if not isinstance(host, dict):
+        return
+    host_servers = host.get("mcpServers")
+    if not isinstance(host_servers, dict):
+        return
+    try:
+        with open(target, "rb") as fh:
+            snapshot = os.fstat(fh.fileno())
+            raw = fh.read()
+    except OSError:
+        return
+    try:
+        farm = json.loads(raw)
+    except ValueError:
+        return
+    if not isinstance(farm, dict):
+        return
+    farm_servers = farm.get("mcpServers")
+    if not isinstance(farm_servers, dict):
+        return
+    merged = dict(farm_servers)
+    merged.update(host_servers)
+    if ("claude-orchestrator" in merged
+            and "claude-orchestrator" not in host_servers
+            and "dockwright" in merged):
+        del merged["claude-orchestrator"]
+    if merged == farm_servers:
+        return
+    farm["mcpServers"] = merged
+    payload = json.dumps(farm)
+    tmp = target.parent / f"{target.name}.tmp.{os.getpid()}"
+    try:
+        tmp.write_text(payload)
+        cur = os.stat(target)
+        if ((cur.st_ino, cur.st_mtime_ns, cur.st_size)
+                != (snapshot.st_ino, snapshot.st_mtime_ns, snapshot.st_size)):
+            tmp.unlink()  # a competing writer landed in our window — theirs wins
+            return
+        os.replace(tmp, target)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def _ensure_account_claude_json(farm: Path) -> None:
     """Ensure farm/.claude.json is a real per-account file carrying the
     orchestrator MCP + project trust with oauthAccount stripped. Rebuilds from the
-    host config only when missing/corrupt/MCP-less (a healthy file is preserved so
-    a running same-account session isn't clobbered and the host isn't re-read each
-    spawn). Best-effort: a host-read failure leaves the spawn to proceed degraded.
-    Consequence: new host MCP servers / project trust added after the farm's first
-    healthy build do NOT propagate to an existing healthy farm until its .claude.json
-    is deleted/rebuilt."""
+    host config only when missing/corrupt/MCP-less. A HEALTHY file is never
+    rebuilt; it gets a host-wins refresh of its mcpServers key ONLY, on every
+    ensure (see _refresh_farm_mcp_servers) so MCP registration tracks the host.
+    That refresh is identity-guarded and aborts if a live same-account session
+    writes the file concurrently — the session's own state (oauthAccount,
+    projects, non-mcpServers keys) always wins and never propagates from the
+    host after the first build. Best-effort: a host-read failure leaves the
+    spawn to proceed degraded."""
     target = farm / ".claude.json"
     if target.is_symlink():
         try:
@@ -560,6 +654,7 @@ def _ensure_account_claude_json(farm: Path) -> None:
         except OSError:
             return
     if _claude_json_healthy(target):
+        _refresh_farm_mcp_servers(target)
         return
     data = _read_host_claude_json()
     if not isinstance(data, dict):
@@ -571,12 +666,25 @@ def _ensure_account_claude_json(farm: Path) -> None:
 def ensure_account_config_dir(letter: str) -> Path:
     """Build/self-heal the per-account CLAUDE_CONFIG_DIR symlink-farm; return it.
 
-    Idempotent — safe on every spawn. Raises OSError only if the farm root can't be
-    created (caller then omits CLAUDE_CONFIG_DIR and falls back to canonical);
+    Idempotent — safe on every spawn. Raises OSError if the farm dir aliases the
+    canonical config home (registry misconfig) or the farm root can't be created;
     symlink and .claude.json steps are best-effort.
     """
     farm = paths.account_config_dir(letter)
     canonical = paths.CONFIG_HOME
+    farm_r = farm.resolve()
+    canonical_r = canonical.resolve()
+    if (farm_r == canonical_r
+            or canonical_r.is_relative_to(farm_r)
+            or farm_r.is_relative_to(canonical_r)):
+        # A registry config_dir override aliasing the canonical config home
+        # (~/.claude itself, $HOME above it, or a path inside it) must never be
+        # farm-assembled: symlink healing on an aliased tree can replace an
+        # operator's own symlinked entry with a self-loop. OSError is the
+        # contract both callers already handle (spawn falls back to the
+        # default login; accounts-sync skips the account with a note).
+        raise OSError(
+            f"account config dir {farm} aliases the canonical config home {canonical}")
     farm.mkdir(parents=True, exist_ok=True)
     try:
         entries = sorted(p.name for p in canonical.iterdir())
@@ -588,6 +696,99 @@ def ensure_account_config_dir(letter: str) -> Path:
         _ensure_symlink(farm / name, canonical / name)
     _ensure_account_claude_json(farm)
     return farm
+
+
+def write_registry_snapshot() -> None:
+    """Mirror config.accounts() to paths.ACCOUNT_REGISTRY for consumers that
+    cannot import the package (standalone stale_monitor, bootstrap-recreate.sh).
+    Best-effort by contract: a snapshot failure must never block a spawn or
+    MCP boot — those consumers fall back to the legacy a/b pair."""
+    try:
+        pool = [{"name": a.name,
+                 "config_dir": str(a.config_dir) if a.config_dir else None}
+                for a in config.accounts()]
+        payload = {"version": 1, "default": config.default_account(), "pool": pool}
+        path = paths.ACCOUNT_REGISTRY
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / f".{path.name}.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps(payload))
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"spawner: registry snapshot write failed ({e})", file=sys.stderr)
+
+
+def _farm_claude_json_status(target: Path) -> str:
+    """Report-grade status of a farm .claude.json vs the host. Stricter than
+    _claude_json_healthy on purpose: a list-shaped mcpServers spawns fine but
+    IS a broken shape, so a report calls it unhealthy. 'legacy-keyed' only
+    fires when the HOST has renamed to 'dockwright' and the farm hasn't caught
+    up — a farm matching a still-legacy host is in-sync, not legacy-keyed."""
+    try:
+        data = json.loads(target.read_text())
+    except FileNotFoundError:
+        return "missing"
+    except (OSError, ValueError):
+        return "unhealthy"
+    if not isinstance(data, dict):
+        return "unhealthy"
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        return "unhealthy"
+    if "dockwright" not in servers and "claude-orchestrator" not in servers:
+        return "unhealthy"
+    host = _read_host_claude_json()
+    host_servers = host.get("mcpServers") if isinstance(host, dict) else None
+    if not isinstance(host_servers, dict):
+        return "unverified"
+    if "dockwright" in host_servers and "dockwright" not in servers:
+        return "legacy-keyed"
+    for key, value in host_servers.items():
+        if servers.get(key) != value:
+            return "stale"
+    if "claude-orchestrator" in servers and "claude-orchestrator" not in host_servers:
+        return "stale"
+    return "in-sync"
+
+
+def farm_parity_report(letter: str) -> dict:
+    """Read-only parity scan of an account's config-dir farm vs canonical.
+
+    Stateless re-scan — deliberately independent of _warned_drift (that set
+    dedups the resident spawner's LOG lines; a report must always name every
+    current drift). Keys: config_dir, exists, shared (count of correct
+    symlinks), drift (real paths / wrong-target symlinks where a canonical
+    symlink belongs), missing (canonical entries with no farm entry),
+    claude_json (see _farm_claude_json_status)."""
+    farm = paths.account_config_dir(letter)
+    canonical = paths.CONFIG_HOME
+    report: dict = {"config_dir": str(farm), "exists": farm.is_dir(),
+                    "shared": 0, "drift": [], "missing": [],
+                    "claude_json": "missing"}
+    if not report["exists"]:
+        return report
+    try:
+        entries = sorted(p.name for p in canonical.iterdir())
+    except OSError:
+        entries = []
+    for name in entries:
+        if _farm_never_symlink(name):
+            continue
+        link = farm / name
+        if link.is_symlink():
+            try:
+                current = os.readlink(link)
+            except OSError:
+                current = None
+            if current == str(canonical / name):
+                report["shared"] += 1
+            else:
+                report["drift"].append(name)
+        elif link.exists():
+            report["drift"].append(name)
+        else:
+            report["missing"].append(name)
+    report["claude_json"] = _farm_claude_json_status(farm / ".claude.json")
+    return report
 
 
 def _build_account_prefix(letter: "str | None") -> str:
@@ -851,7 +1052,21 @@ async def spawn_worker_tab(
         letter = _active_account()   # manager rides the pointer (a->default, b->~/.claude-b)
     else:
         letter = _pick_account(force)     # worker usage-weighted picker (force bypasses breaker)
+    if runtime == "claude":
+        # L-11 official pre-trust. Host config FIRST: a first-build farm
+        # copies the host file inside _build_account_prefix, so the entry
+        # rides the copy — a farm-first write would be a minimal MCP-less
+        # file that _claude_json_healthy rejects and rebuilds over.
+        # Best-effort: a failed write degrades to the interactive dialog.
+        trust.pretrust_dir(cwd)
     account_prefix = _build_account_prefix(letter)
+    if runtime == "claude" and letter is not None and letter != config.default_account():
+        farm_json = paths.account_config_dir(letter) / ".claude.json"
+        # Healthy = the farm file spawn actually reads; an unhealthy farm
+        # fell back to the default login and must not be planted with a
+        # minimal file (it would mask the rebuild path).
+        if _claude_json_healthy(farm_json):
+            trust.pretrust_dir(cwd, config_json=farm_json)
     inner_cmd = (
         f"cd {shlex.quote(cwd)} && "
         f"{account_prefix}"

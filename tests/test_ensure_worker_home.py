@@ -42,3 +42,18 @@ def test_cli_prints_created_path(monkeypatch, tmp_path, capsys):
     assert rc == 0
     assert capsys.readouterr().out.strip() == str(home)
     assert home.is_dir()
+
+
+def test_cli_pretrusts_worker_home(monkeypatch, tmp_path, capsys):
+    import json
+    from dockwright import trust
+    cfg = tmp_path / "cfg.json"
+    monkeypatch.setattr(trust, "_default_config_json", lambda: cfg)
+    home = tmp_path / "wh-trust"
+    monkeypatch.setenv("CLAUDE_ORCH_WORKER_HOME", str(home))
+    rc = ewh.main([])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == str(home), \
+        "stdout must stay EXACTLY the path — setup.sh command-substitutes it"
+    data = json.loads(cfg.read_text())
+    assert data["projects"][str(home.resolve())]["hasTrustDialogAccepted"] is True

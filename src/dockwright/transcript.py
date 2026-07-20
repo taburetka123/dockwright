@@ -57,9 +57,11 @@ def latest_subagent_mtime(session_log: Path, session_id: str) -> float:
         return 0.0
 
 
-DELEGATION_FRESH_SEC = 120  # == monitor.TURN_END_GRACE_SEC_DEFAULT: a worker stops
-                            # reading as working at the same moment its silent-finish
-                            # alert becomes eligible.
+DELEGATION_FRESH_SEC = 120  # read-side freshness for is_delegating (list_workers,
+                            # statusline). The MONITOR's delegation hold ages on
+                            # monitor._episode_grace_sec() (default 900) instead —
+                            # the alarm tolerates slow-but-alive subagents; the
+                            # display answers "delegating right now".
 
 TURN_END_GRACE_ENV = "CLAUDE_ORCH_TURN_END_GRACE_SEC"
 

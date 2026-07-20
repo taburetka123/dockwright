@@ -84,3 +84,35 @@ def test_cli_render_operator_var_wins_over_default(tmp_path, monkeypatch):
     rc = render.main(["--src", str(src), "--out", str(out), "--core-dir", str(core)])
     assert rc == 0
     assert out.read_text() == "val: OP\n"
+
+
+# --- <absolute-home> token on the render surface (inherited from compose) ---
+
+def test_render_expands_home_token_in_var_value(tmp_path):
+    from pathlib import Path as _P
+    src = tmp_path / "a.md"; src.write_text("p: {{k}}\n")
+    out = tmp_path / "out.md"
+    render.render_file(src, out, {"k": "<absolute-home>/.claude/f.json"})
+    assert out.read_text() == f"p: {_P.home()}/.claude/f.json\n"
+
+
+def test_render_file_fails_closed_on_literal_token(tmp_path):
+    from dockwright.compose import ComposeError
+    import pytest
+    src = tmp_path / "a.md"; src.write_text("has <absolute-home> literal\n")
+    out = tmp_path / "out.md"
+    with pytest.raises(ComposeError):
+        render.render_file(src, out, {})
+    assert not out.exists()
+
+
+def test_cli_render_reports_compose_error_cleanly(tmp_path, capsys):
+    core = tmp_path / "core"; core.mkdir()
+    (core / "vars.defaults.toml").write_text("[agent_vars]\n")
+    src = tmp_path / "in.md"; src.write_text("bad <absolute-home> here\n")
+    out = tmp_path / "out.md"
+    rc = render.main(["--src", str(src), "--out", str(out), "--core-dir", str(core)])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "render: ERROR:" in err and "<absolute-home>" in err
+    assert not out.exists()

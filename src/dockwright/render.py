@@ -8,9 +8,11 @@ files use — so render is just compose's var pass.
 Semantics (inherited from compose_text, unchanged):
 - `{{name}}` substitutes a merged-vars entry; an unbound `{{name}}` stays
   literal and is reported as a warning, never an error.
-- IDENTITY: a var-free file renders byte-for-byte (trailing-newline state
-  included). This keeps today's operator command/preset deploys byte-stable,
-  since no command/preset carries {{ }} yet.
+- IDENTITY: a var-free, token-free file renders byte-for-byte (trailing-
+  newline state included). `<absolute-home>` inside a var VALUE expands to
+  the installing user's absolute home; the literal token surviving in
+  rendered output raises ComposeError (see compose.py semantics — this
+  surface inherits them).
 
 The CLI mirrors `dockwright compose`'s var-merging: the defaults layer
 (<core-dir>/vars.defaults.toml) is overlaid by the operator's dockwright.toml
@@ -66,13 +68,17 @@ def main(argv=None) -> int:
                         help="Dir holding vars.defaults.toml (default: deploy/agents).")
     args = parser.parse_args(argv)
     merged_vars = _merged_vars(args.core_dir or _default_core_dir())
-    if args.src.is_dir():
-        args.out.mkdir(parents=True, exist_ok=True)
-        files = sorted(args.src.glob(args.glob))
-        for f in files:
-            render_file(f, args.out / f.name, merged_vars)
-        print(f"Rendered {len(files)} file(s) from {args.src} to {args.out}")
-    else:
-        render_file(args.src, args.out, merged_vars)
-        print(f"Rendered {args.src} to {args.out}")
+    try:
+        if args.src.is_dir():
+            args.out.mkdir(parents=True, exist_ok=True)
+            files = sorted(args.src.glob(args.glob))
+            for f in files:
+                render_file(f, args.out / f.name, merged_vars)
+            print(f"Rendered {len(files)} file(s) from {args.src} to {args.out}")
+        else:
+            render_file(args.src, args.out, merged_vars)
+            print(f"Rendered {args.src} to {args.out}")
+    except compose.ComposeError as e:
+        print(f"render: ERROR: {e}", file=sys.stderr)
+        return 1
     return 0

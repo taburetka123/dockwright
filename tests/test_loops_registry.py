@@ -80,7 +80,15 @@ def _operator_legacy_label_prefix():
 
 LABEL_PREFIX = _operator_label_prefix()
 LEGACY_LABEL_PREFIX = _operator_legacy_label_prefix()
-OVERLAY_DIR = Path.home() / ".claude" / "orchestrator-overlay"
+def _overlay_home() -> Path:
+    # deprecated, one release: legacy fallback while orchestrator-era overlay
+    # installs migrate to the dockwright-named home (same as carve_helpers).
+    new = Path.home() / ".claude" / "dockwright-overlay"
+    legacy = Path.home() / ".claude" / "orchestrator-overlay"
+    return new if new.exists() else legacy
+
+
+OVERLAY_DIR = _overlay_home()
 
 # The Gardener-module loops: [modules] gardener=false no-ops all three and the
 # installer refuses, so on a module-off machine their plists are absent —
@@ -177,11 +185,15 @@ def _expand(path_str):
 
 
 # ~/Library/LaunchAgents alone is a weak proxy (it exists on most Macs); the
-# orchestrator state root only exists where the fleet actually runs, so a fresh
+# dockwright state root only exists where the fleet actually runs, so a fresh
 # clone on a non-fleet Mac skips instead of failing on "gardener not loaded".
-FLEET_MACHINE = LAUNCH_AGENTS.is_dir() and (Path.home() / ".claude" / "orchestrator").is_dir()
+# (Legacy root accepted one release for un-migrated fleet machines. When the
+# compat symlink retired, the old orchestrator-only check silently skipped
+# all 12 machine-layer guards ON the fleet machine — don't regress that.)
+FLEET_MACHINE = LAUNCH_AGENTS.is_dir() and any(
+    (Path.home() / ".claude" / p).is_dir() for p in ("dockwright", "orchestrator"))
 machine = pytest.mark.skipif(
-    not FLEET_MACHINE, reason="not the fleet machine (no LaunchAgents + orchestrator state root)")
+    not FLEET_MACHINE, reason="not the fleet machine (no LaunchAgents + dockwright state root)")
 
 
 # --- Layer 1: schema (always runs) -------------------------------------------

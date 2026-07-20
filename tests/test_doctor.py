@@ -65,3 +65,72 @@ def test_cli_bare_invocation_runs_without_usage_error(tmp_path, monkeypatch, cap
     assert rc in (0, 1)
     out = capsys.readouterr().out
     assert "venv-import" in out  # checks actually ran
+    assert "accounts:pointer" in out  # check_account_pointer is wired into main()'s checks list
+    assert "accounts:login" in out    # check_accounts_login is wired into main()'s checks list
+
+
+def test_account_pointer_check(tmp_path, monkeypatch):
+    from dockwright import doctor, paths
+    monkeypatch.setattr(paths, "ACCOUNT_ACTIVE", tmp_path / "account-active")
+    c = doctor.check_account_pointer()
+    assert c.ok and "absent" in c.detail                      # no pointer = pool off = fine
+    (tmp_path / "account-active").write_text("a\n")
+    assert doctor.check_account_pointer().ok
+    (tmp_path / "account-active").write_text("b\n")           # default registry is now len-1
+    c = doctor.check_account_pointer()
+    assert not c.ok and "silently OFF" in c.detail
+
+
+# ---- accounts:login — every declared NON-DEFAULT pool account should show login
+# evidence (its farm .claude.json carrying oauthAccount, which farm assembly pops
+# on every rebuild so its presence can only come from a real /login). Each pool
+# below routes its non-default account's config_dir into tmp so the check never
+# reads the operator's real ~/.claude-<name>.
+
+def _login_pool(monkeypatch, tmp_path, entries):
+    """entries: [(name, config_dir_or_None), ...]; first is the default."""
+    from dockwright import config
+    lines = ["[accounts]", f'default = "{entries[0][0]}"']
+    for name, cd in entries:
+        lines.append("[[accounts.pool]]")
+        lines.append(f'name = "{name}"')
+        if cd is not None:
+            lines.append(f'config_dir = "{cd}"')
+    cfg = tmp_path / "dockwright.toml"
+    cfg.write_text("\n".join(lines) + "\n")
+    monkeypatch.setenv(config.ENV_CONFIG_PATH, str(cfg))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+
+
+def test_accounts_login_passes_when_no_non_default(tmp_path, monkeypatch):
+    from dockwright import doctor
+    _login_pool(monkeypatch, tmp_path, [("a", None)])   # solo pool → nothing to check
+    c = doctor.check_accounts_login()
+    assert c.ok and "all non-default" in c.detail
+
+
+def test_accounts_login_passes_when_marker_present(tmp_path, monkeypatch):
+    from dockwright import doctor
+    farm = tmp_path / "farm-b"; farm.mkdir()
+    (farm / ".claude.json").write_text(json.dumps(
+        {"oauthAccount": {"accountUuid": "uuid-b", "emailAddress": "b@x"}}))
+    _login_pool(monkeypatch, tmp_path, [("a", None), ("b", str(farm))])
+    c = doctor.check_accounts_login()
+    assert c.ok and "all non-default" in c.detail
+
+
+def test_accounts_login_fails_when_farm_missing(tmp_path, monkeypatch):
+    from dockwright import doctor
+    farm = tmp_path / "farm-b"   # never created → no .claude.json
+    _login_pool(monkeypatch, tmp_path, [("a", None), ("b", str(farm))])
+    c = doctor.check_accounts_login()
+    assert not c.ok and "b (" in c.detail and "never logged in" in c.detail
+
+
+def test_accounts_login_fails_when_marker_absent(tmp_path, monkeypatch):
+    from dockwright import doctor
+    farm = tmp_path / "farm-b"; farm.mkdir()
+    (farm / ".claude.json").write_text(json.dumps({"projects": {}}))  # real json, no marker
+    _login_pool(monkeypatch, tmp_path, [("a", None), ("b", str(farm))])
+    c = doctor.check_accounts_login()
+    assert not c.ok and "b (" in c.detail and "oauthAccount" in c.detail
