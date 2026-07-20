@@ -1,5 +1,6 @@
 """One-shot state migration: ~/.claude/orchestrator (+ scattered dockwright
-state) -> ~/.claude/dockwright, leaving a compat symlink at every old path.
+state) -> ~/.claude/dockwright, leaving a compat symlink at every old path
+it actually moves (an absent legacy path is skipped, never linked).
 
 Live-fleet safe: a manager may be polling these dirs right now. Each row is
 os.rename + os.symlink back-to-back (µs window vs seconds-scale polls), and
@@ -154,18 +155,12 @@ def _migrate_row(claude_dir: Path, legacy_rel: str, new_rel: str,
             f"{legacy} is a symlink to {os.readlink(legacy)}, expected {new}"
         )
     if not legacy.exists():
-        if not new.exists():
-            return f"absent   {legacy_rel} (skip; created on demand at new home)"
-        # Crash residue: a prior run moved the data but died before the
-        # symlink landed. Old deployed code hardcodes the legacy path, so a
-        # cold row would sit fork-armed until something rebirths it — repair
-        # the compat link now. (On a fresh install this also links legacy
-        # names to ensure_dirs-precreated new dirs — inert, self-retires.)
-        if dry_run:
-            return f"would-link {legacy_rel} (crash-repair / compat link)"
-        _place_symlink(legacy, _relative_target(legacy, new), new)
-        _verify(legacy, new)
-        return f"linked   {legacy_rel} (crash-repair / compat link)"
+        # No legacy on disk = nothing to migrate — even when the new home
+        # exists. A crash-repair arm here used to re-link absent legacy
+        # paths; since setup.sh runs migrate-state on every deploy, that
+        # manufactured legacy symlinks on every 2nd+ run of homes that never
+        # had legacy state, and resurrected links operators had removed.
+        return f"absent   {legacy_rel} (skip; created on demand at new home)"
     new_occupied = new.exists() or new.is_symlink()
     if dry_run:
         if new_occupied:

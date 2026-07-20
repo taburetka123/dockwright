@@ -1,11 +1,22 @@
 # evals/investigation — regression evals for the investigation behavior stack
 
 Runs the LIVE deployed investigation stack (global `~/.claude` rules + the
-investigation skill named by `DOCKWRIGHT_INVESTIGATE_SKILL`, default
+investigation skill named by `DOCKWRIGHT_INVESTIGATE_SKILL` (operators can pin
+it durably as `[evals] investigate_skill` in `dockwright.toml` — the gardener
+eval-gate resolves env > toml > this default), default
 `~/.claude/skills/investigate/SKILL.md`) against committed file-fixture cases and scores the
 result with deterministic gates (dexter-ported) and an opus judge. The point:
 a rule/skill edit that silently breaks investigation behavior becomes a red
 suite instead of a latent incident.
+
+**The default path does not exist by default** — pin the real binding in
+`dockwright.toml` before relying on the suite (the gardener eval-gate blocks
+with exit 2 if the resolved path is missing rather than passing vacuously):
+
+```toml
+[evals]
+investigate_skill = "~/.claude/skills/<your-investigate-skill>/SKILL.md"
+```
 
 ## Quick start
 

@@ -50,7 +50,7 @@ DEFAULT_ACCOUNT_NAME = "a"
 DEFAULT_GARDENER_MODULE_ENABLED = True
 DEFAULT_WORKTREE_ROOTS = "~/worktrees,~/worktrees-personal"
 DEFAULT_REPO_ROOTS = "~/projects/work,~/projects/personal"
-_DEFAULT_POOL = (("a", 1), ("b", 1))
+_DEFAULT_POOL = (("a", 1),)
 
 
 @dataclass(frozen=True)
@@ -210,6 +210,14 @@ def worker_model() -> str:
     return _str_key(_section(load(), "spawn"), "worker_model", DEFAULT_WORKER_MODEL)
 
 
+def worker_headless_preset() -> bool:
+    """[spawn] worker_headless_preset — when true (default), claude worker
+    spawns/resumes default to `--settings <deployed worker-headless preset>`.
+    Only a literal boolean false disables; anything else fails open to True."""
+    val = _section(load(), "spawn").get("worker_headless_preset", True)
+    return val if isinstance(val, bool) else True
+
+
 def manager_model() -> str:
     return _str_key(_section(load(), "spawn"), "manager_model", DEFAULT_MANAGER_MODEL)
 
@@ -292,7 +300,7 @@ def _default_pool() -> list[Account]:
 def accounts() -> list[Account]:
     """The account registry, pool order. ANY malformation (missing/empty/dup
     name, weight not a positive int, non-string config_dir) falls back to the
-    whole default a/b pool — fail-open, never a half-registry."""
+    whole default pool — fail-open, never a half-registry."""
     raw = _section(load(), "accounts").get("pool")
     if not isinstance(raw, list) or not raw:
         return _default_pool()
@@ -344,6 +352,17 @@ def default_account() -> str:
     if isinstance(d, str) and d in names:
         return d
     return DEFAULT_ACCOUNT_NAME if DEFAULT_ACCOUNT_NAME in names else names[0]
+
+
+def usage_pause_pct() -> float | None:
+    """[accounts] usage_pause_pct — the worker-spawn pause threshold, percent
+    of the 5h window. Positive number; anything else (missing/malformed/
+    non-positive) -> None so the caller applies its default. Values above 100
+    disable the pause in practice (used pcts never exceed 100)."""
+    raw = _section(load(), "accounts").get("usage_pause_pct")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
+        return None
+    return float(raw)
 
 
 def pricing_overrides() -> dict[str, tuple[float, float]]:
@@ -400,6 +419,11 @@ worker_model = "opus[1m]"
 manager_model = "opus[1m]"
 # Model for the headless manager-memory distill (`claude -p`).
 distill_model = "claude-sonnet-4-6"
+# When true (default), claude worker spawns/resumes default to the deployed
+# worker-headless-settings.json preset (auto permission mode, protocol
+# allowlist, local git verbs, code-root additionalDirectories). Set false to
+# opt out fleet-wide. Default: true (unset behaves the same).
+# worker_headless_preset = true
 
 [spawn.env]
 # Extra environment variables merged into spawned worker sessions (str ->
@@ -411,17 +435,28 @@ distill_model = "claude-sonnet-4-6"
 # The account that runs on the default login (no CLAUDE_CONFIG_DIR).
 default = "a"
 
-# The account pool, in round-robin order. For a non-default account,
-# config_dir defaults to the "~/.claude-<name>" convention; set it to
-# relocate the account's config-dir farm. Weights bias the spawn
-# round-robin (env CLAUDE_ORCH_ACCOUNT_WEIGHT_<NAME> still wins).
+# Worker-spawn pause threshold, as a percent of the 5h usage window. When every
+# selectable account is at/above this on its 5h window, spawn_worker refuses
+# (returns {"status":"paused", ...}) instead of spawning; pass force=True to
+# bypass. Default 88 (env CLAUDE_ORCH_USAGE_PAUSE_PCT wins). Set above 100 to
+# disable the pause (used pcts never exceed 100).
+# usage_pause_pct = 88
+
+# The account pool, in round-robin order. Default: just the default account —
+# the pool feature stays dormant until <state-root>/account-active exists, and
+# a single-account pool always routes to your real login. To add a second
+# account: uncomment below, pick a name, and /login its config dir ONCE
+# (CLAUDE_CONFIG_DIR=~/.claude-<name> claude, then /login). For a non-default
+# account, config_dir defaults to the "~/.claude-<name>" convention; set it to
+# relocate. Weights bias the spawn round-robin
+# (env CLAUDE_ORCH_ACCOUNT_WEIGHT_<NAME> still wins).
 [[accounts.pool]]
 name = "a"
 weight = 1
 
-[[accounts.pool]]
-name = "b"
-weight = 1
+# [[accounts.pool]]
+# name = "b"
+# weight = 1
 
 [hints]
 # Command named in promote.py's "run this from a live session" hint.

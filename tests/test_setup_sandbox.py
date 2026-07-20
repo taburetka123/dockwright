@@ -1,10 +1,10 @@
 """E2E: sandboxed setup.sh file-deploy into a tmp prefix (spec S6)."""
-import os, subprocess, sys
+import os, shutil, subprocess, sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-def run_sandboxed_setup(tmp_path, extra_env=None, codex=True):
+def run_sandboxed_setup(tmp_path, extra_env=None, codex=True, repo=REPO):
     """Sandboxed FILES_ONLY setup.sh run with DETERMINISTIC codex presence.
 
     PATH is pinned to "<stub-bin>:/usr/bin:/bin" in both modes so results never
@@ -24,19 +24,19 @@ def run_sandboxed_setup(tmp_path, extra_env=None, codex=True):
            "PATH": f"{stub_bin}:/usr/bin:/bin",
            "CLAUDE_DIR": str(claude_dir), "CODEX_DIR": str(codex_dir),
            **(extra_env or {})}
-    r = subprocess.run(["bash", str(REPO / "setup.sh")], env=env,
-                       capture_output=True, text=True, cwd=str(REPO))
+    r = subprocess.run(["bash", str(repo / "setup.sh")], env=env,
+                       capture_output=True, text=True, cwd=str(repo))
     assert r.returncode == 0, r.stdout + r.stderr
-    return claude_dir, codex_dir
+    return claude_dir, codex_dir, r
 
 def test_files_only_deploys_commands_and_scripts(tmp_path):
-    claude_dir, codex_dir = run_sandboxed_setup(tmp_path)
+    claude_dir, codex_dir, _ = run_sandboxed_setup(tmp_path)
     assert (claude_dir / "commands" / "dockwright-general-work.md").exists()
     assert (claude_dir / "scripts" / "loops_status.py").exists()
     assert (claude_dir / "dockwright" / "loops-registry.md").exists()
 
 def test_files_only_skips_machine_mutation(tmp_path):
-    claude_dir, _ = run_sandboxed_setup(tmp_path)
+    claude_dir, _, _ = run_sandboxed_setup(tmp_path)
     # settings.json (hook install) must NOT be created in FILES_ONLY mode
     assert not (claude_dir / "settings.json").exists()
 
@@ -51,7 +51,7 @@ def test_orch_bin_override_renders_transforms_in_files_only(tmp_path):
     cfg.write_text(
         f'[paths]\noverlay_dir = "{overlay}"\n'
         '[agent_vars]\nexample_task_key = "TKT-SANDBOX-42"\n')
-    claude_dir, codex_dir = run_sandboxed_setup(tmp_path, {
+    claude_dir, codex_dir, _ = run_sandboxed_setup(tmp_path, {
         "DOCKWRIGHT_ORCH_BIN": str(REPO / ".venv" / "bin" / "orchestrator"),
         "DOCKWRIGHT_OVERLAY_DIR": str(overlay),
         "DOCKWRIGHT_CONFIG": str(cfg),
@@ -114,7 +114,7 @@ def test_files_only_without_orch_bin_skips_transforms(tmp_path):
     """The other side of the seam: bare FILES_ONLY (no DOCKWRIGHT_ORCH_BIN) still
     deploys commands verbatim but skips the binary-driven transforms — no
     composed agents, no codex skill wrappers (Task 1 behavior preserved)."""
-    claude_dir, codex_dir = run_sandboxed_setup(tmp_path)
+    claude_dir, codex_dir, _ = run_sandboxed_setup(tmp_path)
     assert (claude_dir / "commands" / "dockwright-general-work.md").exists()
     assert not (claude_dir / "agents" / "manager.md").exists()
     assert not (codex_dir / "skills").exists()
@@ -128,7 +128,7 @@ def test_overlay_payload_deploys(tmp_path):
     (overlay / "presets" / "op-preset.md").write_text("# operator preset\n")
     (overlay / "scripts").mkdir()
     (overlay / "scripts" / "op.sh").write_text("#!/bin/bash\ntrue\n")
-    claude_dir, codex_dir = run_sandboxed_setup(
+    claude_dir, codex_dir, _ = run_sandboxed_setup(
         tmp_path, {"DOCKWRIGHT_OVERLAY_DIR": str(overlay)})
     assert (claude_dir / "commands" / "op-only.md").exists()
     assert (codex_dir / "commands" / "op-only.md").exists()
@@ -164,7 +164,7 @@ def test_migration_relocates_preseeded_orchestrator_state(tmp_path):
 
 
 def test_no_codex_on_path_never_creates_codex_dir(tmp_path):
-    claude_dir, codex_dir = run_sandboxed_setup(tmp_path, codex=False)
+    claude_dir, codex_dir, _ = run_sandboxed_setup(tmp_path, codex=False)
     assert (claude_dir / "commands" / "dockwright-general-work.md").exists()
     assert (claude_dir / "scripts" / "loops_status.py").exists()
     assert not codex_dir.exists()
@@ -175,7 +175,7 @@ def test_no_codex_with_render_bin_still_skips_codex_dir(tmp_path):
     cfg.write_text(
         f'[paths]\noverlay_dir = "{overlay}"\n'
         '[agent_vars]\nexample_task_key = "TKT-SANDBOX-42"\n')
-    claude_dir, codex_dir = run_sandboxed_setup(tmp_path, {
+    claude_dir, codex_dir, _ = run_sandboxed_setup(tmp_path, {
         "DOCKWRIGHT_ORCH_BIN": str(REPO / ".venv" / "bin" / "orchestrator"),
         "DOCKWRIGHT_OVERLAY_DIR": str(overlay),
         "DOCKWRIGHT_CONFIG": str(cfg),
@@ -191,6 +191,56 @@ def test_files_only_does_not_create_worker_home(tmp_path):
     # The worker-home step is FILES_ONLY-gated; a sandbox run must not mkdir any
     # worker home. Point the config at a sentinel under tmp and assert absence.
     marker = tmp_path / "sentinel-worker-home"
-    claude_dir, _ = run_sandboxed_setup(
+    claude_dir, _, _ = run_sandboxed_setup(
         tmp_path, {"CLAUDE_ORCH_WORKER_HOME": str(marker)})
     assert not marker.exists()
+
+
+# --- L-8: deploy provenance on a detached-HEAD / release-tag checkout --------
+
+
+def _git(clone, *args):
+    env = {**os.environ,
+           "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t.invalid",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t.invalid"}
+    subprocess.run(["git", *args], cwd=str(clone), env=env,
+                   check=True, capture_output=True)
+
+
+def _snapshot_repo(tmp_path):
+    """Copy the WORKING TREE into a fresh git repo (not `git clone` — the test
+    must exercise uncommitted setup.sh changes during TDD)."""
+    clone = tmp_path / "repo"
+    shutil.copytree(REPO, clone, ignore=shutil.ignore_patterns(
+        ".git", ".venv", "__pycache__", ".pytest_cache", "docs", "evals",
+        "node_modules"))
+    _git(clone, "init", "-q")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-qm", "snapshot")
+    return clone
+
+
+def test_release_tag_checkout_prints_tag_not_warning(tmp_path):
+    clone = _snapshot_repo(tmp_path)
+    _git(clone, "tag", "v9.9.9-test")
+    _git(clone, "checkout", "-q", "--detach", "v9.9.9-test")
+    _, _, r = run_sandboxed_setup(tmp_path, repo=clone)
+    assert "Deploying from release tag 'v9.9.9-test'" in r.stdout
+    combined = r.stdout + r.stderr
+    assert "deploying from branch" not in combined
+    assert "detached HEAD" not in combined
+
+
+def test_detached_non_tag_warns_detached_head(tmp_path):
+    clone = _snapshot_repo(tmp_path)
+    _git(clone, "checkout", "-q", "--detach", "HEAD")
+    _, _, r = run_sandboxed_setup(tmp_path, repo=clone)
+    assert "detached HEAD" in r.stderr
+    assert "deploying from branch 'HEAD'" not in r.stderr
+
+
+def test_branch_checkout_still_warns(tmp_path):
+    clone = _snapshot_repo(tmp_path)
+    _git(clone, "checkout", "-q", "-b", "feature-x")
+    _, _, r = run_sandboxed_setup(tmp_path, repo=clone)
+    assert "deploying from branch 'feature-x'" in r.stderr

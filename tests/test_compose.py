@@ -171,3 +171,38 @@ def test_load_default_vars_ignores_non_toml_extension(tmp_path):
     (tmp_path / "vars.defaults.toml").write_text('[agent_vars]\nfoo = "bar"\n')
     core_files = sorted(tmp_path.glob("*.md"))
     assert core_files == []
+
+
+# --- <absolute-home> token: home expansion in var values + fail-closed sweep ---
+
+def test_home_token_in_var_value_expands_to_home():
+    composed, warnings = compose.compose_text(
+        "path: {{p}}\n", [], {"p": "<absolute-home>/.claude/x.json"})
+    assert composed == f"path: {Path.home()}/.claude/x.json\n"
+    assert warnings == []
+
+
+def test_home_token_expansion_reads_HOME_at_call_time(monkeypatch):
+    monkeypatch.setenv("HOME", "/simulated-home")
+    composed, _ = compose.compose_text("{{p}}\n", [], {"p": "<absolute-home>/f"})
+    assert composed == "/simulated-home/f\n"
+
+
+def test_home_token_in_operator_style_var_also_expands():
+    # Expansion applies to the MERGED map uniformly, not just defaults.
+    composed, _ = compose.compose_text(
+        "{{a}} {{b}}\n", [],
+        {"a": "<absolute-home>/one", "b": "plain"})
+    assert composed == f"{Path.home()}/one plain\n"
+
+
+def test_home_token_in_core_text_fails_closed_even_without_vars():
+    with pytest.raises(ComposeError) as exc:
+        compose.compose_text("literal <absolute-home> here\n", [], {})
+    assert "<absolute-home>" in str(exc.value)
+    assert "agent_vars" in str(exc.value)  # actionable: point at the supported mechanism
+
+
+def test_home_token_in_dropin_body_fails_closed():
+    with pytest.raises(ComposeError):
+        compose.compose_text("core\n", [_d("10-a.md", "x <absolute-home>\n")], {})

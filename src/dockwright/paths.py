@@ -20,10 +20,11 @@ MANAGER_TRIGGERS_LOG = ROOT / "manager-triggers.jsonl"
 # history horizon. A file, not a dir — never in ensure_dirs.
 SPEND_LEDGER = ROOT / "spend-ledger.jsonl"
 
-# Account auto-switch pointer: one letter (a|b) selecting which account new
-# spawns BILL — 'a' = the default ~/.claude login, 'b' = the ~/.claude-b login.
-# Missing/invalid file = feature fully off (no account selection, the
-# stale_monitor flip lane is inert). A file, not a dir — never in ensure_dirs.
+# Account auto-switch pointer: an account name from the registry selecting
+# which account new spawns BILL — the default account = the default ~/.claude
+# login, any other name = its ~/.claude-<name> login. Missing/invalid file =
+# feature fully off (no account selection, the stale_monitor flip lane is
+# inert). A file, not a dir — never in ensure_dirs.
 ACCOUNT_ACTIVE = ROOT / "account-active"
 
 # The tmux config the dedicated `tmux -L dockwright` server loads at birth
@@ -44,6 +45,11 @@ TMUX_CONF_LEGACY = ROOT / "claude-orch.tmux.conf"
 # rate-limit banner. Spawner reads this to skip bricked accounts at spawn time
 # (proactive round-robin design). A file, not a dir — never in ensure_dirs.
 ACCOUNT_STATE = ROOT / "account-state.json"
+
+# Registry snapshot mirrored from config.accounts() by spawner.write_registry_snapshot()
+# (MCP boot, every worker spawn, setup.sh deploy). Consumed by the STANDALONE
+# stale_monitor + bootstrap-recreate.sh, which cannot import the package/tomllib.
+ACCOUNT_REGISTRY = ROOT / "account-registry.json"
 
 # Atomic spawn counter for proactive weighted round-robin across accounts.
 # One JSON object {"counter": N}; fcntl-locked for concurrent-spawn safety.

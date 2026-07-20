@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 
 from . import config, paths, state
@@ -39,6 +40,10 @@ from .state import _pid_alive, window_id_of
 USAGE = "Usage: dockwright sweep [--dry-run]"
 DEFAULT_MCP_IMAGES = ("crystaldba/postgres-mcp",)
 MCP_IMAGES_ENV = "CLAUDE_SWEEP_MCP_IMAGES"
+# Mirrors stale_monitor.GARDENER_WINDOW_PROTECT_TTL_SEC — a live gardener run's
+# wrapper shields its pane via gardener/live-windows/<run_id>.window, honored
+# only while mtime-fresh (fail toward flagging on a crashed wrapper's leak).
+GARDENER_WINDOW_PROTECT_TTL_SEC = 7200
 
 
 def _pending_question_sids() -> set[str]:
@@ -94,6 +99,18 @@ def _protected_window_ids(pending_sids: set[str]) -> set[str]:
             wid = window_id_of(record)
             if wid:
                 protected.add(str(wid))
+    live_windows = paths.ROOT / "gardener" / "live-windows"
+    if live_windows.is_dir():
+        cutoff = time.time() - GARDENER_WINDOW_PROTECT_TTL_SEC
+        for sidecar in live_windows.glob("*.window"):
+            try:
+                if sidecar.stat().st_mtime < cutoff:
+                    continue
+                wid = sidecar.read_text().strip()
+            except OSError:
+                continue
+            if wid:
+                protected.add(wid)
     return protected
 
 

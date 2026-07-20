@@ -29,6 +29,16 @@ def fresh_orchestrator_dir(tmp_path, monkeypatch):
     paths.ensure_dirs()
     yield tmp_path
 
+
+def _install_two_pool(monkeypatch, tmp_path):
+    """The default pool is single-account; tests that stamp/validate account 'b'
+    need it registered, so install the two-account registry explicitly."""
+    cfg = tmp_path / "two-pool.toml"
+    cfg.write_text('[accounts]\ndefault = "a"\n'
+                   '[[accounts.pool]]\nname = "a"\n[[accounts.pool]]\nname = "b"\n')
+    monkeypatch.setenv(_config.ENV_CONFIG_PATH, str(cfg))
+
+
 def test_register_self_writes_active(fresh_orchestrator_dir):
     result = register_self_impl(
         claude_sid="sid-1",
@@ -52,6 +62,7 @@ def test_register_self_duplicate_name_rejected(fresh_orchestrator_dir):
         register_self_impl(claude_sid="sid-2", agent="worker", name="alpha", cwd="/y", iterm_sid="i2")
 
 def test_register_self_stamps_account_from_env(fresh_orchestrator_dir, monkeypatch):
+    _install_two_pool(monkeypatch, fresh_orchestrator_dir)
     monkeypatch.setenv("CLAUDE_ORCH_ACCOUNT", "b")
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1")
     record = state.read_json(paths.ACTIVE / "w1.json")
@@ -362,6 +373,28 @@ def test_become_manager_records_claude_runtime_and_list_managers_exposes_it(fres
     managers = list_managers()
     assert managers[0]["claude_sid"] == "mgr-1"
     assert managers[0]["runtime"] == "claude"
+
+
+def test_become_manager_returns_preflight_and_paints(monkeypatch, fresh_orchestrator_dir):
+    from dockwright import mcp_server
+    calls = {}
+    monkeypatch.setattr(mcp_server, "_paint_manager_tab",
+                        lambda name, domain: calls.setdefault("paint", (name, domain)))
+    monkeypatch.setattr(mcp_server, "_run_preflight_cleanup", lambda: "pruned 2 husks")
+    result = mcp_server.become_manager_impl("sid-bm-1", iterm_sid="%5")
+    assert result["ok"] is True
+    assert result["preflight"] == "pruned 2 husks"
+    assert calls["paint"] == (result["name"], result["domain"])
+
+
+def test_become_manager_paint_preflight_failures_do_not_fail_registration(monkeypatch, fresh_orchestrator_dir):
+    from dockwright import mcp_server
+    def boom(*a, **k):
+        raise RuntimeError("no tmux")
+    monkeypatch.setattr(mcp_server, "_paint_manager_tab", boom)
+    monkeypatch.setattr(mcp_server, "_run_preflight_cleanup", boom)
+    result = mcp_server.become_manager_impl("sid-bm-2", iterm_sid="%5")
+    assert result["ok"] is True
 
 # --- PID-test reaper ordering ----------------------------------------------
 # register_self_impl / become_manager_impl run two prunes in order:
@@ -1395,6 +1428,94 @@ def test_become_manager_with_takeover_releases_and_acquires(fresh_orchestrator_d
     assert handoff_after["to_sid"] == "mgr-new"
 
 
+def test_become_manager_with_takeover_reports_pane_closed_and_reuses_preflight(fresh_orchestrator_dir, monkeypatch):
+    from dockwright import mcp_server
+    become_manager_impl(claude_sid="mgr-old", iterm_sid="i0")
+    handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="s", trigger_reason="manual")
+    monkeypatch.setattr("dockwright.mcp_server._close_window", lambda w: None)
+    monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: True)
+    monkeypatch.setattr("dockwright.registry._pid_alive", lambda pid: True)
+    # Overrides the conftest autouse "" stub: proves the takeover reuses the inner
+    # become_manager_impl's preflight line rather than re-running the cleanup.
+    monkeypatch.setattr(mcp_server, "_run_preflight_cleanup", lambda: "pruned 1 husk")
+
+    result = mcp_server.become_manager_with_takeover_impl(
+        claude_sid="mgr-new", takeover_from="mgr-old",
+        handoff_id=handoff["handoff_id"], iterm_sid="i1")
+    # Absorbed tmux → predecessor pane absent from list-panes → reported closed.
+    assert result["predecessor_pane_closed"] is True
+    assert result["preflight"] == "pruned 1 husk"
+
+
+def test_become_manager_with_takeover_flags_predecessor_pane_still_open(fresh_orchestrator_dir, monkeypatch):
+    from dockwright import mcp_server
+    become_manager_impl(claude_sid="mgr-old", iterm_sid="i0")
+    handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="s", trigger_reason="manual")
+    monkeypatch.setattr("dockwright.mcp_server._close_window", lambda w: None)
+    monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: True)
+    monkeypatch.setattr("dockwright.registry._pid_alive", lambda pid: True)
+    monkeypatch.setattr(mcp_server, "_paint_manager_tab", lambda name, domain: None)
+
+    class _StillOpenDriver:
+        def current_pane_id(self):
+            return "i1"
+        async def pane_exists(self, pane):
+            return True  # predecessor pane still live -> takeover reports not-closed
+
+    monkeypatch.setattr(mcp_server, "get_driver", lambda: _StillOpenDriver())
+
+    result = mcp_server.become_manager_with_takeover_impl(
+        claude_sid="mgr-new", takeover_from="mgr-old",
+        handoff_id=handoff["handoff_id"], iterm_sid="i1")
+    assert result["ok"] is True
+    assert result["predecessor_pane_closed"] is False
+
+
+def test_become_manager_with_takeover_verifies_pane_from_inside_running_loop(fresh_orchestrator_dir, monkeypatch):
+    """Regression (CRITICAL): the MCP SDK runs sync tools INLINE in the event-loop
+    thread, so the takeover impl runs with a loop already running. A bare
+    asyncio.run() in the pane-close verification raised "cannot be called from a
+    running event loop", the surrounding except swallowed it, and
+    predecessor_pane_closed came back False for EVERY real resume/recovery boot —
+    routing them all down the manual-approval tmux path. The thread-bridge fix must
+    report True when the (mocked) driver says the predecessor pane is gone, even when
+    the impl is invoked from within a running loop.
+
+    The prior in-loop-agnostic tests missed this because they call the sync impl
+    directly (no running loop); here we call it from inside asyncio.run() exactly as
+    func_metadata does.
+    """
+    import asyncio
+    from dockwright import mcp_server
+    become_manager_impl(claude_sid="mgr-old", iterm_sid="i0")
+    handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="s", trigger_reason="manual")
+    monkeypatch.setattr("dockwright.mcp_server._close_window", lambda w: None)
+    monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: True)
+    monkeypatch.setattr("dockwright.registry._pid_alive", lambda pid: True)
+    monkeypatch.setattr(mcp_server, "_paint_manager_tab", lambda name, domain: None)
+
+    class _PaneGoneDriver:
+        def current_pane_id(self):
+            return "i1"
+        async def pane_exists(self, pane):
+            return False  # predecessor pane absent -> takeover must report closed
+
+    monkeypatch.setattr(mcp_server, "get_driver", lambda: _PaneGoneDriver())
+
+    async def _call_from_loop():
+        # Invoke the SYNC impl with a loop already running, exactly as the MCP SDK
+        # does (func_metadata runs sync tools inline in the loop thread). A bare
+        # asyncio.run() inside the impl raises here; the thread-bridge survives it.
+        assert asyncio.get_running_loop() is not None
+        return mcp_server.become_manager_with_takeover_impl(
+            claude_sid="mgr-new", takeover_from="mgr-old",
+            handoff_id=handoff["handoff_id"], iterm_sid="i1")
+
+    result = asyncio.run(_call_from_loop())
+    assert result["ok"] is True
+    assert result["predecessor_pane_closed"] is True
+
+
 def test_become_manager_with_takeover_stamps_account_from_env(fresh_orchestrator_dir, monkeypatch):
     """A recovery tab spawns with CLAUDE_ORCH_ACCOUNT in its env; the takeover's
     re-registration must stamp the new manager's record with that letter so the
@@ -1404,6 +1525,7 @@ def test_become_manager_with_takeover_stamps_account_from_env(fresh_orchestrator
     monkeypatch.setattr("dockwright.mcp_server._close_window", lambda window_id: None)
     monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: True)
     monkeypatch.setattr("dockwright.registry._pid_alive", lambda pid: True)
+    _install_two_pool(monkeypatch, fresh_orchestrator_dir)
     monkeypatch.setenv("CLAUDE_ORCH_ACCOUNT", "b")
     become_manager_with_takeover_impl(
         claude_sid="mgr-new", takeover_from="mgr-old",
@@ -1958,6 +2080,10 @@ def _enable_pool(monkeypatch, tmp_path, letter="a"):
         )
         return d
     monkeypatch.setattr(spawner, "ensure_account_config_dir", _fake_farm)
+    # L-11 farm pre-trust reads paths.account_config_dir(letter)/.claude.json;
+    # on an unpatched CONFIG_HOME that resolves to the developer's real
+    # ~/.claude-<letter>. Redirect it to the tmp farm _fake_farm already builds.
+    monkeypatch.setattr(paths, "account_config_dir", lambda letter: tmp_path / f".claude-{letter}")
 
     def fake_run(args, **kwargs):
         if isinstance(args, (list, tuple)) and args and args[0] == "security":
@@ -2026,6 +2152,9 @@ def test_spawn_manager_rides_pointer_b(monkeypatch, tmp_path):
     no token, stamp 'b'."""
     captured = _patch_exec(monkeypatch)
     _enable_pool(monkeypatch, tmp_path, letter="b")
+    # 'b' is only a valid pointer when the registry holds it; the default pool
+    # is now single-account, so install the two-account registry explicitly.
+    _install_two_pool(monkeypatch, tmp_path)
     _asyncio.run(spawner.spawn_worker_tab(
         cwd="/tmp/x",
         initial_prompt="hi",
@@ -2256,7 +2385,46 @@ def test_spawn_replacement_manager_pins_opus_model(fresh_orchestrator_dir, monke
     captured = _patch_spawn_worker_tab(monkeypatch)
     _patch_window_id_exists(monkeypatch, True)
     _asyncio.run(spawn_replacement_manager_impl(handoff["handoff_id"]))
-    assert captured["extra_args"] == ["--model", "opus[1m]"]
+    assert captured["extra_args"] == ["--remote-control", "--model", "opus[1m]"]
+
+
+def test_spawn_replacement_manager_carries_settings_and_rc(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    """Recreate lane composes the same tail as `dockwright manager`
+    (manager_claude_args): deployed allowlist settings + default-ON
+    remote-control (the reliable enrollment flag — the global
+    remoteControlAtStartup key is unreliable for spawned sessions)."""
+    presets = tmp_path / "presets"; presets.mkdir(exist_ok=True)
+    settings = presets / "manager-settings.json"
+    settings.write_text("{}")
+    monkeypatch.setattr(mcp_server.paths, "PRESETS", presets)
+    become_manager_impl(claude_sid="mgr-old", iterm_sid="42")
+    handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    _patch_window_id_exists(monkeypatch, True)
+    _asyncio.run(spawn_replacement_manager_impl(handoff["handoff_id"]))
+    assert captured["extra_args"] == [
+        "--remote-control", "--settings", str(settings), "--model", "opus[1m]"]
+    # Parse-shape invariant: the token after --remote-control (the prompt is
+    # appended by spawner._runtime_command right after extra_args) must be a
+    # dash-option, or --remote-control [name] swallows the /manager-resume prompt.
+    _rc = captured["extra_args"].index("--remote-control")
+    assert _rc + 1 < len(captured["extra_args"]) and \
+        captured["extra_args"][_rc + 1].startswith("-"), captured["extra_args"]
+
+
+def test_spawn_replacement_manager_carries_skip_perms_opt_in(fresh_orchestrator_dir, monkeypatch):
+    """The recreate lane inherits the opt-in via manager_claude_args — no
+    lane-local wiring to drift. Default-off is pinned by the existing
+    exact-argv asserts in the neighboring tests."""
+    monkeypatch.setenv("DOCKWRIGHT_MANAGER_SKIP_PERMS", "1")
+    become_manager_impl(claude_sid="mgr-old", iterm_sid="42")
+    handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    _patch_window_id_exists(monkeypatch, True)
+    _asyncio.run(spawn_replacement_manager_impl(handoff["handoff_id"]))
+    assert captured["extra_args"] == [
+        "--remote-control", "--dangerously-skip-permissions",
+        "--model", "opus[1m]"]
 
 
 def test_spawn_replacement_manager_inherits_predecessor_funny_name(fresh_orchestrator_dir, monkeypatch):
@@ -2424,8 +2592,16 @@ from dockwright.mcp_server import _claude_worker_settings_args
 
 
 def test_claude_rc_args_default_keeps_remote_off(monkeypatch):
-    """Flag unset → the legacy RC-off --settings, no --remote-control."""
+    """Flag unset → the legacy RC-off --settings, no --remote-control.
+
+    Preset injection forced off (D1 changed the no-arg default to the
+    deployed preset path when [spawn] worker_headless_preset=true, which
+    this machine's real ~/.claude/dockwright/presets may satisfy) so this
+    test stays scoped to what it actually covers: RC-flag parsing on the
+    inline-fallback path.
+    """
     monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
+    monkeypatch.setattr(_config, "worker_headless_preset", lambda: False)
     assert _claude_worker_settings_args() == REMOTE_OFF_FLAGS
     assert "--remote-control" not in _claude_worker_settings_args()
 
@@ -2434,6 +2610,7 @@ def test_claude_rc_args_default_keeps_remote_off(monkeypatch):
 def test_claude_rc_args_non_one_values_keep_remote_off(monkeypatch, val):
     """Any value other than "1" preserves the byte-identical RC-off default."""
     monkeypatch.setenv("CLAUDE_ORCH_WORKER_RC", val)
+    monkeypatch.setattr(_config, "worker_headless_preset", lambda: False)
     assert _claude_worker_settings_args() == REMOTE_OFF_FLAGS
 
 
@@ -2441,6 +2618,7 @@ def test_claude_rc_args_non_one_values_keep_remote_off(monkeypatch, val):
 def test_claude_rc_args_enables_remote_when_opted_in(monkeypatch, val):
     """CLAUDE_ORCH_WORKER_RC=1 → --remote-control, and NOT the RC-off --settings."""
     monkeypatch.setenv("CLAUDE_ORCH_WORKER_RC", val)
+    monkeypatch.setattr(_config, "worker_headless_preset", lambda: False)
     assert _claude_worker_settings_args() == RC_ON_FLAGS
     assert "--remote-control" in _claude_worker_settings_args()
     assert "remoteControlAtStartup" not in _claude_worker_settings_args()[1]
@@ -2474,9 +2652,242 @@ def test_spawn_worker_opt_in_appends_caller_extra_args(fresh_orchestrator_dir, m
     assert captured["extra_args"] == RC_ON_FLAGS + ["--dangerously-skip-permissions"]
 
 
+# --- Headless preset becomes the claude-spawn default (spec D1) ---
+
+from dockwright import mcp_server
+
+HEADLESS_PRESET_BODY = {
+    "enableAllProjectMcpServers": True,
+    "remoteControlAtStartup": False,
+    "disableRemoteControl": True,
+    "permissions": {"defaultMode": "auto", "allow": ["Bash(printenv:*)"]},
+}
+
+
+def _write_headless_preset(tmp_path, monkeypatch, body=None):
+    presets = tmp_path / "presets"
+    presets.mkdir(parents=True, exist_ok=True)
+    preset = presets / "worker-headless-settings.json"
+    preset.write_text(json.dumps(body if body is not None else HEADLESS_PRESET_BODY))
+    monkeypatch.setattr(mcp_server.paths, "PRESETS", presets)
+    return preset
+
+
+def test_settings_args_default_uses_preset_path(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
+    monkeypatch.setattr(mcp_server.config, "worker_headless_preset", lambda: True)
+    preset = _write_headless_preset(tmp_path, monkeypatch)
+    assert mcp_server._claude_worker_settings_args() == ["--settings", str(preset)]
+
+
+def test_settings_args_knob_off_falls_back_inline(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
+    monkeypatch.setattr(mcp_server.config, "worker_headless_preset", lambda: False)
+    _write_headless_preset(tmp_path, monkeypatch)
+    args = mcp_server._claude_worker_settings_args()
+    assert args[0] == "--settings"
+    settings = json.loads(args[1])
+    assert settings == {"enableAllProjectMcpServers": True,
+                        "remoteControlAtStartup": False,
+                        "disableRemoteControl": True}
+
+
+def test_settings_args_missing_preset_falls_back_inline(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
+    monkeypatch.setattr(mcp_server.config, "worker_headless_preset", lambda: True)
+    monkeypatch.setattr(mcp_server.paths, "PRESETS", tmp_path / "nope")
+    args = mcp_server._claude_worker_settings_args()
+    assert json.loads(args[1])["enableAllProjectMcpServers"] is True
+
+
+def test_settings_args_unparseable_preset_falls_back_inline(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
+    monkeypatch.setattr(mcp_server.config, "worker_headless_preset", lambda: True)
+    presets = tmp_path / "presets"
+    presets.mkdir()
+    (presets / "worker-headless-settings.json").write_text("{corrupt")
+    monkeypatch.setattr(mcp_server.paths, "PRESETS", presets)
+    args = mcp_server._claude_worker_settings_args()
+    assert json.loads(args[1])["enableAllProjectMcpServers"] is True
+
+
+def test_settings_args_rc_merges_preset_inline(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_ORCH_WORKER_RC", "1")
+    monkeypatch.setattr(mcp_server.config, "worker_headless_preset", lambda: True)
+    _write_headless_preset(tmp_path, monkeypatch)
+    args = mcp_server._claude_worker_settings_args()
+    assert args[0] == "--settings" and args[2] == "--remote-control"
+    merged = json.loads(args[1])
+    assert "remoteControlAtStartup" not in merged
+    assert "disableRemoteControl" not in merged
+    assert merged["permissions"]["defaultMode"] == "auto"
+
+
+def test_settings_args_rc_with_missing_preset_falls_back_legacy(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_ORCH_WORKER_RC", "1")
+    monkeypatch.setattr(mcp_server.config, "worker_headless_preset", lambda: True)
+    monkeypatch.setattr(mcp_server.paths, "PRESETS", tmp_path / "nope")
+    args = mcp_server._claude_worker_settings_args()
+    assert args == ["--settings", json.dumps({"enableAllProjectMcpServers": True}),
+                    "--remote-control"]
+
+
+def test_settings_args_caller_settings_suppresses_injection(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
+    monkeypatch.setattr(mcp_server.config, "worker_headless_preset", lambda: True)
+    _write_headless_preset(tmp_path, monkeypatch)
+    assert mcp_server._claude_worker_settings_args(["--settings", "/x.json"]) == []
+
+
+def test_settings_args_caller_settings_keeps_rc_flag(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_ORCH_WORKER_RC", "1")
+    monkeypatch.setattr(mcp_server.config, "worker_headless_preset", lambda: True)
+    _write_headless_preset(tmp_path, monkeypatch)
+    assert mcp_server._claude_worker_settings_args(["--settings", "/x.json"]) == ["--remote-control"]
+
+
+# --- Resume replays the spawn's settings (verifier Finding 1) ---
+#
+# The no-arg headless default must NOT silently apply to EVERY resume: a worker
+# spawned read-only (--settings verifier-settings.json) that resumes onto the
+# auto headless preset is a permission WIDENING. So the composed spawn
+# args are persisted on the assignment record and replayed verbatim on resume;
+# a legacy record with no persisted args resumes NARROW (manual inline), never
+# fails open to the headless preset.
+
+from dockwright.mcp_server import _legacy_inline_settings_args
+
+
+def test_spawn_persists_verifier_settings_to_assignment(fresh_orchestrator_dir, monkeypatch):
+    monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
+    _patch_spawn_worker_tab(monkeypatch)
+    _asyncio.run(spawn_worker_impl(
+        initial_prompt="verify", name="verifier", cwd="/tmp/x",
+        extra_args=["--settings", "/deployed/verifier-settings.json"]))
+    (pending,) = list(paths.ASSIGNMENTS_PENDING.glob("*.json"))
+    record = state.read_json(pending)
+    assert record["spawn_extra_args"] == ["--settings", "/deployed/verifier-settings.json"]
+    assert not any("worker-headless-settings.json" in a for a in record["spawn_extra_args"])
+
+
+def test_spawn_persists_headless_preset_args_to_assignment(fresh_orchestrator_dir, tmp_path,
+                                                           monkeypatch):
+    monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
+    monkeypatch.setattr(mcp_server.config, "worker_headless_preset", lambda: True)
+    preset = _write_headless_preset(tmp_path, monkeypatch)
+    _patch_spawn_worker_tab(monkeypatch)
+    _asyncio.run(spawn_worker_impl(initial_prompt="build", name="w-bare", cwd="/tmp/x"))
+    (pending,) = list(paths.ASSIGNMENTS_PENDING.glob("*.json"))
+    record = state.read_json(pending)
+    assert record["spawn_extra_args"] == ["--settings", str(preset)]
+
+
+def test_resume_replays_verifier_spawn_extra_args(fresh_orchestrator_dir, monkeypatch):
+    monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
+    state.write_json_atomic(paths.CLOSED / "vsid.json", {
+        "claude_sid": "vsid", "name": "verifier", "cwd": "/x", "runtime": "claude",
+        "closed_at": 1.0})
+    paths.ASSIGNMENTS.mkdir(parents=True, exist_ok=True)
+    state.write_json_atomic(paths.ASSIGNMENTS / "vsid.json", {
+        "claude_sid": "vsid", "name": "verifier",
+        "spawn_extra_args": ["--settings", "/deployed/verifier-settings.json"]})
+    captured = {}
+
+    async def fake_spawn(**kwargs):
+        captured.update(kwargs)
+        register_self_impl(claude_sid="vsid", agent="worker", name="verifier", cwd="/x",
+                           iterm_sid="i7")
+        return ("win-7", "verifier")
+
+    _asyncio.run(_spawn_and_confirm_resume(
+        fake_spawn, paths.CLOSED / "vsid.json", state.read_json(paths.CLOSED / "vsid.json"),
+        "verifier", "vsid", "/x", 5.0, 0.05))
+    assert captured["extra_args"] == ["--settings", "/deployed/verifier-settings.json"]
+    assert not any("worker-headless-settings.json" in a for a in captured["extra_args"])
+
+
+def test_resume_replays_headless_preset_spawn_args(fresh_orchestrator_dir, monkeypatch):
+    monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
+    state.write_json_atomic(paths.CLOSED / "hsid.json", {
+        "claude_sid": "hsid", "name": "w-bare", "cwd": "/x", "runtime": "claude", "closed_at": 1.0})
+    paths.ASSIGNMENTS.mkdir(parents=True, exist_ok=True)
+    state.write_json_atomic(paths.ASSIGNMENTS / "hsid.json", {
+        "claude_sid": "hsid", "name": "w-bare",
+        "spawn_extra_args": ["--settings", "/deployed/worker-headless-settings.json"]})
+    captured = {}
+
+    async def fake_spawn(**kwargs):
+        captured.update(kwargs)
+        register_self_impl(claude_sid="hsid", agent="worker", name="w-bare", cwd="/x",
+                           iterm_sid="i7")
+        return ("win-7", "w-bare")
+
+    _asyncio.run(_spawn_and_confirm_resume(
+        fake_spawn, paths.CLOSED / "hsid.json", state.read_json(paths.CLOSED / "hsid.json"),
+        "w-bare", "hsid", "/x", 5.0, 0.05))
+    assert captured["extra_args"] == ["--settings", "/deployed/worker-headless-settings.json"]
+
+
+def test_resume_legacy_record_falls_back_to_manual_inline(fresh_orchestrator_dir, monkeypatch):
+    # A pre-spawn_extra_args record: original settings unknowable → resume must
+    # fail NARROW (manual inline, no permissions key), NEVER open to the headless preset.
+    monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
+    state.write_json_atomic(paths.CLOSED / "lsid.json", {
+        "claude_sid": "lsid", "name": "legacy", "cwd": "/x", "runtime": "claude", "closed_at": 1.0})
+    # No assignment record for this sid — simulates the legacy / crash-orphan case.
+    captured = {}
+
+    async def fake_spawn(**kwargs):
+        captured.update(kwargs)
+        register_self_impl(claude_sid="lsid", agent="worker", name="legacy", cwd="/x",
+                           iterm_sid="i7")
+        return ("win-7", "legacy")
+
+    _asyncio.run(_spawn_and_confirm_resume(
+        fake_spawn, paths.CLOSED / "lsid.json", state.read_json(paths.CLOSED / "lsid.json"),
+        "legacy", "lsid", "/x", 5.0, 0.05))
+    assert captured["extra_args"] == _legacy_inline_settings_args()
+    assert captured["extra_args"] == REMOTE_OFF_FLAGS
+    assert "permissions" not in captured["extra_args"][1]
+    assert not any("worker-headless-settings.json" in a for a in captured["extra_args"])
+
+
+def test_legacy_inline_settings_args_matches_old_main_fallback(monkeypatch):
+    # The legacy resume fallback is byte-identical to the inline no-preset branch
+    # so the two can never drift.
+    monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
+    monkeypatch.setattr(mcp_server.config, "worker_headless_preset", lambda: False)
+    assert _legacy_inline_settings_args() == mcp_server._claude_worker_settings_args()
+    assert _legacy_inline_settings_args() == REMOTE_OFF_FLAGS
+
+
+def test_resume_codex_stays_no_extra_args(fresh_orchestrator_dir, monkeypatch):
+    # Codex resume rides the runtime's fixed defaults — never a --settings replay.
+    monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
+    state.write_json_atomic(paths.CLOSED / "cxsid.json", {
+        "claude_sid": "cxsid", "name": "cx", "cwd": "/x", "runtime": "codex", "closed_at": 1.0})
+    paths.ASSIGNMENTS.mkdir(parents=True, exist_ok=True)
+    state.write_json_atomic(paths.ASSIGNMENTS / "cxsid.json", {
+        "claude_sid": "cxsid", "name": "cx", "spawn_extra_args": ["--model", "gpt-5.5"]})
+    captured = {}
+
+    async def fake_spawn(**kwargs):
+        captured.update(kwargs)
+        register_self_impl(claude_sid="cxsid", agent="worker", name="cx", cwd="/x", iterm_sid="i7")
+        return ("win-7", "cx")
+
+    _asyncio.run(_spawn_and_confirm_resume(
+        fake_spawn, paths.CLOSED / "cxsid.json", state.read_json(paths.CLOSED / "cxsid.json"),
+        "cx", "cxsid", "/x", 5.0, 0.05))
+    assert captured["extra_args"] is None
+
+
 @pytest.mark.parametrize("flag", [None, "1"])
 def test_manager_spawn_unaffected_by_worker_rc_flag(fresh_orchestrator_dir, monkeypatch, flag):
-    """The worker RC opt-in must never leak into the manager spawn path, either way."""
+    """The worker RC opt-in must never leak into the manager spawn path: the
+    manager's own --remote-control (manager_claude_args, default-ON, governed
+    solely by DOCKWRIGHT_MANAGER_RC) makes the composed extra_args IDENTICAL
+    whether or not CLAUDE_ORCH_WORKER_RC is set."""
     if flag is None:
         monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
     else:
@@ -2487,7 +2898,7 @@ def test_manager_spawn_unaffected_by_worker_rc_flag(fresh_orchestrator_dir, monk
     _patch_window_id_exists(monkeypatch, True)
     _asyncio.run(spawn_replacement_manager_impl(handoff["handoff_id"]))
     extra = captured.get("extra_args") or []
-    assert "--remote-control" not in extra
+    assert extra == ["--remote-control", "--model", "opus[1m]"]
     assert "--settings" not in extra
     assert all("remoteControlAtStartup" not in str(a) for a in extra)
 
@@ -5355,6 +5766,13 @@ def test_repo_sync_footer_names_the_git_recipe():
     assert "rebase origin/main" in text
     assert "git rebase --abort" in text
     assert "git show origin/main:<path>" in text
+
+
+def test_repo_sync_footer_is_headless_approvable():
+    footer = mcp_server._repo_sync_footer()
+    assert "git -C" not in footer
+    assert "&&" not in footer
+    assert "cd <repo>" in footer
 
 
 # --- Ownership plane: brief surfacing + pipeline_status join (spec §13) ---

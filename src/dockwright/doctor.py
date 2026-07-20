@@ -12,7 +12,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import compose, config, env_install, homebrew_cleanup
+from . import compose, config, env_install, homebrew_cleanup, paths
 
 
 @dataclass
@@ -61,6 +61,62 @@ def check_venv_import(orch_bin: str, run=subprocess.run) -> Check:
         return Check("venv-import", False, f"could not run {py}: {e}")
     return Check("venv-import", getattr(r, "returncode", 1) == 0,
                  f"{py} import rc={getattr(r, 'returncode', '?')}")
+
+
+def check_account_pointer() -> Check:
+    """account-active, when present, must name a registry account. A stale
+    pointer (e.g. left by a pre-registry flip onto a since-removed account)
+    reads as pool-off everywhere — silently, forever: nothing writes the
+    pointer back."""
+    try:
+        raw = paths.ACCOUNT_ACTIVE.read_text().rstrip("\n")
+    except FileNotFoundError:
+        return Check("accounts:pointer", True, "account-active absent (pool off by default)")
+    except OSError as e:
+        return Check("accounts:pointer", False, f"unreadable {paths.ACCOUNT_ACTIVE}: {e}")
+    names = list(config.account_names())
+    if raw in names:
+        return Check("accounts:pointer", True, f"'{raw}' is in the registry {names}")
+    return Check("accounts:pointer", False,
+                 f"account-active reads '{raw}' but the registry is {names} — the pool "
+                 f"is silently OFF; fix: echo <name> > {paths.ACCOUNT_ACTIVE}, or rm it, "
+                 f"or add the account to [accounts] pool in dockwright.toml")
+
+
+def check_accounts_login() -> Check:
+    """Every declared NON-DEFAULT pool account should show login evidence: its
+    farm .claude.json carrying oauthAccount. Farm assembly pops oauthAccount on
+    every rebuild (spawner._ensure_account_claude_json), so PRESENCE can only
+    come from a real /login in that config dir. ABSENCE is weaker — a corrupt
+    farm rebuild drops the marker while the keychain login survives — hence a
+    doctor flag with that caveat, never a spawn-time gate. Closes the
+    declared-but-never-logged-in residual: spawns routed to such an account
+    brick with AUTH_401 (reactive); this check is the proactive half."""
+    default = config.default_account()
+    missing = []
+    for account in config.accounts():
+        if account.name == default:
+            continue
+        farm = paths.account_config_dir(account.name)
+        try:
+            data = json.loads((farm / ".claude.json").read_text())
+            has_marker = isinstance(data, dict) and "oauthAccount" in data
+        except FileNotFoundError:
+            missing.append(f"{account.name} (no {farm / '.claude.json'} — never logged in?)")
+            continue
+        except (OSError, ValueError):
+            missing.append(f"{account.name} (unreadable {farm / '.claude.json'})")
+            continue
+        if not has_marker:
+            missing.append(
+                f"{account.name} (no oauthAccount in {farm / '.claude.json'} — "
+                f"either never logged in, or a farm rebuild dropped the marker)")
+    if not missing:
+        return Check("accounts:login",
+                     True, "all non-default pool accounts show login evidence")
+    return Check("accounts:login", False,
+                 "; ".join(missing) + " — fix: CLAUDE_CONFIG_DIR=<farm> claude, then /login "
+                 "(a re-login also refreshes a dropped marker)")
 
 
 def check_config() -> Check:
@@ -127,7 +183,9 @@ def main(argv=None) -> int:
 
     checks = [check_venv_import(args.orch_bin),
               check_no_brew_editable(args.brew_prefix, args.dist_name),
-              check_config()]
+              check_config(),
+              check_account_pointer(),
+              check_accounts_login()]
 
     if args.compose_out_dir:
         core = args.compose_core_dir or compose._default_core_dir()

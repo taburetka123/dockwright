@@ -1,5 +1,6 @@
 """FastMCP server exposing dockwright tools for manager + worker sessions."""
 import asyncio
+import concurrent.futures
 import fcntl
 import json
 import os
@@ -1283,6 +1284,26 @@ def _active_display_names() -> set[str]:
     return names_set
 
 
+def _paint_manager_tab(name: str, domain: str) -> None:
+    """Best-effort: title + manager colors on the CURRENT pane (the MCP server
+    runs inside the manager's pane). Replaces the boot docs' 3b tab-paint bash
+    — that inline command carried $-expansions the permission system can never
+    allowlist (E2E F-2)."""
+    from .hooks import _style_manager_tab  # lazy: avoid import cycles at module load
+    _style_manager_tab(name, domain)
+
+
+def _run_preflight_cleanup() -> str:
+    """Run the deployed preflight cleanup, returning its one-line output ("" =
+    clean). Replaces boot step 6b. Best-effort by contract: callers wrap."""
+    script = Path.home() / ".claude" / "scripts" / "preflight_cleanup.py"
+    if not script.is_file():
+        return ""
+    proc = subprocess.run([sys.executable, str(script)],
+                          capture_output=True, text=True, timeout=10)
+    return (proc.stdout or "").strip()
+
+
 def become_manager_impl(
     claude_sid: str,
     iterm_sid: str = "",
@@ -1342,7 +1363,20 @@ def become_manager_impl(
     # Backfill runs after register_self so the just-registered manager is counted.
     # If it's the only one, legacy parent-null workers get attributed to it.
     _backfill_legacy_workers()
-    return {"ok": True, "name": name, "domain": domain, "runtime": "claude"}
+    # Boot-step absorption (E2E F-2): paint + preflight used to be two gated
+    # bash steps in /manager; both are best-effort — a failure must never fail
+    # registration. /manager calls become_manager twice (placeholder sid then
+    # real sid) — both are idempotent, the double run is accepted (cold path).
+    try:
+        _paint_manager_tab(name, domain)
+    except Exception:
+        pass
+    try:
+        preflight = _run_preflight_cleanup()
+    except Exception:
+        preflight = ""
+    return {"ok": True, "name": name, "domain": domain, "runtime": "claude",
+            "preflight": preflight}
 
 # --- Manager recreation / handoff ---
 
@@ -1459,6 +1493,7 @@ def become_manager_with_takeover_impl(claude_sid: str, takeover_from: str, hando
     old_iterm_sid = state.window_id_of(old_record or {})
     inherited_name = (old_record or {}).get("name") or handoff.get("manager_name")
     inherited_domain = (old_record or {}).get("domain") or handoff.get("domain") or DEFAULT_DOMAIN
+    closed_window_id = ""
     if isinstance(old_pid, int) and _pid_alive(old_pid):
         # Closing the predecessor's window is a required handoff step. Prefer its recorded
         # iterm_sid; if that's empty (legacy record from before managers stored their
@@ -1470,6 +1505,7 @@ def become_manager_with_takeover_impl(claude_sid: str, takeover_from: str, hando
             target_window = _resolve_manager_window(takeover_from, inherited_name, exclude_id=new_window)
         if target_window:
             _close_window(target_window)
+            closed_window_id = target_window
     # Drop the old manager's active record so register_self_impl below doesn't trip on
     # the duplicate name. (Window close is async; SessionEnd may still be propagating.)
     paths.ACTIVE.joinpath(f"{takeover_from}.json").unlink(missing_ok=True)
@@ -1478,12 +1514,35 @@ def become_manager_with_takeover_impl(claude_sid: str, takeover_from: str, hando
     _drop_questions_for_worker(takeover_from)
     # Register the new manager. Inherit name + domain so workers' parent_manager_name
     # references stay valid (no re-parent needed: the inherited name is identical).
-    become_manager_impl(
+    # become_manager_impl absorbs the tab-paint + preflight (E2E F-2) on the incoming
+    # pane and returns its preflight line — reuse it rather than double-running.
+    bm_result = become_manager_impl(
         claude_sid=claude_sid,
         iterm_sid=iterm_sid,
         domain=inherited_domain,
         name=inherited_name,
     )
+    # Verify the predecessor's pane is actually gone — replaces manager-resume.md's
+    # un-allowlistable tmux-bash close-verification. If nothing was closed (predecessor
+    # already dead or its window unresolvable), treat the pane as gone. best-effort:
+    # any tmux failure reads as not-yet-closed rather than crashing the takeover.
+    #
+    # The MCP SDK runs sync tools INLINE in the event-loop thread, so a bare
+    # asyncio.run() here would raise "cannot be called from a running event loop"
+    # in production — the except then swallows it and pane_closed is ALWAYS False,
+    # routing every real takeover down the manual-approval tmux path. Bridge through
+    # a worker thread so asyncio.run() gets a fresh loop whether or not the caller is
+    # already inside one.
+    try:
+        if closed_window_id:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                pane_closed = not pool.submit(
+                    asyncio.run, get_driver().pane_exists(closed_window_id)
+                ).result(timeout=5)
+        else:
+            pane_closed = True
+    except Exception:
+        pane_closed = False
     # Mark handoff consumed.
     now = time.time()
     handoff["consumed_at"] = now
@@ -1499,7 +1558,9 @@ def become_manager_with_takeover_impl(claude_sid: str, takeover_from: str, hando
         "trigger_reason": handoff.get("trigger_reason"),
         "narrative_excerpt": narrative[:200],
     })
-    return {"ok": True, "name": inherited_name, "domain": inherited_domain, "runtime": "claude"}
+    return {"ok": True, "name": inherited_name, "domain": inherited_domain, "runtime": "claude",
+            "preflight": bm_result.get("preflight", ""),
+            "predecessor_pane_closed": pane_closed}
 
 
 # --- MCP tool registrations ---
@@ -1683,7 +1744,8 @@ def become_manager(
     to preserve a prior identity instead (the `/manager-reboot` in-place recycle
     lane) — a passed name taken by a different live session is auto-suffixed.
     Managers are Claude-only; the record is always stamped runtime="claude".
-    Returns {ok, name, domain, runtime}.
+    Returns {ok, name, domain, runtime, preflight} — preflight is the one-line
+    server-side cleanup summary ("" = clean).
     """
     return become_manager_impl(claude_sid, iterm_sid, domain=domain, name=name)
 
@@ -1821,9 +1883,15 @@ def prepare_recovery_handoff(from_sid: str, trigger_reason: str = "account-flip-
 def become_manager_with_takeover(claude_sid: str, takeover_from: str, handoff_id: str, iterm_sid: str = "") -> dict:
     """[MANAGER /manager-resume] Atomic takeover from a previous manager.
 
-    Verifies the handoff matches `takeover_from`, SIGTERMs the old manager,
-    inherits its name + domain so workers' parent_manager_name references stay
-    valid, marks the handoff consumed, and appends to manager-triggers.jsonl.
+    Verifies the handoff matches `takeover_from`, closes the old manager's tmux
+    pane via the terminal driver (tmux kill-pane — not SIGTERM; the graceful
+    close lets its SessionEnd fire the retro + memory distill), inherits its
+    name + domain so workers' parent_manager_name references stay valid, marks
+    the handoff consumed, and appends to manager-triggers.jsonl. Returns
+    {ok, name, domain, runtime, preflight, predecessor_pane_closed} — preflight
+    is the reused inner become_manager cleanup line; predecessor_pane_closed
+    confirms the old pane is gone (false → /manager-resume step 4b kill-panes it
+    manually).
     """
     return become_manager_with_takeover_impl(claude_sid, takeover_from, handoff_id, iterm_sid)
 
@@ -1857,6 +1925,7 @@ async def spawn_replacement_manager_impl(handoff_id: str) -> dict:
     """Testable core of spawn_replacement_manager."""
     # Lazy import: don't crash MCP startup if terminal/runtime launch support is unavailable.
     from .spawner import spawn_worker_tab
+    from .manager_launch import manager_claude_args
     handoff_path = paths.HANDOFFS / f"{handoff_id}.json"
     handoff = state.read_json(handoff_path)
     if handoff is None:
@@ -1866,6 +1935,11 @@ async def spawn_replacement_manager_impl(handoff_id: str) -> dict:
     cwd = os.getcwd()
     initial_prompt = f"/manager-resume {handoff_id}"
     target_window_match = await _resolve_old_manager_window_match(handoff)
+    # manager_claude_args() (which leads with --remote-control) FIRST, then
+    # --model: spawner._runtime_command appends the /manager-resume prompt after
+    # extra_args, so --model must sit between the RC tail and that prompt or
+    # --remote-control [name] binds the prompt as the RC session name.
+    manager_extra_args = [*manager_claude_args(), "--model", config.manager_model()]
     try:
         async with asyncio.timeout(15):
             window_id, _ = await spawn_worker_tab(
@@ -1884,8 +1958,9 @@ async def spawn_replacement_manager_impl(handoff_id: str) -> dict:
                 # Manager lane is pinned (orch-audit model-allocation): without
                 # an explicit flag the tab rides the spawner's WORKER default,
                 # and a worker-default change would silently move managers too;
-                # value from dockwright.toml [spawn].manager_model.
-                extra_args=["--model", config.manager_model()],
+                # value from dockwright.toml [spawn].manager_model. The
+                # manager-settings allowlist rides alongside (E2E F-2).
+                extra_args=manager_extra_args,
             )
     except (asyncio.TimeoutError, ConnectionRefusedError, OSError) as e:
         raise RuntimeError(
@@ -2023,7 +2098,13 @@ async def _spawn_and_confirm_resume(
     # spawn (spawn_worker_impl) so resuming never re-enrolls the worker on the
     # phone / Desktop. codex resume must NOT get --settings — it's Claude-only and
     # _validate_codex_extra_args rejects it.
-    extra_args = _claude_worker_settings_args() if runtime == "claude" else None
+    # Resume REPLAYS the session's original spawn settings (verifier Finding 1):
+    # the composed extra_args are persisted on the assignment record at spawn and
+    # replayed verbatim here, so a read-only verifier (or any caller --settings /
+    # composed copy) resumes on the SAME permissions it was born with — never
+    # silently widened onto the auto headless default. A legacy record
+    # with no persisted args falls back to manual-mode inline (fail narrow).
+    extra_args = _resume_settings_args(sid) if runtime == "claude" else None
     # Snapshot BEFORE spawning: the codex-lane fallback below accepts a name claim
     # only from a record that did not exist at this point.
     pre_spawn_sids = {
@@ -2137,8 +2218,28 @@ def _resolve_preset(preset: str) -> str:
     return preset_path.read_text()
 
 
-def _claude_worker_settings_args() -> list[str]:
-    """CLI args injecting a claude worker's --settings (MCP auto-approval + Remote Control).
+def _claude_worker_settings_args(extra_args: list[str] | None = None) -> list[str]:
+    """CLI args injecting a claude worker's --settings.
+
+    Default (E2E N-2 fix): the DEPLOYED headless preset file
+    (paths.PRESETS/worker-headless-settings.json — auto mode + protocol
+    allowlist + finalize-injected additionalDirectories) is passed by PATH so
+    every claude spawn/resume boots stall-proof without the manager having to
+    remember it. Fallbacks preserve the pre-preset inline JSON
+    (enableAllProjectMcpServers + remote-control-off) when the operator set
+    [spawn] worker_headless_preset=false, the preset file is missing
+    (setup.sh not run), or it doesn't parse (interrupted finalize) — a broken
+    deployed file must degrade the spawn's permissions, never kill the worker
+    CLI at boot.
+
+    Caller --settings in extra_args suppresses injection entirely (claude's
+    --settings is last-wins, so injecting a dead flag was noise); the
+    standalone --remote-control flag still rides when CLAUDE_ORCH_WORKER_RC=1
+    so caller-settings spawns keep RC enrollment.
+
+    CLAUDE_ORCH_WORKER_RC=1 (RC on): the preset's remote-control-off pair
+    contradicts --remote-control, so pass the preset MERGED INLINE minus those
+    two keys, keeping its permissions.
 
     enableAllProjectMcpServers auto-approves every server in the worktree's .mcp.json so a
     fresh-worktree worker never blocks on Claude Code's interactive "N new MCP servers found in
@@ -2152,12 +2253,61 @@ def _claude_worker_settings_args() -> list[str]:
     CLAUDE_ORCH_WORKER_RC=1 to enable it via the reliable --remote-control flag
     (anthropics/claude-code #54527/#29929/#41036).
     """
+    rc_on = os.environ.get("CLAUDE_ORCH_WORKER_RC", "").strip() == "1"
+    if extra_args:
+        from .spawner import _matches_option  # lazy: mirror spawn_worker_tab import
+        if any(_matches_option(a, {"--settings"}) for a in extra_args):
+            return ["--remote-control"] if rc_on else []
+    preset_path = paths.PRESETS / "worker-headless-settings.json"
+    preset: dict | None = None
+    if config.worker_headless_preset():
+        try:
+            loaded = json.loads(preset_path.read_text())
+            if isinstance(loaded, dict):
+                preset = loaded
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            preset = None
+    if preset is None:
+        return _legacy_inline_settings_args()
+    if rc_on:
+        preset.pop("remoteControlAtStartup", None)
+        preset.pop("disableRemoteControl", None)
+        return ["--settings", json.dumps(preset), "--remote-control"]
+    return ["--settings", str(preset_path)]
+
+
+def _legacy_inline_settings_args() -> list[str]:
+    """The pre-preset inline `--settings` fallback: enableAllProjectMcpServers +
+    the remote-control-off pair, with NO `permissions` key (manual mode).
+
+    Two callers share this so they can never drift: (a) the `preset is None`
+    fallback of _claude_worker_settings_args (knob off / preset missing / preset
+    unparseable), and (b) the resume lane for a legacy assignment record with no
+    persisted `spawn_extra_args`. For (b) the original settings are unknowable,
+    so resume must fail NARROW to manual mode — never fail open to the
+    auto headless preset."""
+    rc_on = os.environ.get("CLAUDE_ORCH_WORKER_RC", "").strip() == "1"
     settings: dict = {"enableAllProjectMcpServers": True}
-    if os.environ.get("CLAUDE_ORCH_WORKER_RC", "").strip() == "1":
+    if rc_on:
         return ["--settings", json.dumps(settings), "--remote-control"]
     settings["remoteControlAtStartup"] = False
     settings["disableRemoteControl"] = True
     return ["--settings", json.dumps(settings)]
+
+
+def _resume_settings_args(sid: str) -> list[str]:
+    """CLI settings args for a claude resume, replayed from the spawn record.
+
+    Reads assignments/<sid>.json and replays the composed `spawn_extra_args`
+    VERBATIM — reproducing exactly what the session was born with (settings,
+    model, effort), so a read-only verifier resumes read-only and never widens
+    onto the auto headless default. A legacy record with no persisted
+    list falls back to manual-mode inline settings (fail narrow)."""
+    record = state.read_json(paths.assignment_path(sid)) or {}
+    spawn_args = record.get("spawn_extra_args")
+    if isinstance(spawn_args, list) and all(isinstance(a, str) for a in spawn_args):
+        return list(spawn_args)
+    return _legacy_inline_settings_args()
 
 
 async def _confirm_spawn_registration(
@@ -2206,8 +2356,10 @@ async def spawn_worker_impl(
     _poll_interval: float | None = None,
 ) -> dict:
     # Lazy import: don't crash MCP startup if terminal/runtime launch support is unavailable.
-    from .spawner import normalize_runtime, spawn_worker_tab, usage_spawn_gate
+    from .spawner import (normalize_runtime, spawn_worker_tab, usage_spawn_gate,
+                          write_registry_snapshot)
     runtime = normalize_runtime(runtime)
+    write_registry_snapshot()   # keep the standalone monitor's registry fresh
     _validate_task_key(task_key)
     gate = usage_spawn_gate(force=force)
     if gate.get("status") == "paused":
@@ -2233,7 +2385,7 @@ async def spawn_worker_impl(
     if (raw_prompt or "").strip():
         initial_prompt += _repo_sync_footer()
     if runtime == "claude":
-        extra_args = _claude_worker_settings_args() + (extra_args or [])
+        extra_args = _claude_worker_settings_args(extra_args) + (extra_args or [])
     else:
         extra_args = extra_args or []
     # Operators inject worker env via [spawn.env] (e.g. a headless-autonomy flag a
@@ -2261,6 +2413,7 @@ async def spawn_worker_impl(
         assignment_id, name, raw_prompt, preset, cwd,
         manager_sid, parent_manager_name, runtime,
         ticket=ticket,
+        spawn_extra_args=extra_args,
     )
     env = {**(env or {}), "CLAUDE_ASSIGNMENT_ID": assignment_id}
     try:
@@ -2352,9 +2505,18 @@ async def spawn_worker(
               already taken by an active record, an auto-suffix '-2', '-3' is appended.
         cwd: Working directory for the worker. Defaults to current cwd.
         extra_args: Extra CLI flags passed to the selected runtime before the
-            prompt (e.g. ["--model", "gpt-5.5"]). Claude workers still get
-            the orchestrator's remote-control-off `--settings` flags before
-            caller args. Codex workers get `--ask-for-approval never --sandbox
+            prompt (e.g. ["--model", "gpt-5.5"]). Claude workers default to `--settings <deployed
+            worker-headless-settings.json>` (auto mode + protocol allowlist +
+            operator code-roots additionalDirectories) before caller args; a
+            caller-passed --settings REPLACES the preset entirely (last-wins).
+            extra_args=["--permission-mode", "default"] re-gates FILE EDITS only
+            for one spawn (the preset's allow rules — git commit/checkout/etc. —
+            still auto-approve, since allow rules are consulted before the mode
+            default); for a fully-manual spawn pass your own --settings. The
+            final composed extra_args are persisted on the assignment record and
+            replayed verbatim by resume_worker, so a resumed worker keeps the
+            exact permissions it was born with. Fleet-wide opt-out:
+            [spawn] worker_headless_preset=false. Codex workers get `--ask-for-approval never --sandbox
             danger-full-access --dangerously-bypass-hook-trust` plus a
             worker-protocol bootstrap prompt; caller args cannot override those
             defaults or pass known Claude-only flags.
@@ -2392,7 +2554,7 @@ async def spawn_worker(
             non-blank prompt (keyed or not) additionally gets a repo-sync
             footer (sync a repo once before reading it). Blank prompts are
             left untouched.
-        force: Bypass the usage breaker + both-hot pause for THIS spawn only (still
+        force: Bypass the usage breaker + the all-accounts-near-limit pause for THIS spawn only (still
             headroom-weighted, still skips bricked accounts). Use for a genuinely
             urgent spawn when the gate returned {"status":"paused"}. If the chosen
             account is truly maxed the worker will brick and stale_monitor's flip
@@ -2400,9 +2562,11 @@ async def spawn_worker(
 
     Returns:
         On a normal spawn, the worker record dict. May instead return
-        `{"status":"paused", "reason", "a_pct", "b_pct", "earliest_reset_ts",
-        "retry_after_s"}` instead of spawning when every selectable account is
-        >=88% of its limit; pass `force=True` to override.
+        `{"status":"paused", "reason", "hint", "<name>_pct" (one per pool
+        account), "earliest_reset_ts", "retry_after_s"}` instead of spawning
+        when every selectable account is >= the pause threshold ([accounts]
+        usage_pause_pct, default 88) of its 5h limit; pass `force=True` to
+        override.
     """
     return await spawn_worker_impl(initial_prompt, name, cwd, extra_args, env, preset, manager_sid, runtime, task_key, force)
 
@@ -2722,12 +2886,14 @@ def _repo_sync_footer() -> str:
         "\n\n---\n"
         "[orchestrator] Repo freshness — sync once, then read normally\n"
         "Before you read any repo on this machine to investigate it, sync it "
-        "ONCE first: `git -C <repo> fetch origin main`, then "
-        "`git -C <repo> merge --ff-only origin/main` (if on main) or "
-        "`git -C <repo> rebase origin/main` (feature branch). If it can't "
-        "ff/rebase (local uncommitted changes / diverged — abort a conflicted "
-        "rebase with `git rebase --abort`), do NOT silently read a stale tree "
-        "— note it and read the specific files off `origin/main` "
+        "ONCE first — run each as its OWN single command (plain single "
+        "commands stay headless-approvable; chained commands and path-scoped "
+        "git forms trip the permission gate): `cd <repo>`, then `git fetch "
+        "origin main`, then `git merge --ff-only origin/main` (if on main) or "
+        "`git rebase origin/main` (feature branch). If it can't ff/rebase "
+        "(local uncommitted changes / diverged — abort a conflicted rebase "
+        "with `git rebase --abort`), do NOT silently read a stale tree — "
+        "note it and read the specific files off `origin/main` "
         "(`git show origin/main:<path>`). Then use normal Grep/Read on the "
         "now-current tree."
     )
@@ -2754,16 +2920,21 @@ def _current_branch(cwd: str) -> str | None:
 
 def _write_pending_assignment(assignment_id, name, raw_prompt, preset, cwd,
                               manager_sid, parent_manager_name, runtime,
-                              ticket=None) -> None:
+                              ticket=None, spawn_extra_args=None) -> None:
     """Spawn-authored half of the ownership record. The spawn path cannot know
     the sid (it's born at the worker's SessionStart), so content is written here
     under a private uuid and the hook claims it to assignments/<sid>.json —
-    env-keyed (CLAUDE_ASSIGNMENT_ID), exactly-once via os.replace.
+    env-keyed (CLAUDE_ASSIGNMENT_ID), exactly-once via os.replace (a whole-file
+    rename, so every field here survives to the sid-keyed record).
 
     The `ticket` field (kept as the on-disk JSON key for state compat) is the
     grouping key for pipeline_status — a tracker key OR any stable personal-task
     slug, resolved once at the spawn site (spawn_worker_impl) so the assignment
-    record and the prompt footer can never diverge."""
+    record and the prompt footer can never diverge.
+
+    `spawn_extra_args` is the FINAL composed runtime extra_args this session was
+    born with (settings/model/effort); resume_worker replays it verbatim so a
+    resumed worker's permissions can never silently widen (verifier Finding 1)."""
     paths.ensure_dirs()
     state.write_json_atomic(paths.pending_assignment_path(assignment_id), {
         "assignment_id": assignment_id,
@@ -2777,6 +2948,7 @@ def _write_pending_assignment(assignment_id, name, raw_prompt, preset, cwd,
         "parent_manager_name": parent_manager_name,
         "runtime": runtime,
         "ticket": ticket,
+        "spawn_extra_args": spawn_extra_args,
         "spawned_at": time.time(),
     })
 
@@ -3045,6 +3217,11 @@ def release_worker_slot(slot_id: str) -> dict:
 
 
 def main() -> None:
+    try:
+        from .spawner import write_registry_snapshot
+        write_registry_snapshot()
+    except Exception:
+        pass  # never block MCP boot on the snapshot
     mcp.run()
 
 if __name__ == "__main__":

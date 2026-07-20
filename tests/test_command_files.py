@@ -1,16 +1,15 @@
 """Regression guards for the slash-command markdown files.
 
-The `/manager`, `/manager-resume`, and `/manager-takeover-recovery` commands
-paint the manager's own tmux tab with a literal `tmux rename-window` +
-`set-window-option window-status-*-style` invocation (the SessionStart hook
-can't — user-launched managers have no CLAUDE_AGENT env). The command-layer
-shapes MUST mirror `TmuxDriver.set_tab_title`/`set_tab_color` in terminal.py:
-key off `$TMUX_PANE`, use the `dockwright` socket via `-L "$SOCK"`, and carry
-the MANAGER_TAB_COLOR backgrounds (#aa0066 active / #440022 inactive) with a
-`fg=#ffffff`. The legacy kitty `kitty @ set-tab-*` form (and its
-`window_id:`-vs-`id:` match caveat) is gone — tmux has no tab/window id-space
-collision, so the guard now asserts the tmux shape and that no kitty residue
-returns.
+The manager boot commands used to paint the manager's own tmux tab with a
+literal `tmux rename-window` + `set-window-option window-status-*-style` bash
+block and run a standalone `preflight_cleanup.py` step. The zero-touch-headless
+migration (E2E F-2) folded both into `become_manager` /
+`become_manager_with_takeover`, which paint the tab and run preflight cleanup
+server-side (mirroring `TmuxDriver.set_tab_title`/`set_tab_color` in terminal.py
+and the MANAGER_TAB_COLOR backgrounds) and return the `preflight` line. The docs
+now surface that returned line instead of re-issuing the expansion-gated bash —
+so the guard asserts the manual `rename-window`/`set-window-option` bash is gone,
+the docs mention `preflight`, and no legacy kitty residue returns.
 """
 import re
 from pathlib import Path
@@ -41,26 +40,30 @@ def _frontmatter_name(text: str) -> str | None:
     return None
 
 
-@pytest.mark.parametrize(
-    "filename", ["manager.md", "manager-resume.md", "manager-takeover-recovery.md"]
-)
-def test_manager_tab_paint_mirrors_tmux_driver(filename):
+BOOT_FILES = [
+    "manager.md",
+    "manager-resume.md",
+    "manager-reboot.md",
+    "manager-takeover-recovery.md",
+]
+
+
+@pytest.mark.parametrize("filename", BOOT_FILES)
+def test_manager_boot_folds_tab_paint_and_preflight_into_become_manager(filename):
     text = (COMMANDS / filename).read_text()
-    # The tab-paint block must key off the tmux pane and mirror TmuxDriver.
-    assert "[ -n \"$TMUX_PANE\" ]" in text, (
-        f"{filename}: manager tab paint must gate on $TMUX_PANE"
+    # become_manager / become_manager_with_takeover now paint the tab + run
+    # preflight cleanup server-side (Task 7). The manual tmux tab-paint bash and
+    # the standalone preflight step were folded away — the docs must surface the
+    # returned `preflight` line, not re-issue the expansion-gated paint bash.
+    assert "rename-window" not in text, (
+        f"{filename}: manual tmux tab-paint bash must be gone (folded into become_manager)"
     )
-    assert 'tmux -L "$SOCK" rename-window -t "$TMUX_PANE"' in text, (
-        f"{filename}: tab title must use tmux rename-window (TmuxDriver.set_tab_title)"
+    assert "set-window-option" not in text, (
+        f"{filename}: manual tab-color bash must be gone (folded into become_manager)"
     )
-    assert (
-        'set-window-option -t "$TMUX_PANE" window-status-current-style "bg=#aa0066,fg=#ffffff"'
-        in text
-    ), f"{filename}: active tab color must mirror TmuxDriver.set_tab_color"
-    assert (
-        'set-window-option -t "$TMUX_PANE" window-status-style "bg=#440022,fg=#ffffff"'
-        in text
-    ), f"{filename}: inactive tab color must mirror TmuxDriver.set_tab_color"
+    assert "preflight" in text, (
+        f"{filename}: must surface the server-side preflight line"
+    )
     # The legacy kitty form must never reappear.
     assert "kitty @" not in text, f"{filename}: kitty residue must not return"
     assert "--match=window_id:$KITTY_WINDOW_ID" not in text, (
@@ -71,9 +74,12 @@ def test_manager_tab_paint_mirrors_tmux_driver(filename):
 @pytest.mark.parametrize("filename", ["manager.md", "manager-resume.md"])
 def test_manager_commands_resolve_claude_session_id(filename):
     # Managers are Claude-only — own-sid resolution uses CLAUDE_CODE_SESSION_ID,
-    # with no Codex ($CODEX_THREAD_ID) branch.
+    # with no Codex ($CODEX_THREAD_ID) branch. The shell probe is the
+    # expansion-free `printenv` form, not the gated `echo $…` recipe (E2E F-2).
     text = (COMMANDS / filename).read_text()
     assert "CLAUDE_CODE_SESSION_ID" in text
+    assert "printenv CLAUDE_CODE_SESSION_ID" in text
+    assert "echo $CLAUDE_CODE_SESSION_ID" not in text
     assert "Do not invent or synthesize a sid" in text
     assert "CODEX_THREAD_ID" not in text
 
@@ -138,7 +144,14 @@ def test_bootstrap_recreate_is_claude_only():
     # Manager lane is pinned to opus[1m] (orch-audit model-allocation) — see
     # tests/test_model_pins.py::test_bootstrap_recreate_pins_manager_opus for
     # the dedicated pin assertion; this test only guards claude-only-ness.
-    assert "claude --model 'opus[1m]' '/manager-resume $HANDOFF_ID'" in text
+    # Anchored on the claude binary + the manager-resume prompt separately:
+    # the RUNTIME_CMD now interposes ${RC_ARG} (--remote-control, default-on)
+    # and ${SKIP_ARG} (--dangerously-skip-permissions, opt-in) between the
+    # claude binary and the --model pin (arg-order fix: a bare
+    # --remote-control [name] must be followed by a dash-option, never the
+    # trailing prompt), so `claude` and `--model` are no longer adjacent.
+    assert "claude ${RC_ARG}${SKIP_ARG}--model 'opus[1m]'" in text
+    assert "'/manager-resume $HANDOFF_ID'" in text
     # No manager-runtime / codex plumbing survives.
     assert "MANAGER_RUNTIME" not in text
     assert "manager_runtime" not in text

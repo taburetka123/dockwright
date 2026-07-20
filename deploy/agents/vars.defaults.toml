@@ -1,6 +1,9 @@
 # Generic defaults for {{vars}} in the core agent files (Step 3 carve).
 # Operator values (dockwright.toml [agent_vars]) override per-key; the
 # operator overlay carries the original operator bytes.
+# `<absolute-home>` inside a VALUE expands to the installing user's absolute
+# home at compose time (operator overrides may use it too); the literal
+# token surviving into composed output is a ComposeError.
 [agent_vars]
 a_bash_outage_anchor = ''
 a_carryover_rejustify_anchor = ''

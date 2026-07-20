@@ -183,13 +183,168 @@ def no_live_tmux(monkeypatch, request):
     return absorbed
 
 
+# tmux shim body. __REAL_TMUX__ is replaced with the absolute real-tmux path
+# (resolved BEFORE any PATH change) or "" on a tmux-less machine. Throwaway
+# sockets (pid-scoped, isolated from the live fleet) pass through to the real
+# binary; the live/default socket is blocked with exit 97, and mgr is blocked
+# there specifically. `tmux -V` answers with a marker so a meta-test can prove
+# this shim is what PATH resolves.
+_TMUX_SHIM = """#!/bin/bash
+# pytest CLI shim — no test subprocess may touch the LIVE tmux socket or the
+# operator's mgr session. Throwaway sockets (pid-scoped wt-iso-* / dockwright-e2e-*,
+# never the live fleet) pass through to the real binary; the live/default socket
+# is blocked. A bare `tmux` (no -L) is judged by the socket its $TMUX names. mgr
+# is blocked on the live/default socket but NOT on a throwaway (an isolated
+# throwaway server's own mgr is harmless — real_tmux tests create/switch it).
+# tmux -V answers with a marker so a meta-test can prove this shim is what PATH
+# resolves.
+REAL_TMUX="__REAL_TMUX__"   # absolute path baked in at write time, may be empty
+if [ "${1:-}" = "-V" ]; then echo "tmux-shim (dockwright test guard)"; exit 0; fi
+sock=""
+targets_mgr=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-L" ]; then sock="$a"; fi
+  if [ "$prev" = "-t" ] || [ "$prev" = "-s" ]; then
+    case "${a%%:*}" in mgr) targets_mgr=1 ;; esac
+  fi
+  prev="$a"
+done
+# No explicit -L: a bare `tmux` targets the server named by $TMUX (the run-shell
+# child pattern deploy/tmux/status_row.py::_tmux uses). Derive the effective
+# socket from $TMUX so a throwaway server's own status-line jobs pass through,
+# while a bare call under the LIVE $TMUX (or none) is still blocked below.
+if [ -z "$sock" ] && [ -n "${TMUX:-}" ]; then
+  tmux_path="${TMUX%%,*}"
+  sock="${tmux_path##*/}"
+fi
+# Throwaway sockets are pid-scoped and never the live fleet — pass through to the
+# real binary. A mgr session on such a server is isolated and harmless, so the
+# throwaway allowlist wins over the mgr guard (real_tmux tests, e.g.
+# test_manager_launch, create and switch a real mgr on their own socket).
+case "$sock" in
+  wt-iso-*|dockwright-e2e-*)
+    if [ -n "$REAL_TMUX" ]; then exec "$REAL_TMUX" "$@"; fi
+    echo "BLOCKED: no real tmux on this machine for throwaway socket $sock" >&2
+    exit 97 ;;
+esac
+# Non-throwaway socket (live / default / unknown): block. Targeting mgr here is
+# the operator's live manager — a bare `tmux -t mgr` under the live $TMUX derives
+# sock=dockwright and lands here (the 2026-07-17 incident's exact shape).
+if [ -n "$targets_mgr" ]; then
+  echo "BLOCKED: test subprocess targeted the manager session 'mgr' on non-throwaway socket '${sock:-<default=live>}' (argv: $*)" >&2
+  exit 97
+fi
+echo "BLOCKED: test subprocess tried to reach tmux socket '${sock:-<default=live>}' (argv: $*)" >&2
+exit 97
+"""
+
+# claude/codex shim body: unconditional block. A manager/worker CLI agent must
+# NEVER launch from a test subprocess (the 2026-07-17 incident spawned two).
+_CLI_AGENT_SHIM = """#!/bin/bash
+echo "BLOCKED: test subprocess tried to launch a real CLI agent ($0 $*)" >&2
+exit 97
+"""
+
+
+@pytest.fixture(scope="session")
+def _cli_shim_dir(tmp_path_factory):
+    """Write blocking tmux/claude/codex shims into a fresh dir and return it.
+
+    The REAL tmux path is resolved HERE (shutil.which before any PATH change) so
+    the throwaway-socket passthrough still finds the genuine binary once the shim
+    dir fronts PATH. Resolving it after the prepend would re-resolve to the shim
+    itself — an infinite exec loop — so this MUST run before no_live_subprocess_cli
+    (which depends on this fixture, guaranteeing the ordering)."""
+    real_tmux = shutil.which("tmux") or ""
+    d = tmp_path_factory.mktemp("cli-shim")
+    tmux = d / "tmux"
+    tmux.write_text(_TMUX_SHIM.replace("__REAL_TMUX__", real_tmux))
+    tmux.chmod(0o755)
+    for name in ("claude", "codex"):
+        p = d / name
+        p.write_text(_CLI_AGENT_SHIM)
+        p.chmod(0o755)
+    return d
+
+
+@pytest.fixture(autouse=True)
+def no_live_subprocess_cli(_cli_shim_dir, monkeypatch):
+    """Front PATH with blocking tmux/claude/codex shims for EVERY test.
+
+    no_live_tmux guards PYTHON-level tmux entries (subprocess.run /
+    create_subprocess_exec as module attributes). It does NOT reach a CHILD bash
+    process: a test that shells a deploy script (test_module_toggle,
+    test_gardener_run_tmux, test_statusline_usage_tap, the bootstrap-recreate
+    guards) hands that script an inherited PATH, and the script's own `tmux` /
+    `claude` resolution is untouched by the python guard.
+
+    2026-07-17 incident: a subagent self-checked its bootstrap-recreate.sh edit by
+    copying the script to /tmp and executing it twice with a sandboxed HOME.
+    Sandboxed HOME sandboxes nothing about tmux — bootstrap-recreate.sh defaults
+    TMUX_SOCK to the LIVE `dockwright` socket and spawned two real
+    `claude '/manager-resume <fabricated-uuid>'` windows into the operator's live
+    `mgr` session. This PATH shim closes that boundary: any tmux the script
+    resolves is the blocking shim (throwaway sockets excepted), and claude/codex
+    can never launch. Exit code 97 is the single BLOCKED signature."""
+    monkeypatch.setenv("PATH", f"{_cli_shim_dir}{os.pathsep}{os.environ['PATH']}")
+
+
 @pytest.fixture(autouse=True)
 def _dockwright_config_hermetic(monkeypatch, tmp_path):
     """Every test runs as if no dockwright.toml exists unless it sets
     DOCKWRIGHT_CONFIG itself — an operator's real ~/.claude/dockwright.toml
     must never leak into the suite. An explicit env path that doesn't exist
-    is authoritative 'no config' per config.config_path()."""
+    is authoritative 'no config' per config.config_path(). Same for the
+    operator's DOCKWRIGHT_MANAGER_RC opt-out and DOCKWRIGHT_MANAGER_SKIP_PERMS
+    opt-in: tests assert the default tails and would fail machine-dependently
+    if either leaked."""
     monkeypatch.setenv("DOCKWRIGHT_CONFIG", str(tmp_path / "no-dockwright.toml"))
+    monkeypatch.delenv("DOCKWRIGHT_MANAGER_RC", raising=False)
+    monkeypatch.delenv("DOCKWRIGHT_MANAGER_SKIP_PERMS", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_presets(monkeypatch, tmp_path):
+    """paths.PRESETS resolves to the live ~/.claude/dockwright/presets/ — on a
+    host where setup.sh has deployed manager-settings.json, _runtime_argv()
+    (and any other preset reader) silently picks it up and argv assertions
+    fail machine-dependently. Point PRESETS at a nonexistent tmp path (a
+    pristine, setup-never-ran host); tests that need presets create and
+    patch their own, as test_mcp_tools/test_sweep/test_monitor_cli already do."""
+    monkeypatch.setattr(paths, "PRESETS", tmp_path / "no-presets")
+
+
+@pytest.fixture(autouse=True)
+def _no_live_account_registry(monkeypatch, tmp_path):
+    """paths.ACCOUNT_REGISTRY resolves into the real ~/.claude/dockwright/. Any
+    spawn path — spawn_worker_impl, become_manager_impl — calls
+    spawner.write_registry_snapshot(), which WRITES that file; the ~20+ spawn
+    tests therefore clobbered the operator's LIVE registry snapshot (2026-07-17).
+    Redirect it to tmp for EVERY test — the in-process sibling of the PATH-shim
+    subprocess boundary (test_no_live_spawn_boundary). Tests that assert on the
+    registry patch their own path, as test_spawner_registry/test_stale_monitor do."""
+    monkeypatch.setattr(paths, "ACCOUNT_REGISTRY", tmp_path / "account-registry.json")
+
+
+@pytest.fixture(autouse=True)
+def _no_live_account_state(monkeypatch, tmp_path, request):
+    """The account lanes read/write paths under the LIVE state root at call time:
+    usage_spawn_gate reads ACCOUNT_USAGE (a hot live 5h window paused ~46 spawn
+    tests, Tier-2 on PR #215), _pick_account reads ACCOUNT_ACTIVE (the operator's
+    live pointer feature-gates the picker inside tests) and ACCOUNT_STATE (live
+    bricks skew selection) and WRITES SPAWN_COUNTER (suite runs advanced the
+    fleet's round-robin to 920). Sandbox all four per-test. tests/test_paths.py
+    is exempt: it pins the real module-level path wiring (ACCOUNT_ACTIVE == ROOT
+    / "account-active") and never touches file contents."""
+    if request.module.__name__.endswith("test_paths"):
+        yield
+        return
+    monkeypatch.setattr(paths, "ACCOUNT_USAGE", tmp_path / "no-live-usage")
+    monkeypatch.setattr(paths, "ACCOUNT_ACTIVE", tmp_path / "no-live-account-active")
+    monkeypatch.setattr(paths, "ACCOUNT_STATE", tmp_path / "no-live-account-state.json")
+    monkeypatch.setattr(paths, "SPAWN_COUNTER", tmp_path / "no-live-spawn-counter.json")
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -201,6 +356,18 @@ def _fast_spawn_registration(monkeypatch):
     from dockwright import mcp_server
     monkeypatch.setattr(mcp_server, "_DEFAULT_REGISTRATION_TIMEOUT_SEC", 0.05, raising=True)
     monkeypatch.setattr(mcp_server, "_DEFAULT_REGISTRATION_POLL_SEC", 0.01, raising=True)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_preflight_cleanup(monkeypatch):
+    """become_manager_impl now shells out to the deployed
+    ~/.claude/scripts/preflight_cleanup.py — which DELETES real files from the
+    live ~/.claude/dockwright/ state (handoffs/done/closed/active). That script's
+    argv[0] is sys.executable, not "tmux", so the no_live_tmux absorber lets it
+    through to the real binary. Stub the helper to "" so no test mutates live
+    state; tests exercising the absorption path monkeypatch it themselves."""
+    from dockwright import mcp_server
+    monkeypatch.setattr(mcp_server, "_run_preflight_cleanup", lambda: "", raising=True)
 
 
 @pytest.fixture
@@ -226,6 +393,18 @@ def real_tmux(monkeypatch, request, tmp_path):
     monkeypatch.setenv("CLAUDE_ORCH_TMUX_SOCKET", sock)
     terminal._DRIVER = None
     return sock
+
+
+@pytest.fixture(autouse=True)
+def _no_host_claude_json_writes(monkeypatch, tmp_path):
+    """L-11 pre-trust writes ~/.claude.json through trust._default_config_json().
+    Redirect the seam for EVERY test: spawn_worker_tab / manager_launch /
+    ensure-worker-home are exercised all over the suite, and without this an
+    ordinary pytest run would plant tmp_path trust entries in the developer's
+    real ~/.claude.json. Trust tests pass explicit config_json paths."""
+    from dockwright import trust
+    monkeypatch.setattr(trust, "_default_config_json",
+                        lambda: tmp_path / "host-claude-config.json")
 
 
 @pytest.fixture(autouse=True, scope="session")

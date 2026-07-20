@@ -234,7 +234,7 @@ def test_monitor_turn_ends_suppresses_nested_record(fresh_orchestrator_dir, caps
 def test_monitor_turn_ends_superseded_older_files_emit_once(fresh_orchestrator_dir, capsys, tmp_path, monkeypatch):
     """Two aged turn-ends for the same worker → exactly one line (the lull)."""
     monkeypatch.setattr(monitor, "_seen_file", lambda kind, name: tmp_path / f".seen-{kind}-{name}")
-    _write_aged_turn_end("test-mgr", "wkr-1", age_sec=600)
+    _write_aged_turn_end("test-mgr", "wkr-1", age_sec=1300)  # gap > episode grace: not burst evidence
     _write_aged_turn_end("test-mgr", "wkr-1", age_sec=300)
     _write_worker_record("wkr-1")
     monitor.run_turn_ends_scan()
@@ -280,6 +280,97 @@ def test_monitor_turn_ends_does_not_read_unscoped(fresh_orchestrator_dir, capsys
     assert "orphan" not in out
 
 
+# ---- turn-burst (episode) hold: closely-spaced turn-ends are a poll/wait ----
+# cadence, not a finish. The newest lull of a burst is held PENDING until the
+# episode grace, so a polling worker pages at most once per episode boundary
+# (observed 2026-07-16: macos-vm-spike paged once per poll cycle; tkt-1234
+# paged while waiting on a background CI-poll Bash task).
+
+def test_turn_burst_holds_newest_lull(fresh_orchestrator_dir, capsys, tmp_path, monkeypatch):
+    monkeypatch.setattr(monitor, "_seen_file", lambda kind, name: tmp_path / f".seen-{kind}-{name}")
+    monkeypatch.setenv("HOME", str(fresh_orchestrator_dir))
+    _write_aged_turn_end("test-mgr", "wkr-poll", age_sec=480)   # prior poll turn
+    _write_aged_turn_end("test-mgr", "wkr-poll", age_sec=300)   # newest, 3min later
+    _write_worker_record("wkr-poll")
+    monitor.run_turn_ends_scan()
+    assert capsys.readouterr().out.strip() == ""
+    seen = tmp_path / ".seen-turn-ends-test-mgr"
+    if seen.exists():
+        assert "wkr-poll" not in seen.read_text() or \
+            sum("wkr-poll" in line for line in seen.read_text().splitlines()) == 1, \
+            "only the SUPERSEDED older file may be consumed; the newest must stay pending"
+
+
+def test_turn_burst_fires_once_past_episode_grace(fresh_orchestrator_dir, capsys, tmp_path, monkeypatch):
+    """End of episode: the last turn-end of a burst ages past the episode
+    grace and fires exactly once — delayed, never swallowed."""
+    monkeypatch.setattr(monitor, "_seen_file", lambda kind, name: tmp_path / f".seen-{kind}-{name}")
+    monkeypatch.setenv("HOME", str(fresh_orchestrator_dir))
+    _write_aged_turn_end("test-mgr", "wkr-pend", age_sec=1180)
+    _write_aged_turn_end("test-mgr", "wkr-pend", age_sec=1000)  # newest, past 900s
+    _write_worker_record("wkr-pend")
+    monitor.run_turn_ends_scan()
+    assert "FINISHED_SILENTLY wkr-pend" in capsys.readouterr().out
+    monitor.run_turn_ends_scan()
+    assert capsys.readouterr().out.strip() == ""
+
+
+def test_turn_burst_holds_mid_episode_after_first_lull_paged(fresh_orchestrator_dir, capsys, tmp_path, monkeypatch):
+    """The first lull of an episode pages once and gets seen-marked; a
+    mid-episode lull must STILL be burst-held — an already-resolved sibling
+    is burst evidence, not closed business. (Guards against filtering
+    prior_ts by the seen set, which would revive the per-lull flood.)
+    Ladder base is forced to 1s so only classification can hold the second
+    lull — otherwise FS_HOLD masks the difference."""
+    monkeypatch.setattr(monitor, "_seen_file", lambda kind, name: tmp_path / f".seen-{kind}-{name}")
+    monkeypatch.setenv("HOME", str(fresh_orchestrator_dir))
+    monkeypatch.setenv("CLAUDE_ORCH_FS_LADDER_BASE_SEC", "1")
+    _write_aged_turn_end("test-mgr", "wkr-mid", age_sec=1000)
+    _write_worker_record("wkr-mid")
+    monitor.run_turn_ends_scan()
+    assert "FINISHED_SILENTLY wkr-mid" in capsys.readouterr().out
+    _write_aged_turn_end("test-mgr", "wkr-mid", age_sec=300)
+    time.sleep(1.1)
+    monitor.run_turn_ends_scan()
+    assert capsys.readouterr().out.strip() == "", \
+        "mid-episode lull must be held at classification even though its sibling was paged+seen"
+
+
+def test_singleton_turn_end_unaffected_by_burst_hold(fresh_orchestrator_dir, capsys, tmp_path, monkeypatch):
+    """No sibling within the episode window → the common genuine case pages
+    at the base grace exactly as before."""
+    monkeypatch.setattr(monitor, "_seen_file", lambda kind, name: tmp_path / f".seen-{kind}-{name}")
+    monkeypatch.setenv("HOME", str(fresh_orchestrator_dir))
+    _write_aged_turn_end("test-mgr", "wkr-solo", age_sec=300)
+    _write_worker_record("wkr-solo")
+    monitor.run_turn_ends_scan()
+    assert "FINISHED_SILENTLY wkr-solo" in capsys.readouterr().out
+
+
+def test_distant_sibling_does_not_engage_burst_hold(fresh_orchestrator_dir, capsys, tmp_path, monkeypatch):
+    """A sibling from a PREVIOUS episode (gap > episode grace) is not burst
+    evidence."""
+    monkeypatch.setattr(monitor, "_seen_file", lambda kind, name: tmp_path / f".seen-{kind}-{name}")
+    monkeypatch.setenv("HOME", str(fresh_orchestrator_dir))
+    _write_aged_turn_end("test-mgr", "wkr-gap", age_sec=1500)   # >900s before newest
+    _write_aged_turn_end("test-mgr", "wkr-gap", age_sec=300)
+    _write_worker_record("wkr-gap")
+    monitor.run_turn_ends_scan()
+    assert "FINISHED_SILENTLY wkr-gap" in capsys.readouterr().out
+
+
+def test_burst_hold_does_not_delay_exited_session(fresh_orchestrator_dir, capsys, tmp_path, monkeypatch):
+    """A gone session (no active record) pages at the base grace even inside
+    a burst — new information beats episode patience."""
+    monkeypatch.setattr(monitor, "_seen_file", lambda kind, name: tmp_path / f".seen-{kind}-{name}")
+    monkeypatch.setenv("HOME", str(fresh_orchestrator_dir))
+    _write_aged_turn_end("test-mgr", "wkr-gone", age_sec=480)
+    _write_aged_turn_end("test-mgr", "wkr-gone", age_sec=300)
+    # no _write_worker_record → active record missing → EMIT_EXITED path
+    monitor.run_turn_ends_scan()
+    assert "FINISHED_SILENTLY wkr-gone (session exited)" in capsys.readouterr().out
+
+
 def test_monitor_questions_emits_only_current_manager_questions(fresh_orchestrator_dir, capsys, tmp_path, monkeypatch):
     monkeypatch.setattr(monitor, "_seen_file", lambda kind, name: tmp_path / f".seen-{kind}-{name}")
     _write_question("test-mgr", "q-mine", "mine-worker", question="ours?")
@@ -323,7 +414,7 @@ def test_main_module_dispatches_monitor_done(fresh_orchestrator_dir, monkeypatch
     """End-to-end: invoking `python -m dockwright monitor done` via
     the main dispatcher reaches run_done_scan."""
     called = []
-    monkeypatch.setattr(monitor, "run_done_scan", lambda: called.append("done"))
+    monkeypatch.setattr(monitor, "run_done_scan", lambda mgr=None: called.append("done"))
     from dockwright.__main__ import main as dispatcher_main
     monkeypatch.setattr(sys, "argv", ["dockwright", "monitor", "done"])
     dispatcher_main()
@@ -332,7 +423,7 @@ def test_main_module_dispatches_monitor_done(fresh_orchestrator_dir, monkeypatch
 
 def test_main_module_dispatches_monitor_questions(fresh_orchestrator_dir, monkeypatch, capsys):
     called = []
-    monkeypatch.setattr(monitor, "run_questions_scan", lambda: called.append("questions"))
+    monkeypatch.setattr(monitor, "run_questions_scan", lambda mgr=None: called.append("questions"))
     from dockwright.__main__ import main as dispatcher_main
     monkeypatch.setattr(sys, "argv", ["dockwright", "monitor", "questions"])
     dispatcher_main()
@@ -484,10 +575,10 @@ def test_monitor_turn_ends_holds_while_subagent_grows(fresh_orchestrator_dir, ca
 def test_monitor_turn_ends_emits_once_subagent_quiet_past_grace(fresh_orchestrator_dir, capsys, tmp_path, monkeypatch):
     monkeypatch.setattr(monitor, "_seen_file", lambda kind, name: tmp_path / f".seen-{kind}-{name}")
     monkeypatch.setenv("HOME", str(fresh_orchestrator_dir))
-    _write_aged_turn_end("test-mgr", "wkr-dead", age_sec=600)
+    _write_aged_turn_end("test-mgr", "wkr-dead", age_sec=1200)
     _write_worker_record("wkr-dead")
-    # subagent grew after turn-end (300s < 600s) but has been quiet 300s > grace
-    _make_subagent_tree(fresh_orchestrator_dir, "wkr-dead", log_age_sec=600, agent_write_age_sec=300)
+    # subagent grew after turn-end (1000 < 1200) but has been quiet 1000s > episode grace
+    _make_subagent_tree(fresh_orchestrator_dir, "wkr-dead", log_age_sec=1200, agent_write_age_sec=1000)
     monitor.run_turn_ends_scan()
     assert "FINISHED_SILENTLY wkr-dead" in capsys.readouterr().out
     monitor.run_turn_ends_scan()                          # edge-triggered: once
@@ -508,12 +599,9 @@ def test_monitor_turn_ends_emits_when_subagent_writes_predate_turn_end(fresh_orc
 
 def test_delegation_hold_true_at_exact_turn_end_tie(fresh_orchestrator_dir, monkeypatch):
     """Subagent write exactly AT the turn-end ts counts as at/after (>=, not
-    strict >) — a hold, when fresh. Pinned on _delegation_hold directly: the
-    full classifier can't surface this equality as PENDING because the same
-    grace gates the young-file check (now - ts < grace → PENDING before the
-    hold is reached) and the hold's freshness (now - latest < grace) — with
-    latest == ts those are the same quantity, so 'old enough to classify' and
-    'fresh enough to hold' are mutually exclusive at the tie."""
+    strict >) — a hold, when fresh. Pinned on _delegation_hold directly; since
+    the hold freshness split to the episode grace, the classifier CAN surface
+    a tie as PENDING once the file is past the base grace."""
     monkeypatch.setenv("HOME", str(fresh_orchestrator_dir))
     ts = time.time() - 10                                 # one captured instant
     project_dir = fresh_orchestrator_dir / ".claude" / "projects" / "-Users-test"
@@ -563,6 +651,56 @@ def test_monitor_turn_ends_codex_worker_skips_subagent_check(fresh_orchestrator_
     _make_subagent_tree(fresh_orchestrator_dir, "wkr-cdx", log_age_sec=300, agent_write_age_sec=10)
     monitor.run_turn_ends_scan()
     assert "FINISHED_SILENTLY wkr-cdx" in capsys.readouterr().out
+
+
+def test_delegation_hold_survives_slow_subagent_write_gap(fresh_orchestrator_dir, capsys, tmp_path, monkeypatch):
+    """The confirmed 2026-07-16 false-fire class: a LIVE reviewer subagent
+    thinking/reading 3-4min between transcript writes (observed gaps
+    208s/239s/165s) aged out of the old 120s freshness and paged the manager.
+    The hold now ages on the 900s episode grace."""
+    monkeypatch.setattr(monitor, "_seen_file", lambda kind, name: tmp_path / f".seen-{kind}-{name}")
+    monkeypatch.setenv("HOME", str(fresh_orchestrator_dir))
+    _write_aged_turn_end("test-mgr", "wkr-slow", age_sec=600)
+    _write_worker_record("wkr-slow")
+    # subagent wrote 300s ago — after the 600s-old turn-end; 300s > old 120s
+    # grace but well inside the 900s episode grace → still held
+    _make_subagent_tree(fresh_orchestrator_dir, "wkr-slow", log_age_sec=600, agent_write_age_sec=300)
+    monitor.run_turn_ends_scan()
+    assert capsys.readouterr().out.strip() == ""
+    assert not (tmp_path / ".seen-turn-ends-test-mgr").exists()
+
+
+def test_delegation_hold_expires_past_episode_grace(fresh_orchestrator_dir, capsys, tmp_path, monkeypatch):
+    """A dead subagent still fires once — at the episode grace instead of the
+    old 120s (the spec's accepted latency growth)."""
+    monkeypatch.setattr(monitor, "_seen_file", lambda kind, name: tmp_path / f".seen-{kind}-{name}")
+    monkeypatch.setenv("HOME", str(fresh_orchestrator_dir))
+    _write_aged_turn_end("test-mgr", "wkr-deadsa", age_sec=1200)
+    _write_worker_record("wkr-deadsa")
+    # subagent grew after turn-end (1000 < 1200) but quiet 1000s > 900s
+    _make_subagent_tree(fresh_orchestrator_dir, "wkr-deadsa", log_age_sec=1200, agent_write_age_sec=1000)
+    monitor.run_turn_ends_scan()
+    assert "FINISHED_SILENTLY wkr-deadsa" in capsys.readouterr().out
+
+
+def test_episode_grace_env_override(monkeypatch):
+    monkeypatch.setenv("CLAUDE_ORCH_EPISODE_GRACE_SEC", "1800")
+    monkeypatch.delenv("CLAUDE_ORCH_TURN_END_GRACE_SEC", raising=False)
+    assert monitor._episode_grace_sec() == 1800
+
+
+def test_episode_grace_clamps_to_base_grace(monkeypatch):
+    """Invariant episode_grace >= base_grace: an operator raising the shared
+    turn-end grace past 900 must not invert the two."""
+    monkeypatch.setenv("CLAUDE_ORCH_TURN_END_GRACE_SEC", "1200")
+    monkeypatch.delenv("CLAUDE_ORCH_EPISODE_GRACE_SEC", raising=False)
+    assert monitor._episode_grace_sec() == 1200
+
+
+def test_episode_grace_default(monkeypatch):
+    monkeypatch.delenv("CLAUDE_ORCH_EPISODE_GRACE_SEC", raising=False)
+    monkeypatch.delenv("CLAUDE_ORCH_TURN_END_GRACE_SEC", raising=False)
+    assert monitor._episode_grace_sec() == 900
 
 
 # ---- live transcript re-read at emit time -----------------------------------
@@ -963,7 +1101,12 @@ def test_fs_crash_before_ladder_write_duplicates_not_loses(fs_scan, capsys, monk
     # again promptly (duplicate) instead of being silenced.
     _write_fs_worker_record("wkr-1")
     now = time.time()
-    _write_turn_end_at("test-mgr", "wkr-1", now - 300)
+    # first turn-end sits OUTSIDE the episode grace of the retry (gap > 900s),
+    # so the burst hold cannot interfere with the at-least-once check; a
+    # mid-burst retry is covered by
+    # test_turn_burst_holds_mid_episode_after_first_lull_paged (delayed
+    # <= episode grace, never silenced).
+    _write_turn_end_at("test-mgr", "wkr-1", now - 1300)
     real_write = state.write_json_atomic
 
     def failing_ladder_write(path, data):
@@ -1013,3 +1156,92 @@ def test_load_seen_normalizes_legacy_root_prefix(tmp_path, monkeypatch):
     seen = monitor._load_seen(seen_file)
     assert str(new_root / "done/mgr/abc-1.json") in seen
     assert str(new_root / "done/mgr/def-2.json") in seen
+
+
+# --- N-5: positional manager name -------------------------------------------
+# `dockwright monitor <sub> [manager-name]` must honor the positional name
+# (identity resolution via TMUX_PANE/PPID is the fallback, not the only path)
+# and fail LOUDLY (rc=2) when neither resolves.
+
+
+def test_monitor_stale_honors_positional_manager_name(fresh_orchestrator_dir, monkeypatch):
+    monkeypatch.setenv("TMUX_PANE", "bogus-win")  # pane resolution must fail
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        class R:
+            returncode = 0
+        return R()
+
+    monkeypatch.setattr(monitor.subprocess, "run", fake_run)
+    monitor.main(["stale", "test-mgr"])
+    assert len(calls) == 1
+    assert calls[0][3:] == ["--manager", "test-mgr"]
+
+
+def test_monitor_done_positional_scopes_scan(fresh_orchestrator_dir, capsys, tmp_path, monkeypatch):
+    monkeypatch.setenv("TMUX_PANE", "bogus-win")
+    monkeypatch.setattr(monitor, "_seen_file", lambda kind, name: tmp_path / f".seen-{kind}-{name}")
+    _write_done("test-mgr", "wkr-by-name", summary="done-by-name")
+    monitor.main(["done", "test-mgr"])
+    out = capsys.readouterr().out
+    assert "wkr-by-name" in out
+
+
+def test_monitor_positional_unknown_name_exits_2(fresh_orchestrator_dir, capsys):
+    with pytest.raises(SystemExit) as ei:
+        monitor.main(["stale", "no-such-mgr"])
+    assert ei.value.code == 2
+    err = capsys.readouterr().err
+    assert "no-such-mgr" in err
+    assert "test-mgr" in err  # lists the active managers
+
+
+def test_monitor_extra_args_exit_2(fresh_orchestrator_dir, capsys):
+    with pytest.raises(SystemExit) as ei:
+        monitor.main(["done", "test-mgr", "extra"])
+    assert ei.value.code == 2
+
+
+def test_monitor_unresolvable_identity_exits_2(fresh_orchestrator_dir, monkeypatch):
+    """Regression pin for the E2E N-5 rc claim: a resolution failure must be
+    NON-ZERO (the observed rc=0 was a driver measurement artifact)."""
+    monkeypatch.setenv("TMUX_PANE", "bogus-win")
+    from dockwright import identity
+    monkeypatch.setattr(identity, "_resolve_via_ppid_walk", lambda records: None)
+    with pytest.raises(SystemExit) as ei:
+        monitor.main(["stale"])
+    assert ei.value.code == 2
+
+
+def test_monitor_positional_ambiguous_name_exits_2(fresh_orchestrator_dir, capsys):
+    """Two active manager records sharing the same name: the failure message
+    must say the name is ambiguous (with the match count), not the generic
+    no-record-found message."""
+    state.write_json_atomic(paths.ACTIVE / "mgr-test-2.json", {
+        "claude_sid": "mgr-test-2",
+        "agent": "manager",
+        "name": "test-mgr",
+        "window_id": "test-win-2",
+        "pid": os.getpid(),
+        "domain": "general",
+    })
+    with pytest.raises(SystemExit) as ei:
+        monitor.main(["stale", "test-mgr"])
+    assert ei.value.code == 2
+    err = capsys.readouterr().err
+    assert "ambiguous" in err
+    assert "2" in err
+
+
+def test_monitor_unknown_subcommand_reports_before_name_lookup(fresh_orchestrator_dir, capsys):
+    """Fix D: an unknown subcommand must be reported as such even when the
+    positional manager name is also bogus — never misreported as a
+    no-such-manager-record failure."""
+    with pytest.raises(SystemExit) as ei:
+        monitor.main(["bogus-sub", "no-such-mgr"])
+    assert ei.value.code == 2
+    err = capsys.readouterr().err
+    assert "Unknown monitor subcommand" in err
+    assert "no active manager record" not in err

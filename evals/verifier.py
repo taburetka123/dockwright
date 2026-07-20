@@ -28,16 +28,8 @@ DEFAULT_SETTINGS = os.path.join(
     REPO_ROOT, "deploy", "presets", "verifier-settings.json"
 )
 # Deployed location the live dockwright install actually points at; preferred if present.
-_DEPLOYED_SETTINGS_NEW = os.path.expanduser(
+DEPLOYED_SETTINGS = os.path.expanduser(
     "~/.claude/dockwright/presets/verifier-settings.json"
-)
-_DEPLOYED_SETTINGS_LEGACY = os.path.expanduser(
-    "~/.claude/orchestrator/presets/verifier-settings.json"
-)  # deprecated, one release
-DEPLOYED_SETTINGS = (
-    _DEPLOYED_SETTINGS_NEW if os.path.exists(_DEPLOYED_SETTINGS_NEW)
-    else _DEPLOYED_SETTINGS_LEGACY if os.path.exists(_DEPLOYED_SETTINGS_LEGACY)
-    else _DEPLOYED_SETTINGS_NEW
 )
 
 

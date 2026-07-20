@@ -40,6 +40,24 @@ name = "third"
 '''
 
 
+SOLO_POOL = '''
+[accounts]
+default = "main"
+[[accounts.pool]]
+name = "main"
+'''
+
+
+TWO_POOL = '''
+[accounts]
+default = "a"
+[[accounts.pool]]
+name = "a"
+[[accounts.pool]]
+name = "b"
+'''
+
+
 def test_pick_by_counter_two_accounts_is_legacy_formula():
     # the exact pinned sequences from test_spawner_account must fall out
     seq = [spawner._pick_by_counter(["a", "b"], [6, 4], c) for c in range(10)]
@@ -92,8 +110,9 @@ def test_three_account_gate_emits_per_account_pct(sp, monkeypatch):
     assert payload["third_pct"] == 95
 
 
-def test_default_pool_gate_keys_unchanged(sp, monkeypatch):
+def test_two_pool_gate_keys_unchanged(sp, monkeypatch):
     import time
+    _use_pool(monkeypatch, sp, TWO_POOL)
     (sp / "account-active").write_text("a")
     now = time.time()
     usage = sp / "usage"
@@ -122,6 +141,89 @@ def test_env_weight_override_generalizes(sp, monkeypatch):
     (sp / "account-active").write_text("main")
     seq = [spawner._pick_account() for _ in range(4)]
     assert seq.count("main") == 2
+
+
+def test_no_config_default_is_single_account(sp):
+    assert config.account_names() == ("a",)
+    assert config.accounts() == [config.Account(name="a", config_dir=None, weight=1)]
+
+
+def test_solo_default_pool_picks_only_account_every_time(sp):
+    (sp / "account-active").write_text("a")
+    assert [spawner._pick_account() for _ in range(10)] == ["a"] * 10
+
+
+def test_explicit_solo_pool_custom_name(sp, monkeypatch):
+    _use_pool(monkeypatch, sp, SOLO_POOL)
+    (sp / "account-active").write_text("main")
+    assert [spawner._pick_account() for _ in range(6)] == ["main"] * 6
+
+
+def test_solo_gate_ok_when_cold(sp):
+    (sp / "account-active").write_text("a")
+    assert spawner.usage_spawn_gate() == {"status": "ok"}
+
+
+def test_gate_ignores_7d_only_heat(sp):
+    import time as _t
+    (sp / "account-active").write_text("a")
+    now = _t.time()
+    usage = sp / "usage"
+    usage.mkdir()
+    (usage / "a.json").write_text(json.dumps(
+        {"five_hour_pct": 2, "seven_day_pct": 89,
+         "five_hour_resets_at": now + 3600,
+         "seven_day_resets_at": now + 6 * 86400, "ts": now}))
+    assert spawner.usage_spawn_gate() == {"status": "ok"}
+
+
+def test_gate_pauses_solo_5h_hot_with_hint(sp):
+    import time as _t
+    (sp / "account-active").write_text("a")
+    now = _t.time()
+    usage = sp / "usage"
+    usage.mkdir()
+    (usage / "a.json").write_text(json.dumps(
+        {"five_hour_pct": 92, "seven_day_pct": 10,
+         "five_hour_resets_at": now + 1800, "ts": now}))
+    payload = spawner.usage_spawn_gate()
+    assert payload["status"] == "paused"
+    assert "force" in payload["hint"]
+    assert payload["retry_after_s"] <= 1800 + 1
+    assert "5h" in payload["reason"]
+
+
+def test_pause_pct_from_config_env_wins(sp, monkeypatch):
+    import time as _t
+    _use_pool(monkeypatch, sp, '[accounts]\nusage_pause_pct = 50\n'
+              '[[accounts.pool]]\nname = "a"\n')
+    (sp / "account-active").write_text("a")
+    now = _t.time()
+    usage = sp / "usage"
+    usage.mkdir()
+    (usage / "a.json").write_text(json.dumps(
+        {"five_hour_pct": 60, "five_hour_resets_at": now + 900, "ts": now}))
+    assert spawner.usage_spawn_gate()["status"] == "paused"   # 60 >= 50 (config)
+    monkeypatch.setenv("CLAUDE_ORCH_USAGE_PAUSE_PCT", "70")
+    assert spawner.usage_spawn_gate()["status"] == "ok"        # env wins: 60 < 70
+
+
+def test_write_registry_snapshot_shape(sp, monkeypatch):
+    _use_pool(monkeypatch, sp, THREE_POOL)
+    monkeypatch.setattr(paths, "ACCOUNT_REGISTRY", sp / "account-registry.json")
+    spawner.write_registry_snapshot()
+    data = json.loads((sp / "account-registry.json").read_text())
+    assert data == {"version": 1, "default": "main", "pool": [
+        {"name": "main", "config_dir": None},
+        {"name": "alt", "config_dir": None},
+        {"name": "third", "config_dir": None}]}
+
+
+def test_write_registry_snapshot_never_raises(sp, monkeypatch):
+    monkeypatch.setattr(paths, "ACCOUNT_REGISTRY",
+                        sp / "no-such-dir-is-a-file" / "x.json")
+    (sp / "no-such-dir-is-a-file").write_text("not a dir")
+    spawner.write_registry_snapshot()   # must swallow the OSError
 
 
 def test_identity_scrub_no_real_account_names():

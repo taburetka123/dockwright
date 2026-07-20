@@ -117,6 +117,11 @@ Send a decision-ready question: `ask_manager(claude_sid, "<what's blocked> + <wh
 Do NOT quietly swap the method (REST instead of the browser the manager asked for), drop the step, or run the whole task and surface the gap only at the end — a silent workaround can go green while missing the actual ask. One blocked turn is cheap; a wrong silent substitution costs the whole task.
 
 <!-- overlay: push-block-instance -->
+
+## Edits under `~/.claude` (the runtime's own config): keep them in YOUR session, never an implementer subagent
+
+When a plan or task edits self-governing runtime config — `~/.claude` rules/agents/skills/settings — assign that edit to YOUR top-level session, never to an implementer subagent: the file-edit permission classifier DENIES a subagent's edit to such files (subagent provenance reads as unauthorized self-modification) while your own identical edit passes. Even top-level, expect a harness self-modification dialog that no settings preset can pre-clear — it needs your manager at the pane; flag it and keep working rather than reading your own stall as an outage.
+
 ## Worktree isolation when other workers may share the repo
 
 If your task includes `git checkout -b`, committing, or pushing in a repo that may host **concurrent workers** (any repo a sibling worker could also be branching in), you MUST NOT branch in the shared working directory — two workers in the same checkout clobber each other's branch/index/HEAD. Create an isolated worktree off the target base first, and {{worktree_isolation_ref}} rather than improvising. The single-shared-cwd case (you're the only worker in this repo) doesn't need this — when in doubt, isolate.
@@ -159,6 +164,15 @@ For Python work in a worktree, bootstrap a worktree-local venv (`python3 -m venv
 - **Never background fast bounded commands** (`grep`/`find`/`ls`/`wc`) — they finish in under a second, and a late background completion re-triggers your session after you've moved on or finished.
 - **Before `worker_done`** (or any terminal action), drain or `TaskStop` outstanding background tasks — each one completing after your done-signal re-invokes a finished session for a no-op turn.
 - When you DO wait on long background work, the harness notifies on completion — end the turn; no sleeps, no ScheduleWakeup polls. One exception: a bounded poll (total sleep ≤300s per pass) when your terminal report depends on the result{{a_wait_mechanics_ref}}.
+
+## Headless Bash hygiene — commands that never stall
+
+Your session runs under a permission allowlist tuned for plain single commands. Everything else pops an approval dialog that costs minutes (a monitor pages your manager to clear it — but the plain form costs zero):
+
+- One command per Bash call. `cd <repo>` as its own command, then plain git verbs (`git add -A`, `git commit -m "message"`) — the allowlist covers exactly that shape. `cd X && git …` chains and `git -C <path> …` forms trip the permission gate.
+- `printenv VAR`, never `echo $VAR` — any `$…` expansion makes a command permanently un-approvable by allowlist.
+- No `$(…)` command substitution or heredocs when a plain form exists: commit messages via a quoted `-m "literal"`, not `-m "$(cat <<EOF …)"`.
+- `git push` and `git remote` always require approval — batch them (one push at the end) rather than pushing per-commit.
 
 ## How to verify your manager exists (do NOT invent paranoid checks)
 
