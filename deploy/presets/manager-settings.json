@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__dockwright__become_manager",
+      "mcp__dockwright__become_manager_with_takeover",
+      "mcp__dockwright__prepare_recovery_handoff",
+      "mcp__dockwright__attach_existing",
+      "mcp__dockwright__list_workers",
+      "mcp__dockwright__list_pending_questions",
+      "mcp__dockwright__list_managers",
+      "mcp__dockwright__list_closed_workers",
+      "mcp__dockwright__get_worker_summary",
+      "mcp__dockwright__get_worker_tail",
+      "mcp__dockwright__pipeline_status",
+      "mcp__dockwright__artifact_list",
+      "mcp__dockwright__artifact_view",
+      "Bash(printenv:*)",
+      "Bash(dockwright boot-brief:*)"
+    ]
+  }
+}

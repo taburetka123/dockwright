@@ -158,6 +158,25 @@ def test_closed_record_without_question_does_not_protect(fresh_orchestrator_dir)
     assert "87" not in protected
 
 
+def test_protected_window_ids_includes_fresh_gardener_sidecar(fresh_orchestrator_dir):
+    live = fresh_orchestrator_dir / "gardener" / "live-windows"
+    live.mkdir(parents=True)
+    (live / "r1.window").write_text("%7")
+    assert "%7" in sweep._protected_window_ids(set())
+
+
+def test_protected_window_ids_ignores_stale_gardener_sidecar(fresh_orchestrator_dir):
+    """A crashed wrapper's leaked sidecar must not hide a leaked window from
+    `dockwright sweep` past the TTL."""
+    live = fresh_orchestrator_dir / "gardener" / "live-windows"
+    live.mkdir(parents=True)
+    sidecar = live / "r1.window"
+    sidecar.write_text("%7")
+    old = time.time() - sweep.GARDENER_WINDOW_PROTECT_TTL_SEC - 60
+    os.utime(sidecar, (old, old))
+    assert "%7" not in sweep._protected_window_ids(set())
+
+
 def test_non_workers_os_window_ignored(fresh_orchestrator_dir):
     orphans = sweep.scan_orphan_terminal_windows(_terminal_ls_payload(), protected=set())
     assert "7" not in {o["window_id"] for o in orphans}

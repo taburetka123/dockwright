@@ -224,24 +224,45 @@ def test_dry_run_previews_collision(claude):
     assert (claude / "dockwright/loops-registry.md").read_text() == "new"
 
 
-def test_crash_residue_new_only_gets_compat_symlink(claude):
-    """Crash between rename and symlink leaves new populated + legacy absent;
-    a re-run must place the compat link — old deployed code hardcodes legacy
-    paths and would otherwise fork state at the cold path for weeks."""
+def test_crash_residue_new_only_is_skipped_not_relinked(claude):
+    """Legacy absent + new populated (crash residue, or simply a home that
+    never had legacy state) must NOT manufacture a compat symlink. The
+    retired crash-repair arm did exactly that, resurrecting the legacy links
+    on every deploy after an operator removed them."""
     _mk(claude, "dockwright/manager-memory/j.md")
     lines = migrate.run(claude)
     mm = claude / "manager-memory"
-    assert mm.is_symlink()
-    assert os.readlink(mm) == "dockwright/manager-memory"
-    assert (mm / "j.md").is_file()
-    assert any(l.startswith("linked") and "manager-memory" in l for l in lines)
+    assert not mm.is_symlink()
+    assert not mm.exists()
+    assert any(l.startswith("absent") and "manager-memory" in l for l in lines)
+    assert not any("linked" in l for l in lines)
 
 
-def test_dry_run_crash_residue_touches_nothing(claude):
+def test_dry_run_crash_residue_reports_absent(claude):
     _mk(claude, "dockwright/manager-memory/j.md")
     lines = migrate.run(claude, dry_run=True)
     assert not (claude / "manager-memory").is_symlink()
-    assert any("would-link" in l and "manager-memory" in l for l in lines)
+    assert not any("would-link" in l for l in lines)
+    assert any(l.startswith("absent") and "manager-memory" in l for l in lines)
+
+
+def test_never_migrated_home_grows_no_legacy_symlinks(claude):
+    """A populated new home with NO legacy paths on disk — a fresh machine
+    after its first deploy — must stay legacy-free across repeated runs.
+    Before the crash-repair arm retired, every 2nd+ setup.sh run grew a
+    compat symlink at EVERY legacy name (setup.sh runs migrate-state on each
+    deploy), including on machines that never had anything to migrate."""
+    _mk(claude, "dockwright/active/s1.json")
+    _mk(claude, "dockwright/manager-memory/j.md")
+    _mk(claude, "dockwright/loops-registry.md", "reg")
+    _mk(claude, "dockwright-overlay/agent_vars.md")
+    for _ in range(2):
+        lines = migrate.run(claude)
+        for legacy_rel, _new_rel in migrate.ROWS:
+            legacy = claude / legacy_rel
+            assert not legacy.is_symlink(), legacy_rel
+            assert not legacy.exists(), legacy_rel
+        assert all(l.startswith("absent") for l in lines)
 
 
 def test_symlink_at_new_path_is_loud_collision(claude):

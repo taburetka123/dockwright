@@ -38,11 +38,18 @@ def stale(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "EMITTED_STATE", mod._emitted_state_path(None), raising=False)
     monkeypatch.setattr(mod, "ASSIGNMENTS_PENDING",
                         tmp_path / "assignments" / ".pending", raising=False)
+    monkeypatch.setattr(mod, "GARDENER_LIVE_WINDOWS",
+                        tmp_path / "gardener" / "live-windows", raising=False)
     # Squash IDLE threshold so tests can use small elapsed values.
     monkeypatch.setattr(mod, "IDLE_THRESHOLD_SEC", 100)
     for d in ("active", "questions", "closed"):
         (tmp_path / d).mkdir()
     monkeypatch.setattr(mod, "ACCOUNT_ACTIVE", tmp_path / "account-active")
+    # Patched FIRST-CLASS like the other ACCOUNT_* paths: without this,
+    # _registry() reads the operator's LIVE snapshot and every flip test's
+    # pool shape depends on the machine it runs on.
+    monkeypatch.setattr(mod, "ACCOUNT_REGISTRY", tmp_path / "account-registry.json",
+                        raising=False)
     monkeypatch.setattr(mod, "ACCOUNT_LEDGER", tmp_path / "account-flips.jsonl")
     monkeypatch.setattr(mod, "ACCOUNT_STATE", tmp_path / "account-state.json")
     monkeypatch.setattr(mod, "ACCOUNT_LOCK", tmp_path / ".account-flip.lock")
@@ -2272,6 +2279,82 @@ def test_other_bricked_unparsed_window(stale):
     assert stale._other_account_bricked(state, "b", now + 7 * 3600) is False  # > 6h
 
 
+# ---- registry-aware flip lane (account-registry.json snapshot) ---------------
+
+def _write_registry(stale, names, default=None):
+    stale.ACCOUNT_REGISTRY.write_text(json.dumps({
+        "version": 1, "default": default or names[0],
+        "pool": [{"name": n, "config_dir": None} for n in names]}))
+
+
+def test_registry_fallback_is_legacy_pair(stale):
+    assert stale._registry() == (["a", "b"], "a", {})
+
+
+def test_registry_rejects_dup_or_empty_names(stale):
+    # Whole-registry fallback on ANY malformation, like config.accounts() —
+    # never a half-registry.
+    stale.ACCOUNT_REGISTRY.write_text(json.dumps({
+        "version": 1, "default": "x",
+        "pool": [{"name": "x", "config_dir": None}, {"name": "x", "config_dir": None}]}))
+    assert stale._registry() == (["a", "b"], "a", {})
+    stale.ACCOUNT_REGISTRY.write_text(json.dumps({
+        "version": 1, "default": "x",
+        "pool": [{"name": "x", "config_dir": None}, {"name": "", "config_dir": None}]}))
+    assert stale._registry() == (["a", "b"], "a", {})
+    stale.ACCOUNT_REGISTRY.write_text("{not json")
+    assert stale._registry() == (["a", "b"], "a", {})
+
+
+def test_pool_account_accepts_registry_names(stale):
+    _write_registry(stale, ["main", "alt"])
+    _arm_pool(stale, "main")
+    assert stale._pool_account() == "main"   # RED today: hardcoded ("a","b") -> None
+
+
+def test_solo_flip_is_honest_noop(stale, monkeypatch):
+    monkeypatch.setattr(stale, "_keychain_unlocked", lambda: True)
+    _write_registry(stale, ["a"])
+    _arm_pool(stale, "a")
+    now = 1_000_000
+    assert stale._maybe_flip_account("a", "worker w limited", now) is None
+    assert stale.ACCOUNT_ACTIVE.read_text().rstrip("\n") == "a"   # RED today: "b"
+    events = _ledger_events(stale)
+    assert [e["event"] for e in events] == ["flip-skip"]
+    assert events[0]["reason"] == "no other account in registry"
+    assert events[0]["account"] == "a"
+    # dedup: a second attempt inside the cooldown window adds nothing
+    assert stale._maybe_flip_account("a", "worker w limited", now + 60) is None
+    assert len(_ledger_events(stale)) == 1
+
+
+def test_custom_name_flip_prefers_pool_order_and_skips_bricked(stale, monkeypatch):
+    monkeypatch.setattr(stale, "_keychain_unlocked", lambda: True)
+    _write_registry(stale, ["main", "alt", "third"])
+    _arm_pool(stale, "main")
+    now = 1_000_000
+    stale.ACCOUNT_STATE.write_text(json.dumps(
+        {"accounts": {"alt": {"bricked_at": now - 60, "last_seen": now - 60}}}))
+    assert stale._maybe_flip_account("main", "worker w limited", now) == "third"
+    assert stale.ACCOUNT_ACTIVE.read_text().rstrip("\n") == "third"
+    flips = [e for e in _ledger_events(stale) if e["event"] == "flip"]
+    assert flips and flips[-1]["from"] == "main" and flips[-1]["to"] == "third"
+
+
+def test_snapshot_roundtrip_matches_config(stale, tmp_path, monkeypatch):
+    """Writer→reader parity: the spawner-written snapshot parses back to the
+    same registry config.accounts() holds (spec test 4, end-to-end leg)."""
+    from dockwright import config as pkg_config, paths as pkg_paths, spawner
+    cfg = tmp_path / "dockwright.toml"
+    cfg.write_text('[accounts]\ndefault = "main"\n'
+                   '[[accounts.pool]]\nname = "main"\n'
+                   '[[accounts.pool]]\nname = "alt"\n')
+    monkeypatch.setenv(pkg_config.ENV_CONFIG_PATH, str(cfg))
+    monkeypatch.setattr(pkg_paths, "ACCOUNT_REGISTRY", tmp_path / "account-registry.json")
+    spawner.write_registry_snapshot()
+    assert stale._registry() == (["main", "alt"], "main", {})
+
+
 def test_keychain_unlocked_probes_show_keychain_info_only(monkeypatch):
     """`_keychain_unlocked` is a single locked-state probe: rc==0 ⇒ True,
     rc!=0 ⇒ False. No per-letter item probe — `find-generic-password` must
@@ -3734,6 +3817,116 @@ def test_launch_recovery_manager_pins_manager_opus(stale, monkeypatch):
     assert inner.index("--model") < inner.index("/manager-takeover-recovery")
 
 
+def test_recovery_launch_carries_manager_settings(stale, monkeypatch):
+    """F-2: the recovery-manager tab carries --settings <manager-settings.json>
+    (composed from the module ROOT, stdlib-only) so its autonomous boot doesn't
+    stall on approval prompts. Absent file → old behavior (see the negative test)."""
+    (stale.ROOT / "presets").mkdir(parents=True, exist_ok=True)
+    settings = stale.ROOT / "presets" / "manager-settings.json"
+    settings.write_text("{}")
+    captured = {}
+
+    class FakeDrv:
+        async def spawn(self, **kw):
+            captured.update(kw)
+            return "%42"
+
+    monkeypatch.setattr(stale, "_get_driver", lambda: FakeDrv())
+    stale._launch_recovery_manager({"cwd": "/c", "name": "mgr-x"}, "sid123", "a")
+    inner = captured["argv"][-1]
+    assert f"--settings {str(settings)}" in inner
+    assert "/manager-takeover-recovery sid123" in inner
+
+
+def test_recovery_launch_omits_settings_when_preset_absent(stale, monkeypatch):
+    """No deployed preset (setup.sh not run) → no --settings flag, byte-identical
+    to the pre-F-2 recovery command."""
+    captured = {}
+
+    class FakeDrv:
+        async def spawn(self, **kw):
+            captured.update(kw)
+            return "%42"
+
+    monkeypatch.setattr(stale, "_get_driver", lambda: FakeDrv())
+    stale._launch_recovery_manager({"cwd": "/c", "name": "m"}, "sid-1", "a")
+    inner = captured["argv"][-1]
+    assert "--settings" not in inner
+    assert "/manager-takeover-recovery sid-1" in inner
+
+
+def test_recovery_launch_carries_remote_control(stale, monkeypatch):
+    """The recovery lane is where RC matters MOST: it fires on an account-limit
+    brick with no human at the terminal. Default-ON, same tail as
+    manager_launch.manager_claude_args() (standalone copy — this module can't
+    import the package)."""
+    monkeypatch.delenv("DOCKWRIGHT_MANAGER_RC", raising=False)
+    captured = {}
+
+    class FakeDrv:
+        async def spawn(self, **kw):
+            captured.update(kw)
+            return "%9"
+
+    monkeypatch.setattr(stale, "_get_driver", lambda: FakeDrv())
+    stale._launch_recovery_manager({"cwd": "/c", "name": "m"}, "sid-1", "a")
+    inner = captured["argv"][-1]
+    assert "--remote-control" in inner
+    assert inner.index("--remote-control") < inner.index("/manager-takeover-recovery")
+    # Parse-shape invariant: --remote-control must be immediately followed by a
+    # dash-option (--model here), never the trailing /manager* prompt, else
+    # --remote-control [name] binds the prompt as the RC session name.
+    assert "--remote-control --model" in inner, inner
+
+
+def test_recovery_launch_rc_opt_out(stale, monkeypatch):
+    monkeypatch.setenv("DOCKWRIGHT_MANAGER_RC", "0")
+    captured = {}
+
+    class FakeDrv:
+        async def spawn(self, **kw):
+            captured.update(kw)
+            return "%9"
+
+    monkeypatch.setattr(stale, "_get_driver", lambda: FakeDrv())
+    stale._launch_recovery_manager({"cwd": "/c", "name": "m"}, "sid-1", "a")
+    assert "--remote-control" not in captured["argv"][-1]
+
+
+def test_recovery_launch_skip_perms_opt_in_and_scrub(stale, monkeypatch):
+    """Opt-in emission + parse shape (RC, skip, --model adjacency) + the
+    compose-then-pop scrub: TmuxDriver.spawn has a server-birth branch and this
+    daemon can outlive the tmux server, so the env must be clean by spawn time
+    while `inner` still carries the one-shot flag."""
+    monkeypatch.setenv("DOCKWRIGHT_MANAGER_SKIP_PERMS", "1")
+    captured = {}
+
+    class FakeDrv:
+        async def spawn(self, **kw):
+            captured.update(kw)
+            return "%9"
+
+    monkeypatch.setattr(stale, "_get_driver", lambda: FakeDrv())
+    stale._launch_recovery_manager({"cwd": "/c", "name": "m"}, "sid-1", "a")
+    inner = captured["argv"][-1]
+    assert "--remote-control --dangerously-skip-permissions --model" in inner, inner
+    assert inner.index("--dangerously-skip-permissions") < inner.index("/manager-takeover-recovery")
+    assert "DOCKWRIGHT_MANAGER_SKIP_PERMS" not in os.environ
+
+
+def test_recovery_launch_skip_perms_default_off(stale, monkeypatch):
+    captured = {}
+
+    class FakeDrv:
+        async def spawn(self, **kw):
+            captured.update(kw)
+            return "%9"
+
+    monkeypatch.setattr(stale, "_get_driver", lambda: FakeDrv())
+    stale._launch_recovery_manager({"cwd": "/c", "name": "m"}, "sid-1", "a")
+    assert "--dangerously-skip-permissions" not in captured["argv"][-1]
+
+
 def test_write_json_atomic_unique_tmp_per_invocation(tmp_path, monkeypatch):
     # stale_monitor's private copy shares the closed/<sid>.json target with
     # hooks.session_end on the autoclose path - same shared-tmp race class.
@@ -4009,6 +4202,33 @@ def test_orphan_window_protected_by_pending_spawn_sidecar(stale, tmp_path, monke
     assert "ORPHAN_WINDOW" not in capsys.readouterr().out
 
 
+def test_orphan_window_protected_by_fresh_gardener_sidecar(stale, tmp_path, monkeypatch, capsys):
+    """A live gardener run never registers an active record; its wrapper's
+    live-window sidecar is what keeps M-2 from paging the run's own pane."""
+    _arm_driver(stale, monkeypatch, [("claude-workers", "🌱 gardener r1", "%7")])
+    live = tmp_path / "gardener" / "live-windows"
+    live.mkdir(parents=True)
+    (live / "r1.window").write_text("%7")
+    _seed_orphan_state(stale, "%7", time.time() - 700)
+    stale.main()
+    assert "ORPHAN_WINDOW" not in capsys.readouterr().out
+
+
+def test_orphan_window_stale_gardener_sidecar_does_not_protect(stale, tmp_path, monkeypatch, capsys):
+    """A crashed wrapper leaks its sidecar; past the TTL the protection ages
+    out and the alarm resumes — fail toward alarming."""
+    _arm_driver(stale, monkeypatch, [("claude-workers", "🌱 gardener r1", "%7")])
+    live = tmp_path / "gardener" / "live-windows"
+    live.mkdir(parents=True)
+    sidecar = live / "r1.window"
+    sidecar.write_text("%7")
+    old = time.time() - stale.GARDENER_WINDOW_PROTECT_TTL_SEC - 60
+    os.utime(sidecar, (old, old))
+    _seed_orphan_state(stale, "%7", time.time() - 700)
+    stale.main()
+    assert "ORPHAN_WINDOW %7" in capsys.readouterr().out
+
+
 def test_orphan_window_protected_by_closed_record_with_pending_question(
         stale, tmp_path, monkeypatch, capsys):
     _arm_driver(stale, monkeypatch, [("claude-workers", "w", "%5")])
@@ -4138,3 +4358,159 @@ def test_awake_seconds_duplicate_works_without_clock_uptime_raw(stale, monkeypat
     monkeypatch.delattr(time, "CLOCK_UPTIME_RAW", raising=False)
     v = stale._awake_seconds()
     assert isinstance(v, float) and v > 0.0
+
+
+# ---- APPROVAL_PROMPT detection (E2E N-4 Layer 2) --------------------------
+# The brief's helpers reference a module-level `stale_monitor`; the rest of the
+# file uses the per-test `stale` fixture. A single fresh load here keeps the
+# brief's assertions verbatim — each test monkeypatches its own ACTIVE /
+# ASSIGNMENTS_PENDING / _get_driver, auto-reverted at teardown.
+stale_monitor = _load_stale_monitor()
+
+
+PROCEED_DIALOG = """\
+⏺ Bash(git -C /home/user/projects/work/zeb4-recipes commit -m "add recipes")
+╭──────────────────────────────────────────────────────────────╮
+│ Bash command                                                 │
+│   git -C /home/user/projects/work/zeb4-recipes commit -m "…" │
+│ Do you want to proceed?                                      │
+│ ❯ 1. Yes                                                     │
+│   2. Yes, and don't ask again for git commit in this session │
+│   3. No, and tell Claude what to do differently (esc)        │
+╰──────────────────────────────────────────────────────────────╯"""
+
+TRUST_DIALOG_NEW = """\
+ Accessing workspace:
+ /home/user/projects/work/worker
+ Quick safety check: Is this a project you created or one you trust?
+ ❯ 1. Yes, I trust this folder
+   2. No, exit
+ Enter to confirm · Esc to cancel"""
+
+PLAIN_OUTPUT_WITH_QUESTION = """\
+⏺ The test suite prints "Do you want to proceed?" in its usage banner.
+  All 12 tests passed.
+"""
+
+
+class FakeDriver:
+    def __init__(self, screens):
+        self.screens = screens  # window_id -> text or Exception
+    def capture_screen(self, pane):
+        val = self.screens.get(pane)
+        if isinstance(val, Exception):
+            raise val
+        return val
+
+
+def _worker_record(tmp_active, sid, name, wid, state="processing", runtime="claude",
+                   manager="mgr-x"):
+    rec = {"claude_sid": sid, "agent": "worker", "name": name, "window_id": wid,
+           "state": state, "runtime": runtime, "parent_manager_name": manager}
+    (tmp_active / f"{sid}.json").write_text(json.dumps(rec))
+    return rec
+
+
+def _run_approval_scan(monkeypatch, tmp_path, screens, emitted=None,
+                       manager="mgr-x", now=1_000_000):
+    active = tmp_path / "active"; active.mkdir(exist_ok=True)
+    pending = tmp_path / "pending"; pending.mkdir(exist_ok=True)
+    monkeypatch.setattr(stale_monitor, "ACTIVE", active)
+    monkeypatch.setattr(stale_monitor, "ASSIGNMENTS_PENDING", pending)
+    monkeypatch.setattr(stale_monitor, "_get_driver", lambda: FakeDriver(screens))
+    events = []
+    def emit(kind, name, line, dedup_key=None):
+        events.append((kind, name, line, dedup_key))
+    next_emitted = {}
+    return active, pending, events, next_emitted, (emitted or {}), emit, now
+
+
+def test_approval_prompt_detected_and_paged(monkeypatch, tmp_path):
+    active, pending, events, next_emitted, emitted, emit, now = _run_approval_scan(
+        monkeypatch, tmp_path, {"%7": PROCEED_DIALOG})
+    _worker_record(active, "sid1", "zeb4", "%7")
+    stale_monitor._scan_approval_prompts("mgr-x", now, emitted, next_emitted, emit)
+    assert len(events) == 1
+    kind, name, line, key = events[0]
+    assert kind == "approval" and name == "zeb4"
+    assert line.startswith("APPROVAL_PROMPT zeb4: ")
+    assert key.startswith("approval:sid1:")
+    assert next_emitted[key]["paged"] == 1
+
+
+def test_approval_same_prompt_not_repaged_within_rung(monkeypatch, tmp_path):
+    active, pending, events, next_emitted, emitted, emit, now = _run_approval_scan(
+        monkeypatch, tmp_path, {"%7": PROCEED_DIALOG})
+    _worker_record(active, "sid1", "zeb4", "%7")
+    stale_monitor._scan_approval_prompts("mgr-x", now, {}, next_emitted, emit)
+    first_key = events[0][3]
+    events.clear()
+    # 2 minutes later, same dialog: below the 5-min base rung — no re-page
+    later = dict(next_emitted); next2 = {}
+    stale_monitor._scan_approval_prompts("mgr-x", now + 120, later, next2, emit)
+    assert events == []
+    assert next2[first_key]["paged"] == 1
+
+
+def test_approval_repages_on_nudge_ladder(monkeypatch, tmp_path):
+    active, pending, events, next_emitted, emitted, emit, now = _run_approval_scan(
+        monkeypatch, tmp_path, {"%7": PROCEED_DIALOG})
+    _worker_record(active, "sid1", "zeb4", "%7")
+    stale_monitor._scan_approval_prompts("mgr-x", now, {}, next_emitted, emit)
+    events.clear()
+    later_state = dict(next_emitted); next2 = {}
+    # 6 minutes later: crosses the 5-min base rung
+    stale_monitor._scan_approval_prompts("mgr-x", now + 360, later_state, next2, emit)
+    assert len(events) == 1
+    assert next2[events[0][3]]["paged"] == 5
+
+
+def test_approval_cleared_prompt_drops_state(monkeypatch, tmp_path):
+    active, pending, events, next_emitted, emitted, emit, now = _run_approval_scan(
+        monkeypatch, tmp_path, {"%7": "⏺ done\n"})
+    _worker_record(active, "sid1", "zeb4", "%7")
+    prior = {"approval:sid1:abc123def456": {"first_seen": now - 60, "paged": 1}}
+    stale_monitor._scan_approval_prompts("mgr-x", now, prior, next_emitted, emit)
+    assert events == []
+    assert not any(k.startswith("approval:sid1:") for k in next_emitted)
+
+
+def test_approval_negative_cases(monkeypatch, tmp_path):
+    active, pending, events, next_emitted, emitted, emit, now = _run_approval_scan(
+        monkeypatch, tmp_path, {"%1": PLAIN_OUTPUT_WITH_QUESTION,
+                                "%2": PROCEED_DIALOG, "%3": PROCEED_DIALOG,
+                                "%4": PROCEED_DIALOG})
+    _worker_record(active, "s1", "plain", "%1")                      # no option row
+    _worker_record(active, "s2", "idle", "%2", state="idle")         # not processing
+    _worker_record(active, "s3", "codex", "%3", runtime="codex")     # not claude
+    _worker_record(active, "s4", "foreign", "%4", manager="other")   # peer manager's
+    stale_monitor._scan_approval_prompts("mgr-x", now, emitted, next_emitted, emit)
+    assert events == []
+
+
+def test_approval_pending_sidecar_trust_dialog(monkeypatch, tmp_path):
+    active, pending, events, next_emitted, emitted, emit, now = _run_approval_scan(
+        monkeypatch, tmp_path, {"%9": TRUST_DIALOG_NEW})
+    (pending / "aaff01.window").write_text("%9")
+    (pending / "aaff01.json").write_text(json.dumps(
+        {"assignment_id": "aaff01", "name": "fresh-spawn",
+         "parent_manager_name": "mgr-x"}))
+    stale_monitor._scan_approval_prompts("mgr-x", now, emitted, next_emitted, emit)
+    assert len(events) == 1
+    assert events[0][1] == "fresh-spawn"
+    assert events[0][3].startswith("approval:aaff01:")
+
+
+def test_approval_capture_failure_is_no_event(monkeypatch, tmp_path):
+    active, pending, events, next_emitted, emitted, emit, now = _run_approval_scan(
+        monkeypatch, tmp_path, {"%7": RuntimeError("tmux down")})
+    _worker_record(active, "sid1", "zeb4", "%7")
+    stale_monitor._scan_approval_prompts("mgr-x", now, emitted, next_emitted, emit)
+    assert events == []
+
+
+def test_approval_driver_absent_is_noop(monkeypatch, tmp_path):
+    active = tmp_path / "active"; active.mkdir()
+    monkeypatch.setattr(stale_monitor, "ACTIVE", active)
+    monkeypatch.setattr(stale_monitor, "_get_driver", None)
+    stale_monitor._scan_approval_prompts("mgr-x", 1_000_000, {}, {}, lambda *a, **k: None)

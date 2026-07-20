@@ -99,15 +99,20 @@ CLAUDE_ORCH_AUTONUDGE like worker nudges; event coalescing below is not (a
 suppressed line was a wasted wake attempt regardless). Managers stay
 excluded from the ladder, STALE_PROCESSING, the 5-min fast-path, and autoclose.
 
-Account auto-switch (pool of two per-config-dir logins): the pointer file
-(account-active) names the account new spawns authenticate as (a = default
-~/.claude, b = ~/.claude-b via CLAUDE_CONFIG_DIR; each config dir has its own
-keychain login, no injected token). When a limit banner bricks a worker or the
-owning manager on the pointer account, the scan flips the pointer to the other
-account — guarded by a flip cooldown (env CLAUDE_ORCH_FLIP_COOLDOWN_MIN,
-default 30min), a keychain-unlocked probe (a recovery tab opening onto a locked
-keychain would prompt SecurityAgent on claude's own per-config-dir login read),
-and the other account's own brick window. The
+Account auto-switch (pool of per-config-dir logins): the pointer file
+(account-active) names the registry account new spawns authenticate as (the
+default account rides ~/.claude, every other account its own CLAUDE_CONFIG_DIR
+farm; each config dir has its own keychain login, no injected token). The pool
+comes from the package-written registry snapshot (account-registry.json —
+names in order, default, config_dir overrides; absent/corrupt falls back to
+the historical a/b pair). When a limit banner bricks a worker or the owning
+manager on the pointer account, the scan flips the pointer to the first other
+registry account not inside its own brick window — guarded by a flip cooldown
+(env CLAUDE_ORCH_FLIP_COOLDOWN_MIN, default 30min) and a keychain-unlocked
+probe (a recovery tab opening onto a locked keychain would prompt
+SecurityAgent on claude's own per-config-dir login read). A single-account
+registry has NOWHERE to flip: that lane no-ops with a ledgered flip-skip
+(deduped per cooldown) instead of inventing an account. The
 worker-site banner read
 is hoisted above the nudge ladder, so a flip can fire at any silence past the
 5min floor — including past the processing threshold and while a
@@ -134,7 +139,7 @@ SWITCHED wake-up. That duty is the mitigation: resume bricked workers
 promptly; pool-spawned records carry the account stamp and are immune.
 DORMANCY INVARIANT: `rm account-active` is a full disable — no state writes,
 no ledger lines, no flips, no recovery launches; every lane behaves exactly
-as with no pool at all. If BOTH accounts are bricked, an already-flipped
+as with no pool at all. If EVERY account is bricked, an already-flipped
 manager's recovery launch targets the (also-bricked) pointer — up to two dead
 recovery tabs, bounded by the once+once launch/relaunch guards (emitted-state
 key, ledger-backed); the AUTONUDGE
@@ -243,6 +248,32 @@ AUTOCLOSE_CADENCE_SEC = 3600
 WORKERS_SESSION_NAME = "claude-workers"
 ORPHAN_GRACE_SEC = _env_positive_int("CLAUDE_ORCH_ORPHAN_GRACE_SEC", 120)
 
+# A visible gardener run deliberately never registers an active record; its
+# wrapper shields the live pane via gardener/live-windows/<run_id>.window.
+# Protection is honored only while the sidecar is mtime-fresh — a crashed
+# wrapper's leaked sidecar ages out and the alarm resumes (fail toward
+# alarming). TTL covers TIMEOUT+GRACE for both lanes (2700+900 max) + margin.
+GARDENER_WINDOW_PROTECT_TTL_SEC = _env_positive_int(
+    "CLAUDE_ORCH_GARDENER_WINDOW_PROTECT_TTL_SEC", 7200)
+
+# Approval-prompt stall detection (E2E N-4): a worker pane sitting on a
+# permission dialog is invisible for 30min (STALE_PROCESSING) without this.
+# A dialog = BOTH a question marker AND an option-row marker in the pane tail
+# (the double condition keeps task output that merely PRINTS a marker string
+# from paging). Markers are lowercase (matched against text.lower()) and
+# version-drifty — the trust dialog reworded between CC releases, so both
+# generations ship; extend the tuple when a new wording is first seen.
+APPROVAL_QUESTION_MARKERS = (
+    "do you want to proceed?",
+    "requires approval",
+    "do you trust the files in this folder",           # trust dialog, older CC
+    "is this a project you created or one you trust",  # trust dialog, ≥2.1.211
+)
+APPROVAL_OPTION_MARKERS = ("❯ 1.", "1. yes")
+APPROVAL_TAIL_LINES = 40
+APPROVAL_EXCERPT_MAX = 160
+APPROVAL_REPAGE_BASE_MIN = 5
+
 HOME = Path(os.environ.get("HOME", ""))
 
 
@@ -261,6 +292,7 @@ ACTIVE = ROOT / "active"
 QUESTIONS = ROOT / "questions"
 CLOSED = ROOT / "closed"
 ASSIGNMENTS_PENDING = ROOT / "assignments" / ".pending"
+GARDENER_LIVE_WINDOWS = ROOT / "gardener" / "live-windows"
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
 CODEX_SESSIONS = HOME / ".codex" / "sessions"
 # entries must be lowercase — matched against text.lower(). RATE_LIMIT_SIGNATURES
@@ -362,12 +394,14 @@ _RESET_CLAUSE_RE = re.compile(
     r"resets\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)\s*\(([^)]+)\)", re.IGNORECASE)
 
 
-# ---- account auto-switch (pool of two per-config-dir logins; design 2026-06-15) --
-# The pointer selects which account (a = default ~/.claude, b = ~/.claude-b via
-# CLAUDE_CONFIG_DIR) new spawns authenticate as — each config dir has its own
-# keychain login (no injected token). DORMANCY INVARIANT: every helper below
-# no-ops unless the pointer file holds a valid letter — `rm account-active` is a
-# full disable (no state writes, no ledger lines, no flips, no recovery launches).
+# ---- account auto-switch (pool of per-config-dir logins; design 2026-06-15) --
+# The pointer selects which registry account new spawns authenticate as (the
+# default account rides ~/.claude, every other account a CLAUDE_CONFIG_DIR
+# farm) — each config dir has its own keychain login (no injected token). The
+# pool itself comes from the package-written registry snapshot (_registry
+# below). DORMANCY INVARIANT: every helper below no-ops unless the pointer
+# file holds a valid registry name — `rm account-active` is a full disable
+# (no state writes, no ledger lines, no flips, no recovery launches).
 ACCOUNT_ACTIVE = ROOT / "account-active"
 ACCOUNT_LEDGER = ROOT / "account-flips.jsonl"
 ACCOUNT_STATE = ROOT / "account-state.json"
@@ -375,6 +409,36 @@ ACCOUNT_LOCK = ROOT / ".account-flip.lock"
 FLIP_COOLDOWN_SEC = _env_positive_int("CLAUDE_ORCH_FLIP_COOLDOWN_MIN", 30) * 60
 TAKEOVER_GUARD_SEC = 300          # recovery tab must take over within this window
 BRICK_EPISODE_GAP_SEC = 600       # banner unseen this long ⇒ next sighting is a new episode
+ACCOUNT_REGISTRY = ROOT / "account-registry.json"
+_LEGACY_REGISTRY = (["a", "b"], "a", {})
+
+
+def _registry():
+    """(pool names in order, default account, {name: config_dir}) from the
+    package-written snapshot (spawner.write_registry_snapshot — refreshed on
+    every MCP boot, worker spawn, and deploy). Absent/corrupt -> the historical
+    a/b pair, byte-for-byte the pre-registry behavior, so a deploy gap can
+    never behave worse than today. This standalone script cannot import the
+    package (or tomllib on old interpreters) — the snapshot IS the contract."""
+    try:
+        data = json.loads(ACCOUNT_REGISTRY.read_text())
+        names, dirs = [], {}
+        for entry in data.get("pool") or []:
+            name = entry.get("name") if isinstance(entry, dict) else None
+            if not isinstance(name, str) or not name or name in names:
+                return _LEGACY_REGISTRY
+            names.append(name)
+            cd = entry.get("config_dir")
+            if isinstance(cd, str) and cd:
+                dirs[name] = cd
+        if not names:
+            return _LEGACY_REGISTRY
+        default = data.get("default")
+        if default not in names:
+            default = names[0]
+        return (names, default, dirs)
+    except Exception:
+        return _LEGACY_REGISTRY
 
 
 def _pool_account() -> str | None:
@@ -386,16 +450,12 @@ def _pool_account() -> str | None:
         letter = ACCOUNT_ACTIVE.read_text().rstrip("\n")
     except Exception:
         return None
-    return letter if letter in ("a", "b") else None
+    return letter if letter in _registry()[0] else None
 
 
 def _account_of(record: dict, pool_letter: str) -> str:
     stamped = record.get("account")
-    return stamped if stamped in ("a", "b") else pool_letter
-
-
-def _other_account(letter: str) -> str:
-    return "b" if letter == "a" else "a"
+    return stamped if stamped in _registry()[0] else pool_letter
 
 
 def _keychain_unlocked() -> bool:
@@ -414,25 +474,28 @@ def _keychain_unlocked() -> bool:
 
 def _account_config_prefix(letter: str) -> str:
     """Env prefix for a manager tab on `letter` (mirrors spawner, inline — this
-    standalone script can't import the package). 'a' -> default ~/.claude (no
-    CLAUDE_CONFIG_DIR); other letter -> CLAUDE_CONFIG_DIR=~/.claude-<letter> iff
-    its .claude.json is healthy (has the orchestrator MCP), else fall back to the
-    default login with a truthful effective stamp 'a'. Workers build/maintain
-    ~/.claude-<letter>; here we only CHECK.
+    standalone script can't import the package). The registry default account
+    -> default ~/.claude (no CLAUDE_CONFIG_DIR); any other registry account ->
+    CLAUDE_CONFIG_DIR=<its registry config_dir override, else ~/.claude-<letter>>
+    iff its .claude.json is healthy (has the orchestrator MCP), else fall back
+    to the default login with a truthful effective stamp of the default account.
+    Workers build/maintain the farms; here we only CHECK.
 
-    KNOWN FAILURE MODE: recovery onto a non-default letter assumes a worker has
-    already built ~/.claude-<letter>. If account `a` bricks before any worker
-    built the farm, the flip a->b launches a recovery manager that falls back
-    here to the DEFAULT login stamped `a` — i.e. onto the just-bricked account,
-    which may re-brick. We do NOT gate the flip on farm health (that would force
-    every flip test to seed a healthy b-farm). Instead this is bounded by the
-    once+once recovery-launch guard and self-heals once a worker rebuilds the
-    farm; the fallback emits the stderr warning below so the degradation is
-    observable."""
+    KNOWN FAILURE MODE: recovery onto a non-default account assumes a worker
+    has already built its farm. If the default account bricks before any worker
+    built the farm, the flip launches a recovery manager that falls back here
+    to the DEFAULT login stamped with the default name — i.e. onto the
+    just-bricked account, which may re-brick. The flip now only targets
+    *registry* accounts, but farm health stays ungated (gating the flip on it
+    would force every flip test to seed a healthy farm). Instead this is
+    bounded by the once+once recovery-launch guard and self-heals once a
+    worker rebuilds the farm; the fallback emits the stderr warning below so
+    the degradation is observable."""
+    _names, default, dirs = _registry()
     effective = letter
     config_dir = None
-    if letter != "a":
-        farm = Path(os.path.expanduser(f"~/.claude-{letter}"))
+    if letter != default:
+        farm = Path(dirs.get(letter) or os.path.expanduser(f"~/.claude-{letter}"))
         cj = farm / ".claude.json"
         try:
             data = json.loads(cj.read_text())
@@ -441,14 +504,14 @@ def _account_config_prefix(letter: str) -> str:
             if "dockwright" in servers or "claude-orchestrator" in servers:
                 config_dir = farm
             else:
-                effective = "a"
+                effective = default
         except Exception:
-            effective = "a"
+            effective = default
         if config_dir is None:
-            print(f"stale_monitor: account-{letter} farm ~/.claude-{letter}/.claude.json "
-                  f"not healthy; recovery falls back to the DEFAULT login (stamp a) — the "
-                  f"recovery tab may land on the bricked account until a worker rebuilds "
-                  f"the farm", file=sys.stderr)
+            print(f"stale_monitor: account-{letter} farm {farm}/.claude.json "
+                  f"not healthy; recovery falls back to the DEFAULT login (stamp "
+                  f"{default}) — the recovery tab may land on the bricked account "
+                  f"until a worker rebuilds the farm", file=sys.stderr)
     parts = []
     if config_dir is not None:
         parts.append(f"CLAUDE_CONFIG_DIR={shlex.quote(str(config_dir))}")
@@ -496,6 +559,17 @@ def _entry_bricked(entry, now: int) -> bool:
 
 def _other_account_bricked(state: dict, other: str, now: int) -> bool:
     return _entry_bricked(state.get("accounts", {}).get(other), now)
+
+
+def _flip_target(pointer: str, state: dict, now: int) -> str | None:
+    """First registry account != pointer, pool order, not currently bricked.
+    None => nowhere to flip: a single-account registry, or every other
+    account inside its own brick window."""
+    for name in _registry()[0]:
+        if name != pointer and not _entry_bricked(
+                state.get("accounts", {}).get(name), now):
+            return name
+    return None
 
 
 def _record_brick(account: str, reset_ts, source: str, now: int) -> None:
@@ -578,14 +652,15 @@ def _record_auth_401(account: str, uuid: str | None, now: int) -> str:
 
 
 def _maybe_flip_account(bricked_account: str, reason: str, now: int) -> str | None:
-    """Flip the pointer to the other account iff ALL guards pass. Returns the
-    new letter, or None (already flipped / cooling down / other unusable)."""
+    """Flip the pointer to another registry account iff ALL guards pass.
+    Returns the new name, or None (already flipped / cooling down / keychain
+    locked / nowhere to flip). A single-account registry can NEVER flip — that
+    lane no-ops with a ledgered flip-skip instead of inventing an account."""
     try:
         with _flip_lock():
             pointer = _pool_account()
             if pointer is None or pointer != bricked_account:
                 return None
-            other = _other_account(pointer)
             state = _load_account_state()
             last_flip = state.get("last_flip") or {}
             last_ts = last_flip.get("ts")
@@ -593,7 +668,10 @@ def _maybe_flip_account(bricked_account: str, reason: str, now: int) -> str | No
                 return None
             if not _keychain_unlocked():
                 return None
-            if _other_account_bricked(state, other, now):
+            other = _flip_target(pointer, state, now)
+            if other is None:
+                if len(_registry()[0]) <= 1:
+                    _ledger_flip_skip(state, pointer, now)
                 return None
             tmp = ACCOUNT_ACTIVE.with_suffix(".tmp")
             tmp.write_text(other + "\n")
@@ -613,6 +691,28 @@ def _maybe_flip_account(bricked_account: str, reason: str, now: int) -> str | No
     except Exception as e:
         print(f"stale_monitor: account flip failed ({e})", file=sys.stderr)
         return None
+
+
+def _ledger_flip_skip(state: dict, pointer: str, now: int) -> None:
+    """Once per FLIP_COOLDOWN_SEC per account. The flip lane re-attempts every
+    ~60s scan for the whole brick episode; an unthrottled skip line would
+    flood account-flips.jsonl, whose last-64KB tail backs the recovery-launch
+    once+once bound (_ledger_recovery_launches)."""
+    last = state.get("last_flip_skip") or {}
+    if (last.get("account") == pointer
+            and isinstance(last.get("ts"), (int, float))
+            and now - last["ts"] < FLIP_COOLDOWN_SEC):
+        return
+    try:
+        state["last_flip_skip"] = {"ts": now, "account": pointer}
+        _write_json_atomic(ACCOUNT_STATE, state)
+        _append_account_ledger({"ts": now, "event": "flip-skip",
+                                "reason": "no other account in registry",
+                                "account": pointer, "by": "stale_monitor"})
+        print(f"stale_monitor: account {pointer} bricked; no other account in "
+              f"registry — flip skipped", file=sys.stderr)
+    except Exception as e:
+        print(f"stale_monitor: flip-skip bookkeeping failed ({e})", file=sys.stderr)
 
 
 def _ledger_recovery_launches(from_sid: str, now: int,
@@ -731,14 +831,40 @@ def _launch_recovery_manager(mgr_record: dict, mgr_sid: str, new_letter: str) ->
     # ~/.claude-<letter> a worker hasn't built yet it falls back to the default
     # (possibly-bricked) login stamped `a` and warns on stderr — see its
     # "KNOWN FAILURE MODE" docstring. Bounded by the once+once launch guard.
+    # E2E F-2: ride the deployed manager allowlist so the autonomous recovery
+    # boot doesn't stall on approval prompts. Composed from the module ROOT
+    # (stdlib-only — this file can't import paths). Absent = old behavior.
+    settings_path = ROOT / "presets" / "manager-settings.json"
+    settings_arg = (f"--settings {shlex.quote(str(settings_path))} "
+                    if settings_path.is_file() else "")
+    # Same argv tail as manager_launch.manager_claude_args() (inline copy —
+    # this module is standalone stdlib-only and can't import the package):
+    # remote control default-ON via the reliable --remote-control flag;
+    # DOCKWRIGHT_MANAGER_RC=0 opts out. Keep in sync with the helper.
+    rc_arg = ("--remote-control "
+              if os.environ.get("DOCKWRIGHT_MANAGER_RC", "").strip() != "0" else "")
+    # OPT-IN, default OFF (inline copy of manager_claude_args(), keep in
+    # sync): DOCKWRIGHT_MANAGER_SKIP_PERMS=1 removes the Bash safety
+    # classifier for the recovered manager — sanctioned only for
+    # manager.core.md's two named uses. Bare flag: parse-safe before --model.
+    skip_arg = ("--dangerously-skip-permissions "
+                if os.environ.get("DOCKWRIGHT_MANAGER_SKIP_PERMS", "").strip() == "1"
+                else "")
     inner = (
         f"{_account_config_prefix(new_letter)}"
         f"CLAUDE_AGENT=manager CLAUDE_WORKER_NAME={shlex.quote(name)} "
         # Manager lane is pinned (orch-audit model-allocation): never inherit
         # the user's interactive model default. Quoted so the -ic shell can't glob [1m].
-        f"claude --model {shlex.quote('opus[1m]')} "
+        # rc_arg BEFORE --model: --remote-control [name] would otherwise bind the
+        # trailing /manager-takeover-recovery prompt as the RC session name (see
+        # manager_claude_args docstring). --model interposes a dash-option.
+        f"claude {rc_arg}{skip_arg}--model {shlex.quote('opus[1m]')} {settings_arg}"
         f"{shlex.quote(f'/manager-takeover-recovery {mgr_sid}')}"
     )
+    # One-shot guarantee: `inner` already carries the flag; TmuxDriver.spawn
+    # can BIRTH the server (new-session branch) with this daemon's env, which
+    # would make the var sticky for every future window. Compose-then-pop.
+    os.environ.pop("DOCKWRIGHT_MANAGER_SKIP_PERMS", None)
     if _get_driver is None:
         print("stale_monitor: recovery launch skipped (driver unavailable)", file=sys.stderr)
         return None
@@ -1518,6 +1644,17 @@ def _scan_orphan_windows(now: int, emitted: dict, next_emitted: dict, emit) -> N
                 continue
             if wid:
                 protected.add(wid)
+    if GARDENER_LIVE_WINDOWS.is_dir():
+        cutoff = now - GARDENER_WINDOW_PROTECT_TTL_SEC
+        for sidecar in GARDENER_LIVE_WINDOWS.glob("*.window"):
+            try:
+                if sidecar.stat().st_mtime < cutoff:
+                    continue
+                wid = sidecar.read_text().strip()
+            except OSError:
+                continue
+            if wid:
+                protected.add(wid)
     base_min = max(1, ORPHAN_GRACE_SEC // 60)
     for pane_id, title in candidates.items():
         if pane_id in protected:
@@ -1540,6 +1677,121 @@ def _scan_orphan_windows(now: int, emitted: dict, next_emitted: dict, emit) -> N
                      f"ORPHAN_WINDOW {pane_id} tab={title!r} ({elapsed // 60}min) "
                      f"— no backing active record",
                      key)
+        next_emitted[key] = entry
+
+
+def _approval_dialog_block(pane_text: str) -> str | None:
+    """The pane tail iff it currently shows a permission dialog, else None."""
+    lines = pane_text.splitlines()[-APPROVAL_TAIL_LINES:]
+    tail = "\n".join(ln.rstrip() for ln in lines)
+    low = tail.lower()
+    if not any(m in low for m in APPROVAL_QUESTION_MARKERS):
+        return None
+    if not any(m in low for m in APPROVAL_OPTION_MARKERS):
+        return None
+    return tail
+
+
+def _approval_excerpt(block: str) -> str:
+    """The dialog's gist: the question-marker line plus up to two non-empty
+    lines above it (usually the gated command), flattened and truncated."""
+    lines = block.splitlines()
+    idx = None
+    for i, ln in enumerate(lines):
+        if any(m in ln.lower() for m in APPROVAL_QUESTION_MARKERS):
+            idx = i
+            break
+    if idx is None:
+        return block[-APPROVAL_EXCERPT_MAX:]
+    context = [ln.strip(" │╭╮╰╯─") for ln in lines[max(0, idx - 2):idx + 1]]
+    excerpt = " · ".join(part.strip() for part in context if part.strip())
+    if len(excerpt) > APPROVAL_EXCERPT_MAX:
+        excerpt = excerpt[:APPROVAL_EXCERPT_MAX - 1] + "…"
+    return excerpt
+
+
+def _scan_approval_prompts(manager_name, now, emitted, next_emitted, emit) -> None:
+    """Page APPROVAL_PROMPT for own workers' panes sitting on a permission
+    dialog. Two populations: registered processing claude workers (mid-task
+    prompts), and spawn-in-flight .pending/*.window sidecar panes (the trust /
+    MCP-approval dialogs fire BEFORE SessionStart registers the worker, and the
+    sidecar shields those panes from the orphan alarm — without this leg a
+    boot-block is invisible). First sighting pages immediately; the SAME dialog
+    re-pages on the nudge-threshold ladder (5/10/20min, then hourly); a
+    DIFFERENT dialog is a new key and pages immediately; a cleared dialog's key
+    is simply not carried forward. Crash-proof: any capture/classify failure
+    reads as no-event."""
+    if _get_driver is None:
+        return
+    targets: list[tuple[str, str, str]] = []   # (dedup_id, display_name, window_id)
+    if ACTIVE.is_dir():
+        for p in ACTIVE.iterdir():
+            if p.suffix != ".json":
+                continue
+            record = _load(p)
+            if record is None or record.get("agent") != "worker":
+                continue
+            if not _matches_manager(record, manager_name):
+                continue
+            if (record.get("runtime") or "claude") != "claude":
+                continue
+            if record.get("state") != "processing" or record.get("nested"):
+                continue
+            wid = record.get("window_id") or record.get("iterm_sid") or ""
+            if not wid:
+                continue
+            sid = record.get("claude_sid") or p.stem
+            targets.append((sid, record.get("name") or sid, str(wid)))
+    if ASSIGNMENTS_PENDING.is_dir():
+        for sidecar in ASSIGNMENTS_PENDING.glob("*.window"):
+            try:
+                wid = sidecar.read_text().strip()
+            except OSError:
+                continue
+            if not wid:
+                continue
+            pending = _load(sidecar.with_suffix(".json")) or {}
+            if manager_name is not None and pending.get("parent_manager_name") != manager_name:
+                continue
+            targets.append((sidecar.stem, pending.get("name") or sidecar.stem, wid))
+    if not targets:
+        return
+    try:
+        driver = _get_driver()
+    except Exception:
+        return
+    for dedup_id, display, wid in targets:
+        try:
+            pane_text = driver.capture_screen(wid)
+        except Exception:
+            continue
+        if not pane_text:
+            continue
+        block = _approval_dialog_block(pane_text)
+        if block is None:
+            continue   # cleared/no dialog: keys not carried forward reset naturally
+        digest = hashlib.sha1(block.encode("utf-8", "replace")).hexdigest()[:12]
+        key = f"approval:{dedup_id}:{digest}"
+        prev = emitted.get(key)
+        prev = prev if isinstance(prev, dict) else {}
+        first_seen = prev.get("first_seen")
+        if not isinstance(first_seen, (int, float)):
+            first_seen = now
+        paged = prev.get("paged")
+        paged = paged if isinstance(paged, int) else 0
+        entry = {"first_seen": first_seen, "paged": paged}
+        if paged == 0:
+            entry["paged"] = 1   # sentinel: immediate first page burned
+            emit("approval", display,
+                 f"APPROVAL_PROMPT {display}: {_approval_excerpt(block)}", key)
+        else:
+            elapsed_min = int(now - first_seen) // 60
+            threshold = _highest_nudge_threshold(elapsed_min, APPROVAL_REPAGE_BASE_MIN)
+            if threshold is not None and threshold > paged:
+                entry["paged"] = threshold
+                emit("approval", display,
+                     f"APPROVAL_PROMPT {display} (still waiting, {elapsed_min}min): "
+                     f"{_approval_excerpt(block)}", key)
         next_emitted[key] = entry
 
 
@@ -1797,8 +2049,8 @@ def main(manager_name: str | None = None) -> int:
                         emit("auth-escalate", manager_name,
                              f"AUTH_401_ESCALATED {account} (manager {manager_name}) — "
                              f"login suspect after repeated 401s; PAGE: /login the "
-                             f"account-{account} config dir (default ~/.claude for a, "
-                             f"~/.claude-b for b)")
+                             f"account-{account} config dir (its own CLAUDE_CONFIG_DIR "
+                             f"farm; the default account rides ~/.claude)")
                         # Recover the manager onto a HEALTHY account only — never
                         # relaunch a takeover on the suspect account (it would
                         # just 401 again; with each takeover rolling a fresh sid,
@@ -2012,8 +2264,8 @@ def main(manager_name: str | None = None) -> int:
                                 emit("auth-escalate", name,
                                      f"AUTH_401_ESCALATED {account} (worker {name}) — "
                                      f"login suspect after repeated 401s; PAGE: /login the "
-                                     f"account-{account} config dir (default ~/.claude for a, "
-                                     f"~/.claude-b for b)")
+                                     f"account-{account} config dir (its own CLAUDE_CONFIG_DIR "
+                                     f"farm; the default account rides ~/.claude)")
                                 next_emitted[auth_emit_key] = now
                             elif decision == "recover" or reemit_due:
                                 # Ledger only the genuine attempt (a fresh 401);
@@ -2140,6 +2392,7 @@ def main(manager_name: str | None = None) -> int:
                              f"STALE_QUESTION {qid} worker={record.get('worker_name', '')} ({elapsed_min}min)",
                              key)
     _scan_orphan_windows(now, emitted, next_emitted, emit)
+    _scan_approval_prompts(manager_name, now, emitted, next_emitted, emit)
     pruned_cache = {s: p for s, p in codex_log_cache.items() if s in seen_codex_sids}
     if pruned_cache:
         next_emitted["codex_log_cache"] = pruned_cache

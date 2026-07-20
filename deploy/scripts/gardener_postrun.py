@@ -118,34 +118,47 @@ def _scan_toml_str(text: str, section: str, key: str):
     return None
 
 
-def _dockwright_repo() -> str:
-    """[paths] dockwright_repo from dockwright.toml, ~-expanded ("" when unset).
-    tomllib when available; the scanner fallback for py3.9. Deployed scripts
-    must NOT import dockwright, so discovery is re-implemented."""
+def config_path():
+    """dockwright.toml discovery: $DOCKWRIGHT_CONFIG, else XDG, else ~/.claude.
+    None when no file exists (env pointing at a missing file = no config).
+    Deployed scripts must NOT import dockwright, so discovery is
+    re-implemented."""
     env = os.environ.get("DOCKWRIGHT_CONFIG", "").strip()
     if env:
         p = Path(env).expanduser()
-        candidates = [p] if p.is_file() else []
-    else:
-        xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
-        base = Path(xdg).expanduser() if xdg else Path.home() / ".config"
-        candidates = [base / "dockwright" / "dockwright.toml",
-                      Path.home() / ".claude" / "dockwright.toml"]
-    path = next((c for c in candidates if c.is_file()), None)
+        return p if p.is_file() else None
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".config"
+    candidates = [base / "dockwright" / "dockwright.toml",
+                  Path.home() / ".claude" / "dockwright.toml"]
+    return next((c for c in candidates if c.is_file()), None)
+
+
+def config_toml_str(section: str, key: str) -> str:
+    """Quoted string value of [section] key from dockwright.toml, "" when
+    unset/unreadable. tomllib when available; _scan_toml_str fallback for the
+    py3.9 /usr/bin/python3 this runs under via gardener-run.sh."""
+    path = config_path()
     if path is None:
         return ""
     try:
         import tomllib
         with open(path, "rb") as fh:
-            value = tomllib.load(fh).get("paths", {}).get("dockwright_repo")
+            value = tomllib.load(fh).get(section, {}).get(key)
     except ModuleNotFoundError:
         try:
-            value = _scan_toml_str(path.read_text(), "paths", "dockwright_repo")
+            value = _scan_toml_str(path.read_text(), section, key)
         except OSError:
             return ""
     except Exception:
         return ""
-    return str(Path(value).expanduser()) if isinstance(value, str) and value else ""
+    return value if isinstance(value, str) else ""
+
+
+def _dockwright_repo() -> str:
+    """[paths] dockwright_repo from dockwright.toml, ~-expanded ("" when unset)."""
+    value = config_toml_str("paths", "dockwright_repo")
+    return str(Path(value).expanduser()) if value else ""
 
 
 # FR-8 scope guard: the Gardener's domain is the Claude meta-system only —
@@ -413,7 +426,7 @@ def _resolve_member(sid: str):
     return None, "missing"
 
 
-def decide(proposal_path: str, kind: str, reason: str) -> int:
+def decide(proposal_path: str, kind: str, reason: str, applied_rev=None) -> int:
     """Review-sitting bookkeeping for one human decision. Returns exit code."""
     if kind not in ("accept", "decline"):
         print(f"gardener-decide: unknown kind {kind!r} (accept|decline)", file=sys.stderr)
@@ -466,6 +479,7 @@ def decide(proposal_path: str, kind: str, reason: str) -> int:
                   members_ambiguous=",".join(ambiguous),
                   lane=str(meta.get("lane") or "digest"),
                   evidence_kind=evidence_kind,
+                  applied_rev=";".join(applied_rev or []),
                   **{"class": str(meta.get("kind", ""))})
     print(f"gardener-decide: {kind} {meta.get('id')} → {dest}; "
           f"marked reviewed: {len(marked)}/{len(members)} members"
@@ -718,6 +732,10 @@ def main(argv: list[str] | None = None) -> int:
     p_dec.add_argument("--proposal", required=True)
     p_dec.add_argument("--kind", required=True, choices=["accept", "decline"])
     p_dec.add_argument("--reason", default="")
+    p_dec.add_argument("--applied-rev", action="append", default=None, dest="applied_rev",
+                       help="root=sha that applied this proposal (repeatable; recorded "
+                            "in the decision event — closes the Phase-2 'capture the "
+                            "applying SHA' item)")
     p_eval = sub.add_parser("evaluate")
     p_eval.add_argument("--verdicts", default=None,
                         help="JSON file mapping check_id -> 'kept'|'violated' or "
@@ -740,7 +758,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "evaluate":
         now = args.now if args.now is not None else time.time()
         return evaluate(args.verdicts, args.dry_run, now)
-    return decide(args.proposal, args.kind, args.reason)
+    return decide(args.proposal, args.kind, args.reason, applied_rev=args.applied_rev)
 
 
 if __name__ == "__main__":

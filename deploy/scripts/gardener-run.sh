@@ -16,12 +16,20 @@
 # DEFERRED-SPIKE: per PRD §12 the headless stdout contract is verified when
 # this mode is first enabled, not in Phase 0. Flip bar lives in PRD §16 Q5.
 #
-# Usage: gardener-run.sh --trigger <accum|floor|force|frontier> [--lane digest|frontier]
+# Usage: gardener-run.sh --trigger <accum|floor|force|frontier> [--lane digest|frontier] [--dry-run]
 #
 # Contract with gardener_gate.py: the gate pre-checks stop file / cap / lock
 # cheaply and spawns this script; this script re-checks stop + lock
 # atomically (the gate's check is advisory), writes run_start BEFORE spawning
 # the session (write-ahead), and always appends a terminal run_end.
+#
+# ⚠️  The VISIBLE spawn tail launches a REAL `claude` session onto the LIVE tmux
+#     socket by default (TMUX_SOCK defaults to `dockwright`; -L namespaces by
+#     uid, not HOME, so a sandboxed HOME does NOT isolate it). Any probe or test
+#     that runs this script MUST pass --dry-run, which prints the resolved spawn
+#     plan and exits BEFORE touching tmux. A run under a sandboxed HOME against
+#     the live/default socket is REFUSED (exit 3) — the same 2026-07-17 vector
+#     that put two rogue managers on the operator's fleet via bootstrap-recreate.
 
 set -u
 
@@ -44,6 +52,7 @@ LOCK_DIR="$HOMEDIR/.claude/locks/analyst-run.lock"
 
 TRIGGER="manual"
 LANE="digest"
+DRY_RUN=""
 while [ $# -gt 0 ]; do
   case "$1" in
     # shift-guarded: a trailing flag with no value must not spin — `shift 2`
@@ -51,6 +60,7 @@ while [ $# -gt 0 ]; do
     # reproduced as a CPU-pinned hang).
     --trigger) TRIGGER="${2:-manual}"; shift; [ $# -gt 0 ] && shift ;;
     --lane)    LANE="${2:-digest}";    shift; [ $# -gt 0 ] && shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
     *) shift ;;
   esac
 done
@@ -97,7 +107,7 @@ if [ "$LANE" = "frontier" ] && [ -z "${GARDENER_TIMEOUT_SEC:-}" ]; then
   TIMEOUT_SEC=2700
 fi
 GRACE_SEC="${GARDENER_GRACE_SEC:-900}"
-POLL_SEC=20
+POLL_SEC="${GARDENER_POLL_SEC:-20}"
 # cwd for the spawned session: must be a dir Claude Code already trusts, or
 # the first prompt blocks on the trust dialog (manager.md "Worker cwd" rule).
 # Resolution: GARDENER_CWD env > [paths] dockwright_repo > ~/.claude (always a
@@ -149,7 +159,16 @@ fi
 # owner-checked release). try-mode: the gate fires hourly, so a busy lock
 # just means "this tick loses"; the next tick retries.
 . "$HOMEDIR/.claude/scripts/runlock.sh"
-trap runlock_release EXIT INT TERM
+LIVE_WINDOW_SIDECAR=""
+_gardener_cleanup() {
+  # Sidecar removal must ride the same trap as the mutex: once the wrapper is
+  # gone nothing else supervises the pane, so its M-2 protection must drop
+  # (fail toward alarming — a crashed wrapper's sidecar also ages out via the
+  # reader-side mtime TTL).
+  [ -n "$LIVE_WINDOW_SIDECAR" ] && rm -f "$LIVE_WINDOW_SIDECAR" 2>/dev/null
+  runlock_release
+}
+trap _gardener_cleanup EXIT INT TERM
 
 if ! runlock_acquire "$LOCK_DIR" try; then
   run_log "skip" "locked holder=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo unknown)"
@@ -359,6 +378,24 @@ FFLAG=()
 if [ -f "$TMUX_CONF_FILE" ]; then FFLAG=(-f "$TMUX_CONF_FILE")
 elif [ -f "$TMUX_CONF_LEGACY" ]; then FFLAG=(-f "$TMUX_CONF_LEGACY")
 elif [ -f "$TMUX_CONF_LEGACY2" ]; then FFLAG=(-f "$TMUX_CONF_LEGACY2"); fi
+if [ -n "$DRY_RUN" ]; then
+    echo "DRY_RUN: no spawn. socket=$TMUX_SOCK cwd=$GARDENER_CWD"
+    exit 0
+fi
+# Refuse the incident shape: a sandboxed HOME does NOT isolate tmux (-L
+# namespaces by uid, not HOME) — a probe run under HOME=/tmp/... would spawn
+# onto the LIVE socket (2026-07-17: two rogue managers via bootstrap-recreate).
+# Real runs always have HOME == the uid's passwd home; probes must use --dry-run.
+# Gated on the socket: a sandboxed-HOME run against an EXPLICIT scratch socket is
+# a legitimate test shape (the real-tmux behavioral tests below do exactly that),
+# so the guard fires only on sandbox-HOME + live/default socket.
+if [ "$HOME" != "$(eval echo ~"$(id -un)")" ]; then
+    case "$TMUX_SOCK" in
+        dockwright|claude-orch)
+            echo "ERROR: \$HOME ($HOME) is not the uid's real home — refusing to spawn onto live socket '$TMUX_SOCK'. Use --dry-run to probe, or set DOCKWRIGHT_TMUX_SOCKET to a scratch socket." >&2
+            exit 3 ;;
+    esac
+fi
 if tmux -L "$TMUX_SOCK" has-session -t claude-workers 2>/dev/null; then
   TMUX_HEAD=(new-window -d -t claude-workers)
 else
@@ -377,6 +414,13 @@ if [ -z "$WINDOW_ID" ]; then
 fi
 run_log "spawned" "window_id=$WINDOW_ID backend=tmux"
 ledger_append session_spawned run_id="$RUN_ID" window_id="$WINDOW_ID" lane="$LANE" mode=visible
+
+# Shield the live pane from the M-2 orphan-window alarm: the gardener session
+# deliberately never registers an active record, so without this sidecar the
+# stale monitor would page ORPHAN_WINDOW ~2min into every visible run.
+mkdir -p "$GARDENER_DIR/live-windows"
+LIVE_WINDOW_SIDECAR="$GARDENER_DIR/live-windows/$RUN_ID.window"
+printf '%s' "$WINDOW_ID" > "$LIVE_WINDOW_SIDECAR"
 
 # Join on the digest's Status line. Overdue → notify, wait one grace window,
 # then mark timed-out and exit (EXIT trap frees the mutex). The tab is the
@@ -399,6 +443,16 @@ fi
 
 if grep -q '^Status: ok' "$DIGEST" 2>/dev/null; then
   finish_run ok
+  # Clean finish: the digest is durable and postrun ran inside finish_run —
+  # the interactive pane's only remaining value is a leak (observed windows
+  # dated 07-09/10/13 lingering a week). Error/timeout tabs stay open for
+  # diagnosis/interjection (PRD §9.3) and the M-2 alarm nags them honestly.
+  if tmux -L "$TMUX_SOCK" kill-pane -t "$WINDOW_ID" 2>/dev/null; then
+    run_log "window_killed" "window_id=$WINDOW_ID"
+    ledger_append window_killed run_id="$RUN_ID" window_id="$WINDOW_ID"
+  else
+    run_log "window_kill_failed" "window_id=$WINDOW_ID"
+  fi
 elif grep -q '^Status:' "$DIGEST" 2>/dev/null; then
   finish_run error "$(grep '^Status:' "$DIGEST" | tail -1)"
 else

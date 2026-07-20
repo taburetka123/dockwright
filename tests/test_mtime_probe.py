@@ -1,96 +1,32 @@
-"""N-1 regression guards: the boot memory-loader mtime probe must be portable.
+"""N-1 regression guard: no platform-split stat probe in the deployed payload.
 
-The old idiom `stat -f %m "$f" 2>/dev/null || stat -c %Y "$f"` is poisoned on
-GNU coreutils: `stat -f %m <file>` prints an fs-info block to STDOUT before
-exiting 1, `$(a || b)` concatenates both stdouts, and the age arithmetic
-aborts — every Linux manager boot then reports "no memory" (E2E rc.2 N-1).
-The fix is the single portable probe `date -r "$f" +%s` (verified GNU+BSD,
-files and dirs). These tests run the ACTUAL snippet extracted from each boot
-command file under both stat personalities, so any reintroduced stat-based
-probe goes red on the GNU leg.
+The old boot memory-loader used an inline `bash -c` idiom whose mtime probe
+`stat -f %m "$f" 2>/dev/null || stat -c %Y "$f"` was GNU-poisoned: `stat -f
+<file>` prints an fs-info block to STDOUT before exiting 1, `$(a || b)`
+concatenates both stdouts, and the age arithmetic aborts — every Linux manager
+boot then reported "no memory" (E2E rc.2 N-1). rc.2 fixed it to the portable
+`date -r "$f" +%s` form.
+
+The zero-touch-headless migration (E2E F-2) then retired the inline bash entirely:
+the loader is now `dockwright boot-brief --domain <d>`, which reads mtimes via
+Python `Path.stat().st_mtime` — inherently portable, no shell `stat`/`date`. The
+newest-5 / 7-day-window / notebook-warn selection is covered directly by
+tests/test_boot_brief.py, and tests/test_manager_boot_docs.py pins that the docs
+carry no inline `date -r` / stat probe. So the per-snippet extraction tests are
+gone (there is no snippet to extract); this broad class-guard survives — it keeps
+any GNU-poisoned `stat -f` / macOS-breaking `stat -c` platform-split probe from
+being reintroduced ANYWHERE under deploy/.
 """
-import os
-import re
-import subprocess
-import time
 from pathlib import Path
-
-import pytest
-
-from tests.stat_shims import write_bsd_stat_shim, write_gnu_stat_shim
 
 REPO = Path(__file__).resolve().parent.parent
 DEPLOY = REPO / "deploy"
-COMMANDS = DEPLOY / "commands"
-BOOT_FILES = [
-    "manager.md",
-    "manager-reboot.md",
-    "manager-resume.md",
-    "manager-takeover-recovery.md",
-]
-SNIPPET_RE = re.compile(r"bash -c '([^']+)'")
-
-
-def _loader_match(filename: str) -> re.Match:
-    text = (COMMANDS / filename).read_text()
-    for m in SNIPPET_RE.finditer(text):
-        if "manager-memory" in m.group(1):
-            return m
-    raise AssertionError(f"{filename}: memory-loader bash -c snippet not found")
-
-
-def _run_loader(filename: str, tmp_path: Path, shim_writer) -> subprocess.CompletedProcess:
-    memdir = tmp_path / "manager-memory" / "general"
-    memdir.mkdir(parents=True)
-    (memdir / "fresh.md").write_text("# fresh distill\n")
-    old = memdir / "old.md"
-    old.write_text("# stale distill\n")
-    stamp = time.time() - 30 * 86400
-    os.utime(old, (stamp, stamp))
-    nb = tmp_path / "notebook" / "general.md"
-    nb.parent.mkdir(parents=True)
-    nb.write_text("## [ ] planned entry\n")
-
-    body = _loader_match(filename).group(1)
-    body = body.replace("~/.claude/dockwright/manager-memory/<domain>", str(memdir))
-    body = body.replace("~/.claude/dockwright/notebook/<domain>.md", str(nb))
-    assert "~" not in body, f"{filename}: unrewritten path remains in snippet: {body}"
-
-    env = dict(os.environ)
-    env["PATH"] = f"{shim_writer(tmp_path / 'shims')}:{env['PATH']}"
-    return subprocess.run(["bash", "-c", body], capture_output=True, text=True,
-                          env=env, timeout=30)
-
-
-@pytest.mark.parametrize("filename", BOOT_FILES)
-@pytest.mark.parametrize("shim_writer", [write_gnu_stat_shim, write_bsd_stat_shim],
-                         ids=["gnu-stat", "bsd-stat"])
-def test_loader_survives_both_stat_personalities(filename, tmp_path, shim_writer):
-    r = _run_loader(filename, tmp_path, shim_writer)
-    assert r.returncode == 0, f"loader died: rc={r.returncode} stderr={r.stderr!r}"
-    assert r.stderr == "", f"loader wrote stderr: {r.stderr!r}"
-    lines = r.stdout.splitlines()
-    assert any(line.startswith("MEMORY ") and line.endswith("/fresh.md") for line in lines), (
-        f"fresh distill not loaded; stdout={r.stdout!r}")
-    assert "old.md" not in r.stdout, "31-day-old distill leaked past the 7-day window"
-    assert any(line.startswith("NOTEBOOK ") for line in lines), (
-        f"notebook pointer missing; stdout={r.stdout!r}")
-
-
-@pytest.mark.parametrize("filename", BOOT_FILES)
-def test_loader_has_no_outer_stderr_suppression(filename):
-    # The outer `2>/dev/null` after the closing quote hid the Linux failure for
-    # a full release cycle — the loader must fail loudly.
-    text = (COMMANDS / filename).read_text()
-    m = _loader_match(filename)
-    tail = text[m.end():m.end() + 20]
-    assert not tail.strip().startswith("2>/dev/null"), (
-        f"{filename}: error-hiding outer 2>/dev/null reintroduced after the loader")
 
 
 def test_no_platform_split_stat_probes_in_deploy():
     # Guard the whole probe class: `stat -f` is GNU-poisoned, a bare `stat -c`
-    # silently breaks macOS. Portable form: `date -r <path> +%s`.
+    # silently breaks macOS. Portable forms: the boot-brief CLI (Python stat) or,
+    # for any shell script that still needs an mtime, `date -r <path> +%s`.
     offenders = []
     for path in sorted(DEPLOY.rglob("*")):
         if not path.is_file():
@@ -103,5 +39,5 @@ def test_no_platform_split_stat_probes_in_deploy():
             offenders.append(str(path.relative_to(REPO)))
     assert not offenders, (
         f"platform-split stat probes found (GNU `stat -f`/`stat -c` breaks "
-        f"across macOS/Linux; use the portable `date -r <path> +%s` form "
-        f"instead): {offenders}")
+        f"across macOS/Linux; use the boot-brief CLI or the portable "
+        f"`date -r <path> +%s` form instead): {offenders}")

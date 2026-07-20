@@ -3,7 +3,7 @@
   "remoteControlAtStartup": false,
   "disableRemoteControl": true,
   "permissions": {
-    "defaultMode": "acceptEdits",
+    "defaultMode": "auto",
     "allow": [
       "mcp__dockwright__worker_done",
       "mcp__dockwright__ask_manager",
@@ -13,7 +13,33 @@
       "mcp__dockwright__artifact_view",
       "mcp__dockwright__pipeline_event",
       "mcp__dockwright__pipeline_status",
-      "Bash(printenv:*)"
+      "Bash(printenv:*)",
+      "Bash(cd:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git init:*)",
+      "Bash(git branch)",
+      "Bash(git branch --show-current)",
+      "Bash(git checkout:*)",
+      "Bash(git switch:*)",
+      "Bash(git restore:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(git stash)",
+      "Bash(git stash push:*)",
+      "Bash(git stash pop:*)",
+      "Bash(git stash apply:*)",
+      "Bash(git stash list:*)",
+      "Bash(git stash show:*)",
+      "Bash(git worktree add:*)",
+      "Bash(git worktree list:*)",
+      "Bash(git fetch:*)",
+      "Bash(git pull:*)",
+      "Bash(git merge:*)",
+      "Bash(git rebase:*)"
     ]
   }
 }

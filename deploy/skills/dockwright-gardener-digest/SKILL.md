@@ -29,10 +29,12 @@ Read `~/.claude/dockwright/gardener/ledger.jsonl` (it is small). Collect:
 - **Declined clusters**: `decision` events with `kind=decline` — their `members` sets and reasons. NEVER re-propose a cluster whose member set adds nothing new over a declined one; mention it in Notes only if strictly-new members arrived.
 - **Accepted proposals** and **armed checks** (`decision` kind=accept, `check_armed`): don't re-propose what's already accepted/armed; outcome follow-up is Phase 2's job, not yours.
 - Prior `proposal` events still pending (files in `proposals/pending/`): do not duplicate them.
+- **Declined/rejected proposals are EVIDENCE, not just dedup substrate:** decline reasons (`decision` kind=decline) and quarantine reasons (`proposal_rejected`) are labeled failures of the Gardener's own drafting. When ≥2 declines share a reason-class (wrong home, too much always-on cost, heuristic patch over root cause, …), report the pattern in the digest's `## Proposal-shaping learnings` section; if it contradicts a shaping prior above, the fix to this skill's own priors is itself proposable (normal bar).
 
 ## Step 2 — Observe (PRD §6 sources, cost discipline)
 
 1. **Findings (primary):** unreviewed = `~/.claude/dockwright/selffix/findings/*.md` with no `.reviewed` sibling. `mode=full` → all of them; `mode=incremental` → only those newer than the last-digest marker. Read them (batch parallel Reads).
+1b. **Engineer corrections (labeled failures, first-class):** issues inside findings files tagged `**Source**: engineer-correction` / `⚖️ [CORRECTION]` (extracted by dockwright-selffix Step 2b). Human-labeled ground truth about a real assistant failure — weigh like 🚩 human-flagged evidence.
 2. **Ops state (windowed, cheap):** `~/.claude/dockwright/gardener/gate.log` tail; `~/.claude/dockwright/closed/*.json` `closed_reason` distribution; `.stale-emitted*.json`; `~/.claude/dockwright/selffix/trigger.log` tail if present.
 3. **Manager memory:** newest ≤5 files in `~/.claude/dockwright/manager-memory/*/`.
 4. **Substrate metrics (arithmetic, not reading):** total bytes + file count of `~/.claude/rules/`, `~/.claude/agents/`, skills count — the manageability-surface trend.
@@ -46,6 +48,8 @@ Group issue-level evidence by recurring FAILURE CLASS (same root pattern across 
 - **Rank** = recurrence count × cost-per-occurrence (as described in the findings) × fix-cheapness. Descending.
 - Singletons: one-line "unclustered" list in the digest.
 - **Human-flagged findings bypass the bar AND get an actionable proposal — treat them as IMPORTANT.** A finding carrying `🚩` / `[MANUAL]` / `**Source**: manual` (a user `/dockwright-fix` flag — see `dockwright-selffix` SKILL.md) is a deliberate human ask; it does NOT need ≥3-session recurrence. Never cluster it away or drop it under "below the bar / unclustered" — surface each verbatim in the dedicated `## 🚩 Human-flagged (manual)` digest section (Step 7), **and pre-draft an actionable proposal for it by default** (human-flagged proposals count *beyond* the ≤10 above-bar cap). Do NOT downgrade a human-flagged ask to "surface only / no proposal": if the clean fix needs a spike, draft the proposal capturing the ready zero-downside part (e.g. a discoverability cross-reference to an existing recipe) and flag the spike as a gated step inside it. Omit a proposal ONLY when there is genuinely no actionable artifact at all — and then say why explicitly in the human-flagged section. (2026-06-22: this run downgraded the human-flagged vendor-auth ask to surface-only; user: "Vendor auth is important. Basically I want you to treat human marked issues as important.")
+- **Engineer corrections bypass the bar** the same way human-flagged findings do (a correction is a human label, not a model guess) — but Step 4 already-fixed detection still applies: a correction whose durable fix already landed (the common case — the engineer fixed it in-session) yields an **outcome check** (does the landed rule/skill actually hold? does its TRIGGER catch the case?), not a duplicate proposal. Like human-flagged proposals, correction-sourced proposals count beyond the ≤10 above-bar cap.
+- **Newer resolution wins.** When two pieces of evidence contradict on the same behavior (an older correction/rule vs a newer correction), draft from the NEWEST resolution; keep the older as history; FLAG the conflict explicitly (in the cluster's Evidence and in Notes) for the reviewer. Never average contradicting guidance, never silently merge. "Newer" is keyed on finding-file recency (the session order Step 2 already reads), not a per-correction timestamp field — when two corrections share a single findings file, the explicit conflict FLAG is the backstop instead.
 
 ## Step 4 — Already-fixed detection (backtest discipline)
 
@@ -83,7 +87,9 @@ revert: git revert of the applying auto-commit (diff below is its own inverse)
 ## Diff
 ```diff
 <READY-TO-APPLY unified diff against the CURRENT live target (you read it in Step 4);
- for kind: new-asset, full file content + exact destination path instead>
+ for kind: new-asset, a NEW-FILE unified diff: `--- /dev/null` header +
+ `+++ <absolute destination path, byte-equal to the targets: entry>` with the
+ full content as +lines — gardener_apply.py (T11) applies it mechanically>
 ```
 
 ## Rationale
@@ -146,6 +152,12 @@ data window: <span> · <N> findings read (<mode>) · trigger: <trigger>
 
 ## 🚩 Human-flagged (manual)
 <one entry per source:manual finding — the flagged text quoted + its sid. These bypass the proposability bar and are NEVER buried under "below the bar". If none, omit this section.>
+
+## Engineer corrections (labeled failures)
+<one entry per ⚖️ correction-sourced issue — the verbatim quote + sid + whether the durable fix landed (→ outcome check) or is still missing (→ proposal). Omit the section when none.>
+
+## Proposal-shaping learnings
+<recurring decline/quarantine reason-classes (≥2) from Step 1 — what the human keeps rejecting and why. Omit the section when none.>
 
 ## Below the bar / unclustered
 <one line each>

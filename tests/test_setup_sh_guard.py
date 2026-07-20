@@ -292,6 +292,15 @@ def test_setup_backup_helper_and_dockwright_identity():
     assert 'echo "    tmux -L dockwright new-session"' not in text
 
 
+def test_setup_refreshes_account_registry_snapshot():
+    """Deploy-gap closure: the snapshot must exist the moment a new
+    stale_monitor lands, or its legacy a/b fallback governs until first boot."""
+    repo = Path(__file__).resolve().parent.parent
+    text = (repo / "setup.sh").read_text()
+    executed = [l for l in text.splitlines() if not l.lstrip().startswith("#")]
+    assert any('"$DOCKWRIGHT_BIN" write-registry-snapshot' in l for l in executed)
+
+
 def test_setup_backs_up_command_copies():
     """The shell-cp command deploy sites into the user-visible Claude + Codex
     command dirs go through per-file backup_then_cp (not glob-cp), so an operator

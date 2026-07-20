@@ -21,10 +21,10 @@ from tests.carve_helpers import (
     compose_generic, compose_operator, requires_operator_overlay,
 )
 
-DEPLOYED_VERIFIER_PATHS = tuple(
-    str(Path.home() / p / "presets" / "verifier-settings.json")
-    for p in (".claude/dockwright", ".claude/orchestrator")
-)
+DEPLOYED_VERIFIER_PATH = str(
+    Path.home() / ".claude/dockwright/presets/verifier-settings.json")
+LEGACY_VERIFIER_PATH = str(
+    Path.home() / ".claude/orchestrator/presets/verifier-settings.json")
 
 
 def _manager_text() -> str:
@@ -105,14 +105,15 @@ def test_tier2_references_classification_not_a_second_list():
 @requires_operator_overlay
 def test_tier2_operator_binding_preserves_readonly_verifier_spawn():
     # The operator binding — superpowers:code-reviewer + the deployed ABSOLUTE
-    # preset path (setup.sh rsyncs presets to ~/.claude/dockwright/presets/;
-    # legacy operators may still pin ~/.claude/orchestrator/presets/ in their
-    # dockwright.toml agent_vars until they update — accept either, and
-    # neither the spawn shell nor claude's --settings expands `~`) — lives
+    # preset path (setup.sh rsyncs presets to ~/.claude/dockwright/presets/,
+    # and neither the spawn shell nor claude's --settings expands `~`) — lives
     # in [agent_vars], so pin the composed operator flavor.
     block = _verifier_block(compose_operator("manager.md"))
     assert "superpowers:code-reviewer" in block
-    assert any(p in block for p in DEPLOYED_VERIFIER_PATHS), (
+    assert DEPLOYED_VERIFIER_PATH in block, (
         "Tier 2 must keep the absolute verifier-settings preset path"
     )
+    # Retired with the compat symlink: a toml re-pin of the orchestrator-era
+    # home must fail here, not spawn a verifier off a dead path.
+    assert LEGACY_VERIFIER_PATH not in block
     assert "read-only" in block.lower()

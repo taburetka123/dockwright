@@ -163,6 +163,7 @@ def _distill_manager_session(claude_sid: str) -> str | None:
                 "--model", config.distill_model(),
                 "--effort", "high",
                 "--output-format", "text",
+                "--disallowedTools", "Write,Edit,NotebookEdit",
             ],
             input=slimmed,
             capture_output=True,

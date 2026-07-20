@@ -13,7 +13,9 @@
 #   This worker captures `claude -p` stdout into $OUT. The skill MUST emit
 #   findings to stdout only — no Write/Edit calls — otherwise findings
 #   diverge from the file the worker wrote and the trigger's findings-exist
-#   gate breaks.
+#   gate breaks. Enforced: the spawn passes
+#   --disallowedTools "Write,Edit,NotebookEdit" (hard denial, matching
+#   gardener-run.sh's headless lane).
 #
 # Retry queue (selffix-retry-lib.sh): failed runs (non-zero exit, <200-byte
 # degenerate stub, lock-timeout) enqueue ONE durable retry entry into
@@ -148,10 +150,21 @@ set -m
 # the dead worker's parent — phantom turn-end noise. Unsetting CLAUDE_AGENT alone
 # disables the gate; the rest are stripped for completeness. The retro has no
 # legitimate need for worker identity.
+#
+# --add-dir / --allowedTools: the transcript lives under ~/.claude/projects/<slug>/,
+# outside the retro child's inherited cwd scope — headless `-p` denies the read
+# and the model apologizes into the findings file (E2E L-5). --add-dir grants
+# the file scope officially; --allowedTools covers the skill's own fixed
+# projection recipe (`jq -r … | grep -vE … | head -c`, `wc -c`), which a fresh
+# install's default settings would otherwise deny. Additive-only on machines
+# with broader operator allowlists.
 ( exec env -u CLAUDE_AGENT -u CLAUDE_WORKER_NAME -u CLAUDE_PARENT_MANAGER -u CLAUDE_DOMAIN \
     claude -p "/dockwright-selffix --transcript $TRANSCRIPT" \
     --model claude-sonnet-5 \
-    --no-session-persistence > "$OUT" 2>&1 ) &
+    --add-dir "$(dirname "$TRANSCRIPT")" \
+    --allowedTools 'Bash(jq:*) Bash(wc:*) Bash(head:*) Bash(tail:*) Bash(grep:*) Read Grep' \
+    --no-session-persistence \
+    --disallowedTools "Write,Edit,NotebookEdit" > "$OUT" 2>&1 ) &
 CHILD_PID=$!
 PGID=$CHILD_PID
 
@@ -181,18 +194,26 @@ if ! grep -q '^Status:' "$OUT"; then
 fi
 
 OUT_BYTES=$(wc -c < "$OUT" | awk '{print $1}')
-if [ "$EC" -eq 0 ]; then
-  worker_log "finished" "exit=$EC bytes=$OUT_BYTES out=$OUT"
-else
-  worker_log "finished-error" "exit=$EC bytes=$OUT_BYTES out=$OUT"
-fi
-
 if [ "$EC" -ne 0 ]; then
+  worker_log "finished-error" "exit=$EC bytes=$OUT_BYTES out=$OUT"
   enqueue_retry "finished-error"
+elif tail -n 3 "$OUT" | grep -q '^Status: error'; then
+  # Zero exit but the skill declared failure (e.g. "Status: error
+  # (transcript-unreadable)"). Anchored to the trailing lines because the
+  # contract's own "Status: error" is always APPENDED at the end (see above)
+  # — a findings body that merely QUOTES such a line earlier in the file must
+  # not false-trigger this branch. Checked BEFORE the stub size guard: the
+  # contract line alone is ~40 bytes and would otherwise be mislabeled a
+  # rate-limit stub — the retry reason must be truthful (E2E L-5).
+  worker_log "finished-error" "exit=$EC status-error bytes=$OUT_BYTES out=$OUT"
+  enqueue_retry "status-error"
 elif [ "$OUT_BYTES" -lt 200 ]; then
   # Zero-exit but degenerate output: real findings are >=2.7KB; ~105B means
   # the model never answered (rate-limit banner stub).
+  worker_log "finished" "exit=$EC bytes=$OUT_BYTES out=$OUT"
   enqueue_retry "stub"
+else
+  worker_log "finished" "exit=$EC bytes=$OUT_BYTES out=$OUT"
 fi
 
 exit 0

@@ -214,3 +214,47 @@ def test_trigger_stale_brick_flag_spawns_normally(retry_home):
     _invoke_trigger(retry_home, sid, transcript)
     assert not (retry_home["retry_dir"] / f"{sid}.json").exists()
     assert "  spawn  " in _log_text(retry_home)
+
+
+ARGV_RECORDING_OK_STUB = (
+    "#!/usr/bin/env bash\n"
+    'printf "%s\\n" "$@" > "$HOME/claude-argv.txt"\n'
+    "echo '## Selffix findings (stub)'\n"
+    "for i in $(seq 1 20); do echo \"- finding line $i: lorem ipsum dolor sit\"; done\n"
+    "echo 'Status: ok'\n"
+)
+
+# ~40 bytes, zero exit: the real-world shape of a permission-denied retro that
+# followed the SKILL.md contract. Must route to status-error, NOT stub.
+STATUS_ERROR_STUB = (
+    "#!/usr/bin/env bash\n"
+    "echo 'Status: error (transcript-unreadable)'\n"
+)
+
+
+def test_run_passes_add_dir_and_allowed_tools(retry_home):
+    _stub_claude(retry_home, ARGV_RECORDING_OK_STUB)
+    sid = "argv-1"
+    transcript = _write_transcript(retry_home["home"], sid)
+    _run_sh(retry_home, transcript, sid)
+    argv = (retry_home["home"] / "claude-argv.txt").read_text().splitlines()
+    assert "--add-dir" in argv
+    assert argv[argv.index("--add-dir") + 1] == str(transcript.parent)
+    assert "--allowedTools" in argv
+    allowed = argv[argv.index("--allowedTools") + 1]
+    for frag in ("Bash(jq:*)", "Bash(wc:*)", "Bash(head:*)", "Bash(grep:*)", "Read"):
+        assert frag in allowed, f"{frag} missing from --allowedTools: {allowed}"
+
+
+def test_zero_exit_status_error_is_not_success(retry_home):
+    _stub_claude(retry_home, STATUS_ERROR_STUB)
+    sid = "status-err-1"
+    transcript = _write_transcript(retry_home["home"], sid)
+    _run_sh(retry_home, transcript, sid)
+    log = _log_text(retry_home)
+    assert "worker:finished-error" in log
+    assert "status-error" in log
+    entry_path = retry_home["retry_dir"] / f"{sid}.json"
+    assert entry_path.is_file(), f"no retry entry; log:\n{log}"
+    entry = json.loads(entry_path.read_text())
+    assert entry["reason"] == "status-error", "status-error must beat the <200B stub check"

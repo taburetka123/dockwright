@@ -27,6 +27,7 @@
 # ~/.claude/skills/dockwright-selffix/SKILL.md):
 #   trigger  -> nohup spawn worker with (transcript-path, session-id)
 #   worker   -> claude -p "/dockwright-selffix --transcript <path>" > $OUT
+#               (spawned with --disallowedTools "Write,Edit,NotebookEdit")
 #   skill    -> emits findings to stdout ONLY; never calls Write/Edit
 # If you change one file, update the other two.
 

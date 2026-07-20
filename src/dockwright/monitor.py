@@ -26,6 +26,32 @@ def _resolve() -> dict:
     return identity.resolve_manager()
 
 
+def _resolve_named(name: str) -> dict:
+    """Resolve a manager by explicit name from active manager records.
+
+    Same record filter as identity's resolvers; exits 2 loudly on no/ambiguous
+    match so scripted invocation fails visibly (E2E N-5).
+    """
+    records = identity._list_manager_records()
+    matches = [r for r in records if r.get("name") == name]
+    if len(matches) == 1:
+        return {"name": matches[0]["name"], "sid": matches[0]["claude_sid"]}
+    if len(matches) > 1:
+        print(
+            f"dockwright monitor: name {name!r} is ambiguous "
+            f"({len(matches)} active manager records match).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    names = sorted(r.get("name", "?") for r in records)
+    print(
+        f"dockwright monitor: no active manager record named {name!r}. "
+        f"Active managers: {names}.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
 def _seen_file(kind: str, manager_name: str) -> Path:
     """Where to persist the SEEN file across one-shot invocations.
 
@@ -131,9 +157,9 @@ def _drain_notify_outbox(manager_name: str) -> None:
         print(f"monitor: outbox drain failed ({e})", file=sys.stderr)
 
 
-def run_done_scan() -> None:
+def run_done_scan(mgr: dict | None = None) -> None:
     """One-shot: emit any new done/<manager>/*.json files; persist SEEN."""
-    mgr = _resolve()
+    mgr = mgr or _resolve()
     name = mgr["name"]
     if _manager_limited(name):
         return
@@ -167,9 +193,11 @@ def run_done_scan() -> None:
 # turn-ends never reach the manager. ~95% of raw per-turn pings were discarded
 # as noise; the silent-finish case is the signal worth a wake-up. A turn-end
 # whose worker has a subagent transcript growing past it is a delegation —
-# held as PENDING with the grace aged from the newest subagent write.
+# held as PENDING, aged from the newest subagent write against
+# _episode_grace_sec() (default 900), NOT this constant.
 # Documentation constant: the live default is transcript.DELEGATION_FRESH_SEC
-# (same 120), read via _turn_end_grace_sec → transcript.delegation_fresh_sec.
+# (same 120), read via _turn_end_grace_sec → transcript.delegation_fresh_sec —
+# this is the turn-end/young-file grace and the read-side freshness only.
 TURN_END_GRACE_SEC_DEFAULT = 120
 # worker_done fires DURING the final turn (an MCP call before the Stop hook),
 # so a done event normally predates its turn-end by seconds-to-minutes. The
@@ -221,6 +249,24 @@ def _turn_end_grace_sec() -> int:
     return delegation_fresh_sec()
 
 
+EPISODE_GRACE_SEC_DEFAULT = 900
+
+
+def _episode_grace_sec() -> int:
+    """Patience window for a worker demonstrably mid-episode: a delegation
+    whose subagent is between transcript writes (2a), or a poll/wait cadence
+    of closely-spaced turn-ends (2b). Clamped to >= the base turn-end grace so
+    raising CLAUDE_ORCH_TURN_END_GRACE_SEC past 900 cannot invert the two."""
+    raw = os.environ.get("CLAUDE_ORCH_EPISODE_GRACE_SEC", "")
+    try:
+        value = int(raw)
+    except ValueError:
+        value = EPISODE_GRACE_SEC_DEFAULT
+    if value <= 0:
+        value = EPISODE_GRACE_SEC_DEFAULT
+    return max(value, _turn_end_grace_sec())
+
+
 def _turn_end_ts(payload: dict, entry: Path) -> float:
     ts = payload.get("completed_at")
     if isinstance(ts, (int, float)) and ts > 0:
@@ -266,9 +312,15 @@ def _delegation_hold(record: dict, sid: str, turn_end_ts: float, now: float) -> 
     goes quiet past grace and the alert still fires once. Crash-proof: any
     failure reads as no-hold (pre-change behavior); the caller's outer
     try/except stays the last resort. Deliberately NOT transcript.is_delegating:
-    the baseline here is the turn-end ts, not the main-log mtime (the grace
-    itself is shared — _turn_end_grace_sec delegates to
-    transcript.delegation_fresh_sec)."""
+    the baseline here is the turn-end ts, not the main-log mtime.
+
+    Freshness ages on _episode_grace_sec (default 900s), NOT the shared 120s
+    turn-end grace: a live reviewer subagent can sit 3-4min between transcript
+    writes (thinking, long tool calls — observed 208s/239s gaps, 2026-07-16),
+    and the old shared bound paged the manager mid-delegation. Cost: a
+    subagent that DIES mid-delegation alerts once at <=episode grace (was
+    <=2min); the read-side is_delegating surfaces deliberately keep the short
+    freshness — they answer "delegating right now", a display concern."""
     try:
         if (record.get("runtime") or "claude") != "claude":
             return False
@@ -277,7 +329,7 @@ def _delegation_hold(record: dict, sid: str, turn_end_ts: float, now: float) -> 
         if log is None:
             return False
         latest = latest_subagent_mtime(log, sid)
-        return latest >= turn_end_ts and now - latest < _turn_end_grace_sec()
+        return latest >= turn_end_ts and now - latest < _episode_grace_sec()
     except Exception as e:
         print(f"monitor: delegation check failed for {sid} ({e})", file=sys.stderr)
         return False
@@ -406,13 +458,17 @@ def classify_turn_end(payload: dict, entry: Path, manager_name: str,
         if now - ts < _turn_end_grace_sec():
             return TURN_END_PENDING
         # Superseded by a newer turn-end for the same sid: that file carries
-        # the current lull; emitting both would double-page one silence.
+        # the current lull; emitting both would double-page one silence. The
+        # same pass collects the newest OLDER sibling ts as burst evidence.
+        prior_ts = 0.0
         for sibling in entry.parent.glob(f"{sid}-*.json"):
             if sibling == entry:
                 continue
             sibling_payload = state.read_json(sibling) or {}
-            if _turn_end_ts(sibling_payload, sibling) > ts:
+            sibling_ts = _turn_end_ts(sibling_payload, sibling)
+            if sibling_ts > ts:
                 return TURN_END_SUPPRESS
+            prior_ts = max(prior_ts, sibling_ts)
         # Accepted edge: done/ files are pruned at 24h. After a >24h manager
         # outage a surviving unseen turn-end can lose its done file and fire
         # one spurious FINISHED_SILENTLY on recovery — harmless next to the
@@ -430,6 +486,13 @@ def classify_turn_end(payload: dict, entry: Path, manager_name: str,
             return TURN_END_SUPPRESS       # worker continued
         if _delegation_hold(record, sid, ts, now):
             return TURN_END_PENDING        # background subagent still working
+        if prior_ts > 0 and ts - prior_ts <= _episode_grace_sec() \
+                and now - ts < _episode_grace_sec():
+            # Turn-burst hold: another turn ended <=episode grace before this
+            # one — a poll/wait cadence (background Bash waits, SDD loops),
+            # not a finish. Held PENDING (never seen-marked): fires once when
+            # the episode's LAST lull ages past the episode grace.
+            return TURN_END_PENDING
         return TURN_END_EMIT
     except Exception as e:
         print(f"monitor: turn-end classification failed for {entry} ({e})",
@@ -473,20 +536,22 @@ def _format_silent_finish_line(payload: dict, entry: Path, verdict: str) -> str:
     return line
 
 
-def run_turn_ends_scan() -> None:
+def run_turn_ends_scan(mgr: dict | None = None) -> None:
     """One-shot: silent-finish detector over new turn-end files.
 
     A turn-end is held (NOT marked seen) until it is GRACE old, then
     classified — suppressed when the worker reported done, kept working, has
     a pending question, is nested, or is the manager itself; held while a
-    background subagent still writes (the delegation hold); emitted as
+    background subagent still writes (the delegation hold); held while an
+    older sibling turn-end sits within the episode grace (the turn-burst
+    hold — a poll/wait cadence); emitted as
     `FINISHED_SILENTLY <name>: <summary>` otherwise (with a `(session
     exited)` variant when the active record is gone). Routine turn-ends
     never reach the manager. Repeats for the same uninterrupted lull are
     rate-limited by the per-sid emit ladder (HELD, not seen-marked, until a
     doubling rung matures — see the FS_LADDER constants). A scan that pages
     also drains the notify outbox into the same burst."""
-    mgr = _resolve()
+    mgr = mgr or _resolve()
     name = mgr["name"]
     if _manager_limited(name):
         return
@@ -540,9 +605,9 @@ def run_turn_ends_scan() -> None:
         _drain_notify_outbox(name)
 
 
-def run_questions_scan() -> None:
+def run_questions_scan(mgr: dict | None = None) -> None:
     """One-shot: emit any new questions/<manager>/*.json files; persist SEEN."""
-    mgr = _resolve()
+    mgr = mgr or _resolve()
     name = mgr["name"]
     if _manager_limited(name):
         return
@@ -569,7 +634,7 @@ def run_questions_scan() -> None:
         _drain_notify_outbox(name)
 
 
-def run_stale_scan() -> None:
+def run_stale_scan(mgr: dict | None = None) -> None:
     """One-shot: run the packaged stale monitor with the resolved manager name.
 
     Runs `sys.executable -m dockwright.stale_monitor` — a fresh
@@ -578,7 +643,7 @@ def run_stale_scan() -> None:
     STALE_QUESTION / AUTOCLOSED lines on stdout). Errors surface via stderr;
     non-zero exit propagates.
     """
-    mgr = _resolve()
+    mgr = mgr or _resolve()
     result = subprocess.run(
         [sys.executable, "-m", "dockwright.stale_monitor",
          "--manager", mgr["name"]],
@@ -588,22 +653,35 @@ def run_stale_scan() -> None:
         sys.exit(result.returncode)
 
 
+_MONITOR_SUBCOMMANDS = ("questions", "done", "turn-ends", "stale")
+
+
 def main(argv: list[str]) -> None:
-    """Dispatch for `dockwright monitor <subcommand>`."""
+    """Dispatch for `dockwright monitor <subcommand> [manager-name]`.
+
+    Validates the subcommand BEFORE resolving the positional manager name, so
+    an unknown subcommand reports as such even when the name is also bogus —
+    `monitor bogus-sub no-such-mgr` must not be misreported as a name-lookup
+    failure.
+    """
+    usage = "Usage: dockwright monitor <questions|done|turn-ends|stale> [manager-name]"
     if not argv:
-        print("Usage: dockwright monitor <questions|done|turn-ends|stale>",
-              file=sys.stderr)
+        print(usage, file=sys.stderr)
         sys.exit(2)
     sub = argv[0]
-    if sub == "questions":
-        run_questions_scan()
-    elif sub == "done":
-        run_done_scan()
-    elif sub == "turn-ends":
-        run_turn_ends_scan()
-    elif sub == "stale":
-        run_stale_scan()
-    else:
+    if sub not in _MONITOR_SUBCOMMANDS:
         print(f"Unknown monitor subcommand: {sub!r}. "
               f"Try questions | done | turn-ends | stale.", file=sys.stderr)
         sys.exit(2)
+    if len(argv) > 2:
+        print(f"Unexpected arguments {argv[2:]!r}. {usage}", file=sys.stderr)
+        sys.exit(2)
+    mgr = _resolve_named(argv[1]) if len(argv) == 2 else None
+    if sub == "questions":
+        run_questions_scan(mgr)
+    elif sub == "done":
+        run_done_scan(mgr)
+    elif sub == "turn-ends":
+        run_turn_ends_scan(mgr)
+    elif sub == "stale":
+        run_stale_scan(mgr)

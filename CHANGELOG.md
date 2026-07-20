@@ -3,6 +3,16 @@
 User-facing release notes for dockwright. Entries describe what an adopter
 gets, not internal development history.
 
+## v1.3.0 — 2026-07-21
+
+- **Zero-touch headless workers.** Worker spawns now default to a scoped headless permission preset (auto permission mode + the protocol MCP allowlist + config-derived writable directories), so a headless/no-human fleet runs without stalling on permission dialogs. The stale monitor detects and pages a pane sitting on an approval prompt, and headless `claude -p` lanes (retrospective/distill) are locked down to disallow `Write`/`Edit`/`NotebookEdit`.
+- **Clickable fleet menu.** The tmux status row carries a one-click fleet menu that opens STAYOPEN, so pointer motion can no longer dismiss it; the decorative worker-count chip was removed in favor of a single clean click target.
+- **Correct single-account operation.** The account layer is now correct for a single-`/login` user with no phantom pool behavior; multi-account pools additionally get an MCP-config refresh and a deploy-time `dockwright accounts-sync` reconcile.
+- **Opt-in manager skip-permissions.** A manager launch can be brought up ungated via `DOCKWRIGHT_MANAGER_SKIP_PERMS=1` (env-gated, off by default) for sanctioned host-driver / classifier-outage windows; every manager launch now carries remote control.
+- **Gardener actuation** (self-improvement module, still off by default). An approved proposal can now be applied as a git patch, gated by an eval-gate that validates what the diff actually touches — not what it declares — with labeled-failure mining feeding the digest.
+- **Faster manager boot.** A new `dockwright boot-brief` emits memory + notebook pointers at manager startup instead of inlining their full contents, keeping large memory/notebook state out of the boot context window.
+- **Notification hygiene.** Quieted three false-positive notification paths (manager-end handoff, silently-finished holds, and gardener windows), and stopped state migration from manufacturing legacy compatibility symlinks.
+
 ## v1.2.0 — 2026-07-16
 
 - **Linux is now a first-class install target.** Fresh-Linux installs work end-to-end: worker spawn picks a portable interactive shell instead of hardcoded `zsh`; the macOS-only awake-clock call is guarded with a portable fallback; the session id reaches workers via SessionStart context injection instead of a shell echo that tripped expansion guards; and the GNU-incompatible `stat` mtime probe was replaced with the portable `date -r` form.

@@ -8,17 +8,19 @@ user-invocable: true
 
 Review the conversation history and identify what was suboptimal about the process that just ran. This is a general-purpose retrospective — it applies to any workflow, skill, or multi-step task.
 
-> **Headless contract** (see `~/.claude/scripts/selffix-trigger.sh` and `selffix-run.sh`): when invoked via `claude -p "/dockwright-selffix --transcript <path>"` the worker captures this skill's stdout into the findings file. The skill must emit findings to stdout only — no `Write`/`Edit` calls — otherwise the findings diverge from the file the worker wrote and the trigger's findings-exist gate breaks. Editing one of these three files? Update the other two.
+> **Headless contract** (see `~/.claude/scripts/selffix-trigger.sh` and `selffix-run.sh`): when invoked via `claude -p "/dockwright-selffix --transcript <path>"` the worker captures this skill's stdout into the findings file. The skill must emit findings to stdout only — no `Write`/`Edit` calls — otherwise the findings diverge from the file the worker wrote and the trigger's findings-exist gate breaks. The worker enforces this with `--disallowedTools "Write,Edit,NotebookEdit"`, so such calls are hard-denied in headless mode. Editing one of these three files? Update the other two.
 
 ## Input mode
 
 - **Interactive (default)**: invoked by the user with no arguments. The "conversation history" is the current session — you already see it.
-- **Headless** (`/dockwright-selffix --transcript <path>`): invoked by the SessionEnd-hook trigger (`~/.claude/scripts/selffix-trigger.sh`) in a separate `claude -p` process. There is **no** prior conversation in this process. Before Step 1, load the `.jsonl` transcript at `<path>` as "the conversation history" for the rest of the steps. **Always** project the transcript with `jq -r` — never `Read` the raw `.jsonl`, regardless of size. The raw file is ~85% non-signal (per-record envelope, thinking blocks, duplicate `toolUseResult` output); the projection keeps user text + assistant text + `tool_use` truncated to ~300 chars — a ~19-20× reduction with no quality loss. Recipe:
+- **Headless** (`/dockwright-selffix --transcript <path>`): invoked by the SessionEnd-hook trigger (`~/.claude/scripts/selffix-trigger.sh`) in a separate `claude -p` process. There is **no** prior conversation in this process. Before Step 1, load the `.jsonl` transcript at `<path>` as "the conversation history" for the rest of the steps. **Always** project the transcript with `jq -r` while `jq` is available and permitted — never `Read` the raw `.jsonl` by preference, regardless of size. If the `jq` projection command is DENIED by the permission system, fall back to the `Read` tool with offset/limit sampling (head + tail of the file) instead of giving up. The raw file is ~85% non-signal (per-record envelope, thinking blocks, duplicate `toolUseResult` output); the projection keeps user text + assistant text + `tool_use` truncated to ~300 chars — a ~19-20× reduction with no quality loss. Recipe:
       ```bash
       jq -r 'select(.type=="user") | .message.content | if type=="string" then . else (.[] | select(.type=="text") | .text) end' <path> | grep -vE '<task-notification>|Monitor event|STALE_(PROCESSING|QUESTION)|AUTOCLOSED|task-id>' | head -c 200000
       jq -r 'select(.type=="assistant") | .message.content[]? | if .type=="text" then .text elif .type=="tool_use" then "TOOL_USE \(.name): \(.input | tostring | .[0:300])" else empty end' <path> | head -c 400000
       ```
       Adjust `head -c` budgets to fit context (run `wc -c <path>` first to gauge size). Read the resulting prose; the .jsonl envelope and tool_result blobs are dropped, which is what makes the projection fit. The user-stream `grep -vE` strips orchestrator noise: manager/worker transcripts are notification-heavy (task-notifications, Monitor events, STALE/AUTOCLOSED markers), and for those sessions the **tail of the conversation + the continuation summary are the highest-signal parts** — don't let the notification volume crowd them out of the budget.
+
+      If the transcript at `<path>` cannot be read at all (missing file, every read tool denied), emit exactly `Status: error (transcript-unreadable)` as your ENTIRE output — never emit apology prose as findings. The worker treats that status as a failed run and enqueues a retry.
 
    **Output rule**: emit the full structured findings (Step 5 format, all issues, with recommendations) directly to your final response — your stdout IS the findings file; the worker captures it. Do NOT call `Write`, `Edit`, or any other tool to create a separate findings file; do NOT mention paths. Skip Step 6 (no interactive user). Do NOT apply fixes in headless mode.
 
@@ -44,6 +46,22 @@ Review the conversation history and identify what was suboptimal about the proce
    - **Efficiency**: Was context wasted on large data? Were things done sequentially that could be parallel? Were there unnecessary re-reads or redundant steps?
    - **Clarity**: Were instructions to the AI ambiguous? Could a step be misinterpreted?
    - **Durability**: Does the process survive session restarts? Is intermediate state persisted?
+
+2b. **Mine engineer in-thread corrections (labeled failures — these are gold).** Scan the conversation's USER messages for places where the engineer CORRECTED the assistant: stated that its output, claim, assumption, or action was wrong (factually or procedurally), or reversed its decision. Tells: direct refutation ("это не так", "GRPC — это не штатный механизм", "you're checking the wrong table"), a reversal instruction after the assistant committed to a path, an in-session rule/skill edit prompted by the pushback. An ordinary instruction or answer is NOT a correction — the marker is the engineer contradicting something the assistant already asserted or did. Emit each as its own issue:
+
+   ```
+   ### Issue N: ⚖️ [CORRECTION] <short title> — <impact>/10
+   <what the assistant asserted/did, and how the engineer corrected it>
+   **Source**: engineer-correction — in-thread.
+   **Quote**: «<verbatim engineer words, ≤2 lines>»
+   **Resolution**: <the corrected truth, one line>
+   **Durable fix**: <path of the rule/skill/code fix landed in-session, or "none">
+   **Fix**: <concrete follow-through — verify/strengthen the landed fix, or the missing durable fix>
+   **Fix rating**: Impact <N>/10 · Risk <N>/10 · Effort <N>/10 · Confidence <N>/10
+   **Recommendation**: apply | discuss — never `skip`: a correction is human-labeled ground truth.
+   ```
+
+   Corrections are first-class evidence downstream (the Gardener digest weighs them like human-flagged findings), so extract them even when a durable fix already landed — the pipeline still needs to know the failure happened and verify the fix holds.
 
 3. **Rate each issue 0-10 by impact** (0 = cosmetic, 10 = causes failure or data loss). Only report issues rated 3 or higher.
 
