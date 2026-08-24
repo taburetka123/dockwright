@@ -141,7 +141,7 @@ def test_recreate_manager_command_is_claude_only():
 
 def test_bootstrap_recreate_is_claude_only():
     text = (SCRIPTS / "bootstrap-recreate.sh").read_text()
-    # Manager lane is pinned to opus[1m] (orch-audit model-allocation) — see
+    # Manager lane is pinned to claude-opus-5[1m] (orch-audit model-allocation) — see
     # tests/test_model_pins.py::test_bootstrap_recreate_pins_manager_opus for
     # the dedicated pin assertion; this test only guards claude-only-ness.
     # Anchored on the claude binary + the manager-resume prompt separately:
@@ -150,7 +150,7 @@ def test_bootstrap_recreate_is_claude_only():
     # claude binary and the --model pin (arg-order fix: a bare
     # --remote-control [name] must be followed by a dash-option, never the
     # trailing prompt), so `claude` and `--model` are no longer adjacent.
-    assert "claude ${RC_ARG}${SKIP_ARG}--model 'opus[1m]'" in text
+    assert "claude ${RC_ARG}${SKIP_ARG}--model 'claude-opus-5[1m]'" in text
     assert "'/manager-resume $HANDOFF_ID'" in text
     # No manager-runtime / codex plumbing survives.
     assert "MANAGER_RUNTIME" not in text

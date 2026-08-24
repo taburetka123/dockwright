@@ -6,7 +6,10 @@ claude-api skill pricing reference (cached 2026-06-04). Cache multipliers are
 applied against the INPUT rate: read 0.1x, write 1.25x (5m TTL) / 2x (1h TTL).
 The `[1m]` model-id suffix is a 1M-context marker, NOT a price premium — Opus
 4.7/4.8 are documented as 1M context at standard pricing — so it is stripped
-before lookup.
+before lookup. `cost_breakdown` also checks the stripped model id as an exact
+`rates` key before falling back to family-prefix matching, so an operator can
+price a whole new model family via a `[pricing.rates]` entry keyed by its
+exact stripped id, without waiting on a `_FAMILY_PREFIXES` update.
 """
 import re
 
@@ -31,6 +34,17 @@ _FAMILY_PREFIXES = (
 )
 
 
+def _strip_model_id(model_id):
+    """Raw model id → lookup key: lower-cased, `[…]` context suffix and
+    `-YYYYMMDD` snapshot suffix stripped. None for non-string/empty."""
+    if not isinstance(model_id, str) or not model_id:
+        return None
+    key = model_id.strip().lower()
+    key = re.sub(r"\[.*?\]$", "", key)          # drop [1m] / [200k] context suffix
+    key = re.sub(r"-\d{8}$", "", key)            # drop -YYYYMMDD snapshot suffix
+    return key or None
+
+
 def normalize_model(model_id):
     """Map a raw transcript `message.model` to a MODEL_RATES key, or None.
 
@@ -38,11 +52,9 @@ def normalize_model(model_id):
     `-YYYYMMDD` date snapshot, lower-cases, then matches a known family prefix.
     `<synthetic>` and any unknown id return None (caller treats as unpriced).
     """
-    if not isinstance(model_id, str) or not model_id:
+    key = _strip_model_id(model_id)
+    if key is None:
         return None
-    key = model_id.strip().lower()
-    key = re.sub(r"\[.*?\]$", "", key)          # drop [1m] / [200k] context suffix
-    key = re.sub(r"-\d{8}$", "", key)            # drop -YYYYMMDD snapshot suffix
     for prefix, canonical in _FAMILY_PREFIXES:
         if key.startswith(prefix):
             return canonical
@@ -61,18 +73,36 @@ def get_rates():
     return {**MODEL_RATES, **overrides} if overrides else MODEL_RATES
 
 
-def cost_breakdown(model_id, *, output_tokens=0, input_tokens=0,
+def rate_key(model_id, rates=None):
+    """The `rates` key a model id prices through, or None when unpriced.
+
+    Exact stripped id first (an operator entry keyed by the exact id is more
+    specific than, and overrides, the family rate), else the family key.
+    """
+    rates = get_rates() if rates is None else rates
+    stripped = _strip_model_id(model_id)
+    if stripped is not None and stripped in rates:
+        return stripped
+    family = normalize_model(model_id)
+    return family if family in rates else None
+
+
+def cost_breakdown(model_id, *, rates=None, output_tokens=0, input_tokens=0,
                    cache_read_tokens=0, cache_creation_5m_tokens=0,
                    cache_creation_1h_tokens=0):
     """USD cost of one model's token usage, split by component.
+
+    `rates` lets a caller prefetch `get_rates()` once and price N entries
+    against it (a report over a whole transcript), instead of re-reading
+    dockwright.toml per entry. Defaults to `get_rates()` when omitted.
 
     Returns {"input","output","cache_read","cache_write","total","priced"}.
     Unknown / synthetic model -> all-zero with priced=False so the caller can
     surface unpriced token volume instead of silently undercounting.
     """
-    rates = get_rates()
-    key = normalize_model(model_id)
-    if key is None or key not in rates:
+    rates = get_rates() if rates is None else rates
+    key = rate_key(model_id, rates)
+    if key is None:
         return {"input": 0.0, "output": 0.0, "cache_read": 0.0,
                 "cache_write": 0.0, "total": 0.0, "priced": False}
     in_rate, out_rate = rates[key]

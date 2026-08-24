@@ -337,6 +337,7 @@ def test_user_prompt_submit_noop_for_non_orchestrator(fresh, monkeypatch, capsys
 
 def test_session_end_removes_active(fresh, monkeypatch):
     monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("HOME", str(fresh))
     state.write_json_atomic(fresh / "active" / "s1.json", {
         "claude_sid": "s1", "agent": "worker", "name": "alpha", "cwd": "/x",
         "iterm_sid": "i1", "pid": 1, "started_at": 0,
@@ -359,6 +360,7 @@ def test_session_end_removes_manager_active_record(fresh, monkeypatch):
 def test_session_end_archives_worker_to_closed(fresh, monkeypatch):
     """User-initiated close (Cmd+W, /exit) must archive worker records so resume_worker can find them."""
     monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("HOME", str(fresh))
     state.write_json_atomic(fresh / "active" / "s1.json", {
         "claude_sid": "s1", "agent": "worker", "name": "alpha", "cwd": "/x",
         "iterm_sid": "i1", "pid": 1, "started_at": 12345.0,
@@ -384,22 +386,46 @@ def test_session_end_copies_spend_into_closed_record(fresh, monkeypatch):
     events expire on a ~24h TTL and active/ is unlinked right here, while the
     Gardener digest reads weekly."""
     monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("HOME", str(fresh))
     spend = {"turns": 3, "out_tokens": 1200, "in_tokens": 4500,
              "cache_read_tokens": 9000, "last_turn_out": 400, "last_msg_id": "msg_3"}
     state.write_json_atomic(fresh / "active" / "s1.json", {
         "claude_sid": "s1", "agent": "worker", "name": "alpha", "cwd": "/x",
         "iterm_sid": "i1", "pid": 1, "started_at": 12345.0, "spend": spend,
+        "transcript_path": "/tmp/somewhere/s1.jsonl",
     })
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "s1"})))
     session_end()
     closed = state.read_json(fresh / "closed" / "s1.json")
     assert closed["spend"] == spend
+    assert closed["transcript_path"] == "/tmp/somewhere/s1.jsonl"
+
+
+def test_session_end_resolves_transcript_path_when_never_cached(fresh, monkeypatch):
+    """A worker that dies before its first Stop never cached transcript_path on
+    the active record — session_end must resolve it via find_session_log so the
+    closed record keeps the recount source."""
+    monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("HOME", str(fresh))
+    project_dir = fresh / ".claude" / "projects" / "-Users-x"
+    project_dir.mkdir(parents=True)
+    log = project_dir / "s1.jsonl"
+    log.write_text("")
+    state.write_json_atomic(fresh / "active" / "s1.json", {
+        "claude_sid": "s1", "agent": "worker", "name": "alpha", "cwd": "/x",
+        "pid": 1, "started_at": 0, "runtime": "claude",
+    })
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "s1"})))
+    session_end()
+    closed = state.read_json(fresh / "closed" / "s1.json")
+    assert closed["transcript_path"] == str(log)
 
 
 def test_session_end_copies_account_into_closed_record(fresh, monkeypatch):
     # D8: per-account spend attribution — the close whitelist must not drop the
     # account the worker was spawned on.
     monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("HOME", str(fresh))
     state.write_json_atomic(fresh / "active" / "s1.json", {
         "claude_sid": "s1", "agent": "worker", "name": "alpha", "cwd": "/x",
         "iterm_sid": "i1", "pid": 1, "started_at": 12345.0, "account": "b",
@@ -413,6 +439,7 @@ def test_session_end_copies_account_into_closed_record(fresh, monkeypatch):
 def test_session_end_account_null_when_absent(fresh, monkeypatch):
     # Pre-fix / accountless records close with an explicit null — uniform schema.
     monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("HOME", str(fresh))
     state.write_json_atomic(fresh / "active" / "s1.json", {
         "claude_sid": "s1", "agent": "worker", "name": "alpha", "cwd": "/x",
         "iterm_sid": "i1", "pid": 1, "started_at": 12345.0,
@@ -425,6 +452,7 @@ def test_session_end_account_null_when_absent(fresh, monkeypatch):
 
 def test_session_end_closed_record_spend_null_when_never_accumulated(fresh, monkeypatch):
     monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("HOME", str(fresh))
     state.write_json_atomic(fresh / "active" / "s1.json", {
         "claude_sid": "s1", "agent": "worker", "name": "alpha", "cwd": "/x",
         "iterm_sid": "i1", "pid": 1, "started_at": 0,
@@ -451,6 +479,7 @@ def test_session_end_does_not_archive_manager_to_closed(fresh, monkeypatch):
 
 def test_session_end_drops_worker_questions(fresh, monkeypatch):
     monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("HOME", str(fresh))
     state.write_json_atomic(fresh / "active" / "s1.json", {
         "claude_sid": "s1", "agent": "worker", "name": "alpha", "cwd": "/x",
         "iterm_sid": "i1", "pid": 1, "started_at": 0,
@@ -1191,6 +1220,7 @@ def test_session_end_preserves_assignment(fresh, monkeypatch):
         "pid": os.getpid(), "started_at": 0,
     })
     monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("HOME", str(fresh))
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "s1"})))
     session_end()
     assert (paths.ASSIGNMENTS / "s1.json").exists()             # structural-survival pin
@@ -1256,6 +1286,12 @@ def _spend_assistant_line(msg_id, usage):
     })
 
 
+def _spend_assistant_line_ts(msg_id, usage, timestamp):
+    line = json.loads(_spend_assistant_line(msg_id, usage))
+    line["timestamp"] = timestamp
+    return json.dumps(line)
+
+
 def _write_worker_transcript(home, sid, lines):
     project_dir = home / ".claude" / "projects" / "-Users-x"
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -1288,8 +1324,9 @@ def test_stop_hook_accumulates_spend_across_turns(fresh, monkeypatch):
     assert record["spend"]["out_tokens"] == 150
     assert record["spend"]["in_tokens"] == 4
     assert record["spend"]["cache_read_tokens"] == 1500
+    assert record["spend"]["cache_creation_tokens"] == 0
     assert record["spend"]["last_turn_out"] == 150
-    assert record["spend"]["last_msg_id"] == "msg_b"
+    assert "last_msg_id" not in record["spend"]
 
     with log.open("a") as f:
         f.write(_spend_assistant_line("msg_c", _spend_usage(output=7, input_tokens=2)) + "\n")
@@ -1298,7 +1335,80 @@ def test_stop_hook_accumulates_spend_across_turns(fresh, monkeypatch):
     assert record["spend"]["turns"] == 2
     assert record["spend"]["out_tokens"] == 157
     assert record["spend"]["last_turn_out"] == 7
-    assert record["spend"]["last_msg_id"] == "msg_c"
+    assert "last_msg_id" not in record["spend"]
+
+
+def test_stop_hook_spend_reconciles_with_full_transcript_recount(fresh, monkeypatch):
+    """Defect-1 regression net: the persisted spend must equal a recount of the
+    WHOLE transcript regardless of a single turn's transcript footprint. Every
+    turn here buries its usage entries behind ~100KiB of non-assistant filler —
+    far past the retired 64KiB tail window — so any windowed re-introduction of
+    the accounting goes RED (the 2026-07-28 2.3x under-count shape)."""
+    monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("HOME", str(fresh))
+    state.write_json_atomic(fresh / "active" / "s1.json", {
+        "claude_sid": "s1", "agent": "worker", "name": "alpha", "cwd": "/x",
+        "pid": 1, "started_at": 0, "runtime": "claude",
+    })
+    filler = json.dumps({"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "content": "x" * 4096}]}})
+
+    def usage(out, inp, cr, cc):
+        return {"input_tokens": inp, "cache_creation_input_tokens": cc,
+                "cache_read_input_tokens": cr, "output_tokens": out,
+                "service_tier": "standard"}
+
+    # Literal expected totals:
+    #   turn 1: msg_t1a out=1000 in=10 cr=100 cc=5 (split event ×2 → counts once)
+    #           msg_t1b out=2000 in=20 cr=200 cc=10          → turn out 3000
+    #   turn 2: msg_t2a out=400 in=4 cr=40 cc=2              → turn out 400
+    #   turn 3: msg_t3a out=30 in=3 cr=300 cc=1              → turn out 30
+    turn_specs = [
+        [("msg_t1a", usage(1000, 10, 100, 5)), ("msg_t1a", usage(1000, 10, 100, 5)),
+         ("msg_t1b", usage(2000, 20, 200, 10))],
+        [("msg_t2a", usage(400, 4, 40, 2))],
+        [("msg_t3a", usage(30, 3, 300, 1))],
+    ]
+    expected_turn_out = [3000, 400, 30]
+    lines = []
+    for turn_index, spec in enumerate(turn_specs):
+        for msg_id, u in spec:
+            lines.extend([filler] * 25)          # ~100KiB ahead of every message
+            lines.append(_spend_assistant_line(msg_id, u))
+        _write_worker_transcript(fresh, "s1", lines)
+        _stop(monkeypatch)
+        record = state.read_json(fresh / "active" / "s1.json")
+        assert record["spend"]["turns"] == turn_index + 1
+        assert record["spend"]["last_turn_out"] == expected_turn_out[turn_index]
+    assert state.read_json(fresh / "active" / "s1.json")["spend"] == {
+        "turns": 3, "out_tokens": 3430, "in_tokens": 37,
+        "cache_read_tokens": 640, "cache_creation_tokens": 18,
+        "last_turn_out": 30,
+        # model-less fixture lines: counted in totals, absent from by_model
+        "by_model": {},
+    }
+
+
+def test_stop_hook_passes_started_at_to_birth_filter(fresh, monkeypatch):
+    """The hook must hand record["started_at"] to recount_spend as the birth
+    cutoff — the wiring that keeps resume-REPLAYED predecessor events (original
+    timestamps, rewritten sessionId) out of the recount. Every other stop-hook
+    test uses started_at=0 (filter off), so only this test goes red if the
+    argument is dropped."""
+    monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("HOME", str(fresh))
+    born = 1785000000.0        # 2026-07-25T17:20:00Z
+    state.write_json_atomic(fresh / "active" / "s1.json", {
+        "claude_sid": "s1", "agent": "worker", "name": "alpha", "cwd": "/x",
+        "pid": 1, "started_at": born, "runtime": "claude",
+    })
+    _write_worker_transcript(fresh, "s1", [
+        _spend_assistant_line_ts("msg_replayed", _spend_usage(output=5000), "2026-07-20T00:00:00Z"),
+        _spend_assistant_line_ts("msg_own", _spend_usage(output=70), "2026-07-26T00:00:00Z"),
+    ])
+    _stop(monkeypatch)
+    record = state.read_json(fresh / "active" / "s1.json")
+    assert record["spend"]["out_tokens"] == 70
 
 
 def test_stop_hook_spend_skips_silently_on_malformed_transcript(fresh, monkeypatch):
@@ -1324,7 +1434,7 @@ def test_stop_hook_survives_spend_parser_raising(fresh, monkeypatch):
     })
     _write_worker_transcript(fresh, "s1", [_spend_assistant_line("msg_a", _spend_usage(output=1))])
     monkeypatch.setattr(
-        "dockwright.transcript.tail_usage_entries",
+        "dockwright.transcript.recount_spend",
         lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     _stop(monkeypatch)                                # must not raise
@@ -1818,8 +1928,9 @@ def test_session_end_malformed_pid_record_does_not_abort_scan(orphan_env, monkey
     assert [w["claude_sid"] for w in flag["workers"]] == ["w1"]
 
 
-def test_worker_session_end_writes_no_orphan_flag(orphan_env, monkeypatch):
+def test_worker_session_end_writes_no_orphan_flag(orphan_env, monkeypatch, fresh):
     monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("HOME", str(fresh))
     _write_worker("w1", "grumpy-yak")
     _write_worker("w2", "grumpy-yak")
     _end_session(monkeypatch, sid="w1")
@@ -1984,6 +2095,7 @@ def _ledger_entries(fresh):
 
 def test_session_end_ledgers_worker_spend_and_archives(fresh, monkeypatch):
     monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("HOME", str(fresh))
     state.write_json_atomic(fresh / "active" / "s1.json", {
         "claude_sid": "s1", "agent": "worker", "name": "alpha",
         "cwd": "/x", "pid": os.getpid(), "started_at": 1.0,
@@ -2026,6 +2138,7 @@ def test_session_end_ledgers_manager_and_nested_spend(fresh, monkeypatch):
 
 def test_session_end_no_spend_no_ledger_line(fresh, monkeypatch):
     monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("HOME", str(fresh))
     state.write_json_atomic(fresh / "active" / "s1.json", {
         "claude_sid": "s1", "agent": "worker", "name": "alpha",
         "cwd": "/x", "pid": os.getpid(), "started_at": 1.0,
@@ -2099,6 +2212,7 @@ def test_session_end_orchestrator_session_ignores_leaked_spend_class(fresh, monk
     the worker's spend already flows through the drop path."""
     monkeypatch.setenv("CLAUDE_AGENT", "worker")
     monkeypatch.setenv("CLAUDE_SPEND_CLASS", "distill")
+    monkeypatch.setenv("HOME", str(fresh))
     state.write_json_atomic(fresh / "active" / "s1.json", {
         "claude_sid": "s1", "agent": "worker", "name": "alpha",
         "cwd": "/x", "pid": os.getpid(), "started_at": 1.0,
@@ -2651,6 +2765,7 @@ def test_session_end_envless_manager_record_runs_manager_leg(fresh, monkeypatch)
 
 def test_session_end_envless_worker_record_archives(fresh, monkeypatch):
     monkeypatch.delenv("CLAUDE_AGENT", raising=False)
+    monkeypatch.setenv("HOME", str(fresh))
     state.write_json_atomic(fresh / "active" / "w1.json", {
         "claude_sid": "w1", "agent": "worker", "name": "alpha", "cwd": "/x",
         "iterm_sid": "i1", "pid": 1, "started_at": 12345.0,
@@ -2689,3 +2804,96 @@ def test_session_end_headless_spend_uses_passed_payload(fresh, monkeypatch):
         {"session_id": "h1", "transcript_path": "/t/h1.jsonl"})))
     session_end()
     assert events == [("distill", "h1", "/t/h1.jsonl")]
+
+
+def test_session_start_pending_takeover_manager_writes_no_record(fresh, monkeypatch, capsys):
+    """Recovery-lane tab (ghost-manager guard): no active record is minted by the
+    hook — identity comes only from become_manager_with_takeover. The whole
+    active/ dir must stay empty (not just this sid's file), and the
+    session-context line must still be emitted for step 2 of the procedure."""
+    monkeypatch.setenv("CLAUDE_AGENT", "manager")
+    monkeypatch.setenv("CLAUDE_WORKER_NAME", "noisy-wizard")
+    monkeypatch.setenv("CLAUDE_ITERM_SID", "i1")
+    monkeypatch.setenv("DOCKWRIGHT_PENDING_TAKEOVER", "1")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "rec-1", "cwd": "/x"})))
+    session_start()
+    assert list((fresh / "active").iterdir()) == []
+    out = capsys.readouterr().out
+    assert "rec-1" in out and "session id" in out
+
+
+def test_session_start_pending_takeover_ignores_workers(fresh, monkeypatch):
+    """A leaked/inherited var on a worker spawn must NOT suppress registration
+    (add-one sweep: the guard is manager-scoped by design)."""
+    monkeypatch.setenv("CLAUDE_AGENT", "worker")
+    monkeypatch.setenv("CLAUDE_WORKER_NAME", "alpha")
+    monkeypatch.setenv("CLAUDE_ITERM_SID", "i1")
+    monkeypatch.setenv("DOCKWRIGHT_PENDING_TAKEOVER", "1")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "w1", "cwd": "/x"})))
+    session_start()
+    assert state.read_json(fresh / "active" / "w1.json")["name"] == "alpha"
+
+
+def test_session_start_pending_takeover_requires_exact_one(fresh, monkeypatch):
+    """Exact-match contract (same as DOCKWRIGHT_MANAGER_SKIP_PERMS): any value
+    other than the literal "1" registers as today."""
+    for i, bad in enumerate(("0", "true", "")):
+        monkeypatch.setenv("CLAUDE_AGENT", "manager")
+        monkeypatch.setenv("CLAUDE_ITERM_SID", "i1")
+        monkeypatch.setenv("DOCKWRIGHT_PENDING_TAKEOVER", bad)
+        sid = f"m-{i}"
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": sid, "cwd": "/x"})))
+        session_start()
+        assert state.read_json(fresh / "active" / f"{sid}.json") is not None, bad
+        # Delete between iterations: a surviving same-pid record would route the
+        # next iteration through the /clear rotation branch, never reaching the
+        # else-branch the guard lives in (the sweep must exercise the GUARD each
+        # pass, not the rotation lane).
+        (fresh / "active" / f"{sid}.json").unlink()
+
+
+def test_session_start_pending_takeover_keeps_existing_record_branch(fresh, monkeypatch):
+    """Post-takeover resume/compaction re-fire: the record written by the takeover
+    exists → the existing-record refresh branch must win over the guard (the env
+    var persists for the session's whole life)."""
+    state.write_json_atomic(fresh / "active" / "rec-1.json", {
+        "claude_sid": "rec-1", "agent": "manager", "name": "noisy-wizard",
+        "cwd": "/old", "window_id": "i0", "pid": 1, "started_at": 123.0,
+        "state": "idle", "last_turn_at": None, "last_summary": None,
+        "domain": "personal", "parent_manager_name": None, "runtime": "claude",
+    })
+    monkeypatch.setenv("CLAUDE_AGENT", "manager")
+    monkeypatch.setenv("CLAUDE_ITERM_SID", "i2")
+    monkeypatch.setenv("DOCKWRIGHT_PENDING_TAKEOVER", "1")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "rec-1", "cwd": "/new"})))
+    session_start()
+    record = state.read_json(fresh / "active" / "rec-1.json")
+    assert record["name"] == "noisy-wizard"
+    assert record["domain"] == "personal"
+    assert record["cwd"] == "/new"
+    assert record["window_id"] == "i2"
+
+
+def test_session_start_pending_takeover_keeps_rotation_branch(fresh, monkeypatch):
+    """/clear post-takeover: same pid, new sid — the rotation lane must still
+    supersede the old record and carry identity, var notwithstanding. Modeled on
+    test_session_start_manager_sid_rotation_keeps_identity."""
+    own_pid = os.getpid()
+    state.write_json_atomic(fresh / "active" / "mgr-old.json", {
+        "claude_sid": "mgr-old", "agent": "manager", "name": "happy-otter",
+        "cwd": "/x", "window_id": "175", "pid": own_pid, "started_at": 0,
+        "state": "idle", "domain": "tickets", "parent_manager_name": None,
+        "funny_name": None, "runtime": "claude",
+    })
+    monkeypatch.setattr("dockwright.hooks._ancestor_pids", lambda pid: set())
+    monkeypatch.setattr("dockwright.hooks._pid_alive", lambda pid: True)
+    monkeypatch.setenv("TMUX_PANE", "175")
+    monkeypatch.setenv("CLAUDE_AGENT", "manager")
+    monkeypatch.setenv("CLAUDE_PARENT_PID", str(own_pid))
+    monkeypatch.setenv("DOCKWRIGHT_PENDING_TAKEOVER", "1")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"session_id": "mgr-new", "cwd": "/x"})))
+    session_start()
+    record = state.read_json(fresh / "active" / "mgr-new.json")
+    assert record is not None and record["name"] == "happy-otter"
+    assert record["domain"] == "tickets"
+    assert not (fresh / "active" / "mgr-old.json").exists()

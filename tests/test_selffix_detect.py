@@ -35,6 +35,13 @@ def selffix(tmp_path, monkeypatch):
     # + [gardener] high_skills resolution; ship it alongside so the helper
     # resolves (as it does deployed to ~/.claude/scripts/).
     shutil.copy(LOOP_LABEL_PREFIX, scripts_dir / "loop-label-prefix.sh")
+    # The human-fix-flag predicate is canonical in transcript_signal.py and
+    # imported by the trigger (one definition shared with selffix-run.sh's gate);
+    # ship it alongside as setup.sh does. Absent, the trigger degrades loudly
+    # ("fix-predicate-unavailable") rather than silently — which is a different
+    # code path than the one these tests exercise.
+    shutil.copy(REPO_ROOT / "deploy" / "scripts" / "transcript_signal.py",
+                scripts_dir / "transcript_signal.py")
     # Stub selffix-run.sh so the HIGH path can fork-and-disown a no-op.
     run_stub = scripts_dir / "selffix-run.sh"
     run_stub.write_text("#!/bin/bash\nexit 0\n")
@@ -401,10 +408,16 @@ def selffix_e2e(tmp_path, monkeypatch):
     scripts_dir.mkdir(parents=True)
     for name, src in (("selffix-trigger.sh", SELFFIX_TRIGGER),
                       ("selffix-run.sh", SELFFIX_RUN),
-                      ("runlock.sh", RUNLOCK)):
+                      ("runlock.sh", RUNLOCK),
+                      ("transcript_signal.py", SELFFIX_RUN.parent / "transcript_signal.py")):
         dst = scripts_dir / name
         shutil.copy(src, dst)
         dst.chmod(0o755)
+    # Default-deny child: no user-level skill discovery, so the worker passes the
+    # skill BODY as the prompt and refuses to spawn without it.
+    skill = home / ".claude" / "skills" / "dockwright-selffix"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# dockwright-selffix\nstub body\n")
     # Stub `claude` on PATH: selffix-run.sh pipes its stdout into the findings
     # file, so a stub that prints findings text makes a real file land on disk
     # without invoking the actual model. Echo the transcript arg back so we can

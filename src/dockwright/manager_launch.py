@@ -151,7 +151,10 @@ def manager_claude_args() -> list[str]:
     # opt-in into a sticky mode. Set it per-invocation; never export it in a
     # shell profile — the recreate lanes run `-ic` shells that source rc
     # files, so a profile export re-enters the environment past the scrub.
-    if os.environ.get("DOCKWRIGHT_MANAGER_SKIP_PERMS", "").strip() == "1":
+    # EXACT compare, deliberately no .strip(): bootstrap-recreate.sh is the
+    # reference lane and bash's `=` never normalizes, so normalizing here
+    # would make "1 " authorize a skip-permissions launch that bash refuses.
+    if os.environ.get("DOCKWRIGHT_MANAGER_SKIP_PERMS", "") == "1":
         args.append("--dangerously-skip-permissions")
     settings = paths.PRESETS / "manager-settings.json"
     if settings.is_file():

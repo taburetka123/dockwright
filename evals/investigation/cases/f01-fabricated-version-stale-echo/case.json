@@ -3,5 +3,5 @@
   "tags": ["investigation", "evidence-fidelity"],
   "adversarial_signals": ["alert_metric_value_is_stale", "tempting_fabricated_provenance", "reflexive_rollback"],
   "difficulty": 4,
-  "provenance": "upstream-scorer eval 102-example-app-rsc-router-skew (the 2026-06-29 evidence-fidelity incident) transplanted onto committed file fixtures"
+  "provenance": "synthetic scenario: an alert value echoed as current state after the incident had self-resolved, shaped to test evidence fidelity (alert-value vs live-value)"
 }

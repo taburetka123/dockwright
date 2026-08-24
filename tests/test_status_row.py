@@ -358,6 +358,41 @@ import time
 import pytest
 
 
+def _tmux_version():
+    """(major, minor) of the tmux on PATH; None if absent or unparseable.
+
+    Probed at import time — before conftest's autouse PATH shim fronts a fake
+    `tmux` — so this reads the real binary. Handles suffixed versions ("3.7b").
+    """
+    exe = shutil.which("tmux")
+    if exe is None:
+        return None
+    try:
+        out = subprocess.run([exe, "-V"], capture_output=True, text=True,
+                             timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"(\d+)\.(\d+)", out)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+_TMUX_VER = _tmux_version()
+
+# status_row.py pops the fleet menu with `display-menu -M` (its mouse-selectable
+# form), which tmux added in 3.5. On an older tmux the command is rejected and
+# the menu never renders, so these tests fail for the ENVIRONMENT's reason
+# rather than the code's — ubuntu-latest ships 3.4, and so does any contributor
+# on Ubuntu 24.04. conftest's real_tmux gate only checks that tmux EXISTS, so
+# state the version actually required here. Absent/unparseable tmux is
+# deliberately NOT skipped: the real_tmux fixture already skips the absent case
+# with its own accurate reason, and an unparseable one should fail loudly
+# rather than vanish into a silent pass.
+requires_menu_tmux = pytest.mark.skipif(
+    _TMUX_VER is not None and _TMUX_VER < (3, 5),
+    reason=f"fleet menu needs tmux >= 3.5 for `display-menu -M` "
+           f"(found {'.'.join(map(str, _TMUX_VER)) if _TMUX_VER else 'none'})")
+
+
 def _capture(sock, session, secs=8):
     pid, fd = pty.fork()
     if pid == 0:
@@ -1303,6 +1338,7 @@ def _birth_manager_and_two_workers(sock, conf, orch, rows, cols):
 
 
 @pytest.mark.real_tmux
+@requires_menu_tmux
 def test_live_fleet_menu_pops_on_label_click(tmp_path, monkeypatch, real_tmux):
     """Clicking the shipped WORKERS label (menu:fleet range, col 3) pops the
     display-menu on the clicking client: the menu title and a worker funny_name
@@ -1337,6 +1373,7 @@ def test_live_fleet_menu_pops_on_label_click(tmp_path, monkeypatch, real_tmux):
 
 
 @pytest.mark.real_tmux
+@requires_menu_tmux
 def test_live_fleet_menu_survives_pointer_motion(tmp_path, monkeypatch, real_tmux):
     """The engineer's 2026-07-17 bug, verbatim: click WORKERS, the menu opens,
     move the pointer toward it — the menu vanishes before reaching a row. A
@@ -1393,6 +1430,7 @@ def test_live_fleet_menu_survives_pointer_motion(tmp_path, monkeypatch, real_tmu
 
 
 @pytest.mark.real_tmux
+@requires_menu_tmux
 def test_live_fleet_menu_row_click_jumps(tmp_path, monkeypatch, real_tmux):
     """The full shipped path WITH a moving pointer: open the menu, walk the
     pointer from the label into the box (motion events hover the target row —
@@ -1448,6 +1486,7 @@ def test_live_fleet_menu_row_click_jumps(tmp_path, monkeypatch, real_tmux):
 
 
 @pytest.mark.real_tmux
+@requires_menu_tmux
 def test_live_fleet_menu_survives_human_timed_click(tmp_path, monkeypatch, real_tmux):
     """The engineer's actual gesture: press the WORKERS label, hold ~0.8s (far
     longer than the Popen'd display-menu needs to appear), release. On the old
@@ -1508,6 +1547,7 @@ def test_live_fleet_menu_survives_human_timed_click(tmp_path, monkeypatch, real_
 
 
 @pytest.mark.real_tmux
+@requires_menu_tmux
 def test_live_fleet_menu_scoped_to_clicking_manager(tmp_path, monkeypatch, real_tmux):
     """Peer-leak constraint, end-to-end: manager A's own window views the bar;
     the popped menu lists A's worker and NOT peer manager B's worker, and the
@@ -1561,3 +1601,610 @@ def test_live_fleet_menu_scoped_to_clicking_manager(tmp_path, monkeypatch, real_
     assert "wb-funny" not in overlay, f"peer manager B's worker leaked into A's menu: {overlay!r}"
     assert "alpha-mgr" in overlay, f"menu title missing scoping manager A's name: {overlay!r}"
     assert "1 workers" in overlay, f"menu title not scoped to A's single worker: {overlay!r}"
+
+
+# --- manager "new message" chip -------------------------------------------
+# The chip lights when a manager has written something the engineer has not
+# seen, and clears when he opens that tab. Everything here guards ONE property:
+# the read mark holds the record's own signature STRING and is compared with
+# != — never against a clock. last_turn_at is ISO-UTC from the transcript; any
+# clock-derived mark is local epoch, and mixing the two scales yields a chip
+# that is always-on or never-on, off by hours and invisible to the eye.
+
+_TS = "2026-08-14T01:55:33.039Z"
+
+
+@pytest.fixture(autouse=True)
+def _tmux_cannot_answer(monkeypatch):
+    """In-process tests get the "tmux unanswerable" branch by default, so they
+    exercise the fail-loud direction and stay independent of whatever fake tmux
+    is on PATH. The cases that care about pane liveness stub a real set."""
+    monkeypatch.setattr(sr, "_live_pane_ids", lambda: None)
+
+
+def _mgr(**kw):
+    rec = {"agent": "manager", "name": "boss", "claude_sid": "sid1", "window_id": "%5",
+           "last_turn_at": _TS, "last_summary": "готово"}
+    rec.update(kw)
+    return {k: v for k, v in rec.items() if v is not _ABSENT}
+
+
+class _Absent:
+    pass
+
+
+_ABSENT = _Absent()
+
+
+def _lit(out):
+    """Unread is asserted on the ✉ prefix, not the color: _styled discards the
+    color argument for a SELECTED chip (_styled), so a color-only
+    assertion passes against an implementation hardwired to 'unread'."""
+    return sr.UNREAD_MARKER in out
+
+
+def test_unread_lights_when_no_mark_exists(tmp_path):
+    out = sr.render_managers([_mgr()], selected_pane="%9", orch=tmp_path)
+    assert _lit(out)
+    assert f"bg={sr.UNREAD_COLOR[0]}" in out
+
+
+def test_read_mark_equal_to_signature_is_not_lit(tmp_path):
+    sr._write_mark(sr._mark_path(tmp_path, _mgr()), sr._signature(_mgr()))
+    out = sr.render_managers([_mgr()], selected_pane="%9", orch=tmp_path)
+    assert not _lit(out)
+    assert f"bg={sr.MANAGER_COLOR[0]}" in out
+
+
+def test_stamp_then_leave_clears_the_chip(tmp_path):
+    """THE key-round-trip guard. A writer/reader key mismatch (name vs
+    claude_sid, a path typo, .read- vs .read_) passes every single-render test
+    and ships a chip that never turns off."""
+    lit_before = sr.render_managers([_mgr()], selected_pane="%9", orch=tmp_path)
+    viewing = sr.render_managers([_mgr()], selected_pane="%5", orch=tmp_path)
+    after = sr.render_managers([_mgr()], selected_pane="%9", orch=tmp_path)
+    assert _lit(lit_before)
+    assert not _lit(viewing)
+    assert not _lit(after), "opening the tab did not clear the mark"
+
+
+def test_no_stamp_when_the_manager_pane_is_not_selected(tmp_path):
+    """An implementation that stamps unconditionally passes every single-render
+    test AND the stamp-then-leave test's first half, while silently killing the
+    feature."""
+    sr.render_managers([_mgr()], selected_pane="%9", orch=tmp_path)
+    assert list(tmp_path.glob(".read-*")) == []
+    assert _lit(sr.render_managers([_mgr()], selected_pane="%9", orch=tmp_path))
+
+
+def test_mark_round_trip_through_the_production_writer(tmp_path):
+    """Writing the mark file by hand is a coincidence detector: it cannot catch
+    a trailing newline on write or a missing strip on read, each of which makes
+    != permanently true (chip lit forever)."""
+    rec = _mgr(last_summary="хвост с переводом строки\n")
+    path = sr._mark_path(tmp_path, rec)
+    sr._write_mark(path, sr._signature(rec))
+    assert sr._read_mark(path) == sr._signature(rec)
+    assert not _lit(sr.render_managers([rec], selected_pane="%9", orch=tmp_path))
+
+
+def test_mark_file_with_a_trailing_newline_still_reads_as_read(tmp_path):
+    """Guards the .strip() in _read_mark. Our own writer never leaves one, so
+    without this case that strip is unguarded defense a future edit could drop —
+    and dropping it makes != permanently true (chip lit forever)."""
+    rec = _mgr()
+    sr._mark_path(tmp_path, rec).write_text(sr._signature(rec) + "\n")
+    assert not _lit(sr.render_managers([rec], selected_pane="%9", orch=tmp_path))
+
+
+def test_signature_moves_on_summary_alone(tmp_path):
+    """hooks.py:689-692 updates last_summary and last_turn_at under SEPARATE
+    conditions: a transcript event with no timestamp moves only the summary."""
+    first = _mgr(last_turn_at=None)
+    sr.render_managers([first], selected_pane="%5", orch=tmp_path)
+    second = _mgr(last_turn_at=None, last_summary="новое сообщение")
+    assert _lit(sr.render_managers([second], selected_pane="%9", orch=tmp_path))
+
+
+def test_no_signal_at_all_is_never_lit(tmp_path):
+    out = sr.render_managers([_mgr(last_turn_at=None, last_summary=None)],
+                             selected_pane="%9", orch=tmp_path)
+    assert not _lit(out)
+    assert f"bg={sr.MANAGER_COLOR[0]}" in out
+    assert list(tmp_path.glob(".read-*")) == []
+
+
+def test_no_key_is_never_lit_and_writes_nothing(tmp_path):
+    rec = _mgr(claude_sid=_ABSENT, name=_ABSENT)
+    out = sr.render_managers([rec], selected_pane="%5", orch=tmp_path)
+    assert not _lit(out)
+    assert list(tmp_path.glob(".read-*")) == []
+
+
+def test_future_timestamp_marked_read_stays_dark(tmp_path):
+    """Kills any implementation that parses the ISO value and compares it to the
+    local clock: a 2030 timestamp is 'newer than now' under every clock."""
+    rec = _mgr(last_turn_at="2030-01-01T00:00:00.000Z")
+    sr._write_mark(sr._mark_path(tmp_path, rec), sr._signature(rec))
+    assert not _lit(sr.render_managers([rec], selected_pane="%9", orch=tmp_path))
+    other = _mgr(last_turn_at="2030-01-02T00:00:00.000Z")
+    assert _lit(sr.render_managers([other], selected_pane="%9", orch=tmp_path))
+
+
+def test_past_timestamp_with_older_mark_mtime_stays_dark(tmp_path):
+    """Kills an mtime-based mark. The utime is load-bearing: a freshly written
+    mark has mtime≈now, so `last_turn_at > mtime` asks `2020 > now` -> False and
+    a broken implementation goes green over the very bug this case advertises."""
+    rec = _mgr(last_turn_at="2020-01-01T00:00:00.000Z")
+    path = sr._mark_path(tmp_path, rec)
+    sr._write_mark(path, sr._signature(rec))
+    old = time.time() - 10 * 365 * 24 * 3600      # mtime older than last_turn_at
+    os.utime(path, (old, old))
+    assert not _lit(sr.render_managers([rec], selected_pane="%9", orch=tmp_path))
+
+
+def test_epoch_shaped_mark_never_reads_as_read(tmp_path):
+    rec = _mgr()
+    sr._mark_path(tmp_path, rec).write_text("1786377498")
+    assert _lit(sr.render_managers([rec], selected_pane="%9", orch=tmp_path))
+
+
+def test_unwritable_mark_dir_still_renders_the_chips(tmp_path):
+    """Asserting 'it did not crash' is a coincidence detector: main() swallows
+    everything in `except: pass`, so an empty row passes that. Assert the chips."""
+    wall = tmp_path / "nodir"
+    wall.write_text("not a directory")
+    out = sr.render_managers([_mgr()], selected_pane="%5", orch=wall)
+    assert "🎯 boss" in out
+
+
+def test_orch_default_none_leaves_managers_row_unchanged(tmp_path):
+    """Pinned to the LITERAL pre-change chip. Comparing this code against itself
+    (render_managers vs render_managers) cannot see a divergence from the row
+    that shipped before."""
+    assert sr.render_managers([_mgr()]) == (
+        "#[range=user|switch:%5]#[bg=#aa0066,fg=#ffffff] 🎯 boss #[default]#[norange]")
+    assert sr.render_managers([_mgr(domain="general", window_id=None)]) == (
+        "#[bg=#aa0066,fg=#ffffff] 🎯 boss · general #[default]")
+
+
+def test_mark_write_failure_leaves_a_reason(tmp_path):
+    """A failed write degrades to 'chip stays lit' — safe, but silent about why,
+    and a #() job has no stderr. Without this the next person sees a stuck chip
+    and no cause."""
+    rec = _mgr(last_summary="\udcff")            # surrogate: write_text raises
+    assert "🎯 boss" in sr.render_managers([rec], selected_pane="%5", orch=tmp_path)
+    assert "UnicodeEncodeError" in (tmp_path / ".read-sid1.err").read_text()
+    assert list(tmp_path.glob("*.tmp")) == []
+    sr._write_mark(sr._mark_path(tmp_path, _mgr()), "recovered")
+    assert not (tmp_path / ".read-sid1.err").exists(), "stale reason survived a good write"
+
+
+def test_each_manager_gets_its_own_failure_reason(tmp_path):
+    """One shared log file would leave only the LAST failure of a render pass,
+    naming a manager the reader did not ask about."""
+    a = _mgr(claude_sid="sidA", window_id="%1", last_summary="\udcff")
+    b = _mgr(claude_sid="sidB", window_id="%2", last_summary="\udcfe")
+    sr.render_managers([a], selected_pane="%1", orch=tmp_path)
+    sr.render_managers([b], selected_pane="%2", orch=tmp_path)
+    assert "\\udcff" in repr((tmp_path / ".read-sidA.err").read_text())
+    assert "\\udcfe" in repr((tmp_path / ".read-sidB.err").read_text())
+
+
+def test_sanitised_key_never_contains_a_dot(tmp_path):
+    """The whole naming scheme hangs on this. A mark is `.read-<key>`, its
+    diagnostic `.read-<key>.err`, its tmp `.read-<key>.<pid>.tmp` — all one dot
+    away. Admit "." to the sanitiser and a crafted key maps onto another
+    manager's diagnostic: the chip goes permanently lit and the diagnostic is
+    overwritten by a signature."""
+    checked = 0
+    for key in ("a.b", "mark-errors.log", "x.err", "y.123.tmp", "..", "./../z", ".",
+                "sid.1", "a..b", "…", "sid\u3002err", "9.9"):
+        path = sr._mark_path(tmp_path, {"claude_sid": key})
+        if path is None:
+            continue
+        checked += 1
+        assert "." not in path.name[len(".read-"):], key
+    assert checked >= 8, "gutting _mark_path to None would pass this vacuously"
+
+
+def test_failure_reason_carries_a_utc_timestamp(tmp_path):
+    """ISO with Z, matching last_turn_at. A naive local stamp in ISO shape beside
+    ISO-UTC data is how someone reads a 7-hour skew as a 7-hour delay."""
+    # Own MonkeyPatch instance: pytest hands the whole test ONE, so undo() here
+    # would also drop the autouse _live_pane_ids stub.
+    with pytest.MonkeyPatch.context() as tz:
+        tz.setenv("TZ", "Etc/GMT-9")             # else UTC-configured CI cannot tell
+        time.tzset()
+        try:
+            rec = _mgr(last_summary="\udcff")
+            sr.render_managers([rec], selected_pane="%5", orch=tmp_path)
+            stamp = (tmp_path / ".read-sid1.err").read_text().split()[0]
+            assert stamp.endswith("Z")
+            assert abs(time.mktime(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ"))
+                       - time.mktime(time.gmtime())) < 120
+        finally:
+            pass
+    time.tzset()
+
+
+def test_manager_without_window_id_is_never_lit(tmp_path):
+    """With no pane there is no path to ever stamp the mark, so a lit chip would
+    be lit permanently — the one failure worse than a missed message. Reachable:
+    hooks.py:472 falls back to "" when neither CLAUDE_ITERM_SID nor the driver
+    yields a pane id, and :620 stores that; :488/:526 overwrite only when
+    truthy, so the "" persists."""
+    rec = _mgr(window_id="")
+    for pane in ("", "%5", "%999"):
+        assert not _lit(sr.render_managers([rec], selected_pane=pane, orch=tmp_path)), pane
+    assert list(tmp_path.glob(".read-*")) == []
+
+
+class _Proc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+def test_live_pane_ids_parses_tmux_output(monkeypatch):
+    monkeypatch.undo()                      # the autouse stub hides the real function
+    seen = []
+    monkeypatch.setattr(sr.subprocess, "run",
+                        lambda *a, **k: seen.append((a, k)) or _Proc(stdout="%1\n%660\n\n  %663  \n"))
+    assert sr._live_pane_ids() == {"%1", "%660", "%663"}
+    argv, kwargs = seen[0]
+    assert argv[0] == ["tmux", "list-panes", "-a", "-F", "#{pane_id}"], argv
+    assert kwargs.get("capture_output") and kwargs.get("text")
+
+
+def test_live_pane_ids_returns_none_when_tmux_raises(monkeypatch):
+    """None means "I cannot tell", and _unread keeps lighting on None. Returning
+    set() here instead would make `wid in panes` False for EVERY manager, so
+    every unread chip goes permanently dark — the failure this feature exists to
+    remove — and no consumer-side test can see it, because they stub this
+    function."""
+    monkeypatch.undo()
+    def boom(*a, **k):
+        raise OSError("tmux is gone")
+    monkeypatch.setattr(sr.subprocess, "run", boom)
+    assert sr._live_pane_ids() is None
+
+
+def test_live_pane_ids_returns_none_on_an_unexplained_failure(monkeypatch):
+    """Same trap as above, by the other branch: an error we cannot interpret is
+    "I cannot tell", never "no panes exist"."""
+    monkeypatch.undo()
+    monkeypatch.setattr(sr.subprocess, "run",
+                        lambda *a, **k: _Proc(returncode=1, stderr="protocol version mismatch"))
+    assert sr._live_pane_ids() is None
+
+
+def test_live_pane_ids_returns_empty_only_when_there_is_no_server(monkeypatch):
+    """The one case where "no panes" is a fact rather than an absence of
+    evidence. Mirrors preflight_cleanup._live_pane_ids."""
+    monkeypatch.undo()
+    monkeypatch.setattr(sr.subprocess, "run",
+                        lambda *a, **k: _Proc(returncode=1, stderr="no server running on /tmp/x"))
+    assert sr._live_pane_ids() == set()
+
+
+def test_live_pane_ids_bounds_its_wait(monkeypatch):
+    """It runs on the status-bar render path. An unbounded wait hangs the row."""
+    monkeypatch.undo()
+    seen = {}
+    monkeypatch.setattr(sr.subprocess, "run",
+                        lambda *a, **k: seen.update(k) or _Proc(stdout="%1\n"))
+    sr._live_pane_ids()
+    assert 0 < seen.get("timeout", 0) <= 5
+
+
+def test_unread_resolves_live_panes_itself_when_the_caller_omits_them(tmp_path, monkeypatch):
+    """The guard must not be opt-in per caller: a future caller of _unread that
+    forgets the argument would light dead-pane chips again."""
+    monkeypatch.setattr(sr, "_live_pane_ids", lambda: {"%660"})
+    assert sr._unread(_mgr(window_id="%1"), "%660", tmp_path) is False
+    assert sr._unread(_mgr(window_id="%660", claude_sid="s2"), "%999", tmp_path) is True
+
+
+def test_dead_pane_manager_is_never_lit(tmp_path, monkeypatch):
+    """The sibling of the no-pane case, and the one a `not wid` guard misses: a
+    window_id naming a pane that has since died. #{pane_id} only ever names a
+    LIVE pane, so the equality never matches and the click that would clear it
+    fails silently — a chip lit forever. preflight_cleanup.py:269-285 keeps such
+    a record deliberately when its pid was recycled."""
+    monkeypatch.setattr(sr, "_live_pane_ids", lambda: {"%660", "%663"})
+    ghost = _mgr(window_id="%1")
+    for pane in ("", "%660", "%663", "%999"):
+        assert not _lit(sr.render_managers([ghost], selected_pane=pane, orch=tmp_path)), pane
+    assert list(tmp_path.glob(".read-*")) == []
+
+
+def test_live_pane_manager_still_lights(tmp_path, monkeypatch):
+    """Other polarity: refusing every chip also passes the guard above."""
+    monkeypatch.setattr(sr, "_live_pane_ids", lambda: {"%5", "%660"})
+    assert _lit(sr.render_managers([_mgr()], selected_pane="%660", orch=tmp_path))
+
+
+def test_unanswerable_tmux_keeps_lighting(tmp_path, monkeypatch):
+    """Absence of evidence is not a dead pane. Treating None as "dead" would
+    silence every chip on any tmux hiccup — the failure this whole feature is
+    against."""
+    monkeypatch.setattr(sr, "_live_pane_ids", lambda: None)
+    assert _lit(sr.render_managers([_mgr()], selected_pane="%999", orch=tmp_path))
+
+
+def test_live_pane_lookup_is_skipped_while_nothing_would_light(tmp_path, monkeypatch):
+    """The lookup costs a subprocess. It must not run on a steady-state tick
+    where every manager is already read, and it must run at most once per pass."""
+    calls = []
+    monkeypatch.setattr(sr, "_live_pane_ids", lambda: calls.append(1) or {"%5"})
+    rec = _mgr()
+    sr._write_mark(sr._mark_path(tmp_path, rec), sr._signature(rec))
+    sr.render_managers([rec], selected_pane="%999", orch=tmp_path)
+    assert calls == [], "queried tmux with nothing to light"
+    two = [_mgr(claude_sid="a"), _mgr(claude_sid="b")]
+    sr.render_managers(two, selected_pane="%999", orch=tmp_path)
+    assert calls == [1], "queried tmux once per manager instead of once per pass"
+
+
+def test_manager_with_window_id_still_lights(tmp_path):
+    """The other polarity of the guard above: refusing every chip also passes
+    `never permanently lit`."""
+    assert _lit(sr.render_managers([_mgr()], selected_pane="%999", orch=tmp_path))
+
+
+def test_key_with_a_path_separator_cannot_escape_the_orch_dir(tmp_path):
+    rec = _mgr(claude_sid="../../escaped")
+    sr.render_managers([rec], selected_pane="%5", orch=tmp_path)
+    assert list(tmp_path.parent.glob(".read-*")) == []
+    assert not (tmp_path / ".." / ".." / ".read-").exists()
+    assert all(p.is_file() for p in tmp_path.glob(".read-*"))
+
+
+def test_two_processes_never_share_one_tmp_mark_file(tmp_path, monkeypatch):
+    """A target-derived tmp name lets two tmux clients' render jobs interleave on
+    ONE file and publish a half-written mark — src/dockwright/state.py:43-48
+    documents the same defect. Asserted on the path os.replace actually RECEIVES,
+    under two different pids, so the guard cannot be satisfied by a comment."""
+    path = sr._mark_path(tmp_path, _mgr())
+    seen = []
+    real_replace = sr.os.replace
+
+    def spy(src, dst):
+        seen.append(str(src))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(sr.os, "replace", spy)
+    monkeypatch.setattr(sr.os, "getpid", lambda: 111)
+    sr._write_mark(path, "A" * 200)
+    monkeypatch.setattr(sr.os, "getpid", lambda: 222)
+    sr._write_mark(path, "B" * 200)
+    assert seen[0] != seen[1], f"both processes wrote through one tmp file: {seen[0]}"
+    assert list(tmp_path.glob("*.tmp")) == []
+    assert sr._read_mark(path) == "B" * 200
+
+
+def test_surrogate_in_summary_does_not_blank_the_managers_row(tmp_path, capsys, monkeypatch):
+    """A lone surrogate survives json.loads and makes write_text raise
+    UnicodeEncodeError — a ValueError, not an OSError. Escaping _write_mark it
+    reaches main()'s blanket except and blanks the WHOLE row, every 5s, the
+    moment he opens that manager's tab."""
+    monkeypatch.setattr(sr, "_selected_pane", _boom_selected_pane)
+    orch = tmp_path / ".claude" / "dockwright"
+    _write(orch / "active" / "m.json",
+           {"agent": "manager", "name": "boss", "claude_sid": "sid1", "pid": os.getpid(),
+            "window_id": "%5", "last_turn_at": _TS, "last_summary": "\udcff"})
+    sr.main(["status_row.py", "managers", "%5"], tmp_path)
+    assert "🎯 boss" in capsys.readouterr().out
+
+
+def test_selected_chip_keeps_marker_and_lit_chip_keeps_click_range(tmp_path):
+    """Split deliberately: a selected chip is stamped and therefore never lit,
+    so '▸ on a lit chip' is an unreachable state."""
+    selected = sr.render_managers([_mgr()], selected_pane="%5", orch=tmp_path)
+    assert f"{sr.SELECTED_MARKER}" in selected
+    lit = sr.render_managers([_mgr(claude_sid="sid2")], selected_pane="%9", orch=tmp_path)
+    assert "#[range=user|switch:%5]" in lit and _lit(lit)
+
+
+def test_main_managers_passes_orch_so_the_chip_can_light(tmp_path, capsys, monkeypatch):
+    """All other cases are render_managers-level. With orch defaulting to None a
+    main() that forgets to pass it yields 'never lights, never stamps' green."""
+    monkeypatch.setattr(sr, "_selected_pane", _boom_selected_pane)
+    home = tmp_path
+    orch = home / ".claude" / "dockwright"
+    _write(orch / "active" / "m.json",
+           {"agent": "manager", "name": "boss", "claude_sid": "sid1", "pid": os.getpid(),
+            "window_id": "%5", "last_turn_at": _TS, "last_summary": "готово"})
+    sr.main(["status_row.py", "managers", "%9"], home)
+    assert sr.UNREAD_MARKER in capsys.readouterr().out
+    sr.main(["status_row.py", "managers", "%5"], home)      # he opens the tab
+    assert (orch / ".read-sid1").read_text() == _TS + "\x00готово"
+    sr.main(["status_row.py", "managers", "%9"], home)      # and leaves again
+    assert sr.UNREAD_MARKER not in capsys.readouterr().out
+
+
+@pytest.mark.real_tmux
+def test_unread_marker_is_one_cell_as_tmux_counts_it(real_tmux):
+    """tmux's own width oracle, not ours: it lays out the status row, so its
+    count is what positions every #[range=user|…] click boundary. A marker tmux
+    counts as 1 while the terminal draws 2 shifts every boundary right of a lit
+    chip by a column, per lit chip — clicking a chip then switches to the wrong
+    manager. The control cases pin the oracle itself: a literal argument to
+    #{pN:} expands to nothing and would make every marker measure 0."""
+    sock = real_tmux
+    subprocess.run(["tmux", "-L", sock, "new-session", "-d", "-s", "widthcheck"], check=True)
+
+    def cells(text):
+        subprocess.run(["tmux", "-L", sock, "set", "-g", "@probe", text], check=True)
+        out = subprocess.run(["tmux", "-L", sock, "display-message", "-p", "#{p6:@probe}|"],
+                             capture_output=True, text=True, check=True).stdout
+        return 6 - out.split("|")[0].count(" ")
+
+    try:
+        assert (cells("A"), cells("漢"), cells("🎯")) == (1, 2, 2), "the width oracle itself is broken"
+        assert cells(sr.UNREAD_MARKER) == 1
+    finally:
+        subprocess.run(["tmux", "-L", sock, "kill-server"], capture_output=True)
+    # The terminal half has no in-process oracle: U+FE0E asks for TEXT
+    # presentation, which is what makes a terminal agree with the 1 above.
+    # Asserted as an exact SHAPE, not as a substring — "\ufe0e\u2709" and
+    # "\u2709\ufe0f\ufe0e" both measure 1 cell in tmux and both contain
+    # U+FE0E, and a terminal draws both in two.
+    assert len(sr.UNREAD_MARKER) == 2 and sr.UNREAD_MARKER[1] == "\ufe0e"
+
+
+@pytest.mark.real_tmux
+def test_live_manager_chip_lights_then_clears_on_visit(tmp_path, monkeypatch, real_tmux):
+    """The end-to-end proof, in a real tmux: the chip lights while the engineer
+    is on another window, is dark while he is on the manager's window, and STAYS
+    dark after he leaves. Only this test proves #{pane_id} as tmux expands it
+    really equals the window_id stored in the manager's record — every other
+    case feeds that equality in by hand."""
+    home = tmp_path
+    orch = home / ".claude" / "dockwright"
+    (orch / "active").mkdir(parents=True)
+    (orch / "questions").mkdir(parents=True)
+    shutil.copy(_SCRIPT, orch / "status_row.py")
+    conf = tmp_path / "unread.conf"
+    conf.write_text(
+        'set -g status 2\n'
+        'set -g status-interval 1\n'
+        'set -g \'status-format[0]\' "MGR '
+        '#(python3 $HOME/.claude/dockwright/status_row.py managers #{pane_id})"\n'
+        'set -g \'status-format[1]\' "WRK"\n'
+    )
+    monkeypatch.setenv("HOME", str(home))
+    sock = real_tmux
+    subprocess.run(["tmux", "-L", sock, "-f", str(conf), "new-session", "-d", "-s", "unreadsess",
+                    "-x", "200", "-y", "50"], check=True)
+    try:
+        subprocess.run(["tmux", "-L", sock, "new-window", "-t", "unreadsess"], check=True)
+        mgr_pane = subprocess.run(["tmux", "-L", sock, "display-message", "-p", "-t", "unreadsess:0",
+                                   "#{pane_id}"], capture_output=True, text=True).stdout.strip()
+        _write(orch / "active" / "m.json",
+               {"agent": "manager", "name": "boss", "claude_sid": "sid1", "pid": os.getpid(),
+                "window_id": mgr_pane, "last_turn_at": _TS, "last_summary": "готово"})
+        # Second manager on a pane this server does not have. Without it the
+        # test cannot tell a WORKING pane-liveness lookup from a totally broken
+        # one: mistyping the binary makes _live_pane_ids return None, _unread
+        # falls back to lighting, and "the live manager lights" still holds.
+        _write(orch / "active" / "g.json",
+               {"agent": "manager", "name": "ghost", "claude_sid": "sid2", "pid": os.getpid(),
+                "window_id": "%9999", "last_turn_at": _TS, "last_summary": "готово"})
+
+        subprocess.run(["tmux", "-L", sock, "select-window", "-t", "unreadsess:1"], check=True)
+        away = _capture(sock, "unreadsess", secs=5)
+        subprocess.run(["tmux", "-L", sock, "select-window", "-t", "unreadsess:0"], check=True)
+        visiting = _capture(sock, "unreadsess", secs=5)
+        subprocess.run(["tmux", "-L", sock, "select-window", "-t", "unreadsess:1"], check=True)
+        back = _capture(sock, "unreadsess", secs=5)
+    finally:
+        subprocess.run(["tmux", "-L", sock, "kill-server"], capture_output=True)
+
+    assert "boss" in away, f"manager chip missing entirely: {away!r}"
+    assert "ghost" in away, f"dead-pane manager chip missing entirely: {away!r}"
+    assert sr.UNREAD_MARKER in away, f"unread chip did not light: {away!r}"
+    lines = [l for l in away.splitlines() if "boss" in l and "ghost" in l]
+    assert lines, f"never captured a frame holding both chips: {away!r}"
+    assert all(l.count(sr.UNREAD_MARKER) == 1 for l in lines), (
+        f"expected exactly one lit chip per frame — the dead-pane manager must "
+        f"not light: {lines!r}")
+    assert sr.UNREAD_MARKER not in visiting, f"chip lit while he was looking at it: {visiting!r}"
+    assert sr.UNREAD_MARKER not in back, f"visiting the tab did not clear the chip: {back!r}"
+    assert (orch / ".read-sid1").read_text() == _TS + "\x00готово"
+
+
+def _delegating_tree(tmp_path, sid="w-sid", log_age=400.0, sub_age=5.0):
+    import time as _t
+    project = tmp_path / ".claude" / "projects" / "-Users-x"
+    project.mkdir(parents=True, exist_ok=True)
+    log = project / f"{sid}.jsonl"
+    log.write_text("")
+    subagents = project / sid / "subagents"
+    subagents.mkdir(parents=True, exist_ok=True)
+    agent = subagents / "agent-aaa.jsonl"
+    agent.write_text("{}")
+    now = _t.time()
+    os.utime(log, (now - log_age, now - log_age))
+    os.utime(agent, (now - sub_age, now - sub_age))
+    return log
+
+
+def _idle_record(log, sid="w-sid", **extra):
+    rec = {"claude_sid": sid, "state": "idle", "runtime": "claude",
+           "transcript_path": str(log)}
+    rec.update(extra)
+    return rec
+
+
+def test_classify_idle_with_live_subagent_reads_as_processing(tmp_path):
+    log = _delegating_tree(tmp_path)
+    assert sr.classify_worker(_idle_record(log), set()) == "processing"
+
+
+def test_classify_idle_when_subagent_write_predates_the_main_log(tmp_path):
+    log = _delegating_tree(tmp_path, log_age=5.0, sub_age=400.0)
+    assert sr.classify_worker(_idle_record(log), set()) == "idle"
+
+
+def test_classify_idle_when_subagent_quiet_past_the_liveness_window(tmp_path):
+    log = _delegating_tree(tmp_path, log_age=4000.0, sub_age=2000.0)
+    assert sr.classify_worker(_idle_record(log), set()) == "idle"
+
+
+def test_classify_liveness_window_moves_with_the_episode_grace_env(tmp_path, monkeypatch):
+    log = _delegating_tree(tmp_path, log_age=800.0, sub_age=600.0)
+    rec = _idle_record(log)
+    monkeypatch.setenv("CLAUDE_ORCH_EPISODE_GRACE_SEC", "1200")
+    assert sr.classify_worker(rec, set()) == "processing"
+    monkeypatch.setenv("CLAUDE_ORCH_EPISODE_GRACE_SEC", "300")
+    assert sr.classify_worker(rec, set()) == "idle"
+
+
+def test_classify_idle_without_a_transcript_path(tmp_path):
+    _delegating_tree(tmp_path)
+    assert sr.classify_worker({"claude_sid": "w-sid", "state": "idle"}, set()) == "idle"
+
+
+def test_classify_idle_for_codex_runtime(tmp_path):
+    log = _delegating_tree(tmp_path)
+    assert sr.classify_worker(_idle_record(log, runtime="codex"), set()) == "idle"
+
+
+def test_classify_survives_an_unreadable_transcript_path(tmp_path):
+    assert sr.classify_worker(
+        {"claude_sid": "w-sid", "state": "idle",
+         "transcript_path": str(tmp_path / "nope" / "gone.jsonl")}, set()) == "idle"
+    assert sr.classify_worker(
+        {"claude_sid": "w-sid", "state": "idle", "transcript_path": 17}, set()) == "idle"
+
+
+def test_classify_question_still_beats_a_live_subagent(tmp_path):
+    log = _delegating_tree(tmp_path)
+    assert sr.classify_worker(_idle_record(log), {"w-sid"}) == "question"
+
+
+def test_render_workers_lifts_a_delegating_worker_out_of_the_idle_group(tmp_path):
+    log = _delegating_tree(tmp_path)
+    recs = [
+        _idle_record(log, name="alpha", agent="worker"),
+        {"agent": "worker", "name": "bravo", "state": "idle", "claude_sid": "b"},
+    ]
+    out = sr.render_workers(recs, set())
+    assert "🔧 alpha" in out
+    assert "#aa8800" in out          # busy orange, not idle grey
+    assert "💤1" in out              # bravo alone stays collapsed
+    assert "💤 alpha" not in out
+
+
+def test_fleet_menu_row_marks_a_delegating_worker_as_working(tmp_path):
+    log = _delegating_tree(tmp_path)
+    label = sr._menu_label(_idle_record(log, name="alpha"), set(), "")
+    assert "🔧" in label and "💤" not in label
+
+
+def test_dead_delegating_worker_is_still_filtered_out(tmp_path):
+    log = _delegating_tree(tmp_path)
+    dead = _idle_record(log, name="alpha", agent="worker", pid=2 ** 22)
+    assert sr._is_visible(dead) is False
+    assert sr.render_workers([r for r in [dead] if sr._is_visible(r)], set()) == ""

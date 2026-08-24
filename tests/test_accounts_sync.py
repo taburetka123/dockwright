@@ -79,8 +79,11 @@ def test_no_provisioned_farms_message(monkeypatch, tmp_path, capsys):
 def test_setup_sh_runs_accounts_sync_inside_third_guard_before_doctor():
     """Drift guard, anchored to EXECUTED lines (comments stripped): setup.sh must
     invoke `"$DOCKWRIGHT_BIN" accounts-sync` inside the THIRD FILES_ONLY guard
-    block (venv=1st, MCP+hooks=2nd, worker-home/doctor=3rd), before the doctor
-    gate. Proven RED by deleting the invocation line."""
+    block (venv=1st, MCP+hooks=2nd, farm/snapshot reconciliation=3rd,
+    overlay setup.d=4th), before the doctor gate — which sits between the 3rd
+    and 4th guards under its own RUN_DOCTOR_GATE knob so tests can drive it
+    (tests/test_setup_doctor_gate.py). Proven RED by deleting the invocation
+    line."""
     from pathlib import Path
 
     setup = (Path(__file__).resolve().parents[1] / "setup.sh").read_text()
@@ -89,12 +92,13 @@ def test_setup_sh_runs_accounts_sync_inside_third_guard_before_doctor():
     assert len(invocations) == 1, f"expected exactly 1 invocation, got {invocations}"
     guards = [i for i, ln in enumerate(code)
               if "DOCKWRIGHT_SETUP_FILES_ONLY" in ln and ln.lstrip().startswith("if ")]
-    assert len(guards) == 3, f"expected exactly 3 FILES_ONLY guard ifs, got {len(guards)}"
+    assert len(guards) == 4, f"expected exactly 4 FILES_ONLY guard ifs, got {len(guards)}"
     sync_idx = next(i for i, ln in enumerate(code) if '"$DOCKWRIGHT_BIN" accounts-sync' in ln)
     doctor_idx = next(i for i, ln in enumerate(code) if '" doctor "' in ln)
-    assert guards[2] < sync_idx < doctor_idx, (
-        "accounts-sync must run inside the third (worker-home/doctor) "
-        "FILES_ONLY-guarded block, before the doctor gate")
+    assert guards[2] < sync_idx < doctor_idx < guards[3], (
+        "accounts-sync must run inside the third (reconciliation) "
+        "FILES_ONLY-guarded block, before the doctor gate, which precedes "
+        "the fourth (overlay setup.d) guard")
 
 
 def test_warning_lines_for_missing_and_bad_claude_json(monkeypatch, tmp_path, capsys):

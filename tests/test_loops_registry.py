@@ -90,10 +90,17 @@ def _overlay_home() -> Path:
 
 OVERLAY_DIR = _overlay_home()
 
-# The Gardener-module loops: [modules] gardener=false no-ops all three and the
-# installer refuses, so on a module-off machine their plists are absent —
-# reconciliation must not demand a `live` block be loaded there.
-GARDENER_MODULE_LOOPS = ("selffix", "gardener-gate", "gardener-frontier")
+# The Gardener-module loops: [modules] gardener=false no-ops all four, so a
+# module-off machine may legitimately show no live row for any of them —
+# reconciliation must not demand it. The real gating split is 3-way, not
+# uniform: gardener-gate and gardener-frontier share gardener-install.sh, which
+# REFUSES to install at all on [modules] gardener=false; selffix's
+# `dockwright selffix enable` and corpus-watch's corpus-watch-install.sh both
+# install UNCONDITIONALLY regardless of the module toggle — their module-off
+# gating happens at trigger/tick time instead (selffix-trigger.sh no-ops;
+# corpus_watch_gate.py's module-off check is a silent no-op), so their plist
+# can be present-but-idle on a module-off machine.
+GARDENER_MODULE_LOOPS = ("selffix", "gardener-gate", "gardener-frontier", "corpus-watch")
 
 
 def _operator_gardener_enabled():
@@ -281,8 +288,11 @@ def test_status_reconciles_with_machine(loop):
         pytest.skip("launchctl unavailable")
     status, label, name = loop["status"], loop["label"], loop["name"]
 
-    # [modules] gardener=false: the three gardener loops are legitimately not
-    # installed (gardener-install.sh refuses), so a `live` row need not be loaded.
+    # [modules] gardener=false: all four Gardener-module loops may legitimately
+    # show no live row, but for two different reasons — gardener-gate and
+    # gardener-frontier are installer-refused (gardener-install.sh exits before
+    # writing a plist), while selffix and corpus-watch install unconditionally
+    # and are gated at trigger/tick time instead (see GARDENER_MODULE_LOOPS above).
     if name in GARDENER_MODULE_LOOPS and not GARDENER_ENABLED:
         pytest.skip(f"{name}: [modules] gardener disabled — loop intentionally not installed")
 

@@ -6,6 +6,9 @@
 # token surviving into composed output is a ComposeError.
 [agent_vars]
 a_bash_outage_anchor = ''
+a_brief_authoring_incident = ''
+a_artifact_shape_incident = ''
+a_brief_facts_sibling_ref = ''
 a_carryover_rejustify_anchor = ''
 a_design_gate_relay_anchor = ''
 a_directive_refusal_anchor = ''
@@ -55,13 +58,14 @@ fix_preset_review_M = 'invoke a code review on your current git diff. Address ev
 fresh_impl_dispatch = '(per the non-keyed spec dispatch rule above)'
 impl_dispatch_commands = 'dispatched via the non-keyed spec dispatch rule or an operator-bound keyed-dispatch command'
 interactive_skills_eg = 'e.g. a brainstorming or debugging skill'
-key_examples = 'derived task keys and '
+key_examples = 'explicit task keys and '
 keyed_dispatch_command = '<keyed-dispatch prompt>'
 keyed_work_safety_net = '''## Task-key safety net
 
 Before doing anything else: scan your initial task description for a task key (the pattern your deployment binds via `[task_keys] key_regex`). If you find ANY task key in the task description, IGNORE the current preset level and follow the L (Large) flow instead. Keyed work is non-negotiably full-flow.
 
 Reason: the standing preference is that any keyed task runs through brainstorming/planning/subagent-driven-development/review, regardless of how trivial it looks. This rule exists because "trivial-looking" keyed tasks routinely surface scope or edge cases mid-implementation that would have been caught in brainstorming.'''
+model_roster_ref = ''
 no_implicit_deferral_rule_ref = 'your no-implicit-deferral rule'
 phase2_roadmap_note = ''
 prep_script = 'a pre-created worktree'
@@ -71,7 +75,7 @@ sdd_layer_note = '''**In-worker subagents are a SEPARATE layer.** This #10 sets 
 skill_prefix = ''
 subagent_dispatch_skills = ''
 subagent_stop_ref = ''
-tier2_verifier_binding = 'spawn a fresh read-only reviewer worker (full-diff read, findings report, no write tools)'
+tier2_flow_ref = ''
 tracker_eg = 'work-item'
 tracker_etiquette_block = ' The'
 tracker_link_rule = ''

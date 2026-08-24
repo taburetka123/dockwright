@@ -1,3 +1,4 @@
+import ast
 import inspect
 import os
 import subprocess
@@ -26,6 +27,7 @@ def fresh_orchestrator_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "ARTIFACTS", tmp_path / "artifacts")
     monkeypatch.setattr(paths, "ASSIGNMENTS", tmp_path / "assignments")
     monkeypatch.setattr(paths, "ASSIGNMENTS_PENDING", tmp_path / "assignments" / ".pending")
+    monkeypatch.setattr(paths, "SPEND_LEDGER", tmp_path / "spend-ledger.jsonl")
     paths.ensure_dirs()
     yield tmp_path
 
@@ -85,6 +87,21 @@ def test_register_self_preserves_hook_stamp_when_env_absent(fresh_orchestrator_d
                        cwd="/x", iterm_sid="i1", pid=os.getpid())
     record = state.read_json(paths.ACTIVE / "mgr-1.json")
     assert record["account"] == "a"
+
+def test_register_self_preserves_started_at_on_reregistration(fresh_orchestrator_dir):
+    """become_manager re-registers an already-active sid minutes after session
+    birth; the rebuilt record must keep the ORIGINAL started_at — the Stop
+    hook's recount uses it as the birth cutoff, and a reset would exclude all
+    pre-promotion usage from the spend recount."""
+    state.write_json_atomic(paths.ACTIVE / "mgr-1.json", {
+        "claude_sid": "mgr-1", "agent": "manager", "name": "spry-walrus",
+        "cwd": "/x", "window_id": "i1", "pid": os.getpid(),
+        "started_at": 1785000000.0, "state": "idle", "last_turn_at": None,
+    })
+    register_self_impl(claude_sid="mgr-1", agent="manager", name="manager",
+                       cwd="/x", iterm_sid="i1")
+    record = state.read_json(paths.ACTIVE / "mgr-1.json")
+    assert record["started_at"] == 1785000000.0
 
 def test_register_self_account_none_without_env_or_prior_record(fresh_orchestrator_dir, monkeypatch):
     monkeypatch.delenv("CLAUDE_ORCH_ACCOUNT", raising=False)
@@ -1619,7 +1636,791 @@ def test_become_manager_with_takeover_rejects_mismatched_handoff(fresh_orchestra
     assert not (paths.ACTIVE / "mgr-new.json").exists()
 
 
+def test_bootstrap_recreate_handoff_key_parity(fresh_orchestrator_dir, tmp_path):
+    """T2: the handoff record prepare_handoff_impl writes and the payload the
+    REAL bootstrap-recreate.sh (the third blessed writer) prints under
+    --dry-run must carry the exact same key set — a drift here means the
+    script's handoff silently omits (or adds) a field the takeover consumer
+    depends on."""
+    become_manager_impl(claude_sid="mgr-old", iterm_sid="i0")
+    handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
+    mcp_keys = set(state.read_json(paths.HANDOFFS / f"{handoff['handoff_id']}.json").keys())
+
+    script = Path(__file__).resolve().parent.parent / "deploy" / "scripts" / "bootstrap-recreate.sh"
+    home = tmp_path / "script-home"
+    active = home / ".claude" / "dockwright" / "active"
+    active.mkdir(parents=True)
+    (active / "sid-x.json").write_text(_json.dumps({
+        "claude_sid": "sid-x", "agent": "manager", "name": "mighty-demon",
+        "domain": "personal", "pid": 4242,
+    }))
+    proc = subprocess.run(
+        ["bash", str(script), "--narrative", "probe", "--from-sid", "sid-x", "--dry-run"],
+        capture_output=True, text=True, env={**os.environ, "HOME": str(home)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    payload_line = next(l for l in proc.stdout.splitlines() if l.startswith("handoff_payload: "))
+    script_keys = set(_json.loads(payload_line[len("handoff_payload: "):]).keys())
+
+    assert mcp_keys == script_keys, (mcp_keys, script_keys)
+
+
+@pytest.mark.parametrize("missing_mode", ["deleted", "empty"])
+def test_takeover_fails_loud_when_handoff_lacks_manager_name(fresh_orchestrator_dir, missing_mode):
+    """T7: predecessor's active record is gone (normal — this function unlinks
+    it on first consumption) AND the handoff itself omits manager_name (the
+    bootstrap-recreate.sh bug this change fixes, or any other legacy/hand-
+    authored handoff) — as a deleted key OR as an empty string, both of which
+    must trip `if not v` (guards against an `is None`-only regression). Must
+    refuse rather than roll a fresh identity — and must mutate NOTHING:
+    handoff unconsumed, and a pending question addressed to the predecessor
+    must survive (drop happens below the raise). (No _close_window spy here —
+    the predecessor's record is unlinked so old_pid is None and that branch is
+    structurally unreachable; the on-disk-record shape that DOES exercise it
+    is pinned separately by
+    test_takeover_pre_mutation_when_predecessor_record_on_disk_but_nameless.)"""
+    become_manager_impl(claude_sid="mgr-old", iterm_sid="i0", domain="personal")
+    handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
+    (paths.ACTIVE / "mgr-old.json").unlink()
+
+    from dockwright.mcp_server import _write_question
+    _write_question(worker_sid="mgr-old", worker_name="manager", question="dangling?")
+
+    handoff_path = paths.HANDOFFS / f"{handoff['handoff_id']}.json"
+    stripped = state.read_json(handoff_path)
+    if missing_mode == "deleted":
+        del stripped["manager_name"]
+    else:
+        stripped["manager_name"] = ""
+    state.write_json_atomic(handoff_path, stripped)
+
+    with pytest.raises(ValueError) as exc_info:
+        become_manager_with_takeover_impl(
+            claude_sid="mgr-new", takeover_from="mgr-old",
+            handoff_id=handoff["handoff_id"], iterm_sid="i1",
+        )
+    message = str(exc_info.value)
+    assert handoff["handoff_id"] in message, message
+    # Bind to the rendered "omits ..." clause, not just substring presence —
+    # a message naming the WRONG missing field would otherwise still pass
+    # (the invariant tail always mentions "manager_name" regardless).
+    omitted = message.split("omits ", 1)[1].split(".", 1)[0]
+    assert omitted == "manager_name", message
+
+    handoff_after = state.read_json(handoff_path)
+    assert handoff_after["consumed_at"] is None
+    assert handoff_after["to_sid"] is None
+    assert not (paths.ACTIVE / "mgr-new.json").exists()
+    remaining = [
+        state.read_json(q) for q in paths.QUESTIONS.iterdir() if q.suffix == ".json"
+    ]
+    assert any(r is not None and r.get("worker_sid") == "mgr-old" for r in remaining), \
+        "refused takeover must not drop the predecessor's pending question"
+
+
+@pytest.mark.parametrize("missing_mode", ["deleted", "empty"])
+def test_takeover_fails_loud_when_handoff_lacks_domain_never_defaults_general(fresh_orchestrator_dir, missing_mode):
+    """T8: same shape as T7 but the handoff omits domain instead (deleted key
+    or empty string) — the latent half of the bug, where a dead manager's
+    successor would silently boot into "general" (wrong memory pool, wrong
+    distill directory) with no signal anywhere. Must refuse instead, and must
+    mutate NOTHING: handoff unconsumed, no successor record (so in particular
+    none with domain "general"), and a pending question addressed to the
+    predecessor must survive."""
+    become_manager_impl(claude_sid="mgr-old", iterm_sid="i0", domain="personal")
+    handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
+    (paths.ACTIVE / "mgr-old.json").unlink()
+
+    from dockwright.mcp_server import _write_question
+    _write_question(worker_sid="mgr-old", worker_name="manager", question="dangling?")
+
+    handoff_path = paths.HANDOFFS / f"{handoff['handoff_id']}.json"
+    stripped = state.read_json(handoff_path)
+    if missing_mode == "deleted":
+        del stripped["domain"]
+    else:
+        stripped["domain"] = ""
+    state.write_json_atomic(handoff_path, stripped)
+
+    with pytest.raises(ValueError) as exc_info:
+        become_manager_with_takeover_impl(
+            claude_sid="mgr-new", takeover_from="mgr-old",
+            handoff_id=handoff["handoff_id"], iterm_sid="i1",
+        )
+    message = str(exc_info.value)
+    assert handoff["handoff_id"] in message, message
+    omitted = message.split("omits ", 1)[1].split(".", 1)[0]
+    assert omitted == "domain", message
+
+    handoff_after = state.read_json(handoff_path)
+    assert handoff_after["consumed_at"] is None
+    assert handoff_after["to_sid"] is None
+    assert not (paths.ACTIVE / "mgr-new.json").exists()
+    remaining = [
+        state.read_json(q) for q in paths.QUESTIONS.iterdir() if q.suffix == ".json"
+    ]
+    assert any(r is not None and r.get("worker_sid") == "mgr-old" for r in remaining), \
+        "refused takeover must not drop the predecessor's pending question"
+
+
+def test_takeover_pre_mutation_when_predecessor_record_on_disk_but_nameless(fresh_orchestrator_dir, monkeypatch):
+    """M-3: pins the pre-mutation ordering in a shape T7/T8 structurally cannot
+    reach — both tests unlink the predecessor's record themselves, so their
+    "nothing mutated" assertions can never observe whether the unlink itself
+    ran. Here the predecessor's record stays ON DISK (pid + window_id intact)
+    but loses its name, and the handoff loses manager_name too — the raise
+    must fire before _close_window, before the record unlink, and before the
+    question drop. Red-proven separately by moving the raise below those three
+    mutations."""
+    become_manager_impl(claude_sid="mgr-old", iterm_sid="i0", domain="personal")
+    handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
+
+    old_record_path = paths.ACTIVE / "mgr-old.json"
+    old_record = state.read_json(old_record_path)
+    del old_record["name"]
+    state.write_json_atomic(old_record_path, old_record)
+
+    handoff_path = paths.HANDOFFS / f"{handoff['handoff_id']}.json"
+    stripped = state.read_json(handoff_path)
+    del stripped["manager_name"]
+    state.write_json_atomic(handoff_path, stripped)
+
+    from dockwright.mcp_server import _write_question
+    _write_question(worker_sid="mgr-old", worker_name="manager", question="dangling?")
+
+    closed = []
+    monkeypatch.setattr("dockwright.mcp_server._close_window", lambda w: closed.append(w))
+    monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: True)
+    monkeypatch.setattr("dockwright.registry._pid_alive", lambda pid: True)
+
+    with pytest.raises(ValueError) as exc_info:
+        become_manager_with_takeover_impl(
+            claude_sid="mgr-new", takeover_from="mgr-old",
+            handoff_id=handoff["handoff_id"], iterm_sid="i1",
+        )
+    message = str(exc_info.value)
+    omitted = message.split("omits ", 1)[1].split(".", 1)[0]
+    assert omitted == "manager_name", message
+
+    assert closed == [], "the predecessor's window must not be closed before the raise"
+    assert old_record_path.exists(), "the predecessor's record must not be unlinked before the raise"
+    remaining = [
+        state.read_json(q) for q in paths.QUESTIONS.iterdir() if q.suffix == ".json"
+    ]
+    assert any(r is not None and r.get("worker_sid") == "mgr-old" for r in remaining), \
+        "refused takeover must not drop the predecessor's pending question"
+    handoff_after = state.read_json(handoff_path)
+    assert handoff_after["consumed_at"] is None
+    assert not (paths.ACTIVE / "mgr-new.json").exists()
+
+
+def test_takeover_record_gone_complete_handoff_succeeds(fresh_orchestrator_dir, monkeypatch):
+    """T9 (control): the legitimate lane the fail-loud change must not break —
+    predecessor's active record is gone (normal post-first-consumption state)
+    but the handoff carries both fields (as every MCP writer always does).
+    Takeover succeeds, inheriting name + domain from the handoff itself."""
+    old_result = become_manager_impl(claude_sid="mgr-old", iterm_sid="i0", domain="personal")
+    handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
+    (paths.ACTIVE / "mgr-old.json").unlink()
+
+    monkeypatch.setattr("dockwright.mcp_server._close_window", lambda w: None)
+    monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: True)
+    monkeypatch.setattr("dockwright.registry._pid_alive", lambda pid: True)
+
+    result = become_manager_with_takeover_impl(
+        claude_sid="mgr-new", takeover_from="mgr-old",
+        handoff_id=handoff["handoff_id"], iterm_sid="i1",
+    )
+    assert result["ok"] is True
+    assert result["name"] == old_result["name"]
+    assert result["domain"] == "personal"
+    new_record = state.read_json(paths.ACTIVE / "mgr-new.json")
+    assert new_record["name"] == old_result["name"]
+    assert new_record["domain"] == "personal"
+    # I-2(iii): the returned name must be the PERSISTED name, not merely the
+    # requested one — the two diverge exactly when become_manager_impl
+    # auto-suffixes a collision (covered below).
+    assert result["name"] == new_record["name"]
+
+
+def test_takeover_prunes_dead_corpse_holding_inherited_name(fresh_orchestrator_dir, monkeypatch):
+    """D-3: _prune_stale_active_records() inside the collision check is
+    load-bearing, not decorative — without it, a dead corpse record still
+    holding the inherited name would permanently false-refuse every future
+    takeover of this name (nothing else on this path ever reaps it). The
+    corpse's pid is dead and it carries no window_id, so the pane-liveness
+    gate never engages ("windowless records keep the pid-only bar" —
+    registry._prune_stale_active_records docstring) and the prune reaps it
+    outright, letting the takeover succeed normally."""
+    old_result = become_manager_impl(claude_sid="mgr-old", iterm_sid="i0", domain="personal")
+    handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
+    (paths.ACTIVE / "mgr-old.json").unlink()
+
+    state.write_json_atomic(paths.ACTIVE / "corpse.json", {
+        "claude_sid": "corpse", "agent": "manager", "name": old_result["name"],
+        "pid": 99999, "domain": "personal",
+    })
+
+    monkeypatch.setattr("dockwright.mcp_server._close_window", lambda w: None)
+    monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: pid != 99999)
+    monkeypatch.setattr("dockwright.registry._pid_alive", lambda pid: pid != 99999)
+
+    result = become_manager_with_takeover_impl(
+        claude_sid="mgr-new", takeover_from="mgr-old",
+        handoff_id=handoff["handoff_id"], iterm_sid="i1",
+    )
+    assert result["ok"] is True
+    assert result["name"] == old_result["name"]
+    assert result["domain"] == "personal"
+    assert not (paths.ACTIVE / "corpse.json").exists(), "the dead corpse must have been pruned"
+    new_record = state.read_json(paths.ACTIVE / "mgr-new.json")
+    assert new_record["name"] == old_result["name"]
+    assert new_record["domain"] == "personal"
+
+
+@pytest.mark.parametrize("collision_field", ["name", "funny_name"])
+def test_takeover_fails_loud_when_inherited_name_collides_with_live_session(
+    fresh_orchestrator_dir, monkeypatch, collision_field
+):
+    """I-2(a): a live session already holds the inherited name — the recovery
+    double-launch race prepare_recovery_handoff_impl's own docstring documents
+    (two successors can consume two different handoffs for the same
+    predecessor). Registering would silently auto-suffix
+    (become_manager_impl -> _resolve_unique_name) and strand every in-flight
+    worker whose parent_manager_name still points at the un-suffixed name —
+    the exact incident this PR exists to fix, re-entering through a different
+    door. Must refuse before any mutation. Covers both scan arms: the
+    collision can sit in the holder's `name` or its `funny_name` (R-2).
+
+    The predecessor's active record stays ON DISK holding its name (NOT
+    unlinked) so the close-window / record-unlink / question-drop path is
+    actually reachable — otherwise neutering the collision check is
+    invisible: become_manager_impl auto-suffixes the same collision anyway,
+    so the BACKSTOP raises instead, and a test that only checks "some
+    ValueError, handoff unconsumed, no mgr-new record" cannot distinguish the
+    two refusal paths even though their consequences differ materially (the
+    backstop path closes the predecessor's window, deletes its record, and
+    drops its questions before it discovers the race — R-1)."""
+    old_result = become_manager_impl(claude_sid="mgr-old", iterm_sid="i0", domain="personal")
+    handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
+
+    from dockwright.mcp_server import _write_question
+    _write_question(worker_sid="mgr-old", worker_name="manager", question="dangling?")
+
+    # A second consumer of a duplicate handoff already registered under the
+    # predecessor's name before this takeover call runs. register_self_impl
+    # would itself reject the duplicate name (mgr-old's own record is still
+    # live), so write the usurper's record directly — shaped like a real
+    # manager record.
+    usurper_record = {
+        "claude_sid": "usurper", "agent": "manager", "cwd": "/x",
+        "window_id": "i9", "pid": os.getpid(), "domain": "personal", "runtime": "claude",
+    }
+    if collision_field == "name":
+        usurper_record["name"] = old_result["name"]
+    else:
+        usurper_record["name"] = "usurper-own-name"
+        usurper_record["funny_name"] = old_result["name"]
+    state.write_json_atomic(paths.ACTIVE / "usurper.json", usurper_record)
+
+    closed = []
+    monkeypatch.setattr("dockwright.mcp_server._close_window", lambda w: closed.append(w))
+    monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: True)
+    monkeypatch.setattr("dockwright.registry._pid_alive", lambda pid: True)
+
+    with pytest.raises(ValueError) as exc_info:
+        become_manager_with_takeover_impl(
+            claude_sid="mgr-new", takeover_from="mgr-old",
+            handoff_id=handoff["handoff_id"], iterm_sid="i1",
+        )
+    # Survival assertions come FIRST and are the load-bearing check (R-1):
+    # neutering the collision check still raises (the backstop below catches
+    # the same collision), so a message-content-only assertion would pass on
+    # either refusal path. These distinguish them — only the collision-check
+    # path leaves the predecessor completely untouched.
+    assert closed == [], "the predecessor's window must not be closed before the refusal"
+    assert (paths.ACTIVE / "mgr-old.json").exists(), \
+        "the predecessor's record must not be unlinked before the refusal"
+    remaining = [
+        state.read_json(q) for q in paths.QUESTIONS.iterdir() if q.suffix == ".json"
+    ]
+    assert any(r is not None and r.get("worker_sid") == "mgr-old" for r in remaining), \
+        "refused takeover must not drop the predecessor's pending question"
+
+    message = str(exc_info.value)
+    assert old_result["name"] in message, message
+    assert "stand down" in message, message
+
+    handoff_after = state.read_json(paths.HANDOFFS / f"{handoff['handoff_id']}.json")
+    assert handoff_after["consumed_at"] is None
+    assert handoff_after["to_sid"] is None
+    assert not (paths.ACTIVE / "mgr-new.json").exists()
+    assert state.read_json(paths.ACTIVE / "usurper.json") is not None
+
+
+def test_takeover_raises_and_unregisters_when_registration_races_and_returns_suffixed_name(
+    fresh_orchestrator_dir, monkeypatch
+):
+    """I-2(b) backstop: the pre-mutation collision check above closes the
+    common race, but a NEW collision can still land in the gap between that
+    check and become_manager_impl's own registration. If become_manager_impl
+    silently auto-suffixes anyway, the takeover must not report success under
+    the un-suffixed name — unregister the wrongly-named successor and refuse,
+    with the handoff left unconsumed so a retry can still consume it.
+
+    D-2: become_manager_impl's real _backfill_legacy_workers call would have
+    just stamped every null-parent worker with the dead suffixed name before
+    the backstop unwinds the registration — unlinking the successor alone
+    leaves those workers pointing at a name nothing will ever register again
+    (worse than None: unadoptable by the next single-manager boot). The fake
+    below stamps a pre-seeded legacy worker exactly the way the real backfill
+    would, to prove the backstop reverts it."""
+    from dockwright import mcp_server
+
+    old_result = become_manager_impl(claude_sid="mgr-old", iterm_sid="i0", domain="personal")
+    handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
+    (paths.ACTIVE / "mgr-old.json").unlink()
+
+    register_self_impl(
+        claude_sid="legacy-worker", agent="worker", name="legacy-worker-name",
+        cwd="/x", iterm_sid="i7", pid=os.getpid(),
+    )
+
+    monkeypatch.setattr(mcp_server, "_close_window", lambda w: None)
+    monkeypatch.setattr(mcp_server, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr("dockwright.registry._pid_alive", lambda pid: True)
+
+    raced_name = old_result["name"] + "-2"
+
+    def fake_become_manager_impl(claude_sid, iterm_sid="", domain=None, name=None):
+        state.write_json_atomic(paths.ACTIVE / f"{claude_sid}.json", {
+            "claude_sid": claude_sid, "agent": "manager", "name": raced_name,
+            "cwd": "/x", "window_id": iterm_sid, "pid": os.getpid(),
+            "domain": domain, "runtime": "claude",
+        })
+        # Simulate the real become_manager_impl's _backfill_legacy_workers call:
+        # this attempt is (momentarily) the only manager, so it adopts the
+        # null-parent legacy worker under the freshly suffixed name.
+        legacy = state.read_json(paths.ACTIVE / "legacy-worker.json")
+        legacy["parent_manager_name"] = raced_name
+        state.write_json_atomic(paths.ACTIVE / "legacy-worker.json", legacy)
+        return {"ok": True, "name": raced_name, "domain": domain, "runtime": "claude", "preflight": ""}
+
+    monkeypatch.setattr(mcp_server, "become_manager_impl", fake_become_manager_impl)
+
+    with pytest.raises(ValueError) as exc_info:
+        mcp_server.become_manager_with_takeover_impl(
+            claude_sid="mgr-new", takeover_from="mgr-old",
+            handoff_id=handoff["handoff_id"], iterm_sid="i1",
+        )
+    message = str(exc_info.value)
+    assert "raced" in message, message
+    assert raced_name in message, message
+    assert old_result["name"] in message, message
+
+    legacy_after = state.read_json(paths.ACTIVE / "legacy-worker.json")
+    assert legacy_after["parent_manager_name"] is None, \
+        "a worker just backfilled onto the dead suffixed name must be reverted to unowned"
+    assert "reverted" in message.lower(), message
+
+    assert not (paths.ACTIVE / "mgr-new.json").exists(), \
+        "the wrongly-named successor must be unregistered, not left active"
+    handoff_after = state.read_json(paths.HANDOFFS / f"{handoff['handoff_id']}.json")
+    assert handoff_after["consumed_at"] is None
+    assert handoff_after["to_sid"] is None
+
+
+def test_bootstrap_recreate_seam_end_to_end(tmp_path, fresh_orchestrator_dir, monkeypatch):
+    """ATTACK-4 seam: the PR's own test files never cross writer -> consumer —
+    bootstrap-recreate.sh (Task A) writes a real handoff, and this test feeds
+    it to the real become_manager_with_takeover_impl (Task B), proving the two
+    halves actually agree end to end, not just independently."""
+    import shutil
+    script = Path(__file__).resolve().parent.parent / "deploy" / "scripts" / "bootstrap-recreate.sh"
+    script_home = tmp_path / "script-home"
+    active = script_home / ".claude" / "dockwright" / "active"
+    active.mkdir(parents=True)
+    (active / "sid-x.json").write_text(_json.dumps({
+        "claude_sid": "sid-x", "agent": "manager", "name": "mighty-demon",
+        "domain": "personal", "pid": 4242, "window_id": "i0",
+    }))
+    handoffs_dir = script_home / ".claude" / "dockwright" / "handoffs"
+
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    tmux_log = tmp_path / "tmux-invocations.log"
+    (fakebin / "tmux").write_text(
+        "#!/bin/bash\n"
+        f"echo \"$@\" >> {tmux_log}\n"
+        "case \"$*\" in *has-session*) exit 1 ;; *new-session*|*new-window*) echo '@1'; exit 0 ;; esac\n"
+        "exit 0\n"
+    )
+    (fakebin / "tmux").chmod(0o755)
+    (fakebin / "jq").symlink_to(shutil.which("jq"))
+    (fakebin / "uuidgen").symlink_to(shutil.which("uuidgen"))
+
+    sock = f"wt-iso-{os.getpid()}-seam"
+    proc = subprocess.run(
+        ["bash", str(script), "--narrative", "seam probe", "--from-sid", "sid-x"],
+        capture_output=True, text=True,
+        env={**os.environ, "HOME": str(script_home),
+             "PATH": f"{fakebin}{os.pathsep}{os.environ['PATH']}",
+             "DOCKWRIGHT_TMUX_SOCKET": sock},
+    )
+    assert proc.returncode == 0, proc.stderr
+    written = list(handoffs_dir.glob("*.json"))
+    assert len(written) == 1, written
+    handoff_id = written[0].stem
+
+    # Point the MCP layer's paths at the SAME home the script wrote into —
+    # fresh_orchestrator_dir's tmp_path is unrelated to script_home, so
+    # re-target every path attribute the fixture patches, same idiom.
+    dw = script_home / ".claude" / "dockwright"
+    monkeypatch.setattr(paths, "ROOT", dw)
+    monkeypatch.setattr(paths, "ACTIVE", dw / "active")
+    monkeypatch.setattr(paths, "QUESTIONS", dw / "questions")
+    monkeypatch.setattr(paths, "ANSWERS", dw / "answers")
+    monkeypatch.setattr(paths, "DONE", dw / "done")
+    monkeypatch.setattr(paths, "CLOSED", dw / "closed")
+    monkeypatch.setattr(paths, "HANDOFFS", dw / "handoffs")
+    monkeypatch.setattr(paths, "PRESETS", dw / "presets")
+    monkeypatch.setattr(paths, "MANAGER_TRIGGERS_LOG", dw / "manager-triggers.jsonl")
+    monkeypatch.setattr(paths, "MANAGER_MEMORY", dw / "manager-memory")
+    monkeypatch.setattr(paths, "SLOTS", dw / "slots")
+    monkeypatch.setattr(paths, "ARTIFACTS", dw / "artifacts")
+    monkeypatch.setattr(paths, "ASSIGNMENTS", dw / "assignments")
+    monkeypatch.setattr(paths, "ASSIGNMENTS_PENDING", dw / "assignments" / ".pending")
+    monkeypatch.setattr(paths, "SPEND_LEDGER", dw / "spend-ledger.jsonl")
+
+    monkeypatch.setattr("dockwright.mcp_server._close_window", lambda w: None)
+    monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: True)
+    monkeypatch.setattr("dockwright.registry._pid_alive", lambda pid: True)
+
+    result = become_manager_with_takeover_impl(
+        claude_sid="mgr-new", takeover_from="sid-x",
+        handoff_id=handoff_id, iterm_sid="i1",
+    )
+    assert result["ok"] is True
+    assert result["name"] == "mighty-demon"
+    assert result["domain"] == "personal"
+    new_record = state.read_json(paths.ACTIVE / "mgr-new.json")
+    assert new_record["name"] == "mighty-demon"
+    assert new_record["domain"] == "personal"
+
+
 # --- prepare_recovery_handoff ---
+
+def _brick_manager_record(sid, age_sec=300):
+    """Model the monitor's precondition for a legit recovery target: state
+    'processing' and record file silent for >= MANAGER_LIMIT_CHECK_FLOOR_SEC."""
+    p = paths.ACTIVE / f"{sid}.json"
+    record = state.read_json(p)
+    record["state"] = "processing"
+    state.write_json_atomic(p, record)
+    old = time.time() - age_sec
+    os.utime(p, (old, old))
+
+
+def test_prepare_recovery_handoff_refuses_live_idle_manager(fresh_orchestrator_dir):
+    """A healthy idle manager (live pid, state idle) must never be handed out
+    as a recovery-takeover target — 2026-07-29 16:23 live-manager-kill class."""
+    become_manager_impl(claude_sid="mgr-live", iterm_sid="i0")
+    with pytest.raises(ValueError, match="not an active manager"):
+        prepare_recovery_handoff_impl("mgr-live")
+
+
+def test_prepare_recovery_handoff_refuses_live_processing_fresh(fresh_orchestrator_dir):
+    """Live pid + state processing + record written <120s ago = a manager
+    mid-work, not a brick."""
+    become_manager_impl(claude_sid="mgr-live", iterm_sid="i0")
+    p = paths.ACTIVE / "mgr-live.json"
+    record = state.read_json(p)
+    record["state"] = "processing"
+    state.write_json_atomic(p, record)  # fresh mtime
+    with pytest.raises(ValueError, match="not an active manager"):
+        prepare_recovery_handoff_impl("mgr-live")
+
+
+def test_prepare_recovery_handoff_refuses_live_idle_stale_record(fresh_orchestrator_dir):
+    """Delete-one-line coverage for the `state != "processing"` clause: a healthy manager
+    idle >120s between turns is the common posture — the mtime clause alone lets it through."""
+    become_manager_impl(claude_sid="mgr-idle-old", iterm_sid="i0")
+    p = paths.ACTIVE / "mgr-idle-old.json"
+    old = time.time() - 3600
+    os.utime(p, (old, old))
+    with pytest.raises(ValueError, match="not an active manager"):
+        prepare_recovery_handoff_impl("mgr-idle-old")
+
+
+def test_prepare_recovery_handoff_allows_bricked_target(fresh_orchestrator_dir):
+    """The designed lane: live pid + processing + >=120s silent record."""
+    become_manager_impl(claude_sid="mgr-bricked", iterm_sid="i0")
+    _brick_manager_record("mgr-bricked")
+    out = prepare_recovery_handoff_impl("mgr-bricked")
+    assert "handoff_id" in out
+
+
+def test_prepare_recovery_handoff_allows_dead_pid(fresh_orchestrator_dir, monkeypatch):
+    """Dead process = dead manager: proceed regardless of state/mtime."""
+    become_manager_impl(claude_sid="mgr-dead", iterm_sid="i0")  # state idle, fresh mtime
+    monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: False)
+    out = prepare_recovery_handoff_impl("mgr-dead")
+    assert "handoff_id" in out
+
+
+def test_prepare_recovery_handoff_allows_pidless_record(fresh_orchestrator_dir):
+    """No pid = no liveness evidence (legacy/hand-made record): fail open —
+    refusing would deadlock legit recovery; the monitor's own detection remains
+    the gate."""
+    state.write_json_atomic(paths.ACTIVE / "mgr-legacy.json", {
+        "claude_sid": "mgr-legacy", "agent": "manager", "name": "old-timer",
+        "cwd": "/x", "window_id": "i0", "pid": None, "started_at": 1.0,
+        "state": "idle", "last_turn_at": None, "last_summary": None,
+        "domain": "general", "parent_manager_name": None,
+    })
+    out = prepare_recovery_handoff_impl("mgr-legacy")
+    assert "handoff_id" in out
+
+
+def test_prepare_recovery_handoff_refuses_live_manager_mid_long_turn(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    """THE 2026-07-29 kill class (Tier-2 Critical repro): a healthy manager 40 min
+    into a single turn — state processing, record mtime frozen at turn start,
+    transcript appended seconds ago. The record clock alone calls it dead; the
+    transcript leg must refuse."""
+    become_manager_impl(claude_sid="mgr-live", iterm_sid="i0")
+    p = paths.ACTIVE / "mgr-live.json"
+    record = state.read_json(p)
+    record["state"] = "processing"
+    state.write_json_atomic(p, record)
+    old = time.time() - 2400
+    os.utime(p, (old, old))
+    log = tmp_path / "mgr-live.jsonl"
+    log.write_text("{}\n")
+    monkeypatch.setattr("dockwright.mcp_server.find_session_log",
+                        lambda sid, runtime="claude": log)
+    with pytest.raises(ValueError, match="not an active manager"):
+        prepare_recovery_handoff_impl("mgr-live")
+
+
+def test_prepare_recovery_handoff_allows_bricked_target_with_stale_transcript(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    """The other direction (a liveness check that never allows is as bad as one
+    that wrongly allows): genuinely bricked — processing, record AND transcript
+    both silent 40 min — must still be detected as recoverable."""
+    become_manager_impl(claude_sid="mgr-bricked", iterm_sid="i0")
+    _brick_manager_record("mgr-bricked", age_sec=2400)
+    log = tmp_path / "mgr-bricked.jsonl"
+    log.write_text("{}\n")
+    old = time.time() - 2400
+    os.utime(log, (old, old))
+    monkeypatch.setattr("dockwright.mcp_server.find_session_log",
+                        lambda sid, runtime="claude": log)
+    out = prepare_recovery_handoff_impl("mgr-bricked")
+    assert "handoff_id" in out
+
+
+def _write_transcript(path, lines):
+    path.write_text("".join(_json.dumps(ev) + "\n" for ev in lines))
+
+
+def _asst(blocks):
+    return {"type": "assistant", "message": {"model": "claude-opus-5", "content": blocks}}
+
+
+_SYNTHETIC_401 = {"type": "assistant", "isApiErrorMessage": True,
+                  "message": {"model": "<synthetic>",
+                              "content": [{"type": "text", "text": "Login expired · Please run /login"}]}}
+_SYNTHETIC_LIMIT = {"type": "assistant", "isApiErrorMessage": True,
+                    "message": {"model": "<synthetic>",
+                                "content": [{"type": "text", "text": "You've hit your session limit."}]}}
+
+
+def test_prepare_recovery_handoff_refuses_manager_blocked_on_tool(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    """Tier-2 round-3 Critical repro (autonomous chain): a manager asks its human
+    about a rate limit, calls AskUserQuestion, and goes silent on both files —
+    the monitor's banner check false-positives on the prose and launches a
+    recovery. The guard must recognise the trailing unfinished tool_use as
+    ALIVE and refuse; killing a manager mid-question is the round-1 outcome."""
+    become_manager_impl(claude_sid="mgr-modal", iterm_sid="i0")
+    _brick_manager_record("mgr-modal", age_sec=2400)
+    log = tmp_path / "mgr-modal.jsonl"
+    _write_transcript(log, [
+        _asst([{"type": "text", "text": "Account a hit your session limit. Flip to b?"},
+               {"type": "tool_use", "id": "toolu_ask1", "name": "AskUserQuestion", "input": {}}]),
+    ])
+    old = time.time() - 2400
+    os.utime(log, (old, old))
+    monkeypatch.setattr("dockwright.mcp_server.find_session_log",
+                        lambda sid, runtime="claude": log)
+    with pytest.raises(ValueError, match="not an active manager"):
+        prepare_recovery_handoff_impl("mgr-modal")
+
+
+def test_prepare_recovery_handoff_allows_real_latched_brick_shapes(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    """A genuinely latched brick always ENDS in a synthetic assistant TEXT event
+    (validated on the 2026-07-29 incident transcripts: model="<synthetic>",
+    isApiErrorMessage=True). Both banner classes, each preceded by an earlier
+    real tool_use turn — the discriminator must key on the LAST assistant
+    event, not on any tool_use anywhere in the file."""
+    for i, latch in enumerate((_SYNTHETIC_401, _SYNTHETIC_LIMIT)):
+        sid = f"mgr-latched-{i}"
+        become_manager_impl(claude_sid=sid, iterm_sid=f"i{i}")
+        _brick_manager_record(sid, age_sec=2400)
+        log = tmp_path / f"{sid}.jsonl"
+        _write_transcript(log, [
+            _asst([{"type": "tool_use", "id": "toolu_old", "name": "Bash", "input": {}}]),
+            {"type": "user", "message": {"content": [{"type": "tool_result",
+                                                      "tool_use_id": "toolu_old"}]}},
+            latch,
+        ])
+        old = time.time() - 2400
+        os.utime(log, (old, old))
+        monkeypatch.setattr("dockwright.mcp_server.find_session_log",
+                            lambda sid_, runtime="claude", _log=log: _log)
+        out = prepare_recovery_handoff_impl(sid)
+        assert "handoff_id" in out, sid
+
+
+def test_liveness_refusal_matches_procedure_routing_phrase(fresh_orchestrator_dir):
+    """Prose-code contract, both sides anchored: the raised message must contain
+    the exact phrase manager-takeover-recovery.md step 3 routes on."""
+    import re
+    doc = (Path(__file__).resolve().parents[1]
+           / "deploy" / "commands" / "manager-takeover-recovery.md").read_text()
+    m = re.search(r'errors with "([^"]+)"', doc)
+    assert m, "step-3 routing phrase not found in procedure doc"
+    become_manager_impl(claude_sid="mgr-live", iterm_sid="i0")
+    with pytest.raises(ValueError) as ei:
+        prepare_recovery_handoff_impl("mgr-live")
+    assert m.group(1) in str(ei.value)
+
+
+def test_recovery_silence_floor_matches_stale_monitor():
+    """Drift guard between the guard's clock and the monitor's detection floor —
+    if the floor ever moves, the guard must move with it or legit recoveries
+    get refused at the successor's first call."""
+    from dockwright import mcp_server, stale_monitor
+    assert (mcp_server.RECOVERY_TAKEOVER_MIN_SILENCE_SEC
+            == stale_monitor.MANAGER_LIMIT_CHECK_FLOOR_SEC)
+
+
+def test_liveness_clock_is_the_monitors_quantity(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    """Round-1's Critical was prose-only parity: the constant was pinned
+    (120 == 120) while the QUANTITY diverged. Pin the quantity: on identical
+    on-disk state, the guard's verdict must agree with the monitor's own
+    _last_activity computation — the expectation is DERIVED from
+    _last_activity, so any source it gains later (e.g. subagent mtimes via
+    _latest_subagent_mtime — the planted agent-1.jsonl below is exactly that
+    signal, invisible to both clocks today) reds this test until the guard
+    follows. Both clocks run their own real resolvers over one tmp tree;
+    stale_monitor binds its projects root at import (repo-documented caveat),
+    so that side's root is aligned via the same attr the test_stale_monitor
+    fixture uses. The mtime→max→floor computation on both sides is
+    untouched."""
+    from dockwright import stale_monitor
+    from dockwright.mcp_server import (_recovery_target_liveness,
+                                       RECOVERY_TAKEOVER_MIN_SILENCE_SEC)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(stale_monitor, "CLAUDE_PROJECTS", tmp_path / ".claude" / "projects")
+    sid = "mgr-parity"
+    become_manager_impl(claude_sid=sid, iterm_sid="i0")
+    p = paths.ACTIVE / f"{sid}.json"
+    record = state.read_json(p)
+    record["state"] = "processing"
+    state.write_json_atomic(p, record)
+    old = time.time() - 2400
+    os.utime(p, (old, old))
+    proj = tmp_path / ".claude" / "projects" / "-x"
+    proj.mkdir(parents=True)
+    log = proj / f"{sid}.jsonl"
+    log.write_text("{}\n")
+    sub_dir = proj / sid / "subagents"
+    sub_dir.mkdir(parents=True)
+    (sub_dir / "agent-1.jsonl").write_text("{}\n")
+    for transcript_age in (0, 60, 300, 2400):
+        t = time.time() - transcript_age
+        os.utime(log, (t, t))
+        rec = state.read_json(p)
+        activity, resolved = stale_monitor._last_activity(rec, int(p.stat().st_mtime))
+        assert resolved == log
+        monitor_says_bricked = (time.time() - activity
+                                >= RECOVERY_TAKEOVER_MIN_SILENCE_SEC)
+        verdict = _recovery_target_liveness(sid, rec)
+        assert (verdict is None) == monitor_says_bricked, (transcript_age, verdict)
+
+
+def test_takeover_refuses_revived_recovery_target(fresh_orchestrator_dir, monkeypatch):
+    """Guard point B: a recovery-marked handoff whose target shows liveness at
+    CONSUME time must refuse BEFORE any destructive act — window untouched,
+    predecessor record kept, handoff unconsumed."""
+    become_manager_impl(claude_sid="old-sid", iterm_sid="i0")
+    _brick_manager_record("old-sid")
+    out = prepare_recovery_handoff_impl("old-sid")
+    p = paths.ACTIVE / "old-sid.json"
+    record = state.read_json(p)
+    record["state"] = "idle"
+    state.write_json_atomic(p, record)  # revival: fresh mtime + idle
+    closed = []
+    monkeypatch.setattr("dockwright.mcp_server._close_window", lambda w: closed.append(w))
+    with pytest.raises(ValueError, match="liveness|live"):
+        become_manager_with_takeover_impl(
+            claude_sid="new-sid", takeover_from="old-sid",
+            handoff_id=out["handoff_id"], iterm_sid="i2")
+    assert closed == []
+    assert state.read_json(paths.ACTIVE / "old-sid.json") is not None
+    handoff = state.read_json(paths.HANDOFFS / f"{out['handoff_id']}.json")
+    assert handoff["consumed_at"] is None
+
+
+def test_takeover_refuses_revived_target_gone_idle_and_quiet(fresh_orchestrator_dir, monkeypatch):
+    """Guard-B twin: the predecessor revived, finished its turn (state idle) and has been
+    quiet >120s — only the state clause refuses."""
+    become_manager_impl(claude_sid="old-sid", iterm_sid="i0")
+    p = paths.ACTIVE / "old-sid.json"
+    r = state.read_json(p); r["state"] = "processing"; state.write_json_atomic(p, r)
+    os.utime(p, (time.time() - 300,) * 2)
+    out = prepare_recovery_handoff_impl("old-sid")
+    r = state.read_json(p); r["state"] = "idle"; state.write_json_atomic(p, r)
+    os.utime(p, (time.time() - 300,) * 2)
+    closed = []
+    monkeypatch.setattr("dockwright.mcp_server._close_window", lambda w: closed.append(w))
+    with pytest.raises(ValueError, match="liveness|live"):
+        become_manager_with_takeover_impl(claude_sid="new-sid", takeover_from="old-sid",
+                                          handoff_id=out["handoff_id"], iterm_sid="i2")
+    assert closed == []
+
+
+def test_become_manager_pops_pending_takeover_env(fresh_orchestrator_dir, monkeypatch):
+    """The recovery tab's whole process tree (claude CLI + its MCP server)
+    inherits DOCKWRIGHT_PENDING_TAKEOVER=1. Registration IS the identity
+    acquisition, so become_manager_impl must pop the var from the MCP server's
+    env — otherwise a later TmuxDriver.spawn from this process could birth a
+    tmux server with the var in its global env, silently suppressing
+    SessionStart registration for every future manager tab (add-one sweep on
+    the guard's blast radius)."""
+    monkeypatch.setenv("DOCKWRIGHT_PENDING_TAKEOVER", "1")
+    become_manager_impl(claude_sid="mgr-pop", iterm_sid="i0")
+    assert "DOCKWRIGHT_PENDING_TAKEOVER" not in os.environ
+
+
+def test_takeover_nonrecovery_handoff_live_predecessor_still_works(fresh_orchestrator_dir, monkeypatch):
+    """Guard-B scoping (the recreate-lane protection): a NON-recovery handoff
+    consumed against a live, fresh, idle predecessor is the designed
+    /recreate-manager flow and must not regress. Handoff hand-written in
+    bootstrap-recreate.sh's shape + manager_name/domain."""
+    result = become_manager_impl(claude_sid="old-sid", iterm_sid="i0")
+    state.write_json_atomic(paths.HANDOFFS / "h-recreate.json", {
+        "handoff_id": "h-recreate", "from_sid": "old-sid", "to_sid": None,
+        "prepared_at": time.time(), "consumed_at": None,
+        "trigger_reason": "recreate", "narrative_summary": "n",
+        "manager_name": result["name"], "domain": "general",
+        "workers_snapshot": [], "questions_snapshot": [],
+    })
+    monkeypatch.setattr("dockwright.mcp_server._close_window", lambda w: None)
+    res = become_manager_with_takeover_impl(
+        claude_sid="new-sid", takeover_from="old-sid",
+        handoff_id="h-recreate", iterm_sid="i2")
+    assert res["name"] == result["name"]
+
 
 def test_prepare_recovery_handoff_shape(fresh_orchestrator_dir):
     mgr_result = become_manager_impl(claude_sid="mgr-sid-1", iterm_sid="i0")
@@ -1634,6 +2435,7 @@ def test_prepare_recovery_handoff_shape(fresh_orchestrator_dir):
         parent_manager_name=mgr_result["name"],
     )
 
+    _brick_manager_record("mgr-sid-1")
     out = prepare_recovery_handoff_impl("mgr-sid-1")
     assert "handoff_id" in out
     assert "path" in out
@@ -1682,6 +2484,7 @@ def test_recovery_handoff_accepted_by_takeover(fresh_orchestrator_dir, monkeypat
         parent_manager_name=old_result["name"],
     )
 
+    _brick_manager_record("old-sid")
     out = prepare_recovery_handoff_impl("old-sid")
 
     monkeypatch.setattr("dockwright.mcp_server._close_window", lambda w: None)
@@ -1869,8 +2672,8 @@ def test_spawn_worker_defaults_unchanged_when_new_params_omitted(monkeypatch):
         name="alpha",
     ))
     inner_cmd = captured["args"][-1]
-    # No model passed → orchestrator appends its opus[1m] default before the prompt
-    assert inner_cmd.rstrip().endswith("claude --model 'opus[1m]' hi")
+    # No model passed → orchestrator appends its claude-opus-5[1m] default before the prompt
+    assert inner_cmd.rstrip().endswith("claude --model 'claude-opus-5[1m]' hi")
 
 
 def test_spawn_worker_codex_runtime_builds_codex_command(monkeypatch):
@@ -2385,7 +3188,7 @@ def test_spawn_replacement_manager_pins_opus_model(fresh_orchestrator_dir, monke
     captured = _patch_spawn_worker_tab(monkeypatch)
     _patch_window_id_exists(monkeypatch, True)
     _asyncio.run(spawn_replacement_manager_impl(handoff["handoff_id"]))
-    assert captured["extra_args"] == ["--remote-control", "--model", "opus[1m]"]
+    assert captured["extra_args"] == ["--remote-control", "--model", "claude-opus-5[1m]"]
 
 
 def test_spawn_replacement_manager_carries_settings_and_rc(fresh_orchestrator_dir, monkeypatch, tmp_path):
@@ -2403,7 +3206,7 @@ def test_spawn_replacement_manager_carries_settings_and_rc(fresh_orchestrator_di
     _patch_window_id_exists(monkeypatch, True)
     _asyncio.run(spawn_replacement_manager_impl(handoff["handoff_id"]))
     assert captured["extra_args"] == [
-        "--remote-control", "--settings", str(settings), "--model", "opus[1m]"]
+        "--remote-control", "--settings", str(settings), "--model", "claude-opus-5[1m]"]
     # Parse-shape invariant: the token after --remote-control (the prompt is
     # appended by spawner._runtime_command right after extra_args) must be a
     # dash-option, or --remote-control [name] swallows the /manager-resume prompt.
@@ -2424,7 +3227,7 @@ def test_spawn_replacement_manager_carries_skip_perms_opt_in(fresh_orchestrator_
     _asyncio.run(spawn_replacement_manager_impl(handoff["handoff_id"]))
     assert captured["extra_args"] == [
         "--remote-control", "--dangerously-skip-permissions",
-        "--model", "opus[1m]"]
+        "--model", "claude-opus-5[1m]"]
 
 
 def test_spawn_replacement_manager_inherits_predecessor_funny_name(fresh_orchestrator_dir, monkeypatch):
@@ -2898,7 +3701,7 @@ def test_manager_spawn_unaffected_by_worker_rc_flag(fresh_orchestrator_dir, monk
     _patch_window_id_exists(monkeypatch, True)
     _asyncio.run(spawn_replacement_manager_impl(handoff["handoff_id"]))
     extra = captured.get("extra_args") or []
-    assert extra == ["--remote-control", "--model", "opus[1m]"]
+    assert extra == ["--remote-control", "--model", "claude-opus-5[1m]"]
     assert "--settings" not in extra
     assert all("remoteControlAtStartup" not in str(a) for a in extra)
 
@@ -3305,8 +4108,13 @@ def test_prepare_handoff_writes_distill_file(fresh_orchestrator_dir, tmp_path, m
     assert argv[argv.index("--model") + 1] == "claude-sonnet-4-6"
     # Effort pinned to high (deterministic) instead of inheriting the CLI's undocumented default.
     assert argv[argv.index("--effort") + 1] == "high"
-    # Slimmed bytes piped to claude -p (raw transcripts can be MBs and overflow the prompt).
-    assert captured["input"] == b"USER: do X\n\nASSISTANT: ok"
+    # Slimmed bytes piped to claude -p (raw transcripts can be MBs and overflow
+    # the prompt), fenced as untrusted data (2026-07-29 distill-injection kill).
+    assert captured["input"] == (
+        b"<<<TRANSCRIPT_DATA_BEGIN>>>\n"
+        b"USER: do X\n\nASSISTANT: ok"
+        b"\n<<<TRANSCRIPT_DATA_END>>>"
+    )
     # Timeout cap applied so a hung subprocess can't block the handoff indefinitely.
     assert captured["timeout"] == 180
     assert log.exists()  # transcript stays on disk through the test
@@ -3400,6 +4208,7 @@ def test_distill_logs_stdout_on_nonzero_exit(fresh_orchestrator_dir, tmp_path, m
     """`claude -p` writes 'Prompt is too long' to STDOUT (not stderr) — log it."""
     _write_fake_transcript(tmp_path, monkeypatch, "mgr-old", [
         {"type": "user", "message": {"content": "hi"}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
     ])
     become_manager_impl(claude_sid="mgr-old", iterm_sid="i0")
 
@@ -3889,6 +4698,7 @@ def test_distill_subprocess_env_strips_orchestrator_keys(fresh_orchestrator_dir,
     from dockwright.mcp_server import _distill_manager_session
     _write_fake_transcript(tmp_path, monkeypatch, "mgr-x", [
         {"type": "user", "message": {"content": "go"}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
     ])
     monkeypatch.setenv("CLAUDE_AGENT", "manager")
     monkeypatch.setenv("CLAUDE_WORKER_NAME", "grumpy-yak")
@@ -4526,131 +5336,6 @@ def test_resume_worker_refuses_when_resume_sid_already_active(fresh_orchestrator
     assert (paths.CLOSED / "old-sid.json").exists()
 
 
-# --- Worker-slot semaphore -------------------------------------------------
-
-from dockwright.mcp_server import (
-    acquire_worker_slot_impl,
-    release_worker_slot_impl,
-)
-
-
-def _register_worker(sid: str, name: str = "w", pid: int | None = None) -> None:
-    """Helper: register an active worker so acquire's liveness check passes."""
-    register_self_impl(
-        claude_sid=sid,
-        agent="worker",
-        name=name,
-        cwd="/tmp",
-        iterm_sid="i",
-        pid=pid if pid is not None else os.getpid(),
-    )
-
-
-def test_acquire_worker_slot_succeeds_under_cap(fresh_orchestrator_dir):
-    _register_worker("sid-A", name="A")
-    _register_worker("sid-B", name="B")
-    r1 = acquire_worker_slot_impl(claude_sid="sid-A", category="mvn", max_concurrent=3)
-    r2 = acquire_worker_slot_impl(claude_sid="sid-B", category="mvn", max_concurrent=3)
-    assert "slot_id" in r1 and "slot_id" in r2
-    assert r1["slot_id"] != r2["slot_id"]
-
-
-def test_acquire_worker_slot_blocks_at_cap(fresh_orchestrator_dir):
-    for n in ("A", "B", "C"):
-        _register_worker(f"sid-{n}", name=n)
-        acquire_worker_slot_impl(claude_sid=f"sid-{n}", category="mvn", max_concurrent=3)
-    _register_worker("sid-D", name="D")
-    with pytest.raises(TimeoutError):
-        acquire_worker_slot_impl(
-            claude_sid="sid-D", category="mvn", max_concurrent=3, timeout_sec=1
-        )
-
-
-def test_release_worker_slot_frees_one(fresh_orchestrator_dir):
-    slot_ids = []
-    for n in ("A", "B", "C"):
-        _register_worker(f"sid-{n}", name=n)
-        slot_ids.append(
-            acquire_worker_slot_impl(
-                claude_sid=f"sid-{n}", category="mvn", max_concurrent=3
-            )["slot_id"]
-        )
-    release_worker_slot_impl(slot_id=slot_ids[1])
-    _register_worker("sid-D", name="D")
-    result = acquire_worker_slot_impl(
-        claude_sid="sid-D", category="mvn", max_concurrent=3, timeout_sec=2
-    )
-    assert "slot_id" in result
-
-
-def test_release_worker_slot_idempotent(fresh_orchestrator_dir):
-    _register_worker("sid-A", name="A")
-    slot = acquire_worker_slot_impl(claude_sid="sid-A", category="mvn", max_concurrent=3)
-    r1 = release_worker_slot_impl(slot_id=slot["slot_id"])
-    r2 = release_worker_slot_impl(slot_id=slot["slot_id"])
-    assert r1["released"] is True
-    assert r2["released"] is True
-
-
-def test_acquire_evicts_stale_holders(fresh_orchestrator_dir):
-    import json
-    # Pre-seed a slot file with a holder whose claude_sid has no active record
-    # AND whose pid is dead. acquire should evict it and grant.
-    (paths.SLOTS).mkdir(parents=True, exist_ok=True)
-    (paths.SLOTS / "mvn.json").write_text(json.dumps({
-        "max_concurrent": 1,
-        "holders": [{
-            "slot_id": "stale-1",
-            "claude_sid": "ghost-sid",
-            "acquired_at": 0.0,
-            "pid": 999999,  # almost certainly dead
-        }],
-    }))
-    _register_worker("sid-A", name="A")
-    result = acquire_worker_slot_impl(
-        claude_sid="sid-A", category="mvn", max_concurrent=1, timeout_sec=2
-    )
-    assert "slot_id" in result and result["slot_id"] != "stale-1"
-
-
-def test_env_var_overrides_default_count(fresh_orchestrator_dir, monkeypatch):
-    monkeypatch.setenv("CLAUDE_ORCH_SLOTS_MVN", "5")
-    # Acquire 5 with max_concurrent omitted; the env var should set the cap.
-    for n in range(5):
-        _register_worker(f"sid-{n}", name=f"W{n}")
-        acquire_worker_slot_impl(claude_sid=f"sid-{n}", category="mvn")
-    _register_worker("sid-X", name="X")
-    with pytest.raises(TimeoutError):
-        acquire_worker_slot_impl(claude_sid="sid-X", category="mvn", timeout_sec=1)
-
-
-def test_concurrent_acquires_serialize_safely(fresh_orchestrator_dir):
-    import threading
-    _register_worker("sid-A", name="A")
-    _register_worker("sid-B", name="B")
-    results: list = []
-    errors: list = []
-
-    def grab(sid):
-        try:
-            results.append(
-                acquire_worker_slot_impl(
-                    claude_sid=sid, category="mvn", max_concurrent=2, timeout_sec=5
-                )
-            )
-        except Exception as e:
-            errors.append(e)
-
-    t1 = threading.Thread(target=grab, args=("sid-A",))
-    t2 = threading.Thread(target=grab, args=("sid-B",))
-    t1.start(); t2.start()
-    t1.join(); t2.join()
-    assert not errors
-    assert len(results) == 2
-    ids = {r["slot_id"] for r in results}
-    assert len(ids) == 2
-
-
 # --- kill_worker graceful-close path --------------------------------------
 # kill_worker_impl closes the worker's tmux window so Claude Code's SessionEnd
 # hook fires (which in turn fires selffix-trigger.sh + orchestrator session-
@@ -5152,22 +5837,85 @@ def test_list_managers_returns_iterm_sid_from_window_id_records(fresh_orchestrat
     assert out[0]["iterm_sid"] == "win-9"
 
 
-# --- spawn_worker manager_sid resolution: unresolvable sid → UNSCOPED warning ---
+# --- spawn_worker manager_sid resolution: reject-or-scope (linux E2E F-β1) ---
 
-def test_spawn_worker_warns_on_unresolvable_manager_sid(fresh_orchestrator_dir, monkeypatch):
-    """A non-empty manager_sid with no ACTIVE record (e.g. the funny NAME passed
-    instead of the session UUID) must still spawn, but UNSCOPED and with a warning."""
+def test_spawn_worker_rejects_unresolvable_manager_sid(fresh_orchestrator_dir, monkeypatch):
+    """A non-empty manager_sid with no ACTIVE record (funny name / typo'd or
+    mangled UUID) must REJECT pre-spawn: parent_manager_name is stamped at
+    registration and never rewritten, so a warned-but-spawned worker stays
+    misrouted for its whole life (linux E2E C12). No tab, no pending file."""
     captured = _patch_spawn_worker_tab(monkeypatch)
-    result = _asyncio.run(spawn_worker_impl(
-        initial_prompt="hi",
-        name="worker-unscoped",
-        manager_sid="snug-ibex",  # funny name, not a registered sid
-    ))
-    assert result["parent_manager_name"] is None
-    assert "warning" in result
-    assert "snug-ibex" in result["warning"]
-    assert "UNSCOPED" in result["warning"]
-    assert "CLAUDE_PARENT_MANAGER" not in (captured.get("env") or {})
+    with pytest.raises(ValueError) as exc:
+        _asyncio.run(spawn_worker_impl(
+            initial_prompt="hi",
+            name="worker-rejected",
+            manager_sid="snug-ibex",  # funny name, not a registered sid
+        ))
+    msg = str(exc.value)
+    assert "snug-ibex" in msg
+    assert "list_managers" in msg
+    assert "manager_sid=None" in msg
+    assert captured == {}   # spawner never invoked
+    assert list(paths.ASSIGNMENTS_PENDING.glob("*.json")) == []
+
+
+def test_spawn_worker_rejects_worker_sid_as_manager_sid(fresh_orchestrator_dir, monkeypatch):
+    """C12's mangled sid was cross-contaminated from a WORKER's sid. Today that
+    lane is fully SILENT (the sid resolves to the worker's name, no warning) —
+    the guard must name the actual agent kind and reject."""
+    register_self_impl(claude_sid="w-sid-1", agent="worker", name="some-worker",
+                       cwd="/x", iterm_sid="i1")
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    with pytest.raises(ValueError) as exc:
+        _asyncio.run(spawn_worker_impl(
+            initial_prompt="hi", name="worker-x", manager_sid="w-sid-1"))
+    msg = str(exc.value)
+    assert "active worker record" in msg
+    assert "some-worker" in msg
+    assert captured == {}
+    assert list(paths.ASSIGNMENTS_PENDING.glob("*.json")) == []
+
+
+def test_spawn_worker_rejects_nested_manager_record(fresh_orchestrator_dir, monkeypatch):
+    """A nested manager-agent ghost (agent="manager", nested=True — the
+    nested-<sid8> shape hooks.py registers for a manager's nested child) passes
+    a naive agent check, but no monitor watches its buckets; the guard mirrors
+    _find_manager_record's `not nested` predicate."""
+    state.write_json_atomic(paths.ACTIVE / "n-sid-1.json", {
+        "claude_sid": "n-sid-1", "agent": "manager", "name": "nested-abc12345",
+        "nested": True, "cwd": "/x", "window_id": "i2",
+    })
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    with pytest.raises(ValueError) as exc:
+        _asyncio.run(spawn_worker_impl(
+            initial_prompt="hi", name="worker-y", manager_sid="n-sid-1"))
+    msg = str(exc.value)
+    assert "active nested manager-agent record" in msg
+    assert "nested-abc12345" in msg
+    assert captured == {}
+    assert list(paths.ASSIGNMENTS_PENDING.glob("*.json")) == []
+
+
+def test_spawn_worker_rejects_manager_record_with_falsy_name(fresh_orchestrator_dir, monkeypatch):
+    """Same bug-class as F-β1: a resolvable manager record whose `name` is
+    falsy used to return that falsy name — spawn_worker_impl then skipped the
+    env stamp and spawned SILENTLY unscoped, bypassing the record-is-None
+    reject arm. A live manager always has a name (become_manager /
+    register_self_impl write it synchronously), so a nameless record is a
+    corrupt registration: reject it like the other bad-sid shapes."""
+    state.write_json_atomic(paths.ACTIVE / "noname-1.json", {
+        "claude_sid": "noname-1", "agent": "manager", "name": "",
+        "cwd": "/x", "window_id": "i3",
+    })
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    with pytest.raises(ValueError) as exc:
+        _asyncio.run(spawn_worker_impl(
+            initial_prompt="hi", name="worker-z", manager_sid="noname-1"))
+    msg = str(exc.value)
+    assert "manager record with no name" in msg
+    assert "noname-1" in msg
+    assert captured == {}
+    assert list(paths.ASSIGNMENTS_PENDING.glob("*.json")) == []
 
 
 def test_spawn_worker_no_warning_on_none_manager_sid(fresh_orchestrator_dir, monkeypatch):
@@ -5200,18 +5948,32 @@ def test_resolve_parent_manager_branches(fresh_orchestrator_dir):
     from dockwright.mcp_server import _resolve_parent_manager
     become_manager_impl(claude_sid="mgr-a", iterm_sid="i0", domain="general")
     mgr_name = state.read_json(paths.ACTIVE / "mgr-a.json")["name"]
-    # falsy manager_sid → intentional legacy wildcard, no warning
-    assert _resolve_parent_manager(None) == (None, None)
-    assert _resolve_parent_manager("") == (None, None)
-    # resolvable sid → name, no warning (resolvable-path behavior unchanged)
-    resolved_name, resolved_warning = _resolve_parent_manager("mgr-a")
-    assert resolved_name == mgr_name
-    assert resolved_warning is None
-    # truthy but unresolvable sid → None + warning
-    unscoped_name, unscoped_warning = _resolve_parent_manager("snug-ibex")
-    assert unscoped_name is None
-    assert unscoped_warning is not None
-    assert "UNSCOPED" in unscoped_warning
+    # falsy manager_sid → intentional legacy/unscoped wildcard, allowed
+    assert _resolve_parent_manager(None) is None
+    assert _resolve_parent_manager("") is None
+    # resolvable top-level manager sid → name (happy path unchanged)
+    assert _resolve_parent_manager("mgr-a") == mgr_name
+    # truthy but unresolvable → reject
+    with pytest.raises(ValueError, match="snug-ibex"):
+        _resolve_parent_manager("snug-ibex")
+    # a WORKER's sid → reject, naming the kind
+    register_self_impl(claude_sid="w-1", agent="worker", name="wrk",
+                       cwd="/x", iterm_sid="i9")
+    with pytest.raises(ValueError, match="active worker record"):
+        _resolve_parent_manager("w-1")
+    # nested manager-agent ghost → reject (mirrors _find_manager_record)
+    state.write_json_atomic(paths.ACTIVE / "n-1.json", {
+        "claude_sid": "n-1", "agent": "manager",
+        "name": "nested-deadbeef", "nested": True,
+    })
+    with pytest.raises(ValueError, match="active nested manager-agent record"):
+        _resolve_parent_manager("n-1")
+    # manager record with a MISSING name key → falsy-name arm, same reject
+    state.write_json_atomic(paths.ACTIVE / "noname-2.json", {
+        "claude_sid": "noname-2", "agent": "manager",
+    })
+    with pytest.raises(ValueError, match="manager record with no name"):
+        _resolve_parent_manager("noname-2")
 
 
 def test_resolve_manager_name_for_filter_warns_to_stderr_on_unresolvable_sid(fresh_orchestrator_dir, capsys):
@@ -5339,6 +6101,217 @@ def test_pipeline_event_accepts_task_key_and_ticket_alias(fresh_orchestrator_dir
         _tool_pipeline_event(type="note")
 
 
+from dockwright.mcp_server import _read_events, _write_artifact_atomic, _put_clobber_verdict
+
+
+# --- No-clobber guard on artifact_put (single-writer invariant, enforced) ---
+
+
+def test_artifact_put_refuses_clobber_of_hand_authored_file(fresh_orchestrator_dir):
+    path = paths.artifact_path("TKT-SANDBOX-9", "review", "report")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# full hand-written review\nlots of detail\n")
+    with pytest.raises(ValueError, match="artifact_put refused"):
+        artifact_put_impl("TKT-SANDBOX-9", "review", "report", "condensed summary",
+                          "complete", "w1")
+    assert path.read_text() == "# full hand-written review\nlots of detail\n"
+    events = _read_events(paths.artifact_events_path("TKT-SANDBOX-9"))
+    assert [e["type"] for e in events] == ["artifact_put_refused"]
+    assert events[0]["reason"] == "non_record_file"
+    assert events[0]["actor_sid"] == "w1"
+
+
+def test_artifact_put_refuses_foreign_writer_record(fresh_orchestrator_dir):
+    artifact_put_impl("TKT-SANDBOX-9", "spec", "repo", "body A", "partial", "writer-a")
+    with pytest.raises(ValueError, match="artifact_put refused"):
+        artifact_put_impl("TKT-SANDBOX-9", "spec", "repo", "body B", "complete", "writer-b")
+    got = artifact_get_impl("TKT-SANDBOX-9", "spec", "repo")
+    assert got["writer_sid"] == "writer-a"
+    assert got["content"] == "body A"
+    events = _read_events(paths.artifact_events_path("TKT-SANDBOX-9"))
+    assert events[-1]["type"] == "artifact_put_refused"
+    assert events[-1]["reason"] == "foreign_record"
+
+
+def test_artifact_put_same_writer_update_flows(fresh_orchestrator_dir):
+    # The designed partial -> complete flip must stay frictionless.
+    artifact_put_impl("TKT-SANDBOX-9", "spec", "repo", "draft", "partial", "w1")
+    artifact_put_impl("TKT-SANDBOX-9", "spec", "repo", "final", "complete", "w1")
+    got = artifact_get_impl("TKT-SANDBOX-9", "spec", "repo")
+    assert got["status"] == "complete"
+    assert got["content"] == "final"
+
+
+def test_artifact_put_overwrite_flag_replaces(fresh_orchestrator_dir):
+    # Canonical legitimate use: a successor finishing a dead worker's phase.
+    artifact_put_impl("TKT-SANDBOX-9", "spec", "repo", "body A", "complete", "writer-a")
+    artifact_put_impl("TKT-SANDBOX-9", "spec", "repo", "successor body", "complete",
+                      "writer-b", overwrite=True)
+    got = artifact_get_impl("TKT-SANDBOX-9", "spec", "repo")
+    assert got["writer_sid"] == "writer-b"
+    assert got["content"] == "successor body"
+    events = _read_events(paths.artifact_events_path("TKT-SANDBOX-9"))
+    assert events[-1]["type"] == "artifact_put"
+    assert events[-1]["overwrite"] is True
+
+
+def test_artifact_put_stamps_identical_hand_content(fresh_orchestrator_dir):
+    # A hand-written full report whose text equals the put's content byte-exact
+    # is stamped in place — nothing can be lost.
+    path = paths.artifact_path("TKT-SANDBOX-9", "review", "report")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("full verdict text")
+    artifact_put_impl("TKT-SANDBOX-9", "review", "report", "full verdict text",
+                      "complete", "w1")
+    got = artifact_get_impl("TKT-SANDBOX-9", "review", "report")
+    assert got["content"] == "full verdict text"
+    assert got["writer_sid"] == "w1"
+
+
+def test_write_artifact_atomic_exclusive_raises_on_existing(tmp_path):
+    p = tmp_path / "a.md"
+    p.write_text("occupant")
+    with pytest.raises(FileExistsError):
+        _write_artifact_atomic(p, "new", exclusive=True)
+    assert p.read_text() == "occupant"
+    assert list(tmp_path.glob(".*.tmp")) == []     # tmp cleaned up on failure
+
+
+def test_artifact_put_eexist_race_reruns_guard_refuse(fresh_orchestrator_dir, monkeypatch):
+    # TOCTOU closure: guard saw no file, a FOREIGN record lands before our
+    # exclusive create -> the put must re-guard and refuse, never replace blind.
+    import dockwright.mcp_server as m
+    real = m._write_artifact_atomic
+    injected = {"done": False}
+
+    def racing(p, text, exclusive=False):
+        if exclusive and not injected["done"]:
+            injected["done"] = True
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(state.serialize_artifact(
+                {"phase": "spec", "name": "repo", "status": "partial",
+                 "writer_sid": "intruder", "contract_hash": None,
+                 "written_at": 1.0, "read_set": []}, "foreign body"))
+        return real(p, text, exclusive=exclusive)
+
+    monkeypatch.setattr(m, "_write_artifact_atomic", racing)
+    with pytest.raises(ValueError, match="artifact_put refused"):
+        artifact_put_impl("TKT-SANDBOX-9", "spec", "repo", "mine", "complete", "w1")
+    got = artifact_get_impl("TKT-SANDBOX-9", "spec", "repo")
+    assert got["writer_sid"] == "intruder"
+    assert got["content"] == "foreign body"
+
+
+def test_artifact_put_eexist_race_allows_same_writer(fresh_orchestrator_dir, monkeypatch):
+    # Same race, but the record that landed is OUR OWN (e.g. a retried put):
+    # re-guard says allowed -> last-wins replace, the pre-existing semantics.
+    import dockwright.mcp_server as m
+    real = m._write_artifact_atomic
+    injected = {"done": False}
+
+    def racing(p, text, exclusive=False):
+        if exclusive and not injected["done"]:
+            injected["done"] = True
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(state.serialize_artifact(
+                {"phase": "spec", "name": "repo", "status": "partial",
+                 "writer_sid": "w1", "contract_hash": None,
+                 "written_at": 1.0, "read_set": []}, "earlier attempt"))
+        return real(p, text, exclusive=exclusive)
+
+    monkeypatch.setattr(m, "_write_artifact_atomic", racing)
+    res = artifact_put_impl("TKT-SANDBOX-9", "spec", "repo", "mine", "complete", "w1")
+    got = artifact_get_impl("TKT-SANDBOX-9", "spec", "repo")
+    assert got["content"] == "mine"
+    # The re-guard's "allowed" arm (site C) must archive the interloper's
+    # record the same as the other two allowed-branch sites — deleting site
+    # C's `_archive_replaced` call leaves the module 481-green otherwise.
+    prev = paths.artifact_path("TKT-SANDBOX-9", "spec", "repo").with_name("spec.repo.md.prev")
+    _, prev_body = state.parse_artifact(prev.read_text())
+    assert prev_body == "earlier attempt"
+    assert res["archived_previous"] == str(prev)
+    assert _last_event("TKT-SANDBOX-9")["archived_previous"] == str(prev)
+
+
+def test_artifact_put_second_eexist_propagates(fresh_orchestrator_dir, monkeypatch):
+    # Guard said absent, exclusive create keeps losing the race (file appears,
+    # vanishes before the re-guard, reappears): the second EEXIST must
+    # propagate loudly — no retry loop.
+    import dockwright.mcp_server as m
+
+    def always_eexist(p, text, exclusive=False):
+        if exclusive:
+            raise FileExistsError(str(p))
+        raise AssertionError("non-exclusive write must not be reached")
+
+    monkeypatch.setattr(m, "_write_artifact_atomic", always_eexist)
+    with pytest.raises(FileExistsError):
+        artifact_put_impl("TKT-SANDBOX-9", "spec", "repo", "mine", "complete", "w1")
+
+
+def test_artifact_put_eexist_reguard_refuses_own_complete_record(fresh_orchestrator_dir, monkeypatch):
+    # Same race shape as test_artifact_put_eexist_race_reruns_guard_refuse, but
+    # what lands is OUR OWN finalized record with different content: the
+    # re-guard's default-deny arm must classify own_complete_record and
+    # refuse, never blind-replace it.
+    import dockwright.mcp_server as m
+    real = m._write_artifact_atomic
+    injected = {"done": False}
+
+    def racing(p, text, exclusive=False):
+        if exclusive and not injected["done"]:
+            injected["done"] = True
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(state.serialize_artifact(
+                {"phase": "spec", "name": "repo", "status": "complete",
+                 "writer_sid": "w1", "contract_hash": None,
+                 "written_at": 1.0, "read_set": []}, "earlier final body"))
+        return real(p, text, exclusive=exclusive)
+
+    monkeypatch.setattr(m, "_write_artifact_atomic", racing)
+    with pytest.raises(ValueError, match="artifact_put refused"):
+        artifact_put_impl("TKT-SANDBOX-9", "spec", "repo", "mine", "complete", "w1")
+    got = artifact_get_impl("TKT-SANDBOX-9", "spec", "repo")
+    assert got["writer_sid"] == "w1"
+    assert got["content"] == "earlier final body"
+    assert _last_event("TKT-SANDBOX-9")["reason"] == "own_complete_record"
+
+
+def test_artifact_put_eexist_reguard_refuses_unknown_verdict(fresh_orchestrator_dir, monkeypatch):
+    # Side-effecting verdict fake: the FIRST call (initial guard) returns
+    # "absent" so the put reaches the EEXIST branch at all; the SECOND call
+    # (the re-guard) returns an unrecognized verdict. A constant fake would
+    # short-circuit at dispatch site 1 and never exercise the re-guard's own
+    # default-deny arm.
+    import dockwright.mcp_server as m
+    calls = {"n": 0}
+
+    def fake_verdict(*a, **k):
+        calls["n"] += 1
+        return "absent" if calls["n"] == 1 else "some_future_verdict"
+
+    def always_eexist(p, text, exclusive=False):
+        if exclusive:
+            raise FileExistsError(str(p))
+        raise AssertionError("non-exclusive write must not be reached")
+
+    monkeypatch.setattr(m, "_put_clobber_verdict", fake_verdict)
+    monkeypatch.setattr(m, "_write_artifact_atomic", always_eexist)
+    with pytest.raises(ValueError, match="artifact_put refused"):
+        artifact_put_impl("TKT-SANDBOX-9", "spec", "repo", "mine", "complete", "w1")
+    assert calls["n"] == 2
+    assert _last_event("TKT-SANDBOX-9")["reason"] == "some_future_verdict"
+
+
+def test_artifact_put_tool_threads_overwrite(fresh_orchestrator_dir):
+    _tool_artifact_put(task_key="TKT-SANDBOX-9", phase="spec", name="srs", content="a",
+                       status="complete", writer_sid="w1")
+    _tool_artifact_put(task_key="TKT-SANDBOX-9", phase="spec", name="srs", content="b",
+                       status="complete", writer_sid="w2", overwrite=True)
+    assert _tool_artifact_get(task_key="TKT-SANDBOX-9", phase="spec",
+                              name="srs")["content"] == "b"
+
+
 def test_partial_then_complete_same_writer_overwrites(fresh_orchestrator_dir):
     artifact_put_impl("TKT-SANDBOX-1", "spec", "srs", "v1", "partial", "sid-w1")
     artifact_put_impl("TKT-SANDBOX-1", "spec", "srs", "v2", "complete", "sid-w1")
@@ -5394,6 +6367,507 @@ def test_artifact_put_emits_event(fresh_orchestrator_dir):
     lines = [json.loads(l) for l in paths.artifact_events_path("TKT-SANDBOX-1").read_text().splitlines()]
     (ev,) = [l for l in lines if l["type"] == "artifact_put"]
     assert ev["actor_sid"] == "sid-w1" and ev["status"] == "complete"
+
+
+# --- Own-final guard + default-deny dispatch (spec 2026-07-31, builds on #234) ---
+
+
+def _last_event(task_key):
+    return _read_events(paths.artifact_events_path(task_key))[-1]
+
+
+def _seed_raw_record(task_key, phase, name, body, stamp_overrides=None):
+    """Write a record file directly (bypassing the put) so tests can seed
+    stamps the put itself can no longer produce (null status, falsy sid).
+    NOTE: serialize_artifact emits EVERY _FM_KEYS key — an override of None
+    yields `status: null`, never a missing line; where a genuinely missing
+    key is needed, the occupant is seeded from raw frontmatter text instead
+    (see test_put_clobber_verdict_fail_closed_axes's p4 leg)."""
+    stamp = {"phase": phase, "name": name, "status": "complete",
+             "writer_sid": "sid-w1", "contract_hash": None,
+             "written_at": 0.0, "read_set": []}
+    stamp.update(stamp_overrides or {})
+    p = paths.artifact_path(task_key, phase, name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(state.serialize_artifact(stamp, body))
+    return p
+
+
+def test_artifact_put_refuses_own_complete_record_different_content(fresh_orchestrator_dir):
+    artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "FULL REPORT", "complete", "sid-w1")
+    p = paths.artifact_path("TKT-SANDBOX-1", "review", "verdict")
+    before = p.read_text()
+    with pytest.raises(ValueError, match="final"):
+        artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "condensed summary", "complete", "sid-w1")
+    assert p.read_text() == before
+    ev = _last_event("TKT-SANDBOX-1")
+    assert ev["type"] == "artifact_put_refused" and ev["reason"] == "own_complete_record"
+
+
+def test_artifact_put_refuses_status_demotion_of_own_final_record(fresh_orchestrator_dir):
+    artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "FULL REPORT", "complete", "sid-w1")
+    p = paths.artifact_path("TKT-SANDBOX-1", "review", "verdict")
+    before = p.read_text()
+    with pytest.raises(ValueError, match="demot"):
+        artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "FULL REPORT", "partial", "sid-w1")
+    assert p.read_text() == before
+    assert _last_event("TKT-SANDBOX-1")["reason"] == "demotes_final"
+
+
+def test_artifact_put_refuses_partial_stamping_of_hand_file(fresh_orchestrator_dir):
+    p = paths.artifact_path("TKT-SANDBOX-1", "review", "verdict")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("# hand-written full verdict\n")
+    with pytest.raises(ValueError, match="demot"):
+        artifact_put_impl("TKT-SANDBOX-1", "review", "verdict",
+                          "# hand-written full verdict\n", "partial", "sid-w1")
+    assert p.read_text() == "# hand-written full verdict\n"
+    assert _last_event("TKT-SANDBOX-1")["reason"] == "demotes_final"
+
+
+def test_artifact_put_refuses_colliding_record(fresh_orchestrator_dir):
+    artifact_put_impl("TKT-SANDBOX-1", "review", "api.v2", "occupant body", "partial", "sid-w1")
+    p = paths.artifact_path("TKT-SANDBOX-1", "review", "api.v2")
+    assert p == paths.artifact_path("TKT-SANDBOX-1", "review", "api_v2")
+    before = p.read_text()
+    with pytest.raises(ValueError, match="collid"):
+        artifact_put_impl("TKT-SANDBOX-1", "review", "api_v2", "different body", "partial", "sid-w1")
+    assert p.read_text() == before
+    assert _last_event("TKT-SANDBOX-1")["reason"] == "colliding_record"
+
+
+def test_artifact_put_own_complete_identical_reput_allowed(fresh_orchestrator_dir):
+    artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "FINAL BODY", "complete", "sid-w1")
+    res = artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "FINAL BODY", "complete", "sid-w1")
+    assert res["ok"] is True
+    assert artifact_get_impl("TKT-SANDBOX-1", "review", "verdict")["content"] == "FINAL BODY"
+
+
+def test_artifact_put_overwrite_replaces_own_complete_record(fresh_orchestrator_dir):
+    artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "FULL REPORT", "complete", "sid-w1")
+    res = artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "revised", "complete", "sid-w1",
+                            overwrite=True)
+    assert res["ok"] is True
+    assert artifact_get_impl("TKT-SANDBOX-1", "review", "verdict")["content"] == "revised"
+    ev = _last_event("TKT-SANDBOX-1")
+    assert ev["type"] == "artifact_put" and ev["overwrite"] is True
+
+
+def test_artifact_put_rejects_falsy_writer_sid(fresh_orchestrator_dir):
+    with pytest.raises(ValueError, match="writer_sid"):
+        artifact_put_impl("TKT-SANDBOX-1", "spec", "srs", "x", "complete", "")
+    with pytest.raises(ValueError, match="writer_sid"):
+        artifact_put_impl("TKT-SANDBOX-1", "spec", "srs", "x", "complete", None)
+    assert not list(paths.ARTIFACTS.glob("**/*.md"))
+
+
+def test_put_clobber_verdict_fail_closed_axes(fresh_orchestrator_dir):
+    # Direct unit calls: stamp axes that artifact_put_impl can no longer
+    # produce must still classify fail-closed if found on disk.
+    p1 = _seed_raw_record("TKT-SANDBOX-1", "spec", "a", "body", {"writer_sid": ""})
+    assert _put_clobber_verdict(p1, "spec", "a", "other", "complete", "") == "foreign_record"
+    p2 = _seed_raw_record("TKT-SANDBOX-1", "spec", "b", "body", {"status": None})
+    assert _put_clobber_verdict(p2, "spec", "b", "other", "complete", "sid-w1") == "own_complete_record"
+    p3 = _seed_raw_record("TKT-SANDBOX-1", "spec", "c", "body", {"phase": None})
+    assert _put_clobber_verdict(p3, "spec", "c", "other", "complete", "sid-w1") == "colliding_record"
+    # Genuinely MISSING status key (reachable on disk: parse_artifact skips a
+    # non-JSON value line, dropping the key) — must classify final too.
+    p4 = paths.artifact_path("TKT-SANDBOX-1", "spec", "d")
+    p4.write_text('---\nphase: "spec"\nname: "d"\nstatus: notjson\n'
+                  'writer_sid: "sid-w1"\n---\nbody')
+    assert _put_clobber_verdict(p4, "spec", "d", "other", "complete", "sid-w1") == "own_complete_record"
+
+
+def test_artifact_put_unknown_verdict_fails_closed(fresh_orchestrator_dir, monkeypatch):
+    artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "PRECIOUS", "complete", "sid-w1")
+    p = paths.artifact_path("TKT-SANDBOX-1", "review", "verdict")
+    before = p.read_text()
+    monkeypatch.setattr(mcp_server, "_put_clobber_verdict",
+                        lambda *a, **k: "some_future_verdict")
+    with pytest.raises(ValueError, match="some_future_verdict"):
+        artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "stomper", "complete", "sid-OTHER")
+    assert p.read_text() == before
+    assert _last_event("TKT-SANDBOX-1")["reason"] == "some_future_verdict"
+
+
+# --- Replaced-content sidecar (spec 2026-07-31, builds on #234, own-final guard) ---
+
+
+def test_artifact_put_partial_replacement_archives_previous(fresh_orchestrator_dir):
+    # The manager-named red-proof: a partial full report replaced by a summary
+    # must leave the report recoverable byte-exact in the sidecar.
+    artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "FULL 514-line report", "partial", "sid-w1")
+    p = paths.artifact_path("TKT-SANDBOX-1", "review", "verdict")
+    original = p.read_text()
+    res = artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "summary", "complete", "sid-w1")
+    prev = p.with_name(p.name + ".prev")
+    assert prev.read_text() == original
+    assert res["archived_previous"] == str(prev)
+    assert _last_event("TKT-SANDBOX-1")["archived_previous"] == str(prev)
+    assert artifact_get_impl("TKT-SANDBOX-1", "review", "verdict")["content"] == "summary"
+
+
+def test_artifact_put_overwrite_archives_replaced_record(fresh_orchestrator_dir):
+    artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "FULL REPORT", "complete", "sid-w1")
+    p = paths.artifact_path("TKT-SANDBOX-1", "review", "verdict")
+    original = p.read_text()
+    res = artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "revised", "complete", "sid-w1",
+                            overwrite=True)
+    prev = p.with_name(p.name + ".prev")
+    assert prev.read_text() == original
+    assert res["archived_previous"] == str(prev)
+
+
+def test_artifact_put_idempotent_reput_no_sidecar(fresh_orchestrator_dir):
+    artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "FINAL BODY", "complete", "sid-w1")
+    res = artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "FINAL BODY", "complete", "sid-w1")
+    p = paths.artifact_path("TKT-SANDBOX-1", "review", "verdict")
+    assert "archived_previous" not in res
+    assert not p.with_name(p.name + ".prev").exists()
+
+
+def test_artifact_put_sidecar_latest_only(fresh_orchestrator_dir):
+    artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "v1", "partial", "sid-w1")
+    artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "v2", "partial", "sid-w1")
+    artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "v3", "partial", "sid-w1")
+    p = paths.artifact_path("TKT-SANDBOX-1", "review", "verdict")
+    prev_text = p.with_name(p.name + ".prev").read_text()
+    _, prev_body = state.parse_artifact(prev_text)
+    assert prev_body == "v2"
+
+
+def test_artifact_put_archive_failure_fails_closed(fresh_orchestrator_dir, monkeypatch):
+    # Pin, not red-first: exists to stop a later swallow-and-proceed wrap
+    # around the archive (spec §3a fail-closed bullet).
+    artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "FULL REPORT", "partial", "sid-w1")
+    p = paths.artifact_path("TKT-SANDBOX-1", "review", "verdict")
+    before = p.read_text()
+    events_before = paths.artifact_events_path("TKT-SANDBOX-1").read_text()
+
+    def boom(path, content):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(mcp_server, "_archive_replaced", boom)
+    with pytest.raises(OSError):
+        artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "summary", "complete", "sid-w1")
+    assert p.read_text() == before
+    assert paths.artifact_events_path("TKT-SANDBOX-1").read_text() == events_before
+
+
+def test_artifact_put_real_archive_failure_fails_closed(fresh_orchestrator_dir):
+    # Behavioural sibling to the pin above: a REAL failure inside
+    # _archive_replaced itself (no monkeypatch of the helper), so a
+    # swallow-and-proceed wrap written INSIDE the helper's body — which the
+    # monkeypatch pin above cannot see — is caught here too.
+    artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "FULL REPORT", "partial", "sid-w1")
+    p = paths.artifact_path("TKT-SANDBOX-1", "review", "verdict")
+    before = p.read_text()
+    events_before = paths.artifact_events_path("TKT-SANDBOX-1").read_text()
+    prev = p.with_name(p.name + ".prev")
+    prev.mkdir()
+    (prev / "blocker").write_text("occupied")  # non-empty: os.replace cannot succeed
+    with pytest.raises(OSError):
+        artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "summary", "complete", "sid-w1")
+    assert p.read_text() == before
+    assert paths.artifact_events_path("TKT-SANDBOX-1").read_text() == events_before
+
+
+def test_sidecar_invisible_to_readers(fresh_orchestrator_dir):
+    artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "v1", "partial", "sid-w1")
+    artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "v2", "complete", "sid-w1")
+    assert [a["name"] for a in artifact_list_impl("TKT-SANDBOX-1")] == ["verdict"]
+    assert not list(paths.artifact_ticket_dir("TKT-SANDBOX-1").glob("*.tmp"))
+
+
+# --- Guard matrix: hand-enumerated from spec 2026-07-31 §3 — NEVER derive these
+# expectations from the code under test. Each value: refusal reason, or
+# ("write", sidecar_expected). ADD-ONE contract: a new occupant class, status
+# value, kwarg, or write path must add cells here (and the == meta-assertion
+# below forces the count to be deliberate).
+
+_INCOMING = "incoming content"
+_OTHER_BODY = "previous different body"
+
+_MATRIX_EXPECT = {
+    ("absent", "partial", False): ("write", False),
+    ("absent", "complete", False): ("write", False),
+    ("absent", "partial", True): ("write", False),
+    ("absent", "complete", True): ("write", False),
+    ("own_partial", "partial", False): ("write", True),
+    ("own_partial", "complete", False): ("write", True),
+    ("own_partial", "partial", True): ("write", True),
+    ("own_partial", "complete", True): ("write", True),
+    ("own_final_same_body", "partial", False): "demotes_final",
+    ("own_final_same_body", "complete", False): ("write", False),
+    ("own_final_same_body", "partial", True): ("write", False),
+    ("own_final_same_body", "complete", True): ("write", False),
+    ("own_final_diff_body", "partial", False): "own_complete_record",
+    ("own_final_diff_body", "complete", False): "own_complete_record",
+    ("own_final_diff_body", "partial", True): ("write", True),
+    ("own_final_diff_body", "complete", True): ("write", True),
+    ("own_status_null", "partial", False): "own_complete_record",
+    ("own_status_null", "complete", False): "own_complete_record",
+    ("own_status_null", "partial", True): ("write", True),
+    ("own_status_null", "complete", True): ("write", True),
+    ("own_status_missing_key", "partial", False): "own_complete_record",
+    ("own_status_missing_key", "complete", False): "own_complete_record",
+    ("own_status_missing_key", "partial", True): ("write", True),
+    ("own_status_missing_key", "complete", True): ("write", True),
+    ("colliding_record", "partial", False): "colliding_record",
+    ("colliding_record", "complete", False): "colliding_record",
+    ("colliding_record", "partial", True): ("write", True),
+    ("colliding_record", "complete", True): ("write", True),
+    ("foreign_record", "partial", False): "foreign_record",
+    ("foreign_record", "complete", False): "foreign_record",
+    ("foreign_record", "partial", True): ("write", True),
+    ("foreign_record", "complete", True): ("write", True),
+    ("hand_file_equal", "partial", False): "demotes_final",
+    ("hand_file_equal", "complete", False): ("write", False),
+    ("hand_file_equal", "partial", True): ("write", False),
+    ("hand_file_equal", "complete", True): ("write", False),
+    ("hand_file_diff", "partial", False): "non_record_file",
+    ("hand_file_diff", "complete", False): "non_record_file",
+    ("hand_file_diff", "partial", True): ("write", True),
+    ("hand_file_diff", "complete", True): ("write", True),
+}
+
+
+def test_guard_matrix_is_total():
+    # Meta-assertion (drift-guard: pin every axis with ==, never >= — a
+    # displaced cell must go red, not just a shrunk total): 10 occupants x 2
+    # statuses x 2 overwrite = 40 cells, every one enumerated by hand.
+    assert {k[0] for k in _MATRIX_EXPECT} == {
+        "absent", "own_partial", "own_final_same_body", "own_final_diff_body",
+        "own_status_null", "own_status_missing_key", "colliding_record",
+        "foreign_record", "hand_file_equal", "hand_file_diff"}
+    assert {k[1] for k in _MATRIX_EXPECT} == {"partial", "complete"}
+    assert {k[2] for k in _MATRIX_EXPECT} == {False, True}
+    assert len(_MATRIX_EXPECT) == 40
+
+
+def _seed_occupant(kind, task_key):
+    """Returns the canonical path targeted by the matrix put
+    (phase='review', name='tar_get'), with `kind` occupying it. The target
+    name is deliberately underscore-shaped so a REAL prior put under the
+    dotted sibling 'tar.get' sanitize-collides onto the same file."""
+    phase, name = "review", "tar_get"
+    p = paths.artifact_path(task_key, phase, name)
+    if kind == "absent":
+        return p
+    if kind == "own_partial":
+        artifact_put_impl(task_key, phase, name, _OTHER_BODY, "partial", "sid-w1")
+    elif kind == "own_final_same_body":
+        artifact_put_impl(task_key, phase, name, _INCOMING, "complete", "sid-w1")
+    elif kind == "own_final_diff_body":
+        artifact_put_impl(task_key, phase, name, _OTHER_BODY, "complete", "sid-w1")
+    elif kind == "own_status_null":
+        _seed_raw_record(task_key, phase, name, _OTHER_BODY, {"status": None})
+    elif kind == "own_status_missing_key":
+        # parse_artifact drops a non-JSON value line entirely — the on-disk
+        # shape a hand-edit/truncation produces: the status KEY is absent.
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('---\nphase: "review"\nname: "tar_get"\nstatus: notjson\n'
+                     'writer_sid: "sid-w1"\n---\n' + _OTHER_BODY)
+    elif kind == "colliding_record":
+        # A REAL put under the dotted sibling name: same writer, status
+        # partial — proving the collision check precedes the owner/status
+        # allow rows. Lands at this exact path via sanitization.
+        artifact_put_impl(task_key, phase, "tar.get", _OTHER_BODY, "partial", "sid-w1")
+        assert paths.artifact_path(task_key, phase, "tar.get") == p
+    elif kind == "foreign_record":
+        _seed_raw_record(task_key, phase, name, _OTHER_BODY, {"writer_sid": "sid-OTHER"})
+    elif kind == "hand_file_equal":
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(_INCOMING)
+    elif kind == "hand_file_diff":
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(_OTHER_BODY)
+    else:
+        raise AssertionError(f"unknown occupant kind {kind!r}")
+    return p
+
+
+@pytest.mark.parametrize("occupant,incoming_status,overwrite",
+                         sorted(_MATRIX_EXPECT))
+def test_artifact_put_guard_matrix(fresh_orchestrator_dir, occupant,
+                                   incoming_status, overwrite):
+    task_key = "TKT-SANDBOX-1"
+    p = _seed_occupant(occupant, task_key)
+    before = p.read_text() if occupant != "absent" else None
+    prev = p.with_name(p.name + ".prev")
+    expect = _MATRIX_EXPECT[(occupant, incoming_status, overwrite)]
+    if isinstance(expect, tuple):
+        _, sidecar_expected = expect
+        res = artifact_put_impl(task_key, "review", "tar_get", _INCOMING,
+                                incoming_status, "sid-w1", overwrite=overwrite)
+        assert res["ok"] is True
+        _, body = state.parse_artifact(p.read_text())
+        assert body == _INCOMING
+        if sidecar_expected:
+            assert prev.read_text() == before
+            assert res["archived_previous"] == str(prev)
+        else:
+            assert not prev.exists()
+            assert "archived_previous" not in res
+    else:
+        with pytest.raises(ValueError):
+            artifact_put_impl(task_key, "review", "tar_get", _INCOMING,
+                              incoming_status, "sid-w1", overwrite=overwrite)
+        assert p.read_text() == before
+        assert not prev.exists()
+        assert _last_event(task_key)["reason"] == expect
+
+
+def test_artifact_put_signature_pin():
+    # ADD-ONE tripwire: a NEW parameter on the put path must consciously
+    # visit the guard table (spec 2026-07-31 §3) and _MATRIX_EXPECT above —
+    # update both, then this pin. (_tool_artifact_put is the tool's existing
+    # import at the top of this file; @mcp.tool() returns the plain function.)
+    assert list(inspect.signature(artifact_put_impl).parameters) == [
+        "task_key", "phase", "name", "content", "status", "writer_sid",
+        "contract_hash", "read_set", "overwrite"]
+    assert list(inspect.signature(_tool_artifact_put).parameters) == [
+        "task_key", "phase", "name", "content", "status", "writer_sid",
+        "contract_hash", "read_set", "overwrite", "ticket"]
+
+
+def test_store_write_helpers_called_only_from_artifact_put_impl():
+    # ADD-ONE tripwire: a future write path USING EITHER HELPER from outside
+    # the guarded put surfaces as a new caller; _archive_replaced's caller
+    # set pins that archiving happens only on the guarded path. Honest limit
+    # (spec §7): a writer that uses NEITHER helper — raw open/replace here or
+    # elsewhere — is outside this tripwire's sight; _archive_replaced's own
+    # inlined tmp+replace is exactly such a write, guarded instead by its
+    # caller pin.
+    tree = ast.parse(inspect.getsource(mcp_server))
+    callers = {"_write_artifact_atomic": set(), "_archive_replaced": set()}
+    stack = []
+
+    class V(ast.NodeVisitor):
+        def visit_FunctionDef(self, node):
+            stack.append(node.name)
+            self.generic_visit(node)
+            stack.pop()
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Call(self, node):
+            f = node.func
+            n = getattr(f, "id", None) or getattr(f, "attr", None)
+            if n in callers:
+                callers[n].add(stack[-1] if stack else "<module>")
+            self.generic_visit(node)
+
+    V().visit(tree)
+    assert callers == {"_write_artifact_atomic": {"artifact_put_impl"},
+                       "_archive_replaced": {"artifact_put_impl"}}
+
+
+def test_non_exclusive_writes_paired_with_archive():
+    # ADDENDUM (controller, routed from the Task 2 review — Important 2): the
+    # caller-SET tripwire above cannot see the sidecar contract — a fourth
+    # non-exclusive _write_artifact_atomic call added inside
+    # artifact_put_impl with no archive prefix, or a dropped archive prefix on
+    # an existing one, leaves the caller set unchanged (still {artifact_put_impl})
+    # and so is invisible to it. This pairs each non-exclusive write with its
+    # immediately preceding sibling statement, which must be an assignment
+    # whose value is a call to _archive_replaced. ADD-ONE contract: a 4th
+    # non-exclusive write site must consciously visit spec §3a's archive
+    # contract and update the pinned (guarded, unguarded) count below.
+    #
+    # Honest limits (Task 3 review Minors 1+2; Minor 4 closed by a sibling
+    # tripwire below): this walk matches _write_artifact_atomic BY NAME at the
+    # call site, so it only classifies a write shaped as a bare `ast.Expr`
+    # statement calling that name directly — an aliased call
+    # (`w = _write_artifact_atomic; w(path, text)`) is invisible to `total`
+    # itself, not merely to the guarded/unguarded buckets, since neither
+    # `_write_artifact_atomic` nor `_archive_replaced` appears as that call's
+    # func. test_write_helpers_never_aliased (below) closes that gap
+    # independently by pinning that every BARE-NAME reference to either helper
+    # is itself a direct call. A reference reachable only as a string or an
+    # attribute at runtime (`getattr(mod, "_write...")`, `globals()[...]`) is
+    # outside ANY name-based check — the floor of static analysis, not an
+    # unclosed gap — and is covered behaviourally instead: a dynamic-lookup
+    # write that actually RUNS reddens the matrix WHEN THE OCCUPANT CLASS IS
+    # ONE THE MATRIX ENUMERATES. That qualifier is load-bearing: the matrix's
+    # occupant set is a hand-maintained list of 10, so a put path reachable
+    # only via a NEW occupant class (a new stamp field + a new verdict) is
+    # unguarded by construction — the hand-list case
+    # `~/.claude/rules/drift-guard-tests.md` rule 4 names. Likewise a new
+    # accepted STATUS value is unpinned but harmless: only the literal
+    # "partial" keeps a record replaceable, so any unknown status is treated
+    # as final on the destructive axis. Separately, the pairing check only pins that the
+    # preceding sibling CALLS _archive_replaced, not that its result is BOUND
+    # to `archived` — `_unused = _archive_replaced(...)` reads as guarded
+    # here. The `guarded+unguarded+exclusive == total` count below turns an
+    # unrecognised (non-aliased) statement shape (assignment/return) red
+    # instead of silently uncounted; the wrong-binding gap has no such
+    # structural guard and is instead caught behaviourally by the 40-cell
+    # matrix above (14 cells go red on a missing `archived_previous`).
+    tree = ast.parse(inspect.getsource(mcp_server))
+    target = next(n for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef) and n.name == "artifact_put_impl")
+
+    def _call_name(node):
+        if not isinstance(node, ast.Call):
+            return None
+        f = node.func
+        return getattr(f, "id", None) or getattr(f, "attr", None)
+
+    def _is_exclusive_true(call):
+        return any(kw.arg == "exclusive" and isinstance(kw.value, ast.Constant)
+                   and kw.value.value is True for kw in call.keywords)
+
+    total = sum(1 for n in ast.walk(target)
+               if isinstance(n, ast.Call) and _call_name(n) == "_write_artifact_atomic")
+
+    guarded = unguarded = exclusive = 0
+    for node in ast.walk(target):
+        for field in ("body", "orelse", "finalbody"):
+            stmts = getattr(node, field, None)
+            if not isinstance(stmts, list) or not all(
+                    isinstance(s, ast.stmt) for s in stmts):
+                continue
+            for i, stmt in enumerate(stmts):
+                if not (isinstance(stmt, ast.Expr)
+                       and _call_name(stmt.value) == "_write_artifact_atomic"):
+                    continue
+                if _is_exclusive_true(stmt.value):
+                    exclusive += 1
+                    continue
+                prev = stmts[i - 1] if i > 0 else None
+                if isinstance(prev, ast.Assign) and _call_name(prev.value) == "_archive_replaced":
+                    guarded += 1
+                else:
+                    unguarded += 1
+    # Coverage tripwire: every _write_artifact_atomic call inside
+    # artifact_put_impl must land in one of the three buckets above — a call
+    # in a statement shape the walk doesn't recognise (assignment, return,
+    # ...) would inflate `total` without moving any bucket, going red here
+    # instead of passing uncounted.
+    assert guarded + unguarded + exclusive == total
+    assert (guarded, unguarded) == (3, 0)
+
+
+def test_write_helpers_never_aliased():
+    # Minor 4 (round-2 review): both the caller-set tripwire and the pairing
+    # tripwire above match on the callee's NAME at the call site, so
+    # rebinding a helper to a local name (`w = _write_artifact_atomic` then
+    # `w(path, text)`) is unguarded, unarchived, and invisible to all three —
+    # the caller-set pin, the pairing walk, and its total-balance check
+    # alike, since none of them ever see `_write_artifact_atomic` or
+    # `_archive_replaced` as the aliased call's func. This pins that every
+    # BARE-NAME reference to either helper anywhere in the module is itself
+    # the direct func of a Call node — an alias would leave a bare `ast.Name`
+    # reference that is never called by that name. It does NOT see a name
+    # that exists only as a string or an attribute at runtime
+    # (`getattr(mod, "_write...")`, `globals()[...]`, `mod._write...`): no
+    # name-based check can, and a reachable one is caught by the matrix.
+    tree = ast.parse(inspect.getsource(mcp_server))
+    called = {id(n.func) for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert [n.id for n in ast.walk(tree) if isinstance(n, ast.Name)
+           and n.id in {"_write_artifact_atomic", "_archive_replaced"}
+           and id(n) not in called] == []
 
 
 # --- Artifact store: folds (spec §6) ---
@@ -5505,15 +6979,15 @@ def test_prune_sweeps_orphan_tmp(fresh_orchestrator_dir):
 
 # --- Ownership plane: spawn-path pending assignment (spec §11, §12) ---
 
-from dockwright.mcp_server import _derive_ticket, _current_branch
+from dockwright.mcp_server import _unkeyed_key_hint, _current_branch
 
 
 @pytest.fixture
 def configured_key_regex(monkeypatch, tmp_path):
     """Point config discovery at a temp dockwright.toml carrying an operator's
-    Jira-style key regex, so `_derive_ticket`/spawn derive keys exactly as an
-    operator's deployment would — independent of the ambient ~/.claude config
-    (DOCKWRIGHT_CONFIG is authoritative)."""
+    Jira-style key regex, so the unkeyed-spawn hint sees a configured pattern
+    exactly as an operator's deployment would — independent of the ambient
+    ~/.claude config (DOCKWRIGHT_CONFIG is authoritative)."""
     p = tmp_path / "dockwright.toml"
     p.write_text("[task_keys]\nkey_regex = '[A-Za-z]{2,}-\\d+'\n")
     monkeypatch.setenv(_config.ENV_CONFIG_PATH, str(p))
@@ -5534,7 +7008,8 @@ def test_spawn_worker_writes_pending_assignment(fresh_orchestrator_dir, monkeypa
     register_self_impl(claude_sid="mgr-1", agent="manager", name="boss", cwd="/x", iterm_sid="i9")
     _asyncio.run(spawn_worker_impl(
         initial_prompt="/ticket-start TKT-8353 extra context",
-        name="tkt-8353-dlq-fix", cwd="/tmp", manager_sid="mgr-1"))
+        name="tkt-8353-dlq-fix", cwd="/tmp", manager_sid="mgr-1",
+        task_key="TKT-8353"))
     (pending,) = list(paths.ASSIGNMENTS_PENDING.glob("*.json"))
     record = state.read_json(pending)
     assert record["initial_prompt"] == "/ticket-start TKT-8353 extra context"
@@ -5551,11 +7026,12 @@ def test_spawn_worker_no_derivation_no_footer_without_config(fresh_orchestrator_
     # Generic default: no [task_keys] key_regex -> a Jira-shaped reference in the
     # prompt is NOT auto-derived, and a keyless spawn gets no artifact footer.
     captured = _patch_spawn_worker_tab(monkeypatch)
-    _asyncio.run(spawn_worker_impl(
+    result = _asyncio.run(spawn_worker_impl(
         initial_prompt="/ticket-start TKT-8353 extra", name="w1", cwd="/tmp"))
     (pending,) = list(paths.ASSIGNMENTS_PENDING.glob("*.json"))
     assert state.read_json(pending)["ticket"] is None
     assert "[orchestrator] Artifact discipline" not in captured["initial_prompt"]
+    assert "task_key_hint" not in result
 
 
 def test_spawn_env_injected_from_config(fresh_orchestrator_dir, monkeypatch, tmp_path):
@@ -5611,29 +7087,32 @@ def test_spawn_failure_unlinks_pending(fresh_orchestrator_dir, monkeypatch):
     assert list(paths.ASSIGNMENTS_PENDING.glob("*.json")) == []
 
 
-def test_derive_ticket_from_name_or_prompt(configured_key_regex):
-    assert _derive_ticket("tkt-8353-dlq-fix", "free text") == "TKT-8353"
-    assert _derive_ticket("w1", "/ticket-start TKT-99") == "TKT-99"
-    assert _derive_ticket("w1", "no key here") is None
+def test_unkeyed_hint_fires_on_prompt_or_name_mention(configured_key_regex):
+    # The token is quoted VERBATIM (the deleted derivation uppercased; an
+    # advisory must quote what the text actually contains).
+    assert "TKT-4242" in _unkeyed_key_hint("scout", "background: TKT-4242 was affected")
+    assert "tkt-4242" in _unkeyed_key_hint("tkt-4242-fix", "free text")
+    assert _unkeyed_key_hint("scout", "no key here") is None
 
 
-def test_derive_ticket_none_without_config(no_orch_config):
-    # Generic default: no configured key_regex -> nothing is derived, even from a
-    # Jira-shaped reference. Explicit task_key is then the only keying path.
-    assert _derive_ticket("x", "the ask TKT-8353") is None
-    assert _derive_ticket("tkt-8353-dlq-fix", "free text") is None
+def test_unkeyed_hint_is_conditional_never_a_recommendation(configured_key_regex):
+    # The hint fires on exactly the misfiling incident's shape (a prose
+    # mention), so its wording must stay conditional — never directive.
+    hint = _unkeyed_key_hint("scout", "see TKT-4242 for background")
+    assert "mention is not an assignment" in hint
+    assert "UNKEYED" in hint
 
 
-def test_derive_ticket_with_configured_regex(configured_key_regex):
-    assert _derive_ticket("w1", "the ask TKT-8353") == "TKT-8353"
+def test_unkeyed_hint_none_without_config(no_orch_config):
+    assert _unkeyed_key_hint("scout", "the ask TKT-8353") is None
 
 
-def test_derive_ticket_invalid_regex_falls_to_none(monkeypatch, tmp_path):
-    # A malformed operator regex must fail-open to no derivation, never crash.
+def test_unkeyed_hint_invalid_regex_falls_to_none(monkeypatch, tmp_path):
+    # A malformed operator regex must fail-open to no hint, never crash a spawn.
     p = tmp_path / "dockwright.toml"
     p.write_text("[task_keys]\nkey_regex = '[A-Za-z'\n")
     monkeypatch.setenv(_config.ENV_CONFIG_PATH, str(p))
-    assert _derive_ticket("w1", "the ask TKT-8353") is None
+    assert _unkeyed_key_hint("w1", "the ask TKT-8353") is None
 
 
 def test_current_branch_best_effort(tmp_path):
@@ -5658,12 +7137,12 @@ def test_spawn_footer_injected_with_explicit_task_key(fresh_orchestrator_dir, mo
     assert text.startswith("build the scraper")     # the ask still leads; footer trails
 
 
-def test_spawn_footer_injected_with_derived_jira_key(fresh_orchestrator_dir, monkeypatch,
-                                                     configured_key_regex):
+def test_spawn_footer_absent_on_prompt_mention_without_explicit_key(
+        fresh_orchestrator_dir, monkeypatch, configured_key_regex):
     captured = _patch_spawn_worker_tab(monkeypatch)
     _asyncio.run(spawn_worker_impl(
         initial_prompt="/ticket-start TKT-8353 extra", name="tkt-8353-fix", cwd="/tmp"))
-    assert "task_key: `TKT-8353`" in captured["initial_prompt"]
+    assert "[orchestrator] Artifact discipline" not in captured["initial_prompt"]
 
 
 def test_spawn_footer_absent_when_no_key_resolves(fresh_orchestrator_dir, monkeypatch):
@@ -5686,7 +7165,8 @@ def test_spawn_footer_lands_after_preset_boilerplate(fresh_orchestrator_dir, mon
     paths.PRESETS.mkdir(parents=True, exist_ok=True)
     (paths.PRESETS / "boiler.md").write_text("BOILERPLATE")
     _asyncio.run(spawn_worker_impl(
-        initial_prompt="the ask TKT-9", name="w1", cwd="/tmp", preset="boiler"))
+        initial_prompt="the ask TKT-9", name="w1", cwd="/tmp", preset="boiler",
+        task_key="TKT-9"))
     text = captured["initial_prompt"]
     assert text.index("BOILERPLATE") < text.index("the ask TKT-9") \
         < text.index("[orchestrator] Artifact discipline")
@@ -5975,16 +7455,6 @@ def test_spawn_value_error_unlinks_pending(fresh_orchestrator_dir, monkeypatch):
     assert list(paths.ASSIGNMENTS_PENDING.glob("*.json")) == []   # Minor #1
 
 
-def test_derive_ticket_auto_name_never_shadows_prompt_key(fresh_orchestrator_dir,
-                                                          configured_key_regex):
-    # verifier round 2: spawn defaults name to "worker-<epoch>" BEFORE the pending
-    # write; the name half of the regex matched it ahead of the real prompt key.
-    assert _derive_ticket("worker-1749672000", "/ticket-start TKT-8353") == "TKT-8353"
-    assert _derive_ticket("worker-1749672000", "no key here") is None
-    # prompt key wins over a name-embedded key (canonical dispatch carries it in the prompt)
-    assert _derive_ticket("tkt-8353-dlq-fix", "/ticket-start TKT-99") == "TKT-99"
-
-
 # --- Personal task keys (no Jira ticket) ---
 
 def test_spawn_worker_explicit_task_key_wins_over_derivation(fresh_orchestrator_dir, monkeypatch,
@@ -5995,16 +7465,78 @@ def test_spawn_worker_explicit_task_key_wins_over_derivation(fresh_orchestrator_
         name="yt-bot-scraper", cwd="/tmp", task_key="yt-bot-public"))
     (pending,) = list(paths.ASSIGNMENTS_PENDING.glob("*.json"))
     record = state.read_json(pending)
-    assert record["ticket"] == "yt-bot-public"      # explicit ALWAYS wins over the derived key
+    assert record["ticket"] == "yt-bot-public"      # explicit task_key is the ONLY keying path
 
 
-def test_spawn_worker_without_task_key_keeps_derivation(fresh_orchestrator_dir, monkeypatch,
-                                                        configured_key_regex):
+def test_spawn_never_derives_key_from_prompt_prose(fresh_orchestrator_dir, monkeypatch,
+                                                   configured_key_regex):
+    # The misfiling incident: no explicit task_key, an unrelated key mentioned
+    # once in a background anecdote. The spawn must stay UNKEYED — no stamped
+    # ticket, no artifact-discipline footer — and surface only an advisory hint.
     captured = _patch_spawn_worker_tab(monkeypatch)
+    result = _asyncio.run(spawn_worker_impl(
+        initial_prompt="investigate the filing bug; background: TKT-4242 was hit",
+        name="scout", cwd="/tmp"))
+    (pending,) = list(paths.ASSIGNMENTS_PENDING.glob("*.json"))
+    assert state.read_json(pending)["ticket"] is None
+    assert "[orchestrator] Artifact discipline" not in captured["initial_prompt"]
+    assert "TKT-4242" in result["task_key_hint"]
+
+
+def test_spawn_never_derives_key_from_name(fresh_orchestrator_dir, monkeypatch,
+                                           configured_key_regex):
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    result = _asyncio.run(spawn_worker_impl(
+        initial_prompt="free text", name="tkt-4242-fix", cwd="/tmp"))
+    (pending,) = list(paths.ASSIGNMENTS_PENDING.glob("*.json"))
+    assert state.read_json(pending)["ticket"] is None
+    assert "[orchestrator] Artifact discipline" not in captured["initial_prompt"]
+    assert "tkt-4242" in result["task_key_hint"]     # verbatim, not uppercased
+
+
+def test_spawn_hint_absent_with_explicit_task_key(fresh_orchestrator_dir, monkeypatch,
+                                                  configured_key_regex):
+    _patch_spawn_worker_tab(monkeypatch)
+    result = _asyncio.run(spawn_worker_impl(
+        initial_prompt="build the bot; cleanup tracked in TKT-999",
+        name="yt-bot-scraper", cwd="/tmp", task_key="yt-bot-public"))
+    assert "task_key_hint" not in result
+    (pending,) = list(paths.ASSIGNMENTS_PENDING.glob("*.json"))
+    assert state.read_json(pending)["ticket"] == "yt-bot-public"
+
+
+def test_spawn_hint_absent_without_any_mention(fresh_orchestrator_dir, monkeypatch,
+                                               configured_key_regex):
+    _patch_spawn_worker_tab(monkeypatch)
+    result = _asyncio.run(spawn_worker_impl(
+        initial_prompt="just poke around", name="scout", cwd="/tmp"))
+    assert "task_key_hint" not in result
+
+
+def test_spawn_hint_uses_raw_caller_name_not_resolved(fresh_orchestrator_dir, monkeypatch,
+                                                      configured_key_regex):
+    # _resolve_unique_name suffixes a colliding name with -<ordinal>, which can
+    # make a non-key-shaped caller name match the regex. The hint must judge the
+    # caller's RAW name. Auto-generated worker-<epoch> names (name=None) must
+    # never fire the hint either.
+    _patch_spawn_worker_tab(monkeypatch)
+    state.write_json_atomic(paths.ACTIVE / "sid-taken.json",
+                            {"claude_sid": "sid-taken", "agent": "worker", "name": "scout"})
+    result = _asyncio.run(spawn_worker_impl(
+        initial_prompt="just poke around", name="scout", cwd="/tmp"))
+    assert "task_key_hint" not in result
+    result2 = _asyncio.run(spawn_worker_impl(
+        initial_prompt="just poke around", name=None, cwd="/tmp"))
+    assert "task_key_hint" not in result2
+
+
+def test_spawn_worker_without_task_key_stays_unkeyed(fresh_orchestrator_dir, monkeypatch,
+                                                     configured_key_regex):
+    _patch_spawn_worker_tab(monkeypatch)
     _asyncio.run(spawn_worker_impl(
         initial_prompt="/ticket-start TKT-8353", name="w1", cwd="/tmp"))
     (pending,) = list(paths.ASSIGNMENTS_PENDING.glob("*.json"))
-    assert state.read_json(pending)["ticket"] == "TKT-8353"
+    assert state.read_json(pending)["ticket"] is None
 
 
 def test_slug_key_round_trips_store_and_joins_assignments(fresh_orchestrator_dir):
@@ -6048,10 +7580,17 @@ def test_list_workers_renders_compact_spend(fresh_orchestrator_dir):
     record = state.read_json(paths.ACTIVE / "w1.json")
     record["spend"] = {"turns": 12, "out_tokens": 340_000, "in_tokens": 900,
                        "cache_read_tokens": 5_100_000, "last_turn_out": 200,
-                       "last_msg_id": "msg_z"}
+                       "last_msg_id": "msg_z",
+                       "by_model": {"claude-opus-5": {
+                           "out_tokens": 340_000, "in_tokens": 900,
+                           "cache_read_tokens": 5_100_000,
+                           "cache_creation_5m_tokens": 0,
+                           "cache_creation_1h_tokens": 0}}}
     state.write_json_atomic(paths.ACTIVE / "w1.json", record)
     workers = list_workers_impl()
-    assert workers[0]["spend"] == "12 turns / 340k out"
+    # Money leads, priced at display time from the per-model buckets:
+    # out 340k*$25/M + in 900*$5/M + cache-rd 5.1M*$5*0.1/M = $11.05.
+    assert workers[0]["spend"] == "$11.05 / 340k out / 5.1M cache-rd"
 
 
 def test_list_workers_spend_none_when_never_metered(fresh_orchestrator_dir):
@@ -6066,27 +7605,40 @@ def test_list_workers_compact_spend_small_and_large_counts(fresh_orchestrator_di
     record["spend"] = {"turns": 1, "out_tokens": 512, "in_tokens": 0,
                        "cache_read_tokens": 0, "last_turn_out": 512, "last_msg_id": "m"}
     state.write_json_atomic(paths.ACTIVE / "w1.json", record)
-    assert list_workers_impl()[0]["spend"] == "1 turn / 512 out"
+    # Pre-by_model record (no per-model buckets): tokens only, no $ figure —
+    # and no turn/episode count at all. The ledger's Stop-derived `turns` and
+    # the session report's prompt-derived episodes are DIFFERENT measures
+    # (Tier-2 round 2 measured 3/41 real divergences); neither renders here.
+    spend_line = list_workers_impl()[0]["spend"]
+    assert spend_line == "512 out"
+    assert "turn" not in spend_line and "episode" not in spend_line
 
     record["spend"] = {"turns": 200, "out_tokens": 2_400_000, "in_tokens": 0,
-                       "cache_read_tokens": 0, "last_turn_out": 1, "last_msg_id": "m"}
+                       "cache_read_tokens": 0, "last_turn_out": 1, "last_msg_id": "m",
+                       "by_model": {"claude-mystery-9": {
+                           "out_tokens": 2_400_000, "in_tokens": 0,
+                           "cache_read_tokens": 0,
+                           "cache_creation_5m_tokens": 0,
+                           "cache_creation_1h_tokens": 0}}}
     state.write_json_atomic(paths.ACTIVE / "w1.json", record)
-    assert list_workers_impl()[0]["spend"] == "200 turns / 2.4M out"
+    # Unpriced model: the $ figure is a LOWER BOUND, marked as such.
+    assert list_workers_impl()[0]["spend"] == "≥$0.00 / 2.4M out"
 
 
 def test_worker_done_stamps_spend_totals(fresh_orchestrator_dir):
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1", pid=os.getpid())
     record = state.read_json(paths.ACTIVE / "w1.json")
     record["spend"] = {"turns": 12, "out_tokens": 340_000, "in_tokens": 900,
-                       "cache_read_tokens": 5_100_000, "last_turn_out": 200,
-                       "last_msg_id": "msg_z"}
+                       "cache_read_tokens": 5_100_000, "cache_creation_tokens": 75_000,
+                       "last_turn_out": 200, "last_msg_id": "msg_z"}
     state.write_json_atomic(paths.ACTIVE / "w1.json", record)
     worker_done_impl(claude_sid="w1", summary="done")
     done_files = list(paths.DONE.rglob("*.json"))
     event = state.read_json(done_files[0])
     # Totals only — the tail cursor and per-turn value are record internals.
     assert event["spend"] == {"turns": 12, "out_tokens": 340_000,
-                              "in_tokens": 900, "cache_read_tokens": 5_100_000}
+                              "in_tokens": 900, "cache_read_tokens": 5_100_000,
+                              "cache_creation_tokens": 75_000}
 
 
 def test_worker_done_spend_none_when_never_metered(fresh_orchestrator_dir):
@@ -6506,3 +8058,37 @@ def test_send_tool_default_auto_resume_false_unchanged(fresh_orchestrator_dir, t
     monkeypatch.setattr(srv, "resume_worker_impl", no_resume)
     with pytest.raises(ValueError, match="no worker named 'alpha'"):
         _asyncio.run(srv.send_manager_to_worker(worker="alpha", text="hi"))
+
+
+def _write_manager_record(sid, name, **overrides):
+    record = {
+        "claude_sid": sid, "agent": "manager", "name": name, "cwd": "/x",
+        "window_id": "i0", "pid": os.getpid(), "started_at": time.time(),
+        "state": "idle", "last_turn_at": None, "last_summary": None,
+        "domain": "general", "parent_manager_name": None, "runtime": "claude",
+    }
+    record.update(overrides)
+    state.write_json_atomic(paths.ACTIVE / f"{sid}.json", record)
+
+
+def test_list_managers_flags_never_took_a_turn(fresh_orchestrator_dir):
+    """The %405 ghost class: registered long ago, zero completed turns. Keyed on
+    BOTH last_turn_at (conditional stamp) and last_turn_at_uptime (unconditional
+    per Stop) so a live manager with broken transcript resolution never flags."""
+    from dockwright.mcp_server import list_managers
+    now = time.time()
+    _write_manager_record("ghost", "noisy-wizard-2", started_at=now - 700)
+    _write_manager_record("booting", "fresh-boot", started_at=now - 30)
+    _write_manager_record("turned", "old-faithful", started_at=now - 90000,
+                          last_turn_at="2026-07-31T05:00:00.000Z")
+    _write_manager_record("uptime-only", "quiet-scribe", started_at=now - 90000,
+                          last_turn_at_uptime=12345.6)
+    _write_manager_record("no-birth", "ancient-one", started_at=None)
+    flags = {m["name"]: m["never_took_a_turn"] for m in list_managers()}
+    assert flags == {
+        "noisy-wizard-2": True,     # never turned, past grace
+        "fresh-boot": False,        # never turned, inside grace
+        "old-faithful": False,      # turned
+        "quiet-scribe": False,      # Stop fired (uptime stamp), transcript never resolved
+        "ancient-one": True,        # identity-less ancient record IS the anomaly
+    }

@@ -2,13 +2,24 @@
 
 Each subcommand is invoked from a long-running Monitor task like:
 
-    while true; do dockwright monitor done; sleep 2; done
+    while dockwright monitor done || exit $?; do sleep 2; done
+
+The loop is condition-driven, NOT `while true`: any non-zero exit ends the
+lane, so the Monitor task exits and the manager is notified. That is the only
+way a dead lane becomes visible — see lane_io for the incident this encodes.
 
 Identity is resolved per-scan via identity.resolve_manager() — cheap; lets
 the Monitor command be a literal one-liner (no substitution of name/sid).
 
 Questions, done, turn-ends, and stale scans live here so every trigger resolves
 the owning manager before emitting.
+
+Every scan follows one order, and the order is the contract:
+
+    preflight -> emit (flushed per line) -> commit cursor -> heartbeat
+
+Nothing is committed before its line is proven delivered, and the heartbeat is
+unreachable from a scan that failed to deliver.
 """
 from __future__ import annotations
 
@@ -18,7 +29,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from . import config, identity, paths, state
+from . import config, identity, lane_io, paths, state
+from .lane_io import LaneDead, emit
 
 
 # Resolves once per scan in the public entry points; tests can monkey-patch.
@@ -80,8 +92,7 @@ def _manager_limited(manager_name: str) -> bool:
     stale_monitor._limited_flag_path. A flag whose mtime is past the TTL means
     the writer loop died: ignore it and best-effort unlink so the manager is
     never permanently deaf."""
-    safe = manager_name.replace("/", "_").replace("\\", "_")
-    flag = paths.ROOT / f".manager-limited-{safe}"
+    flag = paths.ROOT / f".manager-limited-{paths._event_bucket(manager_name)}"
     try:
         age = time.time() - flag.stat().st_mtime
     except OSError:
@@ -129,12 +140,17 @@ def _append_seen(seen_path: Path, new_paths: list[Path]) -> None:
 
 
 def _drain_notify_outbox(manager_name: str) -> None:
-    """Print-then-unlink every buffered entry. At-least-once by construction:
-    a crash between print and unlink replays the entry next drain, and a
+    """Emit-then-unlink every buffered entry. At-least-once by construction:
+    a crash between emit and unlink replays the entry next drain, and a
     FileNotFoundError means a concurrent drainer already delivered it — skip.
     An undecodable entry is unlinked (with a stderr note) so it can never
     block entries sorted after it; the durable closed/<sid>.json record
-    remains the fallback source for what it described."""
+    remains the fallback source for what it described.
+
+    The emit FLUSHES before the unlink, so a dead reader can never destroy an
+    outbox entry: LaneDead propagates out (past the blanket except below, which
+    deliberately does not swallow it) and the entry stays on disk for the
+    re-armed lane."""
     try:
         outbox = paths.notify_outbox_dir_for(manager_name)
         if not outbox.is_dir():
@@ -151,8 +167,10 @@ def _drain_notify_outbox(manager_name: str) -> None:
                 continue
             line = payload.get("line") if isinstance(payload, dict) else None
             if isinstance(line, str) and line:
-                print(line)
+                emit(line)
             entry.unlink(missing_ok=True)
+    except LaneDead:
+        raise
     except Exception as e:
         print(f"monitor: outbox drain failed ({e})", file=sys.stderr)
 
@@ -161,7 +179,12 @@ def run_done_scan(mgr: dict | None = None) -> None:
     """One-shot: emit any new done/<manager>/*.json files; persist SEEN."""
     mgr = mgr or _resolve()
     name = mgr["name"]
+    lane_io.preflight()
     if _manager_limited(name):
+        # Deliberately silent, not broken: preflight already proved the reader
+        # is there, so the heartbeat is honest and `dockwright lanes` must not
+        # read a rate-limit hold as a dead lane.
+        lane_io.write_heartbeat(name, "done", emitted=False)
         return
     target_dir = paths.DONE / name
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -172,18 +195,29 @@ def run_done_scan(mgr: dict | None = None) -> None:
     for entry in sorted(target_dir.glob("*.json")):
         if str(entry) in seen:
             continue
-        new_paths.append(entry)
         try:
             payload = json.loads(entry.read_text())
-        except (OSError, json.JSONDecodeError):
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # Permanently malformed: consume it, loudly. Retrying forever would
+            # wedge the lane on one bad file and it can never emit anyway.
+            print(f"monitor: dropped unparseable done event {entry.name}",
+                  file=sys.stderr)
+            new_paths.append(entry)
+            continue
+        except OSError:
+            # Transient (EMFILE, a mid-write rename, a flaky mount): do NOT
+            # consume. The old code appended BEFORE the read, so one transient
+            # error destroyed a real worker_done payload silently.
             continue
         worker = payload.get("worker_name") or payload.get("claude_sid", "?")
         summary = payload.get("summary", "")
-        print(f"{worker} done: {summary}")
+        emit(f"{worker} done: {summary}")
+        new_paths.append(entry)
         printed += 1
     _append_seen(seen_path, new_paths)
     if printed:
         _drain_notify_outbox(name)
+    lane_io.write_heartbeat(name, "done", emitted=bool(printed))
 
 
 # Silent-finish detection over turn-end events. A worker that finishes its
@@ -197,7 +231,7 @@ def run_done_scan(mgr: dict | None = None) -> None:
 # _episode_grace_sec() (default 900), NOT this constant.
 # Documentation constant: the live default is transcript.DELEGATION_FRESH_SEC
 # (same 120), read via _turn_end_grace_sec → transcript.delegation_fresh_sec —
-# this is the turn-end/young-file grace and the read-side freshness only.
+# this is the turn-end/young-file grace and nothing else.
 TURN_END_GRACE_SEC_DEFAULT = 120
 # worker_done fires DURING the final turn (an MCP call before the Stop hook),
 # so a done event normally predates its turn-end by seconds-to-minutes. The
@@ -249,22 +283,14 @@ def _turn_end_grace_sec() -> int:
     return delegation_fresh_sec()
 
 
-EPISODE_GRACE_SEC_DEFAULT = 900
-
-
 def _episode_grace_sec() -> int:
     """Patience window for a worker demonstrably mid-episode: a delegation
     whose subagent is between transcript writes (2a), or a poll/wait cadence
     of closely-spaced turn-ends (2b). Clamped to >= the base turn-end grace so
-    raising CLAUDE_ORCH_TURN_END_GRACE_SEC past 900 cannot invert the two."""
-    raw = os.environ.get("CLAUDE_ORCH_EPISODE_GRACE_SEC", "")
-    try:
-        value = int(raw)
-    except ValueError:
-        value = EPISODE_GRACE_SEC_DEFAULT
-    if value <= 0:
-        value = EPISODE_GRACE_SEC_DEFAULT
-    return max(value, _turn_end_grace_sec())
+    raising CLAUDE_ORCH_TURN_END_GRACE_SEC past 900 cannot invert the two.
+    Value, env read and clamp live in transcript.episode_grace_sec."""
+    from .transcript import episode_grace_sec
+    return episode_grace_sec()
 
 
 def _turn_end_ts(payload: dict, entry: Path) -> float:
@@ -314,13 +340,12 @@ def _delegation_hold(record: dict, sid: str, turn_end_ts: float, now: float) -> 
     try/except stays the last resort. Deliberately NOT transcript.is_delegating:
     the baseline here is the turn-end ts, not the main-log mtime.
 
-    Freshness ages on _episode_grace_sec (default 900s), NOT the shared 120s
-    turn-end grace: a live reviewer subagent can sit 3-4min between transcript
-    writes (thinking, long tool calls — observed 208s/239s gaps, 2026-07-16),
-    and the old shared bound paged the manager mid-delegation. Cost: a
-    subagent that DIES mid-delegation alerts once at <=episode grace (was
-    <=2min); the read-side is_delegating surfaces deliberately keep the short
-    freshness — they answer "delegating right now", a display concern."""
+    Freshness ages on _episode_grace_sec (default 900s), NOT the 120s turn-end
+    grace: a live reviewer subagent can sit 3-4min between transcript writes
+    (thinking, long tool calls — observed 208s/239s gaps, 2026-07-16), and the
+    old shared bound paged the manager mid-delegation. Cost: a subagent that
+    DIES mid-delegation alerts once at <=episode grace (was <=2min). The
+    read-side is_delegating surfaces age on the SAME window."""
     try:
         if (record.get("runtime") or "claude") != "claude":
             return False
@@ -345,11 +370,12 @@ def _fs_ladder_base_sec() -> int:
 
 
 def _fs_ladder_path(manager_name: str) -> Path:
-    # Sanitized like _event_bucket / .stale-emitted-<mgr>.json. The sibling
-    # .seen-<kind>-<mgr> cursors deliberately keep RAW names — do not "fix"
-    # them to match; that would orphan live cursors.
-    safe = manager_name.replace("/", "_").replace("\\", "_")
-    return paths.ROOT / f".fs-emitted-{safe}.json"
+    # Via _event_bucket, the one answer to "this name must be a single path
+    # segment" — an inline copy here disagreed with stale_monitor's about a
+    # "." or ".." name, so the two halves looked at different flag files. The
+    # sibling .seen-<kind>-<mgr> cursors deliberately keep RAW names — do not
+    # "fix" them to match; that would orphan live cursors.
+    return paths.ROOT / f".fs-emitted-{paths._event_bucket(manager_name)}.json"
 
 
 def _load_fs_ladder(ladder_path: Path) -> dict:
@@ -553,7 +579,9 @@ def run_turn_ends_scan(mgr: dict | None = None) -> None:
     also drains the notify outbox into the same burst."""
     mgr = mgr or _resolve()
     name = mgr["name"]
+    lane_io.preflight()
     if _manager_limited(name):
+        lane_io.write_heartbeat(name, "turn-ends", emitted=False)
         return
     own_sid = mgr["sid"]
     target_dir = paths.TURN_ENDS / name
@@ -587,14 +615,16 @@ def run_turn_ends_scan(mgr: dict | None = None) -> None:
                 # re-evaluated every scan until the rung matures or a reset
                 # (re-instruction / done / session-exit) fires.
                 continue
-            print(_format_silent_finish_line(payload, entry, verdict))
+            emit(_format_silent_finish_line(payload, entry, verdict))
             printed += 1
             _fs_ladder_record(ladder, sid, verdict, gate, now)
             ladder_dirty = True
         new_paths.append(entry)
-    # Ordering (spec I4): print -> ladder write -> seen append. Every crash
+    # Ordering (spec I4): emit -> ladder write -> seen append. Every crash
     # window between the steps degrades to a rate-limited duplicate page,
-    # never a silenced lull.
+    # never a silenced lull. The emit now FLUSHES, so a dead reader aborts the
+    # scan here and neither the ladder nor the cursor records a page the
+    # manager never saw.
     if ladder_dirty:
         try:
             state.write_json_atomic(ladder_path, ladder)
@@ -603,13 +633,16 @@ def run_turn_ends_scan(mgr: dict | None = None) -> None:
     _append_seen(seen_path, new_paths)
     if printed:
         _drain_notify_outbox(name)
+    lane_io.write_heartbeat(name, "turn-ends", emitted=bool(printed))
 
 
 def run_questions_scan(mgr: dict | None = None) -> None:
     """One-shot: emit any new questions/<manager>/*.json files; persist SEEN."""
     mgr = mgr or _resolve()
     name = mgr["name"]
+    lane_io.preflight()
     if _manager_limited(name):
+        lane_io.write_heartbeat(name, "questions", emitted=False)
         return
     target_dir = paths.question_dir_for(name)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -620,18 +653,24 @@ def run_questions_scan(mgr: dict | None = None) -> None:
     for entry in sorted(target_dir.glob("*.json")):
         if str(entry) in seen:
             continue
-        new_paths.append(entry)
         try:
             payload = json.loads(entry.read_text())
-        except (OSError, json.JSONDecodeError):
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            print(f"monitor: dropped unparseable question {entry.name}",
+                  file=sys.stderr)
+            new_paths.append(entry)
             continue
+        except OSError:
+            continue                   # transient — retry, never consume
         worker = payload.get("worker_name") or payload.get("worker_sid", "?")
         question = payload.get("question", "")
-        print(f"{worker} asks: {question}")
+        emit(f"{worker} asks: {question}")
+        new_paths.append(entry)
         printed += 1
     _append_seen(seen_path, new_paths)
     if printed:
         _drain_notify_outbox(name)
+    lane_io.write_heartbeat(name, "questions", emitted=bool(printed))
 
 
 def run_stale_scan(mgr: dict | None = None) -> None:
@@ -642,18 +681,60 @@ def run_stale_scan(mgr: dict | None = None) -> None:
     env reads stay per-scan. Output flows straight through (STALE_PROCESSING /
     STALE_QUESTION / AUTOCLOSED lines on stdout). Errors surface via stderr;
     non-zero exit propagates.
+
+    The child inherits this fd 1, so it owns its own emit discipline (it keeps
+    a stdlib copy — it cannot import the package) AND writes its own heartbeat.
+    That split matters: a heartbeat written HERE would certify the child's exit
+    CODE, not that anything was delivered, and `stale` has no backlog arm to
+    cross-check it with.
+
+    Exit codes are triaged rather than blanket-propagated. `sys.exit` raises
+    SystemExit, which main() re-raises past the retry ladder, so forwarding
+    every non-zero code would end this lane on the FIRST transient — and this
+    is the lane with the largest failure surface (tmux calls, keychain probes,
+    transcript IO across ~900 lines, plus the `-m` import itself, which fails
+    for everyone at once during a `pip install -e .`).
     """
     mgr = mgr or _resolve()
+    lane_io.preflight()
     result = subprocess.run(
         [sys.executable, "-m", "dockwright.stale_monitor",
          "--manager", mgr["name"]],
         capture_output=False, check=False,
     )
+    if result.returncode == lane_io.EXIT_LANE_DEAD:
+        raise LaneDead("stale_monitor reported its stdout reader is gone")
+    if result.returncode == lane_io.EXIT_LANE_WEDGED:
+        # The child already ran its own ladder; do not re-ladder its verdict.
+        lane_io.detach_stdout()
+        sys.exit(lane_io.EXIT_LANE_WEDGED)
     if result.returncode != 0:
-        sys.exit(result.returncode)
+        # Anything else is presumed transient and goes through the ladder like
+        # an exception raised in-process.
+        raise RuntimeError(
+            f"stale_monitor exited {result.returncode}")
 
 
-_MONITOR_SUBCOMMANDS = ("questions", "done", "turn-ends", "stale")
+# Derived, never re-listed: `dockwright lanes` iterates the same mapping, so a
+# fifth lane is reported by construction instead of by someone remembering to
+# update a second copy.
+_MONITOR_SUBCOMMANDS = tuple(lane_io.LANES)
+
+# The dispatch table, module-level so a test can compare it against the
+# canonical lane set. As a local dict it was a SECOND hand-maintained list: a
+# lane added to LANES but not here passes subcommand validation and then raises
+# KeyError, which the retry ladder reads as a transient and retries five times
+# before wedging — a missing implementation reported as a flaky one.
+# Values are NAMES, resolved through globals() at call time. Holding the
+# function OBJECTS froze them at import, so a test (or a caller) replacing
+# monitor.run_done_scan no longer reached the dispatch — the table silently
+# stopped describing what actually runs.
+_SCANS = {
+    "questions": "run_questions_scan",
+    "done": "run_done_scan",
+    "turn-ends": "run_turn_ends_scan",
+    "stale": "run_stale_scan",
+}
 
 
 def main(argv: list[str]) -> None:
@@ -663,25 +744,67 @@ def main(argv: list[str]) -> None:
     an unknown subcommand reports as such even when the name is also bogus —
     `monitor bogus-sub no-such-mgr` must not be misreported as a name-lookup
     failure.
+
+    Exit codes are the lane's contract with its
+    `while dockwright monitor <lane> || exit $?; do sleep N; done` wrapper:
+    0 keeps the lane looping, anything else ends it AND propagates out of the
+    shell, so the Monitor task exits non-zero rather than looking like a clean
+    finish.
+    2 = bad usage or the owning manager can no longer be resolved (its session
+    is gone — this is what makes an orphaned loop terminate itself instead of
+    scanning for a week). EXIT_LANE_DEAD = the reader is gone.
     """
-    usage = "Usage: dockwright monitor <questions|done|turn-ends|stale> [manager-name]"
+    lanes = " | ".join(_MONITOR_SUBCOMMANDS)
+    usage = f"Usage: dockwright monitor <{'|'.join(_MONITOR_SUBCOMMANDS)}> [manager-name]"
     if not argv:
         print(usage, file=sys.stderr)
         sys.exit(2)
     sub = argv[0]
     if sub not in _MONITOR_SUBCOMMANDS:
         print(f"Unknown monitor subcommand: {sub!r}. "
-              f"Try questions | done | turn-ends | stale.", file=sys.stderr)
+              f"Try {lanes}.", file=sys.stderr)
         sys.exit(2)
     if len(argv) > 2:
         print(f"Unexpected arguments {argv[2:]!r}. {usage}", file=sys.stderr)
         sys.exit(2)
-    mgr = _resolve_named(argv[1]) if len(argv) == 2 else None
-    if sub == "questions":
-        run_questions_scan(mgr)
-    elif sub == "done":
-        run_done_scan(mgr)
-    elif sub == "turn-ends":
-        run_turn_ends_scan(mgr)
-    elif sub == "stale":
-        run_stale_scan(mgr)
+    # Resolved HERE rather than inside each scan so an unexpected failure below
+    # still knows which lane to charge the error to. An unresolvable identity
+    # exits 2 from the resolver itself, which is correct: the owning manager is
+    # gone, and that is what makes an orphaned loop terminate instead of
+    # scanning for a week.
+    # Bucket for error accounting when identity itself failed and there is no
+    # manager name yet. A reserved name in the SAME store, not a second
+    # mechanism — the alternative was leaving resolution outside the ladder,
+    # where an unreadable active/ dir (PermissionError propagates: is_dir() is
+    # True for a dir you cannot read, and list_json_in's iterdir has no guard)
+    # ends a healthy lane on one transient.
+    mgr = None
+    try:
+        mgr = _resolve_named(argv[1]) if len(argv) == 2 else _resolve()
+        globals()[_SCANS[sub]](mgr)
+    except LaneDead as e:
+        print(f"dockwright monitor: {sub} lane is dead ({e}); ending the lane "
+              f"so its Monitor task exits and the manager is told.",
+              file=sys.stderr)
+        lane_io.detach_stdout()
+        sys.exit(lane_io.EXIT_LANE_DEAD)
+    except SystemExit:
+        raise
+    except Exception as e:
+        # Everything else is presumed TRANSIENT and retried, because the
+        # wrapper now ends the lane on any non-zero exit: a momentarily
+        # unreadable state dir must not permanently deafen a healthy manager.
+        # A persistent fault still ends the lane, just not on the first scan.
+        cap = lane_io.max_consecutive_errors(sub)
+        run = lane_io.record_scan_error(
+            mgr["name"] if mgr else lane_io.UNRESOLVED_BUCKET, sub)
+        print(f"dockwright monitor: {sub} scan failed ({type(e).__name__}: {e}) "
+              f"[{run}/{cap} consecutive]", file=sys.stderr)
+        if run >= cap:
+            print(f"dockwright monitor: {sub} lane wedged after {run} "
+                  f"consecutive failures; ending it so the manager is told.",
+                  file=sys.stderr)
+            lane_io.detach_stdout()
+            sys.exit(lane_io.EXIT_LANE_WEDGED)
+        lane_io.detach_stdout()
+        sys.exit(0)

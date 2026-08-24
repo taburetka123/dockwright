@@ -57,20 +57,15 @@ def latest_subagent_mtime(session_log: Path, session_id: str) -> float:
         return 0.0
 
 
-DELEGATION_FRESH_SEC = 120  # read-side freshness for is_delegating (list_workers,
-                            # statusline). The MONITOR's delegation hold ages on
-                            # monitor._episode_grace_sec() (default 900) instead —
-                            # the alarm tolerates slow-but-alive subagents; the
-                            # display answers "delegating right now".
+DELEGATION_FRESH_SEC = 120  # the monitor's turn-end / young-file grace only
 
 TURN_END_GRACE_ENV = "CLAUDE_ORCH_TURN_END_GRACE_SEC"
 
+EPISODE_GRACE_SEC_DEFAULT = 900
+EPISODE_GRACE_ENV = "CLAUDE_ORCH_EPISODE_GRACE_SEC"
+
 
 def delegation_fresh_sec() -> int:
-    """Shared grace for 'delegation is still fresh': the monitor's silent-finish
-    grace env override moves the read-side surfaces with it, so a non-default
-    grace can't split monitor truth from list_workers/paint truth. (The
-    statusline's `-mmin -2` is a documented hardcoded approximation.)"""
     try:
         value = int(os.environ.get(TURN_END_GRACE_ENV, str(DELEGATION_FRESH_SEC)))
     except ValueError:
@@ -78,11 +73,22 @@ def delegation_fresh_sec() -> int:
     return value if value >= 0 else DELEGATION_FRESH_SEC
 
 
+def episode_grace_sec() -> int:
+    raw = os.environ.get(EPISODE_GRACE_ENV, "")
+    try:
+        value = int(raw)
+    except ValueError:
+        value = EPISODE_GRACE_SEC_DEFAULT
+    if value <= 0:
+        value = EPISODE_GRACE_SEC_DEFAULT
+    return max(value, delegation_fresh_sec())
+
+
 def is_delegating(record: dict, now: float, log: Path | None = None,
                   fresh_sec: float | None = None) -> bool:
     """Whether this session's newest subagent write is BOTH newer than the
     session's own transcript AND fresh within fresh_sec (default: the shared
-    delegation_fresh_sec() grace).
+    episode_grace_sec() liveness window).
 
     The growth predicate (subagent > main log) discriminates background
     delegation from a foreground agent whose result the worker already
@@ -93,7 +99,7 @@ def is_delegating(record: dict, now: float, log: Path | None = None,
     """
     try:
         if fresh_sec is None:
-            fresh_sec = delegation_fresh_sec()
+            fresh_sec = episode_grace_sec()
         if (record.get("runtime") or "claude") != "claude":
             return False
         sid = record.get("claude_sid")
@@ -126,9 +132,6 @@ def _assistant_text(event: dict) -> tuple[str | None, str | None]:
     return (None, None)
 
 
-SPEND_TAIL_MAX_BYTES = 65536
-
-
 def _int_field(mapping: dict, key: str) -> int:
     value = mapping.get(key)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -137,10 +140,12 @@ def _int_field(mapping: dict, key: str) -> int:
 
 
 def _usage_entry(line: str, seen_ids: set) -> dict | None:
-    """One transcript line → usage entry, or None. Every level shape-checked:
-    the transcript is another process's output, any valid-JSON shape can appear.
-    Split API responses repeat the same message id; each id counts once via
-    seen_ids."""
+    """One transcript line → usage entry, or None. Dedup here; extraction in
+    usage_totals_of (split API responses repeat the same message id; each id
+    counts once via seen_ids). sum_usage keeps the FLAT
+    cache_creation_input_tokens field (headless-ledger capture + the standalone
+    gardener_spend.py mirror pin it); the TTL-split consumers are recount_spend
+    and the session report."""
     line = line.strip()
     if not line:
         return None
@@ -148,63 +153,24 @@ def _usage_entry(line: str, seen_ids: set) -> dict | None:
         event = json.loads(line)
     except json.JSONDecodeError:
         return None
-    if not isinstance(event, dict) or event.get("type") != "assistant":
+    entry = usage_totals_of(event)
+    if entry is None or entry["message_id"] in seen_ids:
         return None
-    message = event.get("message")
-    if not isinstance(message, dict):
-        return None
-    message_id = message.get("id")
-    usage = message.get("usage")
-    if not isinstance(message_id, str) or not message_id or not isinstance(usage, dict):
-        return None
-    if message_id in seen_ids:
-        return None
-    seen_ids.add(message_id)
+    seen_ids.add(entry["message_id"])
     return {
-        "message_id": message_id,
-        "output_tokens": _int_field(usage, "output_tokens"),
-        "input_tokens": _int_field(usage, "input_tokens"),
-        "cache_read_tokens": _int_field(usage, "cache_read_input_tokens"),
-        "cache_creation_tokens": _int_field(usage, "cache_creation_input_tokens"),
+        "message_id": entry["message_id"],
+        "output_tokens": entry["out_tokens"],
+        "input_tokens": entry["in_tokens"],
+        "cache_read_tokens": entry["cache_read_tokens"],
+        "cache_creation_tokens": entry["cache_creation_flat"],
     }
-
-
-def tail_usage_entries(log_path: Path, max_bytes: int = SPEND_TAIL_MAX_BYTES) -> list[dict]:
-    """Per-API-call usage entries from the transcript tail, deduped by message id.
-
-    Reads only the last max_bytes (transcripts grow to many MB; stale_monitor's
-    tail pattern) and drops the window's first line as possibly partial. Claude
-    transcript shape only — every assistant event carries message.id + usage; an
-    API response split across several events repeats the SAME id and usage, so
-    each id counts once. The transcript is another process's output: any
-    valid-JSON shape can appear, so every level is shape-checked and a bad line
-    is skipped, never raised.
-    """
-    try:
-        size = log_path.stat().st_size
-        with open(log_path, "rb") as f:
-            if size > max_bytes:
-                f.seek(size - max_bytes)
-            data = f.read(max_bytes)
-    except OSError:
-        return []
-    lines = data.decode("utf-8", errors="replace").splitlines()
-    if size > max_bytes and lines:
-        lines = lines[1:]
-    entries: list[dict] = []
-    seen_ids: set[str] = set()
-    for line in lines:
-        entry = _usage_entry(line, seen_ids)
-        if entry is not None:
-            entries.append(entry)
-    return entries
 
 
 def sum_usage(log_path: Path) -> dict:
     """Whole-transcript usage totals, deduped by message id.
 
     Full-file read — only for bounded headless transcripts (CLAUDE_SPEND_CLASS
-    capture), never the per-turn Stop path (that stays on tail_usage_entries).
+    capture); the per-turn Stop path uses recount_spend.
     Mirrors deploy/scripts/gardener_spend.py's sum_usage, which stays
     standalone-duplicated by design (it runs under /usr/bin/python3 with no
     package on path).
@@ -226,6 +192,134 @@ def sum_usage(log_path: Path) -> dict:
     return totals
 
 
+_SPEND_TOTAL_KEYS = ("out_tokens", "in_tokens", "cache_read_tokens", "cache_creation_tokens")
+
+
+def _parse_event_ts(value) -> float | None:
+    """Transcript event timestamp (ISO-8601, Z-suffixed) → epoch seconds, or None."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return None
+
+
+def subagent_logs_for(log_path: Path, sid: str | None = None) -> list:
+    """Sidecar transcripts of a session's background subagents —
+    `<log.parent>/<sid>/subagents/agent-*.jsonl`, sorted; `sid` defaults to
+    the log's filename stem (the claude layout). THE single acquisition path
+    for subagent spend: recount_spend (Stop hook) and the session report both
+    resolve sidecars through here, so their token sources cannot diverge —
+    list_workers hiding 41% of subagent-session money was exactly a second
+    hand-rolled acquisition path. Crash-proof: any OSError reads as none.
+    """
+    try:
+        base = log_path.parent / (sid or log_path.stem) / "subagents"
+        return sorted(base.glob("agent-*.jsonl"))
+    except OSError:
+        return []
+
+
+def recount_spend(log_path: Path, prior_spend: dict | None,
+                  started_at: float | None = None,
+                  subagent_logs: list | None = None) -> dict | None:
+    """Whole-session recount of the spend — a pure function of the fully-read
+    main transcript PLUS the session's subagent sidecars, recomputed on every
+    Stop. Replaces the retired 64KiB-tail fold, which silently lost every
+    usage entry that rolled out of the window on a big turn (the 2026-07-28
+    2.3x under-count). Sidecars auto-discover via subagent_logs_for when the
+    param is None — the same acquisition path the session report uses — so a
+    caller cannot silently reproduce the main-only under-count by omitting a
+    parameter; pass [] to deliberately scope to the main file. Dedup by
+    message id is GLOBAL across files, main file first.
+
+    Replayed-history exclusion: a resume can copy the predecessor's events into
+    the successor transcript with sessionId REWRITTEN to the new sid, so the sid
+    cannot discriminate them — but copied events keep their ORIGINAL timestamps,
+    which strictly predate this record's started_at. Entries older than
+    started_at are skipped; a missing/unparseable timestamp counts (fail-open).
+
+    Conservative failure semantics (deliberately unlike sum_usage's partial
+    totals): any OSError on the MAIN file, or a session that parses to ZERO
+    usage entries, returns prior_spend unchanged — the caller's `if spend is
+    not None` then leaves the record exactly as it was. A sidecar that fails
+    to read is SKIPPED (best-effort: a torn sidecar must not lose main spend).
+    Unchanged totals also return prior_spend, so a Stop re-fire never drifts
+    `turns`. A fully-read session with lower totals is adopted as the files'
+    truth (last_turn_out clamps at 0).
+    """
+    try:
+        with open(log_path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return prior_spend
+    raws = [raw]
+    if subagent_logs is None:
+        subagent_logs = subagent_logs_for(log_path)
+    for sidecar in subagent_logs:
+        try:
+            raws.append(Path(sidecar).read_bytes())
+        except OSError:
+            continue
+    totals = {key: 0 for key in _SPEND_TOTAL_KEYS}
+    by_model: dict = {}
+    seen_ids: set[str] = set()
+    check_birth = isinstance(started_at, (int, float)) and started_at > 0
+    for line in (line for file_raw in raws
+                 for line in file_raw.decode("utf-8", errors="replace").splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "assistant":
+            continue
+        if check_birth:
+            event_ts = _parse_event_ts(event.get("timestamp"))
+            if event_ts is not None and event_ts < started_at:
+                continue
+        entry = usage_totals_of(event)
+        if entry is None or entry["message_id"] in seen_ids:
+            continue
+        seen_ids.add(entry["message_id"])
+        totals["out_tokens"] += entry["out_tokens"]
+        totals["in_tokens"] += entry["in_tokens"]
+        totals["cache_read_tokens"] += entry["cache_read_tokens"]
+        # TTL split, not the flat field: a 1h-TTL cache write puts 0 in the
+        # flat cache_creation_input_tokens with the real value only in the
+        # structured object.
+        totals["cache_creation_tokens"] += (entry["cache_creation_5m_tokens"]
+                                            + entry["cache_creation_1h_tokens"])
+        # Per-model token buckets so display surfaces (list_workers) can price
+        # at READ time with current rates. A model-less entry counts in the
+        # totals above but cannot be priced — absent here by construction.
+        if entry["model"] is not None:
+            bucket = by_model.setdefault(entry["model"], {
+                "out_tokens": 0, "in_tokens": 0, "cache_read_tokens": 0,
+                "cache_creation_5m_tokens": 0, "cache_creation_1h_tokens": 0})
+            bucket["out_tokens"] += entry["out_tokens"]
+            bucket["in_tokens"] += entry["in_tokens"]
+            bucket["cache_read_tokens"] += entry["cache_read_tokens"]
+            bucket["cache_creation_5m_tokens"] += entry["cache_creation_5m_tokens"]
+            bucket["cache_creation_1h_tokens"] += entry["cache_creation_1h_tokens"]
+    if not seen_ids:
+        return prior_spend
+    prior = prior_spend if isinstance(prior_spend, dict) else {}
+    prior_totals = {key: _int_field(prior, key) for key in _SPEND_TOTAL_KEYS}
+    if totals == prior_totals:
+        return prior_spend
+    return {
+        "turns": _int_field(prior, "turns") + 1,
+        **totals,
+        "last_turn_out": max(0, totals["out_tokens"] - prior_totals["out_tokens"]),
+        "by_model": by_model,
+    }
+
+
 def _cache_creation_split(usage: dict) -> tuple[int, int]:
     """(5m_tokens, 1h_tokens) from a usage block.
 
@@ -239,6 +333,115 @@ def _cache_creation_split(usage: dict) -> tuple[int, int]:
         return (_int_field(cc, "ephemeral_5m_input_tokens"),
                 _int_field(cc, "ephemeral_1h_input_tokens"))
     return (_int_field(usage, "cache_creation_input_tokens"), 0)
+
+
+_KNOWN_USAGE_KEYS = frozenset({
+    "input_tokens", "output_tokens", "cache_read_input_tokens",
+    "cache_creation_input_tokens", "cache_creation", "iterations",
+    "service_tier", "speed", "inference_geo", "server_tool_use",
+})
+
+# Keys that nest further token/count data. A new key INSIDE them (e.g. a 2h
+# cache TTL beside the shipped 5m/1h) is dropped from totals — no multiplier
+# exists for it — so it must fail as loud as a top-level unknown; recognising
+# only the outer key would be blind one level down.
+_KNOWN_CACHE_CREATION_KEYS = frozenset({
+    "ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens",
+})
+_KNOWN_SERVER_TOOL_USE_KEYS = frozenset({
+    "web_search_requests", "web_fetch_requests",
+})
+
+# Nested contract per known container key. Structural default-deny: a KNOWN
+# key whose value is a dict but has NO entry here gets ALL its contents
+# flagged — the next container added to _KNOWN_USAGE_KEYS cannot arrive
+# silently unguarded (the hand-maintained pair list was exactly that hole).
+_NESTED_KNOWN_KEYS = {
+    "cache_creation": _KNOWN_CACHE_CREATION_KEYS,
+    "server_tool_use": _KNOWN_SERVER_TOOL_USE_KEYS,
+}
+
+# Expected value shape per money-bearing / accounted key (None always allowed
+# — APIs emit nulls). A known key whose value flips type (cache_creation
+# becoming a list) silently zeroes an existing money bucket; validate the
+# shape we sum, fail loud on anything else. Informational strings
+# (service_tier/speed/inference_geo) are deliberately unconstrained.
+_EXPECTED_USAGE_SHAPES = {
+    "input_tokens": (int, float),
+    "output_tokens": (int, float),
+    "cache_read_input_tokens": (int, float),
+    "cache_creation_input_tokens": (int, float),
+    "cache_creation": (dict,),
+    "server_tool_use": (dict,),
+    "iterations": (list,),
+}
+
+
+def _unknown_usage_keys(usage: dict) -> list:
+    unknown = [key for key in usage if key not in _KNOWN_USAGE_KEYS]
+    for key, value in usage.items():
+        if key not in _KNOWN_USAGE_KEYS or value is None:
+            continue
+        expected = _EXPECTED_USAGE_SHAPES.get(key)
+        if expected is not None and (isinstance(value, bool)
+                                     or not isinstance(value, expected)):
+            # bool is an int subclass but _int_field zeroes it — same silent loss
+            unknown.append(f"{key}(unexpected-shape)")
+            continue
+        if isinstance(value, dict):
+            known = _NESTED_KNOWN_KEYS.get(key)
+            if known is None:
+                unknown.extend(f"{key}.{nested}" for nested in value)
+                continue
+            for nested, nested_value in value.items():
+                if nested not in known:
+                    unknown.append(f"{key}.{nested}")
+                elif nested_value is not None and (
+                        isinstance(nested_value, bool)
+                        or not isinstance(nested_value, (int, float))):
+                    # Nested VALUES are numeric counts; a type flip here
+                    # silently zeroes an existing bucket (_int_field -> 0),
+                    # same silent-money-loss class as the top-level shapes.
+                    unknown.append(f"{key}.{nested}(unexpected-shape)")
+    return sorted(unknown)
+
+
+def usage_totals_of(event) -> dict | None:
+    """Assistant-event acceptance + usage extraction shared by every accountant.
+
+    The single point deciding which records count and which usage fields sum —
+    recount_spend (Stop hook), sum_usage (headless ledger), sum_usage_by_model
+    (spend-cost), and the session report all consume it, so they cannot drift.
+    NO dedup (callers own seen_ids) and NO birth filter (recount_spend applies
+    its filter BEFORE this call). `model` is None when message.model is absent —
+    that is not a rejection: recount_spend/sum_usage accept model-less events;
+    sum_usage_by_model applies its own model gate. `usage.iterations[]` is a
+    sub-breakdown of this same record's top-level totals — top-level only, or
+    the totals double-count. unknown_usage_keys (any JSON type) lets read-side
+    consumers fail loud when the API grows a token class this set doesn't know.
+    """
+    if not isinstance(event, dict) or event.get("type") != "assistant":
+        return None
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return None
+    message_id = message.get("id")
+    usage = message.get("usage")
+    if not isinstance(message_id, str) or not message_id or not isinstance(usage, dict):
+        return None
+    model = message.get("model")
+    cc_5m, cc_1h = _cache_creation_split(usage)
+    return {
+        "message_id": message_id,
+        "model": model if isinstance(model, str) and model else None,
+        "out_tokens": _int_field(usage, "output_tokens"),
+        "in_tokens": _int_field(usage, "input_tokens"),
+        "cache_read_tokens": _int_field(usage, "cache_read_input_tokens"),
+        "cache_creation_5m_tokens": cc_5m,
+        "cache_creation_1h_tokens": cc_1h,
+        "cache_creation_flat": _int_field(usage, "cache_creation_input_tokens"),
+        "unknown_usage_keys": _unknown_usage_keys(usage),
+    }
 
 
 def sum_usage_by_model(log_path: Path) -> dict:
@@ -262,67 +465,25 @@ def sum_usage_by_model(log_path: Path) -> dict:
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if not isinstance(event, dict) or event.get("type") != "assistant":
+                entry = usage_totals_of(event)
+                if (entry is None or entry["model"] is None
+                        or entry["message_id"] in seen_ids):
                     continue
-                message = event.get("message")
-                if not isinstance(message, dict):
-                    continue
-                message_id = message.get("id")
-                model = message.get("model")
-                usage = message.get("usage")
-                if (not isinstance(message_id, str) or not message_id
-                        or not isinstance(model, str) or not model
-                        or not isinstance(usage, dict) or message_id in seen_ids):
-                    continue
-                seen_ids.add(message_id)
-                bucket = by_model.setdefault(model, {
+                seen_ids.add(entry["message_id"])
+                bucket = by_model.setdefault(entry["model"], {
                     "calls": 0, "out_tokens": 0, "in_tokens": 0,
                     "cache_read_tokens": 0,
                     "cache_creation_5m_tokens": 0, "cache_creation_1h_tokens": 0,
                 })
-                cc_5m, cc_1h = _cache_creation_split(usage)
                 bucket["calls"] += 1
-                bucket["out_tokens"] += _int_field(usage, "output_tokens")
-                bucket["in_tokens"] += _int_field(usage, "input_tokens")
-                bucket["cache_read_tokens"] += _int_field(usage, "cache_read_input_tokens")
-                bucket["cache_creation_5m_tokens"] += cc_5m
-                bucket["cache_creation_1h_tokens"] += cc_1h
+                bucket["out_tokens"] += entry["out_tokens"]
+                bucket["in_tokens"] += entry["in_tokens"]
+                bucket["cache_read_tokens"] += entry["cache_read_tokens"]
+                bucket["cache_creation_5m_tokens"] += entry["cache_creation_5m_tokens"]
+                bucket["cache_creation_1h_tokens"] += entry["cache_creation_1h_tokens"]
     except OSError:
         return {}
     return by_model
-
-
-def accumulate_spend(spend: dict | None, entries: list[dict]) -> dict | None:
-    """Fold the just-ended turn's tail usage entries into the running spend dict.
-
-    The cursor (last_msg_id) marks the last entry already counted: only entries
-    after it are new. Cursor absent from the tail means the window rolled past
-    it — count the whole visible tail and accept the undercount beyond it.
-    Nothing new after the cursor (Stop re-fire) → return spend unchanged so
-    turns don't drift.
-    """
-    if not entries:
-        return spend
-    new_entries = entries
-    if spend is not None:
-        cursor = spend.get("last_msg_id")
-        for index, entry in enumerate(entries):
-            if entry.get("message_id") == cursor:
-                new_entries = entries[index + 1:]
-                break
-    if not new_entries:
-        return spend
-    prior = spend or {}
-    turn_out = sum(e.get("output_tokens", 0) for e in new_entries)
-    return {
-        "turns": _int_field(prior, "turns") + 1,
-        "out_tokens": _int_field(prior, "out_tokens") + turn_out,
-        "in_tokens": _int_field(prior, "in_tokens") + sum(e.get("input_tokens", 0) for e in new_entries),
-        "cache_read_tokens": _int_field(prior, "cache_read_tokens")
-            + sum(e.get("cache_read_tokens", 0) for e in new_entries),
-        "last_turn_out": turn_out,
-        "last_msg_id": new_entries[-1].get("message_id"),
-    }
 
 
 def last_assistant_summary(log_path: Path, max_chars: int = 200) -> Tuple[str | None, str | None]:
@@ -347,3 +508,35 @@ def last_assistant_summary(log_path: Path, max_chars: int = 200) -> Tuple[str | 
     if len(last_summary) > max_chars:
         last_summary = last_summary[:max_chars - 1] + "…"
     return (last_summary, last_timestamp)
+
+
+def last_assistant_ends_in_tool_use(log_path: Path) -> bool:
+    """True when the transcript's LAST assistant event's final content block is
+    a tool_use — the CLI is waiting on a tool or modal result (AskUserQuestion,
+    a long Bash): mid-turn, alive. A latched brick banner is appended as a
+    synthetic assistant TEXT event (model "<synthetic>", isApiErrorMessage —
+    verified against the 2026-07-29 incident transcripts), so a bricked
+    transcript never ends in tool_use. Crash-proof: absent/unreadable/empty
+    reads as False (no aliveness evidence)."""
+    try:
+        if not log_path.is_file():
+            return False
+        last_blocks = None
+        for line in log_path.read_text(errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") != "assistant":
+                continue
+            content = (event.get("message") or {}).get("content")
+            if isinstance(content, list) and content:
+                last_blocks = content
+        if not last_blocks:
+            return False
+        final = last_blocks[-1]
+        return isinstance(final, dict) and final.get("type") == "tool_use"
+    except OSError:
+        return False

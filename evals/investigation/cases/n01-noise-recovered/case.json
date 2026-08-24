@@ -3,5 +3,5 @@
   "tags": ["investigation", "abstention"],
   "adversarial_signals": ["brief_error_spike_then_recovery"],
   "difficulty": 2,
-  "provenance": "upstream-scorer negative-eval 001-noise-recovered shape; abstention is a first-class outcome (worker.core.md findings block)"
+  "provenance": "synthetic scenario: a transient that recovered on its own; abstention is a first-class outcome (worker.core.md findings block)"
 }

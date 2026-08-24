@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from dockwright.transcript import (
     delegation_fresh_sec,
+    episode_grace_sec,
     find_session_log,
     is_delegating,
     last_assistant_summary,
@@ -149,12 +150,13 @@ def test_is_delegating_false_for_consumed_foreground_agent(tmp_path, monkeypatch
 
 def test_is_delegating_false_when_subagent_quiet_past_grace(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_ORCH_EPISODE_GRACE_SEC", raising=False)
     log, subagents = _make_session_tree(tmp_path)
     now = time.time()
-    os.utime(log, (now - 600, now - 600))
+    os.utime(log, (now - 2000, now - 2000))
     agent = subagents / "agent-aaa.jsonl"
     agent.write_text("{}")
-    os.utime(agent, (now - 300, now - 300))              # grew after log, but stale
+    os.utime(agent, (now - 1000, now - 1000))            # grew after log, but stale
     record = {"claude_sid": "del-sid", "runtime": "claude"}
     assert is_delegating(record, now) is False
 
@@ -208,18 +210,64 @@ def test_delegation_fresh_sec_default_and_invalid_env(monkeypatch):
     assert delegation_fresh_sec() == 120
 
 
-def test_is_delegating_grace_env_moves_freshness_window(tmp_path, monkeypatch):
-    """The monitor's grace env override moves the read-side freshness with it,
-    so a non-default grace can't split monitor truth from list_workers/paint."""
+def test_turn_end_grace_env_no_longer_tightens_the_display_window(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_ORCH_EPISODE_GRACE_SEC", raising=False)
     log, subagents = _make_session_tree(tmp_path)
     now = time.time()
     os.utime(log, (now - 400, now - 400))
     agent = subagents / "agent-aaa.jsonl"
     agent.write_text("{}")
-    os.utime(agent, (now - 200, now - 200))              # 200s old: stale at 120, fresh at 300
+    os.utime(agent, (now - 200, now - 200))
     record = {"claude_sid": "del-sid", "runtime": "claude"}
-    monkeypatch.setenv("CLAUDE_ORCH_TURN_END_GRACE_SEC", "300")
-    assert is_delegating(record, now) is True
     monkeypatch.setenv("CLAUDE_ORCH_TURN_END_GRACE_SEC", "60")
+    assert is_delegating(record, now) is True
+
+
+def test_episode_grace_default_and_env(monkeypatch):
+    monkeypatch.delenv("CLAUDE_ORCH_EPISODE_GRACE_SEC", raising=False)
+    monkeypatch.delenv("CLAUDE_ORCH_TURN_END_GRACE_SEC", raising=False)
+    assert episode_grace_sec() == 900
+    monkeypatch.setenv("CLAUDE_ORCH_EPISODE_GRACE_SEC", "1800")
+    assert episode_grace_sec() == 1800
+    monkeypatch.setenv("CLAUDE_ORCH_EPISODE_GRACE_SEC", "abc")
+    assert episode_grace_sec() == 900
+    monkeypatch.setenv("CLAUDE_ORCH_EPISODE_GRACE_SEC", "0")
+    assert episode_grace_sec() == 900
+
+
+def test_episode_grace_never_falls_below_turn_end_grace(monkeypatch):
+    monkeypatch.setenv("CLAUDE_ORCH_EPISODE_GRACE_SEC", "60")
+    monkeypatch.setenv("CLAUDE_ORCH_TURN_END_GRACE_SEC", "1200")
+    assert episode_grace_sec() == 1200
+
+
+def test_is_delegating_survives_a_subagent_pause_past_the_turn_end_grace(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_ORCH_EPISODE_GRACE_SEC", raising=False)
+    monkeypatch.delenv("CLAUDE_ORCH_TURN_END_GRACE_SEC", raising=False)
+    log, subagents = _make_session_tree(tmp_path)
+    now = time.time()
+    os.utime(log, (now - 400, now - 400))
+    agent = subagents / "agent-aaa.jsonl"
+    agent.write_text("{}")
+    os.utime(agent, (now - 300, now - 300))
+    record = {"claude_sid": "del-sid", "runtime": "claude"}
+    assert delegation_fresh_sec() == 120        # the turn-end grace has expired
+    assert is_delegating(record, now) is True   # the display still reads delegating
+
+
+
+def test_is_delegating_freshness_moves_with_the_episode_grace_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    log, subagents = _make_session_tree(tmp_path)
+    now = time.time()
+    os.utime(log, (now - 800, now - 800))
+    agent = subagents / "agent-aaa.jsonl"
+    agent.write_text("{}")
+    os.utime(agent, (now - 600, now - 600))
+    record = {"claude_sid": "del-sid", "runtime": "claude"}
+    monkeypatch.setenv("CLAUDE_ORCH_EPISODE_GRACE_SEC", "1200")
+    assert is_delegating(record, now) is True
+    monkeypatch.setenv("CLAUDE_ORCH_EPISODE_GRACE_SEC", "300")
     assert is_delegating(record, now) is False

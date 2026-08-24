@@ -60,7 +60,7 @@ The MCP server is one stdio FastMCP process per session. Every session (manager 
 
 ## Deployment surfaces — when to run setup.sh after merging an orchestrator change
 
-Four independent surfaces receive an orchestrator change. What you must do depends on which file changed:
+Four independent surfaces receive an orchestrator change. What you must do depends on which file changed: (In every case that calls for `setup.sh`: it refuses (exit 4) while `~/.claude/dockwright/active/` shows registered live sessions — check the fleet first (`list_workers`/`list_managers` or `ls` that dir) and either wait for a quiet fleet or run a deliberate `DOCKWRIGHT_SETUP_FORCE=1` deploy.)
 
 1. **Editable Python package — `src/dockwright/`.** `dockwright` is a `pip install -e` console-script that imports from `src/` directly, so on-disk changes are live the moment the local clone is on merged main. No `setup.sh`, no recreate. But it splits by process lifetime:
    - **Hooks** (`dockwright session-start|stop|user-prompt-submit|session-end`) run as a fresh subprocess each fire → they pick up `src/` changes immediately, for **newly-started sessions / the next hook fire** only.
@@ -113,7 +113,7 @@ Most manager-side read tools take `manager_sid` — the caller's **own session U
 | Tool | Effect |
 |---|---|
 | `become_manager(claude_sid, iterm_sid?, domain?, name?)` | Registers this session as a manager. Rolls a funny `<adjective>-<animal>` name (unique across active records; pass `name` to preserve an existing identity — the `/manager-reboot` lane), defaults `domain="general"`. Runs legacy-worker backfill + same-pid ghost pruning. Returns `{ok, name, domain, runtime}`. No lock — multiple managers coexist. |
-| `spawn_worker(initial_prompt, name?, cwd?, extra_args?, env?, preset?, manager_sid?, runtime?, task_key?, force?)` | Opens a window in the `claude-workers` tmux session (creates it if missing). `name` auto-suffixes `-2`, `-3` on collision. `preset` prepends `<state_root>/presets/<name>.md`. `manager_sid` stamps `parent_manager_name` (via `CLAUDE_PARENT_MANAGER` env) so events route back; unresolvable sid → UNSCOPED worker + warning. `runtime="codex"` launches Codex with `--ask-for-approval never --sandbox danger-full-access --dangerously-bypass-hook-trust` + a bootstrap prompt; Claude workers get remote-control-off `--settings`. `env` can add vars but can't override orchestrator-controlled keys. |
+| `spawn_worker(initial_prompt, name?, cwd?, extra_args?, env?, preset?, manager_sid?, runtime?, task_key?, force?)` | Opens a window in the `claude-workers` tmux session (creates it if missing). `name` auto-suffixes `-2`, `-3` on collision. `preset` prepends `<state_root>/presets/<name>.md`. `manager_sid` stamps `parent_manager_name` (via `CLAUDE_PARENT_MANAGER` env) so events route back; a sid matching no live manager (or a worker/nested record) → ValueError, nothing spawned; `manager_sid=None` = deliberately unscoped. `runtime="codex"` launches Codex with `--ask-for-approval never --sandbox danger-full-access --dangerously-bypass-hook-trust` + a bootstrap prompt; Claude workers get remote-control-off `--settings`. `env` can add vars but can't override orchestrator-controlled keys. |
 | `list_workers(manager_sid?)` | Worker records + last assistant turn from transcript + `alive` (PID check). |
 | `list_pending_questions(manager_sid?)` | Pending questions, oldest first. |
 | `answer_question(question_id, text)` | Writes `answers/<qid>.json`, unlinks the question. |
@@ -138,7 +138,7 @@ Most manager-side read tools take `manager_sid` — the caller's **own session U
 | `ask_manager(claude_sid, question, resume_question_id=None)` | Writes `questions/<manager>/<qid>.json`, polls `answers/<qid>.json` every 500ms (async — other tool calls on the same worker stay serviceable), returns the answer. Server-side timeout of 1500s returns a `NO_ANSWER_YET:` re-ask sentinel; re-call with `resume_question_id` to keep waiting on the SAME pending question. Self-heals on corrupt answer files. |
 | `worker_done(claude_sid, summary)` | One-shot done event in `done/<manager>/`. Worker's REQUIRED last action on task completion. |
 | `wait_for_worker(name, timeout_sec=3600, manager_sid?)` | Block until that worker writes a done event (`{found: "done", summary}`) or its session exits (`{found: "exited"}`). Lets workers (or the manager) chain on a sibling's completion. |
-| `acquire_worker_slot(claude_sid, category, max_concurrent?, timeout_sec=1800)` | Per-category semaphore so N workers don't OOM the host on `mvn test` etc. Default cap: `mvn=3`; override per call or via env `CLAUDE_ORCH_SLOTS_<CATEGORY>`. Stale holders auto-evicted. Pair with… |
+| `acquire_worker_slot(claude_sid, category, max_concurrent?, timeout_sec=1800)` | Per-category semaphore so N workers don't OOM the host on `mvn test` etc. Default cap: `mvn=5`; override per call or via env `CLAUDE_ORCH_SLOTS_<CATEGORY>`. Stale holders auto-evicted. Pair with… |
 | `release_worker_slot(slot_id)` | …release. Idempotent. |
 
 There is no `register_self` MCP tool and no `send_instruction` — registration happens in the SessionStart hook; instruction delivery is `send_manager_to_worker`.
@@ -162,10 +162,14 @@ Managers arm **four Monitor tasks** at `/manager` boot, each a one-shot CLI in a
 
 | Monitor command | Cadence | Fires on |
 |---|---|---|
-| `while true; do dockwright monitor questions; sleep 2; done` | 2s | new `questions/<me>/` files → `<worker> asks: …` |
-| `while true; do dockwright monitor turn-ends; sleep 5; done` | 5s | silent-finish detector → `FINISHED_SILENTLY <name>: <summary>`; repeats per lull ladder-rate-limited (15/30/60min…, cap 4h) |
-| `while true; do dockwright monitor done; sleep 2; done` | 2s | new `done/<me>/` files → `<worker> done: <summary>` |
-| `while true; do dockwright monitor stale; sleep 60; done` | 60s | wraps `stale_monitor.py --manager <me>` |
+| `while dockwright monitor questions || exit $?; do sleep 2; done` | 2s | new `questions/<me>/` files → `<worker> asks: …` |
+| `while dockwright monitor turn-ends || exit $?; do sleep 5; done` | 5s | silent-finish detector → `FINISHED_SILENTLY <name>: <summary>`; repeats per lull ladder-rate-limited (15/30/60min…, cap 4h). ⚠️ Also fires for a design-gate park — a worker blocked in plannotator on the engineer's verdict — which must not be closed; see `~/.claude/agents/manager.md` § Design-gate relays |
+| `while dockwright monitor done || exit $?; do sleep 2; done` | 2s | new `done/<me>/` files → `<worker> done: <summary>` |
+| `while dockwright monitor stale || exit $?; do sleep 60; done` | 60s | wraps `stale_monitor.py --manager <me>` |
+
+The loop is condition-driven on purpose. A scan that exits non-zero ENDS its lane, so the Monitor task exits and the manager is notified — `2` = the owning manager can no longer be resolved (which is how an orphaned loop terminates itself instead of scanning for days), `3` = the stdout reader is gone, `4` = five consecutive unexpected scan failures. Anything transient retries at exit 0. `|| exit $?` propagates the code: without it a `while` loop that ends on a failed condition still leaves the shell exiting 0, and a death would read as a clean finish.
+
+**`dockwright lanes [manager-name]`** answers "are my lanes still delivering?" — one row per lane (`OK` / `DEAD` / `BACKLOGGED` / `NEVER-ARMED`), non-zero exit if any lane is not OK. It reads a per-lane heartbeat that a scan writes only after proving it could still reach its reader, cross-checked against unconsumed events on disk. `turn-ends` and `stale` report `backlog=n/a` — both legitimately hold events, so counting one would cry wolf. Re-arming a lane needs the old loop killed first (`pgrep -f "dockwright monitor <lane>"`): two loops share one cursor and split events between them at random.
 
 `stale_monitor.py` emits edge-triggered alarms — `STALE_PROCESSING <name>` (transcript silent >30min, re-pages at 60/120…), `STALE_QUESTION` (unanswered >2min, doubling), and `AUTOCLOSED <name>` — workers idle >2h with no pending question get auto-closed (archived to `closed/`, pane gracefully closed so SessionEnd fires; threshold via `CLAUDE_ORCH_IDLE_TTL_HOURS`). AUTOCLOSED lines are diverted to a per-manager notify-outbox and ride the next wake from any monitor lane (or flush within 30min) instead of paging on their own. `preflight_cleanup.py` runs at `/manager` boot: prunes aborted handoffs (>1h unconsumed), consumed handoffs + done/turn-end events (>24h), closed records (>7d), dead-pid active records.
 
@@ -210,6 +214,10 @@ The manager notebook is the durable agenda for planned/conditional fleet-scoped 
 
 **Location:** `<state_root>/notebook/<domain>.md` — one file per domain, auto-printed at boot by the `/manager` / `/manager-resume` memory-loader step (same skip-silently-if-absent contract as memory). Resolved/dropped entries move to `<state_root>/notebook/archive/<domain>.md`.
 
+**Sibling store — `<state_root>/tech-debt/<domain>.md`, deliberately NOT boot-loaded.** The notebook carries only what the user approved or parked, plus decisions waiting on them (agent file § Manager notebook owns that scope rule). Engineering debt, fleet defects and measured traps go here instead. Same entry format, same per-domain split, same archive-on-resolve discipline — the only difference is the read contract: read it ON DEMAND (before touching the subsystem an entry names, or when the user asks what debt exists), never in a boot brief.
+
+⛔ **Do not teach the boot loaders about this file.** `boot_brief.py` prints a `NOTEBOOK` pointer only, and the four boot paths (`/manager`, `/manager-resume`, `/manager-reboot`, `/manager-takeover-recovery`) read that pointer only. That omission is the feature — the whole point of a second file is that debt does not ride into every manager's opening context. A trap that keeps biting belongs in `~/.claude/rules/`, not in either file.
+
 **Entry format:**
 
 ```markdown
@@ -225,6 +233,29 @@ The manager notebook is the durable agenda for planned/conditional fleet-scoped 
 
 **Archive-on-resolve.** When an entry is acted on or explicitly dropped: flip `## [ ]` to `## [x]`, append one outcome line (`- resolved: <date> — <what happened>`), move the whole block to `notebook/archive/<domain>.md`, and delete it from the active file. The active file stays small — boot warns above ~4 KB.
 
+**Retirement is about the WORK being finished, not about the `[x]` marker.** The moment an entry's work is done, the WHOLE entry leaves the active file — even if the entry is still marked `## [ ]`, and even if something small is still open from it. Anything still open is re-filed as a FRESH, short entry stating only the remainder, with today's `added:` date and a one-line `re-filed from <archived header>` pointer.
+
+⛔ **The anti-pattern: annotating a finished entry instead of retiring it.** Appending `✅ DONE` / `RESOLVED` / `CORRECTED` on top of a body that is now superseded, and leaving the whole thing in the active file. Each such layer is cheap on its own, which is exactly why they accumulate — the old body stays, the reader must diff the ✅ line against the paragraphs below it to work out what is still true, and the next update adds another layer. Measured on the `general` notebook, 2026-07-31: only 1 of 42 active entries was marked `[x]`, yet 8 carried ✅/DONE/RESOLVED lines layered over superseded text; that layering, not the entry count, was the bulk of the file. Engineer's instruction: completed notebook entries move to the archive in full, body included, so the active file does not silt up.
+
+Applying it:
+
+- **Finished, nothing open** → archive whole. Delete from active.
+- **Finished, small remainder** → archive whole, then write a fresh entry for the remainder. Do not keep the original and trim it in place; a trimmed fossil keeps its stale header, its stale `added:` date, and its resolved history.
+- **Genuinely still open** → leave it, but strip resolution history (what shipped, which PR merged, what a past reviewer found) down to what a cold manager needs to ACT. The narrative belongs in the archive.
+- **Reference entries** (permanent facts, not tasks — e.g. "this failure mode looks like an outage but is a transient") never "finish". Say so in the entry's `when:` so a sweep does not retire them.
+- **When in doubt between done and open, KEEP it** and say so. A wrongly-archived open item is worse than a slightly bloated file.
+- **Re-check gates before trusting them.** A `when:` that blocks on a PR merging or a worker finishing goes stale silently: the entry then reads as blocked when the work is ripe, or as not-started when it is already in flight. Verify the gate's current state as part of any sweep.
+
+**Review findings do not become notebook entries.** A finding from a code review is classified AT DISCOVERY as fix-now or dead. There is no third bucket, because no parking lot gets read — not the notebook, and not an issue tracker either.
+
+**Scope — this governs where a finding is FILED, not whether it may be ignored.** Severity discipline is unchanged: a Critical or Important still blocks the merge until it is fixed or explicitly disclosed in the PR body (`~/.claude/rules/review-discipline.md`), and such a disclosure ships inside the change under review rather than sitting in a queue nobody rereads — so it is not the third bucket this rule rules out. What dies is the separate tracker entry, never the obligation.
+
+The discriminator is whether the finding DEMONSTRATES its failure. "I ran X and observed Y" is a real finding: fix it now, in the same loop. "This could be wrong", "both one-liners, no failure mode", "non-blocking Minor, deferred to keep the merge unblocked" is a cosmetic finding: it dies with its PR. The thing that makes this safe lives on the VERIFIER side, not the parking side — require a finding to demonstrate its failure before it counts as blocking, and the ones worth keeping are exactly the ones that survive.
+
+Why filing is not a safe fallback: `claude-architect` issue #14 was filed correctly on 2026-06-12 by a verifier — right place, right title, honest note that it was "both one-liners, no failure mode, deferred to keep #13's merge unblocked". It sat six weeks. The failure mode existed: it was the `catalog-field` inversion that later produced three fabricated contracts, including one proposing a field that already existed. The tracker did not save it. **The "no failure mode" label was the actual defect, not the parking place** — a finding nobody can demonstrate is cosmetic, and one somebody can demonstrate should never have been deferred.
+
+Applied to an existing notebook: sweep out every entry that is a review residue asserting its own harmlessness, and keep the ones recording an observed misbehaviour. Everything swept still goes to the archive in full — the archive is the record, it is just not an agenda.
+
 **Review-by triage.** An entry past its `review-by` surfaces in the startup brief even if unripe. Triage explicitly with the user: re-date, drop (archive with a reason), or act now. Never silently re-date.
 
 **Gardener stays separate.** The Gardener ledger (`~/.claude/dockwright/gardener/ledger.jsonl`) is machine-parsed JSONL with its own piggybacked check cadence — it does NOT move into the notebook. Notebook entries may reference ledger state in their `check:`, linking by reference.
@@ -235,7 +266,7 @@ The manager notebook is the durable agenda for planned/conditional fleet-scoped 
 |---|---|---|
 | `/manager` says MCP not connected / `become_manager` not found | MCP servers live in `~/.claude.json` (via `claude mcp add`), NOT `~/.claude/settings.json` | `claude mcp add --scope user dockwright dockwright mcp-server`, restart session |
 | `list_workers` / monitors return other managers' stuff, or a stderr "did not resolve to an active manager" warning | You passed the manager's **funny name** as `manager_sid` — it takes the session UUID | Pass `$CLAUDE_CODE_SESSION_ID` (or Codex `$CODEX_THREAD_ID`) |
-| Worker spawned but its events never reach the manager | Worker is UNSCOPED (`parent_manager_name=null`) — `manager_sid` was missing/unresolvable at spawn | Respawn with the correct `manager_sid`; or boot a single manager so `_backfill_legacy_workers` adopts it |
+| Worker spawned but its events never reach the manager | Worker is UNSCOPED (`parent_manager_name=null`) — spawned with `manager_sid=None`/omitted (an unresolvable sid now rejects at spawn instead of spawning unscoped) | Respawn with the correct `manager_sid`; or boot a single manager so `_backfill_legacy_workers` adopts it |
 | `spawn_worker` raises a tmux-spawn error | tmux server unreachable on the dockwright socket | Confirm tmux is installed and can start a server on `-L dockwright` (socket override: `DOCKWRIGHT_TMUX_SOCKET`; legacy `CLAUDE_ORCH_TMUX_SOCKET` honored one release) |
 | Worker blocked but manager sees no question | Monitor missed it or scoping issue | `list_pending_questions(manager_sid=<sid>)`; for legacy flat questions use `manager_sid=None` |
 | Worker pane gone, no SessionEnd fired (kill -9, OOM) | Orphan active record | `_prune_stale_active_records` runs on most tool calls and reaps dead-pid records automatically; worst case `rm active/<sid>.json` |

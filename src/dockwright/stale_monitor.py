@@ -68,7 +68,7 @@ nudged; nothing is ever killed; nudge-ineligible workers (no window id, pending
 question, autonudge off) page STALE_PROCESSING as before.
 
 Banner-scheduled nudge: the session-limit banner carries a reset time ("resets
-2:20am (Etc/UTC)"). When the worker fast-path detects it, a second
+2:20am (Etc/GMT-9)"). When the worker fast-path detects it, a second
 nudge is scheduled for reset+2min (`scheduled:<sid>` in the emitted state) on
 top of the ladder — the ladder stays the universal catch-all because the
 wording is fragile (it changed once already) and parsing is best-effort. A
@@ -191,6 +191,7 @@ import hashlib
 import json
 import os
 import re
+import select
 import shlex
 import shutil
 import subprocess
@@ -238,6 +239,27 @@ except ValueError:
     _IDLE_HOURS = 2.0
 IDLE_THRESHOLD_SEC = int(_IDLE_HOURS * 3600)
 AUTOCLOSE_CADENCE_SEC = 3600
+# A worker that backgrounded a Bash command ENDS ITS TURN, so the Stop hook
+# marks it idle (turn-truth, deliberately) and autoclose reaps the live work at
+# the TTL. A live direct child extends that deadline instead of vetoing the
+# close: the one real failure is a shell that never exits (tail -f, a poller, a
+# docker run waiting on stdin), and without a cap autoclose would be off for
+# that worker forever. The marker is the Claude CLI's shell-snapshot path; it is
+# ONE of two signals — see _has_live_background_shell for why a vendor path
+# alone is not enough.
+BUSY_SHELL_MARKER = "shell-snapshots/snapshot-"
+BUSY_SHELL_IDLE_MULTIPLIER = 3
+# How many autoclose gate RE-OPENINGS can separate two evaluations of one
+# record: 1 base + 1 per skew source. Today 2 — the base plus
+# _record_action_ahead persisting `last_autoclose_run` when a nudge fires
+# early in a scan (before the sweep runs), so a hard kill in between skips a
+# full cadence. It is a BUDGET, not a bound: two chained skew events would
+# need 3. Named once and derived at both sites — the deadline floor below and
+# the floor's test — because it is NOT the same 3 as BUSY_SHELL_IDLE_MULTIPLIER
+# and the two were previously indistinguishable literals in two files. A third
+# skew source is a one-constant edit here; leave it a bare number and the
+# discovery has to reach a literal in a test file no source-side reader opens.
+AUTOCLOSE_SKEW_CADENCES = 2
 # Orphan-window alarm: a pane in the workers tmux session with no backing
 # active record — the report-only sweep's "orphan terminal window" — pages on
 # the doubling ladder once continuously orphan past the grace (the VM-E2E
@@ -344,6 +366,14 @@ TRANSIENT_SERVER_ERROR_SIGNATURES = ("529 overloaded",)
 AUTH_FAILURE_SIGNATURES = ("api error: 401", "please run /login")
 AUTH_401_WINDOW_SEC = 5 * 60        # M: attempts older than this start a fresh episode
 AUTH_401_MAX_ATTEMPTS = 2           # N: same-account resume attempts before escalating
+# Same-account takeover bet: taken ONLY on the episode's FIRST distinct 401
+# (a transient server blip has typically cleared by launch time, and the other
+# account is equally exposed to it). From the second distinct in-window 401 the
+# account is SUSPECT: launch only via _healthy_takeover_target, else promote
+# the decision to escalate (2026-07-29: two recover-launches onto currently-
+# 401ing accounts made zombie managers — dead on arrival, identity conferred
+# by the SessionStart hook before the model ever ran).
+AUTH_401_SAME_ACCOUNT_ATTEMPTS = 1
 # The AUTH_401 worker trigger re-fires on this cadence while the worker stays
 # 401'd (same uuid), so a missed or coalesced-then-recovered event reaches a
 # live manager — decoupled from the uuid-deduped attempt count (re-emits never
@@ -389,7 +419,7 @@ MANAGER_NUDGE_RETRY_SEC = 10 * 60
 # Managers legitimately sit processing with silent transcripts (AskUserQuestion);
 # only read the transcript tail for banner detection after this much silence.
 MANAGER_LIMIT_CHECK_FLOOR_SEC = 120
-# "resets 2:20am (Etc/UTC)" — hour, optional :minutes, am/pm, IANA zone.
+# "resets 2:20am (Etc/GMT-9)" — hour, optional :minutes, am/pm, IANA zone.
 _RESET_CLAUSE_RE = re.compile(
     r"resets\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)\s*\(([^)]+)\)", re.IGNORECASE)
 
@@ -519,6 +549,51 @@ def _account_config_prefix(letter: str) -> str:
     return " ".join(parts) + " "
 
 
+def _login_fix_command(letter: str) -> str:
+    """Exact re-login command for `letter`. The default account rides the
+    HOME-root login: pointing the CLI at ~/.claude via CLAUDE_CONFIG_DIR
+    reads a directory that never held the config and reports a healthy login
+    as dead (2026-07-29 incident) — so the default's command carries NO
+    CLAUDE_CONFIG_DIR. Every other account: its registry config_dir override,
+    else the ~/.claude-<letter> convention — the same resolution as
+    _account_config_prefix, minus the farm-health fallback (a human
+    re-logging-in must target the farm even when it is unhealthy)."""
+    _names, default, dirs = _registry()
+    if letter == default:
+        return "claude"
+    farm = dirs.get(letter) or os.path.expanduser(f"~/.claude-{letter}")
+    return f"CLAUDE_CONFIG_DIR={shlex.quote(str(farm))} claude"
+
+
+def _notify_macos(message: str) -> None:
+    """Best-effort direct-to-human notification (inline copy of
+    hooks._notify_macos — standalone stdlib-only file, kept parity-tested by
+    test_notify_macos_matches_hooks_inline_copy). Used ONLY where no
+    successor manager will ever exist to relay a buffered page: an
+    outcome-derived auth-401 recover/escalate notification. Every failure
+    (no osascript, sandbox, timeout) is swallowed — the caller never sees an
+    exception — but, unlike hooks' 5s-SessionEnd-budget copy, this one warns
+    on stderr (every other best-effort helper in this file does; the
+    likeliest real failure — notification permissions denied — is a
+    non-zero exit that `check=False` would otherwise discard silently).
+    No-ops under pytest (PYTEST_CURRENT_TEST) so suites never fire real
+    desktop notifications."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    try:
+        sanitized = message.replace('"', "")
+        result = subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{sanitized}" with title "dockwright"'],
+            capture_output=True, timeout=2, check=False,
+        )
+        if result.returncode != 0:
+            print(f"stale_monitor: notify failed (osascript rc="
+                  f"{result.returncode})", file=sys.stderr)
+    except Exception as e:
+        print(f"stale_monitor: notify failed ({e})", file=sys.stderr)
+
+
 @contextmanager
 def _flip_lock():
     """Serializes read-check-write across concurrent per-manager scans.
@@ -561,13 +636,54 @@ def _other_account_bricked(state: dict, other: str, now: int) -> bool:
     return _entry_bricked(state.get("accounts", {}).get(other), now)
 
 
+def _auth_401_active(account: str, now: int, state: dict | None = None) -> bool:
+    """True iff `account` has a live in-window auth-401 episode — within
+    AUTH_401_WINDOW_SEC of the last DISTINCT 401 (`last_distinct`; falls back
+    to `last_seen` for entries read before any new-code write touches them —
+    a legacy-format read, not a live gap: `_record_auth_401` backfills
+    `last_distinct` via `setdefault` on its very next write to that account).
+    A live episode disqualifies an account as a takeover TARGET or flip
+    DESTINATION: launching onto a mid-401 account is the zombie factory one
+    account over (2026-07-29: a 401'd in the morning, b in the afternoon — a
+    flip a→b at 15:24 would have launched the takeover onto 401ing b).
+    Keying on `last_distinct` rather than `last_seen` (Tier-2 round-2 B-1) is
+    load-bearing: the worker lane calls `_record_auth_401` unconditionally
+    every scan, so a dead unreaped 401'd worker re-presenting the SAME uuid
+    would otherwise refresh `last_seen` forever and permanently disqualify
+    its account as a flip destination — measured as a permanent rate-limit
+    flip stall. Read outside the flip lock on purpose (read-only heuristic;
+    _write_json_atomic keeps snapshots consistent). Crash/absent state reads
+    False — fall back to the pre-guard behavior rather than dead-ending
+    every flip on a broken state file. Consulted for the attempt-1
+    same-account bet too (Tier-2 round-2 residual 1): the suspect's own
+    episode is live by definition when `pool == account`, so that case
+    bypasses this check by construction; a prior flip leaving the pointer on
+    a DIFFERENT, currently-401ing account no longer launches onto it
+    blindly."""
+    try:
+        if state is None:
+            state = _load_account_state()
+        entry = (state.get("auth_401") or {}).get(account)
+        last_distinct = entry.get("last_distinct", entry.get("last_seen")) \
+            if isinstance(entry, dict) else None
+        return (isinstance(entry, dict)
+                and isinstance(last_distinct, (int, float))
+                and now - last_distinct <= AUTH_401_WINDOW_SEC)
+    except Exception:
+        return False
+
+
 def _flip_target(pointer: str, state: dict, now: int) -> str | None:
-    """First registry account != pointer, pool order, not currently bricked.
-    None => nowhere to flip: a single-account registry, or every other
-    account inside its own brick window."""
+    """First registry account != pointer, pool order, not currently bricked,
+    and not carrying a live auth-401 episode (_auth_401_active) — flipping
+    the pointer onto a mid-401 account would spawn every subsequent worker
+    dead, and a takeover launched there is born dead. Applies to BOTH the
+    rate-limit flip lane and the auth-401 escalate flip. None => nowhere to
+    flip."""
     for name in _registry()[0]:
-        if name != pointer and not _entry_bricked(
-                state.get("accounts", {}).get(name), now):
+        if (name != pointer
+                and not _entry_bricked(state.get("accounts", {}).get(name), now)
+                and not _auth_401_active(name, now, state)):
             return name
     return None
 
@@ -602,13 +718,17 @@ def _record_brick(account: str, reset_ts, source: str, now: int) -> None:
         print(f"stale_monitor: brick recording failed ({e})", file=sys.stderr)
 
 
-def _record_auth_401(account: str, uuid: str | None, now: int) -> str:
-    """Per-account auth-401 attempt counter (uuid-deduped). Returns the action:
-    "duplicate" (this exact 401 was already acted on — the resume hasn't fired/
-    cleared yet, so don't re-trigger or inflate the count), "recover" (a fresh
-    401 within the bound — trigger a SAME-account kill+resume), or "escalate"
-    (more than AUTH_401_MAX_ATTEMPTS failed same-account resumes inside
-    AUTH_401_WINDOW_SEC — the credential is suspect, flip + page).
+def _record_auth_401(account: str, uuid: str | None, now: int) -> tuple[str, int]:
+    """Per-account auth-401 attempt counter (uuid-deduped). Returns
+    (action, attempts). action: "duplicate" (this exact 401 was already acted
+    on — the resume hasn't fired/cleared yet, so don't re-trigger or inflate
+    the count), "recover" (a fresh 401 within the bound — trigger a
+    SAME-account kill+resume), or "escalate" (more than AUTH_401_MAX_ATTEMPTS
+    failed same-account resumes inside AUTH_401_WINDOW_SEC — the credential is
+    suspect, flip + page). attempts is the in-window distinct-401 count
+    backing the action — the manager lane uses it to bound the same-account
+    takeover bet to the episode's FIRST attempt
+    (AUTH_401_SAME_ACCOUNT_ATTEMPTS).
 
     Per-ACCOUNT (not per-session) aggregation is the right grain for "is this
     token dead": two sessions on one account 401'ing in lockstep is strong
@@ -616,9 +736,20 @@ def _record_auth_401(account: str, uuid: str | None, now: int) -> str:
     incident's one-each across two accounts is a shared server blip that
     same-account recovery clears. State lives in its own ACCOUNT_STATE namespace
     (`auth_401`) so it never perturbs the rate-limit brick guards (`accounts`).
-    Crash-proof: any failure reads as "recover" (act, don't escalate) — the safe
-    default, and it mirrors _record_brick's flat _flip_lock usage (no nesting:
-    the caller does _maybe_flip_account separately on escalate)."""
+    Crash-proof: any failure reads as ("recover", 1) — act, don't escalate,
+    and attempts=1 keeps the first-attempt bet (an unreadable state file must
+    not dead-end recovery); mirrors _record_brick's flat _flip_lock usage (no
+    nesting: the caller does _maybe_flip_account separately on escalate).
+
+    Two clocks, two meanings (Tier-2 round-2 B-1): `last_seen` bounds
+    attempt-count rollover and is refreshed by BOTH fresh attempts and
+    duplicates — a persistent unhandled 401 must keep the episode's attempt
+    count alive. `last_distinct` bounds destination-health suspicion
+    (consulted by `_auth_401_active`) and is advanced ONLY by fresh distinct
+    uuids — a dead session re-presenting the SAME banner forever must not
+    hold its account hostage as a flip/takeover destination. Measured
+    pre-fix: a permanent rate-limit-flip stall (a dead unreaped 401'd worker
+    re-reporting the same uuid kept its account "active" indefinitely)."""
     try:
         with _flip_lock():
             state = _load_account_state()
@@ -634,21 +765,53 @@ def _record_auth_401(account: str, uuid: str | None, now: int) -> str:
                     # refresh the episode clock so a persistent unhandled 401
                     # doesn't roll past the window and get re-counted as a fresh
                     # attempt, but DON'T increment: it's one unhandled attempt.
+                    # One-time legacy backfill: an entry written before this
+                    # code existed has no last_distinct — the pre-refresh
+                    # last_seen is the best estimate of its last distinct 401.
+                    entry.setdefault("last_distinct", entry.get("last_seen"))
                     entry["last_seen"] = now
                     namespace[account] = entry
                     _write_json_atomic(ACCOUNT_STATE, state)
-                    return "duplicate"
+                    return "duplicate", _safe_int(entry.get("attempts"))
                 attempts = _safe_int(entry.get("attempts")) + 1
                 uuids = (seen + [uuid])[-8:] if uuid is not None else seen
             else:
                 attempts = 1
                 uuids = [uuid] if uuid is not None else []
-            namespace[account] = {"attempts": attempts, "last_seen": now, "uuids": uuids}
+            namespace[account] = {"attempts": attempts, "last_seen": now,
+                                  "last_distinct": now, "uuids": uuids}
             _write_json_atomic(ACCOUNT_STATE, state)
-            return "recover" if attempts <= AUTH_401_MAX_ATTEMPTS else "escalate"
+            return ("recover" if attempts <= AUTH_401_MAX_ATTEMPTS else "escalate"), attempts
     except Exception as e:
         print(f"stale_monitor: auth-401 record failed ({e})", file=sys.stderr)
-        return "recover"
+        return "recover", 1
+
+
+def _healthy_takeover_target(suspect: str, pool: str,
+                             new_letter: str | None = None,
+                             pool_suspect: bool = False) -> str | None:
+    """Shared invariant of the manager auth-401 recover and escalate branches:
+    a suspect account is never SELECTED as the takeover target (the
+    pre-existing _account_config_prefix farm-health fallback can still land
+    the spawn on the default login — which may be the suspect account itself
+    — see its KNOWN FAILURE MODE docstring). The healthy
+    target is the just-flipped letter, or (if a flip
+    already landed earlier) the current pointer when it differs from the
+    suspect account. Neither ⇒ None: the caller must not launch (escalate /
+    page instead — never wait for a launch slot on the suspect account).
+    Extracted from the escalate branch so the recover branch shares it
+    verbatim: on 2026-07-29 the recover branch, lacking this guard, launched
+    two takeovers onto currently-401ing accounts — both born dead with a
+    manager identity conferred by the SessionStart hook (the zombie factory).
+    `pool_suspect` is the caller's `_auth_401_active(pool, now)` — a pointer
+    that is itself mid-401 is not healthy; the `new_letter` arm needs no such
+    flag because `_flip_target` already refuses 401-active destinations.
+    """
+    if new_letter is not None:
+        return new_letter
+    if pool != suspect and not pool_suspect:
+        return pool
+    return None
 
 
 def _maybe_flip_account(bricked_account: str, reason: str, now: int) -> str | None:
@@ -672,6 +835,11 @@ def _maybe_flip_account(bricked_account: str, reason: str, now: int) -> str | No
             if other is None:
                 if len(_registry()[0]) <= 1:
                     _ledger_flip_skip(state, pointer, now)
+                else:
+                    excluded = [n for n in _registry()[0]
+                                if n != pointer and _auth_401_active(n, now, state)]
+                    if excluded:
+                        _ledger_flip_refused_auth401(state, pointer, excluded, now)
                 return None
             tmp = ACCOUNT_ACTIVE.with_suffix(".tmp")
             tmp.write_text(other + "\n")
@@ -713,6 +881,35 @@ def _ledger_flip_skip(state: dict, pointer: str, now: int) -> None:
               f"registry — flip skipped", file=sys.stderr)
     except Exception as e:
         print(f"stale_monitor: flip-skip bookkeeping failed ({e})", file=sys.stderr)
+
+
+def _ledger_flip_refused_auth401(state: dict, pointer: str,
+                                 excluded: list, now: int) -> None:
+    """Once per FLIP_COOLDOWN_SEC per pointer, mirroring _ledger_flip_skip:
+    the flip lane re-attempts every scan for the whole episode and an
+    unthrottled line would flood the ledger tail that backs the launch
+    bounds. A 401-active refusal can hold for a while (B-1: bounded by
+    last_distinct aging) — it must be diagnosable from the ledger, not
+    reconstructed by a forensics worker (Tier-2 residual 3). Deliberate
+    mirror deviation from _ledger_flip_skip: no success-path stderr line —
+    a 401-active refusal is a routine, frequent occurrence during an
+    aging-out episode (unlike a single-account-registry skip), and the
+    ledger line is already the durable record; a matching stderr print
+    would just be per-scan noise."""
+    last = state.get("last_flip_refused_auth401") or {}
+    if (last.get("account") == pointer
+            and isinstance(last.get("ts"), (int, float))
+            and now - last["ts"] < FLIP_COOLDOWN_SEC):
+        return
+    try:
+        state["last_flip_refused_auth401"] = {"account": pointer, "ts": now}
+        _write_json_atomic(ACCOUNT_STATE, state)
+        _append_account_ledger({"ts": now, "event": "flip-refused-auth401",
+                                "from": pointer, "excluded": excluded,
+                                "by": "stale_monitor"})
+    except Exception as e:
+        print(f"stale_monitor: flip-refused-auth401 bookkeeping failed ({e})",
+              file=sys.stderr)
 
 
 def _ledger_recovery_launches(from_sid: str, now: int,
@@ -847,18 +1044,27 @@ def _launch_recovery_manager(mgr_record: dict, mgr_sid: str, new_letter: str) ->
     # sync): DOCKWRIGHT_MANAGER_SKIP_PERMS=1 removes the Bash safety
     # classifier for the recovered manager — sanctioned only for
     # manager.core.md's two named uses. Bare flag: parse-safe before --model.
+    # EXACT compare, deliberately no .strip(): bootstrap-recreate.sh is the
+    # reference lane and bash's `=` never normalizes.
     skip_arg = ("--dangerously-skip-permissions "
-                if os.environ.get("DOCKWRIGHT_MANAGER_SKIP_PERMS", "").strip() == "1"
+                if os.environ.get("DOCKWRIGHT_MANAGER_SKIP_PERMS", "") == "1"
                 else "")
     inner = (
         f"{_account_config_prefix(new_letter)}"
         f"CLAUDE_AGENT=manager CLAUDE_WORKER_NAME={shlex.quote(name)} "
+        # Identity is acquired by become_manager_with_takeover, never by the
+        # SessionStart hook: a tab whose first API call 401s must not mint a
+        # ghost manager record it can never use. Command-string only on the
+        # daemon side (never daemon os.environ); the successor's MCP server
+        # pops it at registration (become_manager_impl) so its own later
+        # spawns can't birth a tmux server with the var sticky in global env.
+        f"DOCKWRIGHT_PENDING_TAKEOVER=1 "
         # Manager lane is pinned (orch-audit model-allocation): never inherit
         # the user's interactive model default. Quoted so the -ic shell can't glob [1m].
         # rc_arg BEFORE --model: --remote-control [name] would otherwise bind the
         # trailing /manager-takeover-recovery prompt as the RC session name (see
         # manager_claude_args docstring). --model interposes a dash-option.
-        f"claude {rc_arg}{skip_arg}--model {shlex.quote('opus[1m]')} {settings_arg}"
+        f"claude {rc_arg}{skip_arg}--model {shlex.quote('claude-opus-5[1m]')} {settings_arg}"
         f"{shlex.quote(f'/manager-takeover-recovery {mgr_sid}')}"
     )
     # One-shot guarantee: `inner` already carries the flag; TmuxDriver.spawn
@@ -879,6 +1085,18 @@ def _launch_recovery_manager(mgr_record: dict, mgr_sid: str, new_letter: str) ->
         return None
 
 
+def _safe_bucket(name: str) -> str:
+    """Mirror of paths._event_bucket, including the "." / ".." guard.
+
+    Those two survive the separator swap and are TRAVERSAL, not names, so a
+    bucket named ".." lands outside the tree meant to contain it. Duplicated
+    because this file ships standalone; pinned by test_lane_liveness_mirror.py
+    so the two copies cannot disagree about what a legal bucket name is.
+    """
+    bucket = name.replace("/", "_").replace("\\", "_")
+    return f"_{bucket}" if bucket in (".", "..") else bucket
+
+
 def _emitted_state_path(manager_name: str | None) -> Path:
     """Per-manager dedup/edge-trigger state file.
 
@@ -890,8 +1108,7 @@ def _emitted_state_path(manager_name: str | None) -> Path:
     """
     if not manager_name:
         return ROOT / ".stale-emitted.json"
-    safe = manager_name.replace("/", "_").replace("\\", "_")
-    return ROOT / f".stale-emitted-{safe}.json"
+    return ROOT / f".stale-emitted-{_safe_bucket(manager_name)}.json"
 
 
 def _matches_manager(record: dict, manager_name: str | None) -> bool:
@@ -1101,6 +1318,188 @@ def _is_delegation_live(record: dict, log: Path | None = None) -> bool:
         return newest > log.stat().st_mtime and now - newest < IDLE_THRESHOLD_SEC
     except OSError:
         return False
+
+
+def _busy_shell_deadline() -> int:
+    """Idle seconds a worker with a live background shell is allowed.
+
+    max(3x TTL, TTL + (SKEW+1) cadences). The floor is not spare margin: bare
+    3x gives a window of 2*TTL, and a small TTL makes that window narrower than
+    the gap between two autoclose evaluations — consecutive passes step OVER it
+    and the guard is a silent no-op with every test green.
+
+    The gap the floor must outrun is AUTOCLOSE_SKEW_CADENCES * (CADENCE + 60),
+    today 2 * 3660 = 7320s. Each re-opening of the hourly gate lands on the
+    first 60s tick at or after `last + CADENCE`, and under one skew event there
+    are TWO such re-openings, so the scan step is charged twice, not once.
+    Today's single skew source is _record_action_ahead (see its docstring,
+    "Known shape, safe direction"). A floor of two cadences (7200s) does not
+    cover 7320s; (SKEW+1) = three does, at 10800s.
+
+    On the default 2h TTL the floor is a no-op: max(21600, 18000) = 21600,
+    i.e. the plain 3x.
+
+    ⚠️ The floor only governs the distance between evaluations a record
+    actually REACHES. Two `continue`s upstream of the cap — the blocked-sids
+    skip and `_is_delegation_live` — remove a record from evaluation entirely
+    and are bounded by no number of cadences, so no floor value can cover them.
+    A worker holding BOTH a live subagent and a background shell can therefore
+    still be reaped: the delegation hold keeps it out of the sweep for the
+    subagent's whole run, and it can surface past the cap. Not a regression
+    (pre-guard it died at the bare TTL), but "the floor makes the window
+    reachable" means reachable ONCE THE RECORD REACHES THE CHECK.
+
+    TTL <= 0 is an operator saying "close immediately" (the env var is parsed
+    with a bare float(), so 0 and negatives arrive here). The floor would
+    overrule that with a multi-hour hold, so the deadline collapses to the
+    threshold and the window is empty by design.
+    """
+    if IDLE_THRESHOLD_SEC <= 0:
+        return IDLE_THRESHOLD_SEC
+    return max(IDLE_THRESHOLD_SEC * BUSY_SHELL_IDLE_MULTIPLIER,
+               IDLE_THRESHOLD_SEC
+               + AUTOCLOSE_CADENCE_SEC * (AUTOCLOSE_SKEW_CADENCES + 1))
+
+
+def _process_index() -> dict | None:
+    """One `ps` per scan -> {"command_by_pid": {...}, "child_commands": {...}}.
+
+    `pgrep -P <pid>` is the obvious form and was measured to LIE: it hides the
+    caller's own ancestors, so a live shell present in `ps` was absent from
+    `pgrep`. One `ps` per scan also beats one `pgrep` per worker, and argv[0]
+    (the pid-recycling check) comes free in the same snapshot.
+
+    errors="replace" is load-bearing: text=True decodes strictly, and a single
+    live process with non-UTF-8 bytes in argv raises UnicodeDecodeError — a
+    ValueError, not an OSError. Likewise `except Exception`, not a list of
+    types: the same call is stubbed in tests with objects that have no
+    .stdout (AttributeError). Either escape would propagate out of main() and
+    kill EVERY scan while that process lives — no stale pages, no nudges, no
+    autoclose. Same contract _last_activity states: one poison path must never
+    abort monitoring for the rest.
+
+    timeout: a hung `ps` would block the whole scan, not just this branch.
+    """
+    try:
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,command="],
+            capture_output=True, text=True, errors="replace", timeout=10,
+        )
+        if proc.returncode != 0:
+            return None
+        command_by_pid: dict[int, str] = {}
+        child_commands: dict[int, list[str]] = {}
+        for line in proc.stdout.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) != 3:
+                continue
+            pid_s, ppid_s, command = parts
+            if not (pid_s.isdigit() and ppid_s.isdigit()):
+                continue
+            command_by_pid[int(pid_s)] = command
+            child_commands.setdefault(int(ppid_s), []).append(command)
+        if not command_by_pid:
+            # rc=0 with nothing parseable must degrade, not read as "no
+            # children anywhere" — real ps always lists at least itself.
+            return None
+        return {"command_by_pid": command_by_pid, "child_commands": child_commands}
+    except Exception:
+        return None
+
+
+def _looks_like_session(command: str) -> bool:
+    """argv[0]'s basename only. A claude/codex-shaped token elsewhere in the
+    command line (a path arg ending in /claude, a container --name claude)
+    must not read as a session — it would hide a genuine orphan, and the
+    preflight mirror would trust a recycled pid. Every real session's argv[0]
+    is literally `claude`/`codex` or an absolute path to it (the `zsh -ic
+    claude ...` spawn wrapper never matters: the claude child it forks is
+    always the process actually checked or walked through)."""
+    tokens = command.split()
+    return bool(tokens) and os.path.basename(tokens[0]) in ("claude", "codex")
+
+
+def _has_live_background_shell(record: dict, index: dict | None) -> bool:
+    """True when this idle worker's pid still has a live Bash-tool child.
+
+    All four must hold:
+    1. runtime is claude — the marker is a Claude CLI detail, as in
+       _is_delegation_live. A future runtime is excluded here and its
+       background work is killed silently; that is today's behavior, pinned
+       by a test so adding a runtime cannot pass green.
+    2. the recorded pid is a positive int. _write_record defaults it to 0 and
+       0 is a valid int, so the threshold states the intent instead of leaning
+       on pid 0 being absent from the process table.
+    3. that pid's own argv[0] basename is `claude` — a dead record must not
+       inherit a recycled pid's children. `codex` is deliberately NOT accepted
+       here: condition 1 already excluded non-claude records, so codex could
+       only be reached by a claude record whose pid a codex process recycled,
+       which is exactly what this condition exists to catch.
+    4. some DIRECT child is not itself a session and either carries the
+       snapshot marker OR has the `sh -c` shape.
+
+    The nested-session exclusion in (4) is a measured class, not a hypothesis:
+    of 28 marker-carrying rows on a live fleet, one had argv[0] = claude with
+    the marker at offset 1865 — a session's argv carries arbitrary prompt text.
+
+    The OR in (4) is deliberate. The marker is someone else's path: rename the
+    directory in a CLI release and a marker-only predicate returns False
+    forever, the fleet goes back to killing live work, and every test stays
+    green because the fixtures feed the marker by hand. No honest unit test
+    exists for that, so the second branch keys on the SHAPE instead of the
+    vendor path. It only ADDS cases, which is the direction that fails safely:
+    a spurious hit costs a few hours of delay under the cap, a miss costs
+    killed work.
+
+    ⚠️ Do not read that as "derived", though — ("zsh", "bash", "sh") is a
+    hand-maintained list of three names, unguarded by construction, and
+    nothing pins it (appending "fish" leaves the whole suite green). It is
+    deliberately NOT `==`-pinned: adding a shell only widens the safe
+    direction. The residual worth knowing is that the two branches share a
+    failure only under a compound change — a renamed marker directory AND a
+    login shell outside these three defeat both at once.
+
+    index is None (broken ps) -> False HERE, but the closer reads a falsy index
+    as busy and holds the worker until the cap. So a broken `ps` delays
+    autoclose from the TTL to _busy_shell_deadline(); it can never make the
+    fleet uncloseable, because the cap closes regardless.
+    """
+    if (record.get("runtime") or "claude") != "claude":
+        return False
+    if not index:
+        # "cannot tell" from HERE is not "close" — the closer treats any falsy
+        # index as busy and holds the worker to the cap. Kept as a short-circuit
+        # so `index.get(...)` never runs on 0/False/{}; the close/hold decision
+        # is _autoclose_idle_worker's, not this predicate's.
+        return False
+    pid = record.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    own = index.get("command_by_pid", {}).get(pid)
+    if not own:
+        return False
+    own_tokens = own.split()
+    if not own_tokens or os.path.basename(own_tokens[0]) != "claude":
+        return False
+    for command in index.get("child_commands", {}).get(pid, ()):
+        if _looks_like_session(command):
+            continue
+        if BUSY_SHELL_MARKER in command:
+            return True
+        # `" -c " in command` is a SUBSTRING test, looser than "the sh -c
+        # shape" sounds: it fires wherever that text appears, including inside
+        # a payload, and it misses combined flags like `zsh -ic`. Both errors
+        # ADD cases or fall back on the marker branch, so both are the safe
+        # direction — this branch only ever runs when the marker is ABSENT.
+        # Both error modes are live, not hypothetical: one fleet sample of 24
+        # marker rows held 22 `zsh -c`, one `zsh -ic`, and one `claude
+        # --settings` (excluded as a nested session). Treat any such count as a
+        # moment, not a property — the mix changes with what the fleet is doing.
+        tokens = command.split()
+        if (tokens and os.path.basename(tokens[0]) in ("zsh", "bash", "sh")
+                and " -c " in command):
+            return True
+    return False
 
 
 def _last_activity(record: dict, record_mtime: int,
@@ -1446,14 +1845,312 @@ def _build_rollup_line(buffer: dict, manager_name: str, now: int) -> str:
 
 
 def _limited_flag_path(manager_name: str) -> Path:
-    safe = manager_name.replace("/", "_").replace("\\", "_")
-    return ROOT / f".manager-limited-{safe}"
+    return ROOT / f".manager-limited-{_safe_bucket(manager_name)}"
 
 
 def _outbox_dir(manager_name: str) -> Path:
-    # Sanitization mirrors paths._event_bucket / _limited_flag_path.
-    safe = manager_name.replace("/", "_").replace("\\", "_")
-    return ROOT / "notify-outbox" / safe
+    # Sanitization mirrors paths._event_bucket via the shared _safe_bucket.
+    return ROOT / "notify-outbox" / _safe_bucket(manager_name)
+
+
+# --- lane delivery discipline (stdlib copy of dockwright.lane_io) ----------
+# This file is deployed standalone to ~/.claude/scripts/ and CANNOT import the
+# package, so the emit guard is duplicated here — the same trade already made
+# for _write_json_atomic. Keep the two in step; lane_io owns the rationale.
+#
+# This process inherits fd 1 from `dockwright monitor stale`, so its lines go
+# straight to the manager's Monitor task. Without the per-line flush a dead
+# reader would let it write its emitted-state cursor and unlink outbox entries
+# for pages that never arrived — the exact loss the package-side fix removes.
+EXIT_LANE_DEAD = 3
+_READER_GONE = select.POLLERR | select.POLLHUP | select.POLLNVAL
+
+
+class LaneDead(Exception):
+    """The reader of this lane's stdout is gone."""
+
+
+def _reader_is_dead(fd: int = 1) -> bool:
+    """True only on a HUNG-UP far end. Fails OPEN — a backpressured reader
+    (POLLOUT clear, no error bits) is BUSY, not gone."""
+    try:
+        poller = select.poll()
+        poller.register(fd, select.POLLOUT)
+        for _fd, revents in poller.poll(0):
+            return bool(revents & _READER_GONE)
+        return False
+    except Exception:
+        return False
+
+
+def _lane_preflight(fd: int = 1) -> None:
+    if _reader_is_dead(fd):
+        raise LaneDead("stdout reader is gone (poll reports HUP/ERR/NVAL)")
+
+
+def _emit(line: str) -> None:
+    """Write one event line and flush, so failure surfaces here rather than
+    being swallowed at interpreter exit."""
+    try:
+        sys.stdout.write(f"{line}\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError) as exc:
+        raise LaneDead(f"stdout write failed: {exc}") from exc
+
+
+def _detach_stdout() -> None:
+    """Re-point fd 1 at /dev/null so interpreter shutdown cannot override the
+    exit status with 120. See lane_io.detach_stdout — load-bearing."""
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, 1)
+        finally:
+            os.close(devnull)
+    except OSError:
+        pass
+# --- emitted-state key classes --------------------------------------------
+# `next_emitted` is TWO ledgers wearing one dict, and a failed delivery must
+# treat them oppositely:
+#
+#   ACTION keys record something already DONE TO THE WORLD — a nudge typed into
+#   a pane, a recovery session launched, the autoclose gate advanced. Dropping
+#   one does not un-do the act; it makes the NEXT scan do it again. Measured by
+#   a reviewer: worker nudged, reader dies, lane re-armed, `resume your task`
+#   typed into the pane TWICE.
+#
+#   PAGE keys record that a LINE was shown. Dropping one is correct when the
+#   line never arrived — that is the at-least-once discipline working.
+#
+# So when delivery fails the action keys are committed and the page keys are
+# discarded. The prefix lists are hand-maintained, which drift-guard-tests
+# calls unguarded by construction, so tests/test_emitted_key_classes.py parses
+# every key literal in this file and fails on one matching neither class.
+ACTION_KEY_PREFIXES = (
+    "nudge_sent:", "nudged:", "scheduled:", "recovery:", "auth-recovery:",
+)
+ACTION_KEY_EXACT = ("last_autoclose_run", "codex_log_cache", "limited_buffer",
+                    "lane_check_tick")
+# Colon-less page keys would live here. Empty today; present so a new one has
+# an obvious home rather than being wedged into the prefix tuple.
+PAGE_KEY_EXACT = ()
+PAGE_KEY_PREFIXES = (
+    "processing:", "question:", "orphan:", "approval:", "auth-emit:",
+    "lane_silent:", "lane_stale_seen:",
+)
+
+
+def _is_action_key(key: str) -> bool:
+    return (key in ACTION_KEY_EXACT
+            or any(key.startswith(p) for p in ACTION_KEY_PREFIXES))
+
+
+def _record_action_ahead(emitted_state_path: Path, emitted: dict,
+                         next_emitted: dict, key: str, value) -> None:
+    """Persist an action key BEFORE the act it guards.
+
+    Recording after the act is only safe against exceptions. A hard kill —
+    SIGKILL, OOM, the machine going down — between typing a nudge into a pane
+    and reaching the end-of-scan ledger write runs no handler at all, so the
+    retried scan sees no record and types it again. Write-ahead inverts which
+    way the crash fails: at worst a recorded nudge that never happened, which
+    the ladder re-fires on its own schedule, instead of an unrecorded nudge
+    that did, which lands in a worker's pane a second time.
+
+    ⚠️ THIS PUTS THE RECORD AHEAD OF THE ACT. Whether the recorded VALUE is
+    one the next scan reads as "already done" is a separate property, and it
+    held at only ONE of the four call sites when measured 2026-08-06 (re-derive,
+    do not inherit) — elsewhere the suppressor
+    is a flag nothing reads, an omission the ledger merge resurrects, or a page
+    key this helper deliberately drops. Not a regression at any of them (the
+    pre-write-ahead order re-nudged identically), but do not read placement as
+    effectiveness. A behavioural per-site check is owed; see the cursor
+    follow-up scope.
+
+    Best-effort on the write: an unpersistable ledger must not stop the nudge
+    the fleet is waiting on. The in-memory record still holds for this scan.
+
+    ⚠️ Known shape, safe direction: this persists the WHOLE action half, so a
+    nudge firing early in a scan also commits `last_autoclose_run`, which is
+    set before the autoclose sweep runs. A hard kill in between therefore skips
+    autoclose for one cadence (1 h) — a 2 h-idle worker closes at 3 h instead.
+    That is a missed close, never a duplicated one, and the same skew already
+    existed on the LaneDead path; it is recorded so it reads as known rather
+    than as a surprise.
+    """
+    next_emitted[key] = value
+    _commit_actions_only(emitted_state_path, emitted, next_emitted)
+
+
+def _commit_actions_only(emitted_state_path: Path, emitted: dict,
+                         next_emitted: dict) -> None:
+    """Persist the acts, drop the pages. Called when delivery failed."""
+    try:
+        keep = {k: v for k, v in next_emitted.items() if _is_action_key(k)}
+        _write_json_atomic(emitted_state_path, {**emitted, **keep})
+    except Exception as e:
+        print(f"stale_monitor: action-ledger commit failed ({e})",
+              file=sys.stderr)
+
+
+# --- lane liveness cross-check --------------------------------------------
+# A dead lane already ends its own Monitor task, which notifies the manager
+# ONCE. The incident this whole change came from is that nobody noticed for
+# hours — so one notification that can be missed is not enough, and an
+# instruction to run `dockwright lanes` is exactly as strong as a manager
+# remembering to run it.
+#
+# This scan is the unconditional hook: it already runs every 60s and already
+# pages the manager, so it reports on its PEERS' heartbeats. Each lane is
+# therefore watched by a process other than itself. The stale lane's own death
+# is still covered the other way — it exits non-zero and its task exits.
+#
+# Deliberately silent on a lane with NO heartbeat at all: at boot the lanes are
+# armed seconds after this scan could first run, and a manager that never arms
+# lanes (codex) would be paged forever. "Never armed" is a question for
+# `dockwright lanes`; this reports only the incident shape — a lane that WAS
+# working and stopped.
+#
+# Mirrors dockwright.lane_io.LANES and HEARTBEAT_STALE_INTERVALS, which are
+# canonical; this file cannot import the package. test_lane_liveness_mirror.py
+# pins the two together so the copy cannot drift.
+LANE_INTERVALS = {"questions": 2, "done": 2, "turn-ends": 5, "stale": 60}
+LANE_HEARTBEAT_STALE_INTERVALS = 3
+# First page is immediate; repeats double from here so a lane the manager has
+# not re-armed keeps nagging without becoming the noise it is warning about.
+LANE_SILENT_LADDER_BASE_SEC = 600
+LANE_SILENT_LADDER_CAP_SEC = 4 * 3600
+
+
+def _lane_heartbeat_path(manager_name: str, lane: str) -> Path:
+    return ROOT / "lane-health" / _safe_bucket(manager_name) / f"{_safe_bucket(lane)}.json"
+
+
+def _write_lane_heartbeat(manager_name: str, lane: str, now: float) -> None:
+    """Mirror of lane_io.write_heartbeat for the standalone copy.
+
+    Best-effort: a heartbeat that cannot be written must not take down a lane
+    that is otherwise delivering fine. Carries `last_emit` forward across quiet
+    scans — a lane with nothing to say has not stopped working.
+    """
+    try:
+        path = _lane_heartbeat_path(manager_name, lane)
+        prior = _load(path)
+        prior = prior if isinstance(prior, dict) else {}
+        last_emit = prior.get("last_emit")
+        _write_json_atomic(path, {
+            "lane": lane,
+            "manager": manager_name,
+            "pid": os.getpid(),
+            "last_scan": now,
+            "last_emit": last_emit if isinstance(last_emit, (int, float)) else None,
+            "interval_hint": LANE_INTERVALS.get(lane, 0),
+            "consecutive_errors": 0,
+        })
+    except Exception as e:
+        print(f"stale_monitor: heartbeat write failed for {lane} ({e})",
+              file=sys.stderr)
+
+
+def _lane_silence_events(manager_name: str, emitted: dict, next_emitted: dict,
+                         now: float) -> list[tuple[str, str]]:
+    """(dedup_key, line) for every lane whose heartbeat has gone stale.
+
+    Crash-proof: any failure yields no events. This is a safety net over a
+    signal that already fired once; it must never be the thing that breaks the
+    scan that carries the real alarms.
+    """
+    out = []
+    try:
+        # A host suspend freezes every lane at once and then hands this scan a
+        # wall clock that jumped. Every heartbeat reads stale, so the check
+        # pages about all four healthy lanes and tells the manager to kill
+        # four healthy loops — a false alarm that is worse than no check,
+        # because it is the one that teaches the reader to ignore the real
+        # one. This scan's OWN cadence is the evidence: if more time passed
+        # since the previous scan than any lane's window allows, the machine
+        # was asleep, not the lanes. Re-baseline and stay quiet for one cycle.
+        prior_tick = emitted.get("lane_check_tick")
+        next_emitted["lane_check_tick"] = now
+        if isinstance(prior_tick, (int, float)):
+            gap = now - prior_tick
+            # Baseline is the OBSERVER's own cadence — this scan runs on the
+            # stale lane's interval, so a gap far past it means this process
+            # was frozen and every heartbeat it is about to read is stale for a
+            # reason that is not the lanes' fault. (min() across lanes is NOT
+            # the baseline: 6s is smaller than the observer's own 60s period,
+            # so it would call every normal scan a suspend.)
+            #
+            # ⚠️ Naming `stale` rather than max() is a behavioural NO-OP today
+            # — `stale` IS the max — and must not be recorded as the fix for
+            # the false-page band. It is kept because the two diverge the
+            # moment anyone adds a lane slower than 60s, and this spelling is
+            # the one that matches the stated intent. The band itself (a 100s
+            # freeze clears 180s but is far past the 6s window of the 2s lanes)
+            # is closed entirely by the two-observation rule below.
+            if gap > LANE_INTERVALS["stale"] * LANE_HEARTBEAT_STALE_INTERVALS:
+                for lane in LANE_INTERVALS:
+                    carried = emitted.get(f"lane_silent:{lane}")
+                    if carried is not None:
+                        next_emitted[f"lane_silent:{lane}"] = carried
+                return []
+
+        for lane, interval in LANE_INTERVALS.items():
+            # Never report the lane doing the reporting. Its heartbeat is
+            # written at the END of this scan, so it is always one cadence old
+            # here — and a page whose own delivery disproves it is noise.
+            if lane == "stale":
+                continue
+            record = _load(_lane_heartbeat_path(manager_name, lane))
+            last_scan = record.get("last_scan") if isinstance(record, dict) else None
+            if not isinstance(last_scan, (int, float)) or last_scan <= 0:
+                continue                       # never armed — not our alarm
+            silent = now - last_scan
+            if silent <= interval * LANE_HEARTBEAT_STALE_INTERVALS:
+                # Recovery resets both the rung and the confirmation marker by
+                # OMISSION: next_emitted is built
+                # fresh each scan and replaces emitted wholesale, so simply not
+                # carrying the key forward is the reset. An explicit pop() here
+                # looked like the reset and was dead code — a mutation sweep
+                # caught it by removing it and nothing went red.
+                continue
+            # TWO consecutive stale observations before the first page. One
+            # freeze of ANY length makes a single round read stale; a lane that
+            # is genuinely dead still reads stale on the next round, observed
+            # at a normal cadence. Costs one cycle of latency on a real death
+            # and removes every freeze-induced false page, including the band
+            # the gap check above cannot see.
+            confirm_key = f"lane_stale_seen:{lane}"
+            key = f"lane_silent:{lane}"
+            prior = emitted.get(key)
+            if not isinstance(prior, dict) and not emitted.get(confirm_key):
+                next_emitted[confirm_key] = now
+                continue
+            next_emitted[confirm_key] = emitted.get(confirm_key) or now
+            prior = prior if isinstance(prior, dict) else {}
+            last_paged = prior.get("at")
+            level = prior.get("level")
+            level = level if isinstance(level, int) and level > 0 else 0
+            if isinstance(last_paged, (int, float)):
+                rung = min(LANE_SILENT_LADDER_BASE_SEC * (2 ** min(level - 1, 16)),
+                           LANE_SILENT_LADDER_CAP_SEC) if level else 0
+                if now - last_paged < rung:
+                    next_emitted[key] = prior      # hold, keep the rung
+                    continue
+            next_emitted[key] = {"at": now, "level": level + 1}
+            out.append((key,
+                        f"LANE_SILENT {lane} — no scan for {int(silent // 60)}min "
+                        f"(expected every {interval}s). Events are NOT reaching you "
+                        f"on that lane. Re-arm it and kill the old loop process."))
+    except Exception as e:
+        print(f"stale_monitor: lane liveness check failed ({e})", file=sys.stderr)
+    return out
+# --- end lane liveness cross-check ----------------------------------------
+# --- end lane delivery discipline -----------------------------------------
 
 
 def _outbox_write(manager_name: str, kind: str, line: str, now: float, seq: int) -> None:
@@ -1464,15 +2161,26 @@ def _outbox_write(manager_name: str, kind: str, line: str, now: float, seq: int)
         target = _outbox_dir(manager_name) / f"{int(now * 1000)}-{os.getpid()}-{seq}.json"
         _write_json_atomic(target, {"line": line, "kind": kind, "buffered_at": now})
     except Exception as e:
-        print(line)
+        # FLUSHED, not printed: this fallback exists because losing the line is
+        # a true event loss (an AUTOCLOSED whose window and active record are
+        # already gone has no cursor and no replay). A bare print here would
+        # sit in the buffer while main() went on to commit the ladder and stamp
+        # a heartbeat — the exact shape this change removes everywhere else.
+        # LaneDead propagates: main never reaches its emitted-state write, so
+        # the rung stays un-burnt and the line re-fires on a live lane.
+        _emit(line)
         print(f"stale_monitor: outbox write failed ({e}); printed instead",
               file=sys.stderr)
 
 
 def _drain_outbox(manager_name: str) -> None:
-    """Print-then-unlink; same at-least-once discipline and per-entry failure
+    """Emit-then-unlink; same at-least-once discipline and per-entry failure
     policy as monitor._drain_notify_outbox (FileNotFoundError = a concurrent
-    drainer won the race; undecodable = unlink so it can't block the rest)."""
+    drainer won the race; undecodable = unlink so it can't block the rest).
+
+    The emit flushes before the unlink, so a dead reader leaves the entry on
+    disk instead of destroying it — LaneDead is re-raised past the blanket
+    except rather than swallowed."""
     try:
         outbox = _outbox_dir(manager_name)
         if not outbox.is_dir():
@@ -1489,8 +2197,10 @@ def _drain_outbox(manager_name: str) -> None:
                 continue
             line = payload.get("line") if isinstance(payload, dict) else None
             if isinstance(line, str) and line:
-                print(line)
+                _emit(line)
             p.unlink(missing_ok=True)
+    except LaneDead:
+        raise
     except Exception as e:
         print(f"stale_monitor: outbox drain failed ({e})", file=sys.stderr)
 
@@ -1539,10 +2249,72 @@ def _compute_idle_elapsed_sec(record: dict, current_uptime: float, now: int) -> 
     return now - int(last_turn)
 
 
-def _autoclose_idle_worker(record_path: Path, record: dict, elapsed_sec: int) -> str:
+def _autoclose_idle_worker(record_path: Path, record: dict,
+                           elapsed_sec: int) -> str | None:
+    """Archive an idle worker's record and close its window. None = REFUSED.
+
+    ⛔ THE BUSY-SHELL GUARD LIVES HERE, not at the call site, and that placement
+    is the whole point. The property is "no lane may close a worker that still
+    has live background work", and it holds at the closer — so a lane added
+    later inherits it BY CONSTRUCTION instead of having to remember it.
+
+    It sat at the call site for four review rounds. The AST test that tried to
+    keep it honest there was a classifier over syntax and was defeated three
+    times by ordinary refactors — an alias binding, then a one-line wrapper,
+    then `globals()[...]` with a concatenated name — each shipping a second
+    unguarded lane with the whole suite green. Worse, it went RED on a wrapper
+    that ENFORCED the check and GREEN on one that did not: it punished the
+    correct shape and rewarded the hole. Deleted, not patched a fourth time.
+
+    ⛔ THE CLOSER RESOLVES THE INDEX ITSELF. There is deliberately no parameter
+    for passing one in, and that absence is the guard. Six review rounds were
+    spent defending against a malformed caller index — `0`, a truthy
+    non-mapping, `{}`, then three ordinary mistakes (forgot `child_commands`,
+    forgot `command_by_pid`, keyed by ppid), each of which closed a worker
+    holding a live test suite. Every fix bounded the VALUE and was beaten by
+    the next shape, because the ambiguity is not in the value: five of
+    `_has_live_background_shell`'s six False exits mean "cannot tell" and read
+    identically to "not busy" from outside.
+
+    Deleting the parameter deletes that entire class. A new lane cannot pass a
+    wrong index because it cannot pass one at all, and there is no trust
+    question left between the producer and the consumer.
+
+    The parameter bought ONE thing: a single `ps` per scan instead of one per
+    candidate. That optimisation is what cost seven review rounds, so it is
+    gone. A `ps` is ~45ms, the autoclose gate is hourly, and the candidate set
+    is a handful of idle workers.
+    """
+    if elapsed_sec <= _busy_shell_deadline():
+        # Cap first: past the deadline a worker closes regardless, and pays for
+        # no snapshot. A live shell EXTENDS the deadline; it never vetoes.
+        #
+        # A broken `ps` HOLDS rather than closes, bounded by that same cap: the
+        # worst case is autoclose delayed from the TTL to the deadline, never a
+        # worker that cannot be closed. The reverse default is what let every
+        # unenumerated shape above reach a close.
+        try:
+            index = _process_index()
+            busy = not index or _has_live_background_shell(record, index)
+        except Exception:
+            busy = True
+        if busy:
+            return None
     sid = record.get("claude_sid")
     name = record.get("name") or ""
     window_id = record.get("window_id") or record.get("iterm_sid") or ""
+    transcript_path = record.get("transcript_path")
+    if not transcript_path:
+        # Fallback resolve: a worker autoclosed before its first Stop never had
+        # the path cached, and autoclose unlinks active/ before the window
+        # close, so session_end's own fallback is skipped for this lane.
+        # Best-effort like the hooks.py sibling — an OSError mid-scan must not
+        # abort the autoclose and strand the record in active/.
+        try:
+            resolved = _resolve_transcript_path(record)
+        except Exception:
+            resolved = None
+        transcript_path = str(resolved) if resolved else None
     closed_record = {
         "claude_sid": sid,
         "name": name,
@@ -1557,6 +2329,7 @@ def _autoclose_idle_worker(record_path: Path, record: dict, elapsed_sec: int) ->
         "parent_manager_name": record.get("parent_manager_name"),
         "runtime": record.get("runtime") or "claude",
         "account": record.get("account"),
+        "transcript_path": transcript_path,
     }
     if sid:
         _write_json_atomic(CLOSED / f"{sid}.json", closed_record)
@@ -1796,6 +2569,10 @@ def _scan_approval_prompts(manager_name, now, emitted, next_emitted, emit) -> No
 
 
 def main(manager_name: str | None = None) -> int:
+    # Before ANY side effect (nudges, autoclose, account flips) and before the
+    # emitted-state cursor is written: if the manager can no longer hear this
+    # lane there is nothing to page and the scan must not burn its rungs.
+    _lane_preflight()
     now = int(time.time())
     emitted_state_path = _emitted_state_path(manager_name)
     emitted = _load_emitted_state(emitted_state_path)
@@ -1986,6 +2763,10 @@ def main(manager_name: str | None = None) -> int:
                     elif sched is not None and now >= sched["at"]:
                         mgr_window = mgr_record.get("window_id") or ""
                         if mgr_activity <= sched["baseline"] and mgr_window:
+                            _record_action_ahead(
+                                emitted_state_path, emitted, next_emitted,
+                                mgr_sched_key, {"at": now, "baseline": mgr_activity,
+                                                "fired": True})
                             _send_text(mgr_window, MANAGER_NUDGE_TEXT)
                             # Distinct kind: the manager's own recovery nudges
                             # must not inflate the rollup's worker counters.
@@ -2004,13 +2785,22 @@ def main(manager_name: str | None = None) -> int:
                 elif auth_fail is not None and pool is not None:
                     # auth-401 sibling to the limit branch (the limit branch is
                     # byte-for-byte unchanged). A 401'd manager is deaf, so the
-                    # monitor launches a SAME-account takeover (a fresh process
-                    # re-reads the keychain login) — NO flip: the other account
-                    # is equally exposed to a server blip. On
-                    # escalate we STOP launching dead takeover tabs (a revoked
-                    # token can't be respawned out of) and flip + page instead;
-                    # since each takeover is a fresh sid with its own guard key,
-                    # this bounds the takeover count to ~AUTH_401_MAX_ATTEMPTS.
+                    # monitor launches a takeover (a fresh process re-reads the
+                    # keychain login). The SAME-account bet is taken only on
+                    # the episode's first distinct 401 (see
+                    # AUTH_401_SAME_ACCOUNT_ATTEMPTS); afterwards both branches
+                    # below share one invariant via _healthy_takeover_target —
+                    # a suspect account is never SELECTED as the takeover
+                    # target (the pre-existing _account_config_prefix
+                    # farm-health fallback can still land the spawn on the
+                    # default login — see its KNOWN FAILURE MODE docstring) —
+                    # and a recover with no healthy target is PROMOTED to escalate
+                    # rather than left waiting for attempt 3, which may never
+                    # come (a deaf manager re-presents the SAME uuid every
+                    # scan; the duplicate path freezes the window). On escalate
+                    # we STOP launching dead takeover tabs and flip + page;
+                    # each takeover is a fresh sid with its own guard key, so
+                    # the takeover count stays bounded.
                     manager_limited = True
                     account = _account_of(mgr_record, pool)
                     auth_uuid, _auth_text = auth_fail
@@ -2020,21 +2810,70 @@ def main(manager_name: str | None = None) -> int:
                         # stays bricked; it drops naturally once the record is
                         # taken over or the 401 clears (guard teardown).
                         next_emitted[auth_key] = emitted[auth_key]
-                    decision = _record_auth_401(account, auth_uuid, now)
+                    decision, attempts = _record_auth_401(account, auth_uuid, now)
+                    # Computed AFTER _record_auth_401, not before: at attempt
+                    # 1 with pool == account, this now reads the manager's
+                    # OWN just-recorded episode as active, making the
+                    # `pool == account` disjunct below load-bearing (dead
+                    # code otherwise — computed pre-record, pool_suspect for
+                    # the suspect's own account could never be True at
+                    # attempt 1). For pool != account, recording `account`'s
+                    # 401 never touches pool's own state entry, so this
+                    # yields the identical value pre-record would have —
+                    # the healthy-pointer/escalate cells are unaffected.
+                    pool_suspect = _auth_401_active(pool, now)
+                    healthy_target = _healthy_takeover_target(
+                        account, pool, pool_suspect=pool_suspect)
+                    if (attempts <= AUTH_401_SAME_ACCOUNT_ATTEMPTS
+                            and (pool == account or not pool_suspect)):
+                        # The transient-blip bet: first distinct 401, onto the
+                        # pointer — which may BE the suspect (pool == account;
+                        # pool_suspect now reads True by construction the
+                        # moment _record_auth_401 above stamps this account's
+                        # own episode — the `pool == account` disjunct is
+                        # what keeps the bet alive against that). A FOREIGN
+                        # pointer that is itself mid-401 is not a bet, it is
+                        # the zombie factory one account over (Tier-2
+                        # residual 1, measured reachable) — falls through.
+                        recover_target = pool
+                    else:
+                        recover_target = healthy_target
+                    if decision == "recover" and recover_target is None:
+                        # A recover decision with no launchable target IS the
+                        # credential-suspect determination — escalate now
+                        # (flip attempt + page + notification), never wait
+                        # for an attempt 3 a deaf manager may not produce.
+                        decision = "escalate"
                     if decision == "recover":
                         _append_account_ledger({
                             "ts": now, "event": "auth-401", "account": account,
                             "action": "recover", "source": f"manager:{manager_name}",
                             "from_sid": mgr_sid, "by": "stale_monitor"})
+                        target = recover_target
+                        launched = False
                         if (auth_key not in emitted
                                 and _keychain_unlocked()
                                 and _ledger_recovery_launches(mgr_sid, now) == 0):
-                            wid = _launch_recovery_manager(mgr_record, mgr_sid, pool)
+                            wid = _launch_recovery_manager(mgr_record, mgr_sid, target)
                             _append_account_ledger({
                                 "ts": now, "event": "recovery-launch",
                                 "manager": manager_name, "from_sid": mgr_sid,
                                 "window_id": wid, "by": "stale_monitor"})
                             next_emitted[auth_key] = now
+                            launched = True
+                        if (not launched and auth_key not in emitted
+                                and _ledger_recovery_launches(mgr_sid, now) == 0):
+                            # Outcome-derived, not cause-derived (Tier-2 B-2 +
+                            # drift-guard ADD-ONE): a wanted launch that did
+                            # not happen, with no successor in flight, must
+                            # reach the human — silence here is the 6h16m
+                            # mode. The launch itself resumes only on the
+                            # next fresh 401 or human action.
+                            _notify_macos(
+                                f"AUTH_401 {account}: recovery launch blocked "
+                                f"(keychain locked) — run "
+                                f"{_login_fix_command(account)}, then /login "
+                                f"(manager {manager_name})")
                     elif decision == "escalate":
                         _append_account_ledger({
                             "ts": now, "event": "auth-401", "account": account,
@@ -2048,28 +2887,26 @@ def main(manager_name: str | None = None) -> int:
                                  f"(manager {manager_name} auth-401 credential suspect)")
                         emit("auth-escalate", manager_name,
                              f"AUTH_401_ESCALATED {account} (manager {manager_name}) — "
-                             f"login suspect after repeated 401s; PAGE: /login the "
-                             f"account-{account} config dir (its own CLAUDE_CONFIG_DIR "
-                             f"farm; the default account rides ~/.claude)")
-                        # Recover the manager onto a HEALTHY account only — never
-                        # relaunch a takeover on the suspect account (it would
-                        # just 401 again; with each takeover rolling a fresh sid,
-                        # an unhealthy-target relaunch would be unbounded). The
-                        # healthy target is the just-flipped letter, or (if a flip
-                        # already landed earlier) the current pointer when it
-                        # differs from the suspect account. If neither exists
-                        # (flip blocked, both logins suspect), page only — the
-                        # human must /login. Guarded once per sid like the
+                             f"login suspect after repeated 401s; PAGE: run "
+                             f"{_login_fix_command(account)}, then /login")
+                        # Healthy-target-only launch — the invariant lives in
+                        # _healthy_takeover_target (shared with the recover
+                        # branch above). No healthy target (flip blocked,
+                        # pointer still on the suspect account) ⇒ page only —
+                        # the human must /login. Guarded once per sid like the
                         # recover launch.
-                        if new_letter is not None:
-                            target = new_letter
-                        elif account != pool:
-                            target = pool          # a prior flip already moved off the suspect account
-                        else:
-                            target = None           # stuck on the suspect account → page only
+                        target = _healthy_takeover_target(account, pool, new_letter,
+                                                          pool_suspect=pool_suspect)
+                        # Read ONCE and reused below (launch gate + reason):
+                        # a second call could observe a mid-scan unlock,
+                        # making the gate and the notify text disagree about
+                        # which cause fired — and it's a real subprocess
+                        # call, not free to repeat.
+                        keychain_ok = _keychain_unlocked()
+                        launched = False
                         if (target is not None
                                 and auth_key not in emitted
-                                and _keychain_unlocked()
+                                and keychain_ok
                                 and _ledger_recovery_launches(mgr_sid, now) == 0):
                             wid = _launch_recovery_manager(mgr_record, mgr_sid, target)
                             _append_account_ledger({
@@ -2077,6 +2914,34 @@ def main(manager_name: str | None = None) -> int:
                                 "manager": manager_name, "from_sid": mgr_sid,
                                 "window_id": wid, "by": "stale_monitor"})
                             next_emitted[auth_key] = now
+                            launched = True
+                        if (not launched and auth_key not in emitted
+                                and _ledger_recovery_launches(mgr_sid, now) == 0):
+                            # No successor will ever exist to replay the
+                            # buffered auth-escalate page (nothing launched ⇒
+                            # nothing takes the record over ⇒ manager_limited
+                            # holds the buffer forever) — the OS notification
+                            # is the only channel that still reaches the
+                            # human. Outcome-derived, not cause-derived
+                            # (Tier-2 B-2 + drift-guard ADD-ONE): ANY wanted
+                            # launch that didn't happen notifies, not just
+                            # the no-healthy-target cause the author first
+                            # hand-picked (the keychain-locked cause was the
+                            # proof this needed to be outcome-derived).
+                            # A foreign mid-401 pointer and a locked keychain
+                            # are independent causes — when both hold, name
+                            # both; naming only one would hide the other
+                            # from the human.
+                            reasons = []
+                            if target is None:
+                                reasons.append("no healthy account")
+                            if not keychain_ok:
+                                reasons.append("keychain locked")
+                            reason = " + ".join(reasons) or "launch guard"
+                            _notify_macos(
+                                f"AUTH_401_ESCALATED {account}: {reason} — run "
+                                f"{_login_fix_command(account)}, then /login "
+                                f"(manager {manager_name})")
                     # decision == "duplicate": guard persisted above; no-op
     if ACTIVE.is_dir():
         for p in ACTIVE.iterdir():
@@ -2188,8 +3053,9 @@ def main(manager_name: str | None = None) -> int:
                     # remains the catch-all.
                     still_bannered = _limit_banner_text(log) is not None
                     if (activity <= sched["baseline"] or still_bannered) and nudge_eligible:
+                        _record_action_ahead(emitted_state_path, emitted,
+                                             next_emitted, nudge_sent_key, now)
                         _send_text(window_id, NUDGE_TEXT)
-                        next_emitted[nudge_sent_key] = now
                         emit("nudged", name, f"NUDGED {name} (limit-reset)")
                         fired_scheduled = True
                 elapsed = now - activity
@@ -2245,7 +3111,7 @@ def main(manager_name: str | None = None) -> int:
                         if auth_sig is not None:
                             auth_uuid, _auth_text = auth_sig
                             account = _account_of(record, pool)
-                            decision = _record_auth_401(account, auth_uuid, now)
+                            decision, _ = _record_auth_401(account, auth_uuid, now)
                             auth_emit_key = f"auth-emit:{sid}"
                             last_emit = emitted.get(auth_emit_key)
                             reemit_due = (not isinstance(last_emit, (int, float))
@@ -2263,9 +3129,8 @@ def main(manager_name: str | None = None) -> int:
                                          f"(worker {name} auth-401 credential suspect)")
                                 emit("auth-escalate", name,
                                      f"AUTH_401_ESCALATED {account} (worker {name}) — "
-                                     f"login suspect after repeated 401s; PAGE: /login the "
-                                     f"account-{account} config dir (its own CLAUDE_CONFIG_DIR "
-                                     f"farm; the default account rides ~/.claude)")
+                                     f"login suspect after repeated 401s; PAGE: run "
+                                     f"{_login_fix_command(account)}, then /login")
                                 next_emitted[auth_emit_key] = now
                             elif decision == "recover" or reemit_due:
                                 # Ledger only the genuine attempt (a fresh 401);
@@ -2310,8 +3175,9 @@ def main(manager_name: str | None = None) -> int:
                                 # already kicked this pane; still record the
                                 # crossing so the cadence math stays intact.
                                 if not fired_scheduled:
+                                    _record_action_ahead(emitted_state_path, emitted,
+                                                         next_emitted, nudge_sent_key, now)
                                     _send_text(window_id, NUDGE_TEXT)
-                                    next_emitted[nudge_sent_key] = now
                                     emit("nudged", name, f"NUDGED {name} ({elapsed_min}min)")
                             else:
                                 emit("stalled", name,
@@ -2339,9 +3205,11 @@ def main(manager_name: str | None = None) -> int:
                     if not banner_read:
                         banner = _limit_banner_text(log)
                     if banner is not None:
+                        _record_action_ahead(emitted_state_path, emitted,
+                                             next_emitted, stretch_nudge_key, now)
+                        _record_action_ahead(emitted_state_path, emitted,
+                                             next_emitted, nudge_sent_key, now)
                         _send_text(window_id, NUDGE_TEXT)
-                        next_emitted[stretch_nudge_key] = now
-                        next_emitted[nudge_sent_key] = now
                         emit("nudged", name, f"NUDGED {name} ({elapsed // 60}min rate-limited)")
                         reset_ts = _parse_limit_reset_ts(banner, now)
                         if reset_ts is not None:
@@ -2360,7 +3228,14 @@ def main(manager_name: str | None = None) -> int:
             if elapsed > IDLE_THRESHOLD_SEC:
                 if _is_delegation_live(record):
                     continue
+                # The busy-shell guard is INSIDE _autoclose_idle_worker, which
+                # resolves its own process index — so a lane added here or
+                # anywhere else inherits it and has no index to get wrong.
+                # None means it refused: the worker still has live background
+                # work and is under the deadline.
                 line = _autoclose_idle_worker(p, record, elapsed)
+                if line is None:
+                    continue
                 emit("autoclosed", record.get("name") or "", line)
     if QUESTIONS.is_dir():
         # Snapshot live sids once — questions whose worker is gone (auto-closed,
@@ -2393,116 +3268,154 @@ def main(manager_name: str | None = None) -> int:
                              key)
     _scan_orphan_windows(now, emitted, next_emitted, emit)
     _scan_approval_prompts(manager_name, now, emitted, next_emitted, emit)
+    # Peer-lane liveness. Scoped runs only: a global scan has no manager whose
+    # lanes these would be. Emitted as a normal urgent line so it rides the
+    # existing limited-buffer coalescing rather than inventing a second path.
+    if manager_name:
+        for lane_key, lane_line in _lane_silence_events(
+                manager_name, emitted, next_emitted, now):
+            emit("lane_silent", lane_key, lane_line, lane_key)
     pruned_cache = {s: p for s, p in codex_log_cache.items() if s in seen_codex_sids}
     if pruned_cache:
         next_emitted["codex_log_cache"] = pruned_cache
     # ---- flush: coalesce while the owning manager is limited -----------------
-    if manager_name:
-        flag_path = _limited_flag_path(manager_name)
-        buffer = emitted.get("limited_buffer")
-        if not isinstance(buffer, dict):
-            buffer = None
-        if manager_limited:
-            buf = buffer or {"since": now, "stalled_names": [], "nudged": 0,
-                             "resumed": 0, "questions": 0, "autoclosed": 0}
-            if not isinstance(buf.get("stalled_names"), list):
-                buf["stalled_names"] = []
-            if not isinstance(buf.get("suppressed_keys"), list):
-                buf["suppressed_keys"] = []
-            for kind, event_name, line, dedup_key in events:
-                # Distinct stalled/nudged names feed one list — the rollup's
-                # "N workers stalled" covers both shapes of a stalled worker.
-                if kind in ("stalled", "nudged") and event_name:
-                    if event_name not in buf["stalled_names"] and len(buf["stalled_names"]) < 50:
-                        buf["stalled_names"].append(event_name)
-                # The buffered SWITCHED line never replays after the rollup —
-                # its mention in the rollup (plus the ledger) IS the visibility.
-                # No dedup key (flips self-dedup via the pointer) and no worker
-                # counter increments for this kind.
-                if kind == "switched":
-                    buf["switched"] = line.removeprefix("SWITCHED ")
-                # The auth-401 escalation PAGE (/login the suspect account) is a
-                # human-facing action, not a wake attempt at the bricked manager
-                # — it must survive coalescing. Captured here and replayed after
-                # the rollup so a manager bricked on its OWN 401 still pages the
-                # human once the takeover-recovery flushes.
-                if kind == "auth-escalate":
-                    pages = buf.setdefault("auth_pages", [])
-                    if isinstance(pages, list) and line not in pages and len(pages) < 20:
-                        pages.append(line)
-                if (dedup_key and dedup_key not in buf["suppressed_keys"]
-                        and len(buf["suppressed_keys"]) < 200):
-                    buf["suppressed_keys"].append(dedup_key)
-                counter = {"nudged": "nudged", "resumed": "resumed",
-                           "question": "questions", "autoclosed": "autoclosed"}.get(kind)
-                if counter:
-                    buf[counter] = _safe_int(buf.get(counter)) + 1
-            next_emitted["limited_buffer"] = buf
-            try:
-                flag_path.touch()
-            except OSError:
-                pass
-            # No prints at all: each line is a task-notification at a manager
-            # that cannot act on it. The flag also holds the monitor.py scans
-            # (questions/done/turn-ends) — those replay in full on recovery.
-        else:
-            printed_any = False
-            if buffer is not None or flag_path.exists():
-                # Build the rollup BEFORE clearing the flag: once it clears,
-                # the released done scan can mark events seen within seconds
-                # and the "K done events" count would undercount.
-                rollup = _build_rollup_line(buffer or {}, manager_name, now)
-                # Un-burn the rungs whose lines only ever reached the buffer:
-                # dropping the dedup key re-fires the same crossing live on the
-                # next scan instead of waiting for the next doubling. Dict-valued
-                # ladders (orphan:<pane>) keep their own first_seen clock inside
-                # that same entry — popping the whole dict would erase it and
-                # restart the grace window from scratch, so only their "paged"
-                # rung resets in place; int-valued STALE_* keys still pop outright.
-                suppressed = (buffer or {}).get("suppressed_keys")
-                if isinstance(suppressed, list):
-                    for suppressed_key in suppressed:
-                        if not isinstance(suppressed_key, str):
-                            continue
-                        entry = next_emitted.get(suppressed_key)
-                        if isinstance(entry, dict) and "paged" in entry:
-                            entry["paged"] = 0
-                        else:
-                            next_emitted.pop(suppressed_key, None)
-                flag_path.unlink(missing_ok=True)
-                print(rollup)
-                printed_any = True
-                # Replay any buffered auth-401 /login pages — the rollup itself
-                # only summarizes counts; the page text must reach the human.
-                for page in (buffer or {}).get("auth_pages") or []:
-                    if isinstance(page, str):
-                        print(page)
-            # Urgent kinds print live; informational kinds (OUTBOX_DIVERT_KINDS)
-            # ride a wake that is already happening — printed alongside other
-            # lines, or buffered to notify-outbox/<mgr>/ for monitor.py's
-            # scans to piggyback, with the timeout flush as the latency bound.
-            direct = [e for e in events if e[0] not in OUTBOX_DIVERT_KINDS]
-            diverted = [e for e in events if e[0] in OUTBOX_DIVERT_KINDS]
-            for _kind, _event_name, line, _dedup_key in direct:
-                print(line)
-                printed_any = True
-            if printed_any:
-                for _kind, _event_name, line, _dedup_key in diverted:
-                    print(line)
-                _drain_outbox(manager_name)
+    # LaneDead from any _emit below unwinds past the state write, so every
+    # key would be lost — including the record that a nudge was already
+    # TYPED into a pane. Committing the ACTION half here is what stops the
+    # next scan repeating the act; the PAGE half is correctly discarded.
+    try:
+        if manager_name:
+            flag_path = _limited_flag_path(manager_name)
+            buffer = emitted.get("limited_buffer")
+            if not isinstance(buffer, dict):
+                buffer = None
+            if manager_limited:
+                buf = buffer or {"since": now, "stalled_names": [], "nudged": 0,
+                                 "resumed": 0, "questions": 0, "autoclosed": 0}
+                if not isinstance(buf.get("stalled_names"), list):
+                    buf["stalled_names"] = []
+                if not isinstance(buf.get("suppressed_keys"), list):
+                    buf["suppressed_keys"] = []
+                for kind, event_name, line, dedup_key in events:
+                    # Distinct stalled/nudged names feed one list — the rollup's
+                    # "N workers stalled" covers both shapes of a stalled worker.
+                    if kind in ("stalled", "nudged") and event_name:
+                        if event_name not in buf["stalled_names"] and len(buf["stalled_names"]) < 50:
+                            buf["stalled_names"].append(event_name)
+                    # The buffered SWITCHED line never replays after the rollup —
+                    # its mention in the rollup (plus the ledger) IS the visibility.
+                    # No dedup key (flips self-dedup via the pointer) and no worker
+                    # counter increments for this kind.
+                    if kind == "switched":
+                        buf["switched"] = line.removeprefix("SWITCHED ")
+                    # The auth-401 escalation PAGE (/login the suspect account) is a
+                    # human-facing action, not a wake attempt at the bricked manager
+                    # — it must survive coalescing. Captured here and replayed after
+                    # the rollup so a manager bricked on its OWN 401 still pages the
+                    # human once the takeover-recovery flushes.
+                    if kind == "auth-escalate":
+                        pages = buf.setdefault("auth_pages", [])
+                        if isinstance(pages, list) and line not in pages and len(pages) < 20:
+                            pages.append(line)
+                    if (dedup_key and dedup_key not in buf["suppressed_keys"]
+                            and len(buf["suppressed_keys"]) < 200):
+                        buf["suppressed_keys"].append(dedup_key)
+                    counter = {"nudged": "nudged", "resumed": "resumed",
+                               "question": "questions", "autoclosed": "autoclosed"}.get(kind)
+                    if counter:
+                        buf[counter] = _safe_int(buf.get(counter)) + 1
+                next_emitted["limited_buffer"] = buf
+                try:
+                    flag_path.touch()
+                except OSError:
+                    pass
+                # No prints at all: each line is a task-notification at a manager
+                # that cannot act on it. The flag also holds the monitor.py scans
+                # (questions/done/turn-ends) — those replay in full on recovery.
             else:
+                printed_any = False
+                if buffer is not None or flag_path.exists():
+                    # Build the rollup BEFORE clearing the flag: once it clears,
+                    # the released done scan can mark events seen within seconds
+                    # and the "K done events" count would undercount.
+                    rollup = _build_rollup_line(buffer or {}, manager_name, now)
+                    # Un-burn the rungs whose lines only ever reached the buffer:
+                    # dropping the dedup key re-fires the same crossing live on the
+                    # next scan instead of waiting for the next doubling. Dict-valued
+                    # ladders (orphan:<pane>) keep their own first_seen clock inside
+                    # that same entry — popping the whole dict would erase it and
+                    # restart the grace window from scratch, so only their "paged"
+                    # rung resets in place; int-valued STALE_* keys still pop outright.
+                    suppressed = (buffer or {}).get("suppressed_keys")
+                    if isinstance(suppressed, list):
+                        for suppressed_key in suppressed:
+                            if not isinstance(suppressed_key, str):
+                                continue
+                            entry = next_emitted.get(suppressed_key)
+                            if isinstance(entry, dict) and "paged" in entry:
+                                entry["paged"] = 0
+                            else:
+                                next_emitted.pop(suppressed_key, None)
+                    # Emit BEFORE clearing the flag: the flag is the only record
+                    # that these lines are still owed. Unlinking first meant a dead
+                    # reader destroyed the whole limited-window rollup.
+                    _emit(rollup)
+                    flag_path.unlink(missing_ok=True)
+                    printed_any = True
+                    # Replay any buffered auth-401 /login pages — the rollup itself
+                    # only summarizes counts; the page text must reach the human.
+                    for page in (buffer or {}).get("auth_pages") or []:
+                        if isinstance(page, str):
+                            _emit(page)
+                # Urgent kinds print live; informational kinds (OUTBOX_DIVERT_KINDS)
+                # ride a wake that is already happening — printed alongside other
+                # lines, or buffered to notify-outbox/<mgr>/ for monitor.py's
+                # scans to piggyback, with the timeout flush as the latency bound.
+                direct = [e for e in events if e[0] not in OUTBOX_DIVERT_KINDS]
+                diverted = [e for e in events if e[0] in OUTBOX_DIVERT_KINDS]
+                for _kind, _event_name, line, _dedup_key in direct:
+                    _emit(line)
+                    printed_any = True
+                # Divert kinds go to disk FIRST in both branches. Emitting one
+                # straight to stdout looked like a shortcut when a wake was already
+                # happening, but it left the line with NO durable copy: a reader
+                # that died mid-burst destroyed an AUTOCLOSED whose worker was
+                # already archived and whose pane was already closed — no cursor,
+                # no replay, exactly the loss this change exists to stop. The drain
+                # flushes before it unlinks, so the branches now differ only in
+                # WHEN they drain.
                 for seq, (kind, _event_name, line, _dedup_key) in enumerate(diverted):
                     _outbox_write(manager_name, kind, line, now, seq)
-                oldest = _outbox_oldest_ts(manager_name)
-                if oldest is not None and now - oldest >= OUTBOX_MAX_HOLD_SEC:
+                if printed_any:
                     _drain_outbox(manager_name)
-    else:
-        for _kind, _event_name, line, _dedup_key in events:
-            print(line)
+                else:
+                    oldest = _outbox_oldest_ts(manager_name)
+                    if oldest is not None and now - oldest >= OUTBOX_MAX_HOLD_SEC:
+                        _drain_outbox(manager_name)
+        else:
+            for _kind, _event_name, line, _dedup_key in events:
+                _emit(line)
+    except LaneDead:
+        _commit_actions_only(emitted_state_path, emitted, next_emitted)
+        raise
+    cursor_written = True
     try:
         _write_json_atomic(emitted_state_path, next_emitted)
     except Exception as e:
+        cursor_written = False
         print(f"stale_monitor: failed to write {emitted_state_path} ({e})", file=sys.stderr)
+    # The heartbeat is written HERE, by the process that actually emitted, and
+    # only after every _emit above flushed. Written by the PARENT it would have
+    # certified this process's exit CODE rather than delivery — and `stale` has
+    # no backlog arm to cross-check that proxy against. Unreachable from a scan
+    # that raised LaneDead, which is the whole point. Scoped runs only: a global
+    # scan has no manager whose lane this would be.
+    # No heartbeat when the cursor write failed. The heartbeat means "this
+    # lane is delivering"; a scan that could not persist its own dedup state is
+    # about to re-page everything it just paged, and `dockwright lanes` reading
+    # OK through that is the report claiming health while broken.
+    if manager_name and cursor_written:
+        _write_lane_heartbeat(manager_name, "stale", now)
     return 0
 
 
@@ -2515,4 +3428,10 @@ if __name__ == "__main__":
              "Omit for global (all managers') behavior.",
     )
     args = parser.parse_args()
-    sys.exit(main(manager_name=args.manager))
+    try:
+        sys.exit(main(manager_name=args.manager))
+    except LaneDead as exc:
+        print(f"stale_monitor: lane is dead ({exc}); ending the lane so its "
+              f"Monitor task exits and the manager is told.", file=sys.stderr)
+        _detach_stdout()
+        sys.exit(EXIT_LANE_DEAD)

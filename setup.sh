@@ -40,6 +40,37 @@ fi
 
 CLAUDE_DIR="${CLAUDE_DIR:-$HOME/.claude}"
 CODEX_DIR="${CODEX_DIR:-$HOME/.codex}"
+
+# Fleet-liveness gate: setup.sh mutates the deployed $CLAUDE_DIR tree in place,
+# so a live worker/manager mid-turn can boot against a half-updated tree. Prose
+# alone (the CLAUDE.md anchor) missed a recurrence (2026-07-10, then again
+# 2026-07-22) — this is the structural backstop those two incidents named.
+# Scoped to $CLAUDE_DIR (not $HOME) so sandboxed runs that redirect CLAUDE_DIR
+# check the tree they actually mutate. DOCKWRIGHT_SETUP_FORCE=1 overrides for
+# a deliberate live deploy.
+if [ "${DOCKWRIGHT_SETUP_FORCE:-}" != "1" ]; then
+    ACTIVE_DIR="$CLAUDE_DIR/dockwright/active"
+    # Deprecated, one release: a pre-rename install registers sessions under
+    # orchestrator/active until migrate-state (later in this script) relocates
+    # it — the gate must see that fleet too. After migration orchestrator/ is a
+    # compat symlink to dockwright/, so this fires only when dockwright/ is absent
+    # (never double-counts).
+    if [ ! -d "$ACTIVE_DIR" ] && [ -d "$CLAUDE_DIR/orchestrator/active" ]; then
+        ACTIVE_DIR="$CLAUDE_DIR/orchestrator/active"
+    fi
+    if [ -d "$ACTIVE_DIR" ]; then
+        LIVE_COUNT=$(find -L "$ACTIVE_DIR" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d ' ') || {
+            echo "ERROR: cannot enumerate $ACTIVE_DIR — refusing to deploy over an unreadable session registry. Fix its permissions, or re-run with DOCKWRIGHT_SETUP_FORCE=1 for a deliberate live deploy." >&2
+            exit 4
+        }
+        if [ "${LIVE_COUNT:-0}" -gt 0 ]; then
+            echo "ERROR: $LIVE_COUNT active worker/manager session(s) registered under $ACTIVE_DIR — setup.sh mutates the deployed tree in place and a live session mid-turn would boot against a half-updated tree." >&2
+            echo "        Wait for the sessions to finish (or close them), or re-run with DOCKWRIGHT_SETUP_FORCE=1 for a deliberate live deploy." >&2
+            exit 4
+        fi
+    fi
+fi
+
 # Overlay payload root (operator drop-ins: commands/, scripts/, presets/,
 # setup.d/). DOCKWRIGHT_OVERLAY_DIR overrides for sandboxed tests; the default
 # matches how the package resolves the overlay (config.DEFAULT_OVERLAY_DIR).
@@ -132,11 +163,31 @@ if ! python_meets_min python3; then
     echo "  Linux:  install python3.13 (e.g. apt/dnf package, or pyenv) and ensure 'python3' on PATH resolves to it." >&2
     exit 1
 fi
+# Debian/Ubuntu strip ensurepip out of the base python package, so
+# `python3 -m venv` dies mid-setup with Python's raw "ensurepip is not
+# available" and no dockwright-level hint (linux E2E finding I-1, scenario
+# A0). Probe venv capability up front and name the exact package. Scoped to
+# runs that will actually need system ensurepip — a venv create/recreate, or
+# re-bootstrapping pip into an existing venv — so a healthy install keeps
+# working even if the distro's python3.X-venv package later disappears.
+VENV_STALE=0
+if [ -d "$REPO_DIR/.venv" ] && ! python_meets_min "$REPO_DIR/.venv/bin/python"; then
+    VENV_STALE=1
+fi
+if [ ! -d "$REPO_DIR/.venv" ] || [ "$VENV_STALE" = "1" ] || [ ! -x "$REPO_DIR/.venv/bin/pip" ]; then
+    if ! python3 -c "import venv, ensurepip" >/dev/null 2>&1; then
+        PY_MM="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo 3)"
+        echo "ERROR: python3 at $(command -v python3) cannot create virtualenvs — the venv/ensurepip module is missing." >&2
+        echo "  Debian/Ubuntu: sudo apt install python${PY_MM}-venv   (or: python3-venv)" >&2
+        echo "  Other:         install your distro's Python venv/ensurepip package, then re-run ./setup.sh" >&2
+        exit 1
+    fi
+fi
 # A .venv built by an older python — or whose interpreter broke (brew python
 # upgrade, half-finished create) — makes every re-run fail identically with no
 # hint; recovery used to require knowing `rm -rf .venv` (macOS E2E finding
 # N-6). The venv is a build artifact this script itself creates: recreate it.
-if [ -d "$REPO_DIR/.venv" ] && ! python_meets_min "$REPO_DIR/.venv/bin/python"; then
+if [ "$VENV_STALE" = "1" ]; then
     echo "→ Existing .venv is stale or broken (python missing or < $MIN_PY) — recreating"
     rm -rf "$REPO_DIR/.venv"
 fi
@@ -495,8 +546,8 @@ mkdir -p "$CLAUDE_DIR/dockwright"
 } > "$DEPLOY_STAMP"
 echo "→ Stamped deploy provenance to $DEPLOY_STAMP (sha=$DEPLOY_SHA branch=$DEPLOY_BRANCH dirty=$DEPLOY_DIRTY)"
 
-# FILES_ONLY (S6 sandbox) skips doctor (needs $DOCKWRIGHT_BIN + the wired config it
-# verifies) and the overlay setup.d runner below.
+# FILES_ONLY (S6 sandbox) skips the farm/snapshot reconciliation below (needs
+# the built $DOCKWRIGHT_BIN) and the overlay setup.d runner at the end.
 if [ "${DOCKWRIGHT_SETUP_FILES_ONLY:-}" != "1" ]; then
 # Reconcile already-provisioned pool-account config-dir farms (symlink heal +
 # .claude.json MCP refresh) so existing installs converge on every deploy, not
@@ -518,17 +569,53 @@ echo "→ Reconciling pool-account config-dir farms (accounts-sync)…"
 # worker home during FILES_ONLY tests. The FILES_ONLY guard is the machine-mutation seam.
 WORKER_HOME="$("$DOCKWRIGHT_BIN" ensure-worker-home || true)"
 [ -n "$WORKER_HOME" ] && echo "→ Ensured worker home exists: $WORKER_HOME"
+fi
 
+# Doctor gate. DOCKWRIGHT_SETUP_RUN_DOCTOR=1 forces it under FILES_ONLY so
+# tests can drive the real abort-vs-continue logic with a stub binary
+# (tests/test_setup_doctor_gate.py) — before that knob, every setup.sh test ran
+# FILES_ONLY and this block was exercised by no test at all. No shipped path
+# sets the knob.
+RUN_DOCTOR_GATE=0
+[ "${DOCKWRIGHT_SETUP_FILES_ONLY:-}" != "1" ] && RUN_DOCTOR_GATE=1
+[ "${DOCKWRIGHT_SETUP_RUN_DOCTOR:-}" = "1" ] && RUN_DOCTOR_GATE=1
+if [ "$RUN_DOCTOR_GATE" = "1" ]; then
+DOCTOR_BIN="${DOCKWRIGHT_BIN:-${RENDER_BIN:-}}"
+if [ -z "$DOCTOR_BIN" ]; then
+    echo "ERROR: doctor gate needs a dockwright binary (set DOCKWRIGHT_ORCH_BIN when forcing the gate under FILES_ONLY)" >&2
+    exit 1
+fi
 echo "→ Verifying environment wiring (dockwright doctor)…"
-DOCTOR_ARGS=(--orch-bin "$DOCKWRIGHT_BIN" --claude-json "$HOME/.claude.json" --settings "$SETTINGS"
+DOCTOR_ARGS=(--orch-bin "$DOCTOR_BIN" --claude-json "$HOME/.claude.json"
+    --host-claude-json "$HOME/.claude.json" --settings "${SETTINGS:-$CLAUDE_DIR/settings.json}"
     --brew-prefix "$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
     --dist-name dockwright --server-name dockwright --strict)
 DOCTOR_ARGS+=(--compose-core-dir "$REPO_DIR/deploy/agents" --compose-out-dir "$CLAUDE_DIR/agents")
 [ -f "$CODEX_DIR/hooks.json" ] && DOCTOR_ARGS+=(--codex-hooks "$CODEX_DIR/hooks.json")
 [ -f "$CODEX_DIR/config.toml" ] && DOCTOR_ARGS+=(--codex-config "$CODEX_DIR/config.toml")
-"$DOCKWRIGHT_BIN" doctor "${DOCTOR_ARGS[@]}"
-echo "→ Environment wiring verified."
+# accounts:login alone must not abort the install: login state is a user
+# prerequisite (README prereqs stop at tmux/Python/claude CLI), not installer
+# wiring — and on a fresh box the `claude mcp add` above just created a
+# marker-less ~/.claude.json, so the common quickstart path trips it. Every
+# other failure stays fatal, including a doctor CRASH (rc!=0 with no [FAIL]
+# lines) — that is a broken doctor, not a login diagnosis.
+DOCTOR_OUT="$("$DOCTOR_BIN" doctor "${DOCTOR_ARGS[@]}" 2>&1)" && DOCTOR_RC=0 || DOCTOR_RC=$?
+printf '%s\n' "$DOCTOR_OUT"
+if [ "$DOCTOR_RC" -eq 0 ]; then
+    echo "→ Environment wiring verified."
+else
+    DOCTOR_FAILS="$(printf '%s\n' "$DOCTOR_OUT" | grep '\[FAIL\]' || true)"
+    DOCTOR_OTHER="$(printf '%s\n' "$DOCTOR_FAILS" | grep -v '^  \[FAIL\] accounts:login: ' || true)"
+    if [ -z "$DOCTOR_FAILS" ] || [ -n "$DOCTOR_OTHER" ]; then
+        exit "$DOCTOR_RC"
+    fi
+    echo "WARNING: accounts:login failed — login state is a user prerequisite, not installer wiring; install continues." >&2
+    printf '%s\n' "$DOCTOR_FAILS" >&2
+    echo "  Run the fix printed above, then re-verify: $DOCTOR_BIN doctor" >&2
+fi
+fi
 
+if [ "${DOCKWRIGHT_SETUP_FILES_ONLY:-}" != "1" ]; then
 # Overlay setup.d hooks — arbitrary operator install steps (the SSH url rewrite
 # moves here in Task 2). Sorted (glob expands sorted), run last of everything.
 if [ -d "$OVERLAY_DIR/setup.d" ]; then

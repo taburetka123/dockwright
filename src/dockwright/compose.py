@@ -39,6 +39,11 @@ Semantics:
   step keyed off `stamp["core"]` resolves deployed files unchanged); the
   core SOURCE filename per output is recorded separately in
   `stamp["core_sources"]` (informational).
+- The stamp's `outputs` records what compose last successfully WROTE per
+  output basename — not necessarily what is on disk now. They diverge
+  exactly when a file was skipped (its backup failed) or hand-edited since;
+  that divergence IS the drift signal, so a reader must treat "differs from
+  disk" as drift, never as a stale stamp.
 """
 from __future__ import annotations
 
@@ -223,14 +228,107 @@ def _compose_all(core_dir: Path, overlay_dir: Path, vars) -> dict[str, _Rendered
     return rendered
 
 
+def _prev_outputs(out_dir: Path) -> dict:
+    """Output hashes the LAST compose wrote, or {} when unavailable (first
+    deploy, a pre-`outputs` stamp, an unreadable or corrupt one). Fail-open:
+    with no history we make no drift claim — never a false one."""
+    try:
+        data = json.loads((out_dir / STAMP_NAME).read_text())
+    except (OSError, ValueError):
+        return {}
+    outputs = data.get("outputs")
+    return outputs if isinstance(outputs, dict) else {}
+
+
+@dataclass(frozen=True)
+class _Drift:
+    message: str
+    saved: bool  # False: the backup failed, so the write MUST be skipped
+    # Two lines for the abort summary main() prints LAST when ANY file was
+    # skipped: `abort_line` for a skipped file (saved=False), `backup_line` for
+    # one that WAS rewritten in that same run (saved=True). Both self-contained
+    # on purpose: they are the last thing an operator sees before set -e halts
+    # setup.sh, so neither may lean on the DRIFT line scrolled above.
+    abort_line: str = ""
+    backup_line: str = ""
+
+
+def _pick_backup_path(target: Path, current: bytes) -> Path:
+    """A backup path that will not clobber a DIFFERENT saved copy: `<name>.bak`
+    when it is free or already holds exactly these bytes, else `<name>.bak.2`,
+    `.bak.3`, … A backup we cannot read counts as differing — the whole point is
+    that the content it holds may exist nowhere else."""
+    backup = target.with_name(target.name + ".bak")
+    n = 1
+    while backup.exists():
+        try:
+            if backup.read_bytes() == current:
+                return backup
+        except OSError:
+            pass
+        n += 1
+        backup = target.with_name(f"{target.name}.bak.{n}")
+    return backup
+
+
+def _backup_drifted(target: Path, prev_sha, about_to_write: bytes,
+                    overlay_dir: Path) -> _Drift | None:
+    """A deployed file whose bytes differ from what compose last wrote holds
+    content with no home in core or overlay — the write that follows would
+    destroy it with no trace. Copy it aside and report it. Returns the drift,
+    or None when this write destroys nothing."""
+    if not isinstance(prev_sha, str) or not prev_sha or not target.is_file():
+        return None
+    try:
+        current = target.read_bytes()
+    except OSError:
+        return None
+    if hashlib.sha256(current).hexdigest() == prev_sha:
+        return None
+    if current == about_to_write:
+        # The edit already matches what we are about to write (the operator
+        # hand-applied their core change to the deployed copy). Mirrors
+        # setup.sh's `! cmp -s` guard: no change, nothing to preserve.
+        return None
+    remedy = (f"to keep it, move the wanted lines into a drop-in at "
+              f"{overlay_dir / Path(target.name).stem}/*.md and rerun")
+    backup = _pick_backup_path(target, current)
+    try:
+        backup.write_bytes(current)
+    except OSError as exc:
+        # Prescribe from what is ACTUALLY there, not from the errno: _pick_backup_path
+        # only ever returns a free name or one already holding these exact bytes, so a
+        # non-existent backup means the DIRECTORY refused the new entry — telling the
+        # operator to clear an obstruction at a file that is not there is a dead end.
+        unblock = (f"make {backup} writable (or move it aside), then rerun"
+                   if backup.exists() else
+                   f"make the directory {backup.parent} writable, then rerun")
+        return _Drift(
+            f"{target.name}: edited since the last compose — those bytes live in "
+            f"NEITHER the core NOR the overlay and could NOT be saved ({exc}), so "
+            f"{target.name} was NOT rewritten and your edit is still on disk; "
+            f"{unblock}, or {remedy}",
+            saved=False,
+            abort_line=(f"{target.name}: NOT rewritten — the backup at {backup} "
+                        f"could not be written ({exc}); {unblock}"))
+    return _Drift(
+        f"{target.name}: edited since the last compose — those bytes live in "
+        f"NEITHER the core NOR the overlay and this compose overwrites them; "
+        f"saved to {backup.name}; {remedy}",
+        saved=True,
+        backup_line=(f"{target.name}: REWRITTEN — your previous contents were "
+                     f"saved to {backup}"))
+
+
 def compose_agents(core_dir, out_dir, overlay_dir, vars) -> dict:
     core_dir, out_dir, overlay_dir = Path(core_dir), Path(out_dir), Path(overlay_dir)
     merged_vars = {**load_default_vars(core_dir), **vars}
     rendered = _compose_all(core_dir, overlay_dir, merged_vars)
     out_dir.mkdir(parents=True, exist_ok=True)
+    prev_outputs = _prev_outputs(out_dir)
     stamp: dict = {
         "composed_at": time.time(),
-        "core": {}, "core_sources": {}, "overlay": {},
+        "core": {}, "core_sources": {}, "overlay": {}, "outputs": {},
         # Hashed over the UNEXPANDED merged map — informational only; do not
         # build freshness logic on it (it never moves when $HOME differs).
         "vars_sha256": hashlib.sha256(
@@ -238,8 +336,35 @@ def compose_agents(core_dir, out_dir, overlay_dir, vars) -> dict:
         "core_git_sha": _git_sha(core_dir),
     }
     all_warnings: dict[str, list[str]] = {}
+    drift: list[str] = []
+    skipped: list[str] = []
+    skip_details: list[str] = []
+    backed_up: list[str] = []
     for out_name, r in rendered.items():
-        (out_dir / out_name).write_text(r.composed)
+        target = out_dir / out_name
+        # write_text() encodes with the platform default; comparing against UTF-8
+        # can only make the guard MORE conservative (a false "differs", never a
+        # false "same"), so the fail-safe direction is preserved off-UTF-8.
+        drifted = _backup_drifted(target, prev_outputs.get(out_name),
+                                  r.composed.encode(), overlay_dir)
+        if drifted is not None:
+            drift.append(drifted.message)
+        if drifted is not None and not drifted.saved:
+            # Fail closed: the operator's only copy could not be preserved, so
+            # leave the file alone. Carrying the PREVIOUS hash (never the
+            # hand-edited file's) keeps the next compose re-detecting this drift.
+            skipped.append(out_name)
+            skip_details.append(drifted.abort_line)
+            stamp["outputs"][out_name] = prev_outputs[out_name]
+        else:
+            if drifted is not None:
+                backed_up.append(drifted.backup_line)
+            target.write_text(r.composed)
+            # Hash the bytes READ BACK rather than the in-memory string: defence
+            # in depth so the stamp reflects what a reader finds on disk even if
+            # the platform encoding altered them on the way out. No test can
+            # distinguish the two on a UTF-8 host.
+            stamp["outputs"][out_name] = hashlib.sha256(target.read_bytes()).hexdigest()
         stamp["core"][out_name] = hashlib.sha256(
             (core_dir / r.core_name).read_bytes()).hexdigest()
         stamp["core_sources"][out_name] = r.core_name
@@ -250,7 +375,10 @@ def compose_agents(core_dir, out_dir, overlay_dir, vars) -> dict:
         if r.warnings:
             all_warnings[out_name] = r.warnings
     (out_dir / STAMP_NAME).write_text(json.dumps(stamp, indent=2))
-    return {"files": sorted(rendered), "warnings": all_warnings}
+    return {"files": sorted(rendered), "warnings": all_warnings,
+            "drift": drift, "skipped": sorted(skipped),
+            "skip_details": sorted(skip_details),
+            "backed_up": sorted(backed_up)}
 
 
 def check_agents(core_dir, out_dir, overlay_dir, vars) -> tuple[bool, list[str]]:
@@ -296,8 +424,39 @@ def main(argv=None) -> int:
     except ComposeError as e:
         print(f"compose: ERROR: {e}", file=sys.stderr)
         return 1
-    print(f"Composed {len(result['files'])} agent file(s) to {out_dir}")
+    written = len(result["files"]) - len(result["skipped"])
+    print(f"Composed {written} agent file(s) to {out_dir}")
     for fname, warns in sorted(result["warnings"].items()):
         for w in warns:
             print(f"warning: {fname}: {w}", file=sys.stderr)
+    for d in result["drift"]:
+        print(f"DRIFT: {d}", file=sys.stderr)
+    if result["skipped"]:
+        # This is the last thing an operator sees: setup.sh runs under `set -e`, so
+        # returning 1 here aborts the deploy mid-run. Every element below is load
+        # bearing — which file, the backup path AND the OS error, what happened to
+        # each edited file, and the one action that unblocks it.
+        #
+        # The headline is CONDITIONAL because the loop above has three outcomes, not
+        # two: skipped (untouched), drifted-and-backed-up (REWRITTEN, copy saved),
+        # and clean. "NOTHING WAS OVERWRITTEN" is true only when no sibling was
+        # rewritten this run; claiming it otherwise would tell an operator whose
+        # worker.md was just overwritten that they have nothing to look for — the
+        # DRIFT line naming that backup has already scrolled away, which is the
+        # entire reason this self-contained block exists.
+        if result["backed_up"]:
+            print(f"compose: ERROR: YOUR EDITS ARE NOT LOST — but this run did BOTH: "
+                  f"{len(result['skipped'])} file(s) were NOT rewritten and still hold "
+                  f"your edits byte-for-byte, and {len(result['backed_up'])} other "
+                  f"edited file(s) WERE rewritten with the previous contents saved "
+                  f"aside. Every affected file, and what to do about it:",
+                  file=sys.stderr)
+        else:
+            print(f"compose: ERROR: NOTHING WAS OVERWRITTEN — {len(result['skipped'])} "
+                  f"deployed file(s) still hold your edits byte-for-byte, because the "
+                  f"backup that must precede a rewrite could not be written:",
+                  file=sys.stderr)
+        for line in result["skip_details"] + result["backed_up"]:
+            print(f"compose: ERROR:   {line}", file=sys.stderr)
+        return 1
     return 0

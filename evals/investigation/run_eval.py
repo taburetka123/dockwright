@@ -7,16 +7,17 @@ samples, scores every sample with the deterministic gate (``gates``) and — onl
 when the gate passes — an LLM judge (``judge``), then rolls the samples up to a
 per-case PASS/FAIL by a ``min_pass``-of-``samples`` majority.
 
-The model under test (``--model``, default opus) and the LLM judge
-(``--judge-model``, default opus) are independent CLI-overridable knobs — the
-judge is never silently downgraded when ``--model`` picks a cheaper SUT tier.
+The model under test (``--model``, default claude-opus-5) and the LLM judge
+(``--judge-model``, default claude-opus-5) are independent CLI-overridable
+knobs — the judge is never silently downgraded when ``--model`` picks a
+cheaper SUT tier.
 
 Usage:
-    python -m evals.investigation.run_eval                 # full run, model=opus, judge=opus
+    python -m evals.investigation.run_eval                 # full run, model=claude-opus-5, judge=claude-opus-5
     python -m evals.investigation.run_eval --dry-run       # plumbing check, no API calls
     python -m evals.investigation.run_eval --case n01-foo  # one case (repeatable)
     python -m evals.investigation.run_eval --tags abstention --repeats 1
-    python -m evals.investigation.run_eval --model sonnet --judge-model opus
+    python -m evals.investigation.run_eval --model claude-sonnet-5 --judge-model claude-opus-5
 
 Results (real runs only) land in ``results/latest.json``; per-sample traces in
 ``traces/<run-id>.jsonl``.
@@ -28,6 +29,7 @@ import concurrent.futures
 import json
 import math
 import os
+import sys
 import time
 
 from evals.investigation import gates, judge, runner
@@ -88,8 +90,22 @@ def discover_cases(cases_dir, *, limit, only_ids, tags) -> list[dict]:
     return cases[:limit] if limit is not None else cases
 
 
+def _load_fixture_texts(case: dict) -> dict[str, str]:
+    """Required-read fixture contents for the gate's content-evidence check.
+    Existence is enforced at authoring time (test_case_shape); an unreadable
+    file just leaves that entry input-match-only."""
+    texts: dict[str, str] = {}
+    for rel in case["answer"].get("required_reads") or []:
+        try:
+            with open(os.path.join(case["case_dir"], rel), encoding="utf-8") as fh:
+                texts[rel] = fh.read()
+        except OSError:
+            pass
+    return texts
+
+
 def _score_sample(rec: runner.RunRecord, answer, rubric, *, skip_judge, judge_fn,
-                  judge_model) -> dict:
+                  judge_model, fixture_texts) -> dict:
     sample = {
         "gate_failures": None, "judge": None, "error": rec.error,
         "cost_usd": rec.cost_usd, "duration_ms": rec.duration_ms,
@@ -100,7 +116,7 @@ def _score_sample(rec: runner.RunRecord, answer, rubric, *, skip_judge, judge_fn
         return sample
     gate = gates.score_deterministic(
         findings=rec.findings, tool_calls=rec.tool_calls, num_turns=rec.num_turns,
-        answer=answer, corpus=rec.corpus,
+        answer=answer, corpus=rec.corpus, fixture_texts=fixture_texts,
     )
     sample["gate_failures"] = gate.failures
     if not gate.passed:
@@ -115,7 +131,7 @@ def _score_sample(rec: runner.RunRecord, answer, rubric, *, skip_judge, judge_fn
 
 
 def evaluate_case(case, *, model, timeout, repeats, skip_judge, run_case_fn,
-                  judge_fn, judge_model="opus") -> dict:
+                  judge_fn, judge_model="claude-opus-5") -> dict:
     """Run a case for its resolved sample count and roll up to PASS/FAIL.
 
     samples = --repeats override, else answer["samples"] (default 1).
@@ -123,8 +139,8 @@ def evaluate_case(case, *, model, timeout, repeats, skip_judge, run_case_fn,
     clamped to samples so --repeats 1 vs a pinned min_pass 2 stays winnable.
 
     ``model`` drives the SUT worker (``run_case_fn``); ``judge_fn`` is scored
-    with the independent ``judge_model`` (default opus) so grading tier never
-    silently downgrades with ``--model``.
+    with the independent ``judge_model`` (default claude-opus-5) so grading
+    tier never silently downgrades with ``--model``.
     """
     answer = case["answer"]
     samples = repeats if repeats is not None else answer.get("samples", 1)
@@ -134,10 +150,12 @@ def evaluate_case(case, *, model, timeout, repeats, skip_judge, run_case_fn,
     min_pass = min(min_pass, samples)
     rubric = answer.get("rubric", "")
 
+    fixture_texts = _load_fixture_texts(case)
     sample_results = [
         _score_sample(
             run_case_fn(case, model=model, timeout=timeout), answer, rubric,
             skip_judge=skip_judge, judge_fn=judge_fn, judge_model=judge_model,
+            fixture_texts=fixture_texts,
         )
         for _ in range(samples)
     ]
@@ -209,7 +227,7 @@ def _print_report(case_results: list[dict], model: str) -> None:
     print(f"investigation suite: {passed}/{len(case_results)} cases passed (model={model})")
 
 
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Investigation eval harness")
     ap.add_argument("--dry-run", action="store_true",
                     help="fabricate passing records (no API calls) — plumbing check")
@@ -217,9 +235,11 @@ def main(argv=None) -> int:
     ap.add_argument("--case", action="append", dest="cases", default=None,
                     metavar="ID", help="run only this case id (repeatable)")
     ap.add_argument("--tags", default=None, help="comma-separated tag filter")
-    ap.add_argument("--model", default="opus", help="worker (SUT) model (default opus)")
-    ap.add_argument("--judge-model", default="opus",
-                    help="LLM judge model, independent of --model (default opus)")
+    ap.add_argument("--model", default="claude-opus-5",
+                    help="worker (SUT) model (pinned concrete ID)")
+    ap.add_argument("--judge-model", default="claude-opus-5",
+                    help="LLM judge model, independent of --model "
+                         "(pinned concrete ID)")
     ap.add_argument("--repeats", type=int, default=None,
                     help="override per-case sample count")
     ap.add_argument("--skip-judge", action="store_true",
@@ -227,7 +247,21 @@ def main(argv=None) -> int:
     ap.add_argument("--timeout", type=int, default=1800, help="per-sample timeout (s)")
     ap.add_argument("--concurrency", type=int, default=1,
                     help="parallel cases (>1 -> ThreadPoolExecutor)")
-    args = ap.parse_args(argv)
+    return ap
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+
+    skill = runner.investigate_skill_path()
+    print(f"investigation suite: skill binding = {skill}")
+    if not args.dry_run and not os.path.exists(skill):
+        print(
+            f"investigation suite: bound investigate skill MISSING at {skill} "
+            "— refusing to run (a missing binding is a vacuous pass; set "
+            "DOCKWRIGHT_INVESTIGATE_SKILL or [evals] investigate_skill in "
+            "dockwright.toml)", file=sys.stderr)
+        return 2
 
     tags = args.tags.split(",") if args.tags else None
     cases = discover_cases(CASES_DIR, limit=args.limit, only_ids=args.cases, tags=tags)

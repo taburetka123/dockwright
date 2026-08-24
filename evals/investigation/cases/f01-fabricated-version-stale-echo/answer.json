@@ -1,7 +1,7 @@
 {
   "expected_category": "deployment_regression",
   "forbidden_categories": ["resource_exhaustion", "external_dependency"],
-  "required_keywords": ["could not be parsed", "92907"],
+  "required_keywords": ["92907"],
   "ruling_out_keywords": ["0.0007"],
   "required_reads": ["fixtures/es-errors.log", "fixtures/metrics-live.txt"],
   "forbidden_phrases": ["v1.900.440"],

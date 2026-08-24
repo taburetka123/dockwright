@@ -1245,3 +1245,20 @@ def test_monitor_unknown_subcommand_reports_before_name_lookup(fresh_orchestrato
     err = capsys.readouterr().err
     assert "Unknown monitor subcommand" in err
     assert "no active manager record" not in err
+
+
+def test_the_dispatch_table_covers_every_canonical_lane():
+    """The dispatch dict was a SECOND hand-maintained lane list. A lane added
+    to lane_io.LANES but not here passes subcommand validation and then raises
+    KeyError, which the retry ladder reads as a transient — a missing
+    implementation reported for five scans as a flaky one, then as wedged."""
+    from dockwright import lane_io
+    assert set(monitor._SCANS) == set(lane_io.LANES)
+    assert set(monitor._SCANS) == set(monitor._MONITOR_SUBCOMMANDS)
+
+
+def test_every_dispatch_target_actually_exists():
+    """Names are resolved through globals() at call time, so a typo would
+    surface as a NameError mid-scan rather than at import."""
+    for lane, target in monitor._SCANS.items():
+        assert callable(getattr(monitor, target, None)), (lane, target)

@@ -4,7 +4,7 @@ appear in a tool output captured on disk (the session transcript JSONL).
 
 Checks run against the tool-call record, which the model does not author —
 provenance-presence checks in prose are defeated by provenance fabrication
-(ported from upstream-scorer tools/eval_score.py; see the Phase B design spec).
+(see the Phase B design spec).
 
 Standalone + stdlib-only: deployed verbatim to ~/.claude/scripts/ by setup.sh.
 Consumed three ways: CLI (the integrator agent), importlib (evals gates + tests).
@@ -52,7 +52,7 @@ def extract_tokens(text: str, classes: tuple[str, ...] = ALL_CLASSES) -> list[To
             tok = match.group(0)
             if cls == "version":
                 # A year-leading dotted token (2026.06.29) is a date, not a version;
-                # service versions start well below 2000 (upstream-scorer year-guard).
+                # service versions start well below 2000 (year-guard).
                 if int(tok.lstrip("vV").split(".", 1)[0]) >= 2000:
                     continue
             key = (tok, cls)

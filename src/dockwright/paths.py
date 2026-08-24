@@ -81,6 +81,15 @@ PENDING_ASSIGNMENT_TTL_SEC = 24 * 3600
 # having to know about it. Resolution = unlink by the watchdog's healthy-sweep.
 ORPHANS = ROOT / "orphans"
 
+# Per-lane liveness heartbeats: lane-health/<manager-name>/<lane>.json, written
+# by a monitor scan that passed its reader preflight AND flushed every line it
+# emitted. A lane that can no longer deliver raises before reaching the write,
+# so a FRESH heartbeat is evidence of delivery capability rather than a
+# self-report. Read by `dockwright lanes`. Deliberately NOT in ensure_dirs —
+# lazy like ORPHANS: write_json_atomic mkdirs on demand and the reader tolerates
+# a missing dir, which spares every paths-patching fixture from knowing about it.
+LANE_HEALTH = ROOT / "lane-health"
+
 # Per-ticket architect workdir: ~/.claude/dockwright/architect/<ticket>/ holds
 # blackboard.db + the rendered contract/slice/gate views. Sibling to active/, done/.
 # The architect package (deterministic spine) is the only writer; nothing else
@@ -234,7 +243,14 @@ def _event_bucket(parent_manager_name: str | None) -> str:
     if not parent_manager_name:
         return UNSCOPED_BUCKET
     # A manager name must resolve to a single path segment.
-    return parent_manager_name.replace("/", "_").replace("\\", "_")
+    bucket = parent_manager_name.replace("/", "_").replace("\\", "_")
+    # "." and ".." survive the separator swap and are TRAVERSAL, not names:
+    # `DONE / ".."` is DONE's parent, so a bucket named ".." would put events
+    # outside the tree that is supposed to contain them. Defensive rather than
+    # a live exploit — names come from the generator — but every per-manager
+    # directory in the codebase routes through here, so one guard covers
+    # done/, turn-ends/, questions/, notify-outbox/, orphans/ and lane-health/.
+    return f"_{bucket}" if bucket in (".", "..") else bucket
 
 
 def orphan_flag_path(manager_name: str | None) -> Path:

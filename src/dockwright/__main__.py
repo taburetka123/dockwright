@@ -9,8 +9,9 @@ Subcommands:
   doctor                Verify install wiring (hooks, MCP, venv)
   init                  Write a starter dockwright.toml
   monitor               One-shot fleet scans: questions|done|turn-ends|stale [manager-name]
+  lanes                 Report whether this manager's monitor lanes are still delivering
   sweep                 Prune stale orchestrator state
-  spend-report          Per-session token spend report
+  spend-report          Fleet token report, or per-session time+cost report (spend-report <worker|sid>)
   spend-cost            Price a spend report
   distill               Distill a manager session into a memory journal
   boot-brief            Print manager boot pointers (agent line count, memory/notebook paths)
@@ -64,6 +65,9 @@ def main() -> None:
     elif cmd == "monitor":
         from .monitor import main as monitor_main
         monitor_main(sys.argv[2:])
+    elif cmd == "lanes":
+        from .lanes import main as lanes_main
+        sys.exit(lanes_main(sys.argv[2:]))
     elif cmd == "install-codex-skills":
         from .codex_skills import main as codex_skills_main
         sys.exit(codex_skills_main(sys.argv[2:]))

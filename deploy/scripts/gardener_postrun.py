@@ -20,13 +20,15 @@ Three CLI modes:
       carrying the reasons.
 
   gardener_postrun.py decide --proposal <path> --kind accept|decline --reason <text>
-      Called from the review sitting (dockwright-selffix-review's gardener phase)
+      Called from the review sitting (dockwright-selffix-review — the proposals sitting)
       after the human decides a cluster. The proposal must still be under
       proposals/pending/ — deciding an already-moved file is refused, so a
       double-decide cannot write contradictory ledger events. Mechanically:
       moves the proposal to proposals/{accepted,declined}/ (collision-safe),
       appends a `decision` ledger event, and batch-marks every member finding
-      reviewed. Members may be full finding basenames or unique prefixes
+      reviewed (EXCEPTION: a `corpus-retire` decline marks nothing —
+      declining retirement keeps the members in the unreviewed corpus).
+      Members may be full finding basenames or unique prefixes
       (sid-prefix-8): exact match first, then a prefix glob — an ambiguous
       prefix is NOT marked and is reported, never guessed. Decline REQUIRES a
       reason: the recorded decline is what stops the digest from re-surfacing
@@ -84,7 +86,15 @@ def _prefer_new(new: Path, legacy: Path) -> Path:
     return new
 
 
-GARDENER_DIR = _prefer_new(HOME / ".claude" / "dockwright" / "gardener", HOME / ".claude" / "gardener")
+# DOCKWRIGHT_GARDENER_DIR pins the state root by construction: any fresh
+# importlib load or CLI subprocess that sets it writes THERE, never the live
+# ~/.claude/dockwright/gardener/ ledger (I3 — an ad-hoc/test run must not need
+# to fake all of HOME to redirect the audit record). All derived paths follow.
+_GARDENER_DIR_ENV = os.environ.get("DOCKWRIGHT_GARDENER_DIR")
+if _GARDENER_DIR_ENV:
+    GARDENER_DIR = Path(_GARDENER_DIR_ENV)
+else:
+    GARDENER_DIR = _prefer_new(HOME / ".claude" / "dockwright" / "gardener", HOME / ".claude" / "gardener")
 PENDING_DIR = GARDENER_DIR / "proposals" / "pending"
 ACCEPTED_DIR = GARDENER_DIR / "proposals" / "accepted"
 DECLINED_DIR = GARDENER_DIR / "proposals" / "declined"
@@ -155,6 +165,32 @@ def config_toml_str(section: str, key: str) -> str:
     return value if isinstance(value, str) else ""
 
 
+def config_toml_int(section: str, key: str, default: int) -> int:
+    """[section] key as int, tolerating BOTH bare TOML ints (tomllib parses
+    them as int — config_toml_str drops non-str values) and quoted/fallback
+    string forms. Unparseable/missing ⇒ default."""
+    path = config_path()
+    if path is None:
+        return default
+    try:
+        import tomllib
+        with open(path, "rb") as fh:
+            value = tomllib.load(fh).get(section, {}).get(key)
+    except ModuleNotFoundError:
+        try:
+            value = _scan_toml_str(path.read_text(), section, key)
+        except OSError:
+            return default
+    except Exception:
+        return default
+    if value is None:
+        return default
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        return default
+
+
 def _dockwright_repo() -> str:
     """[paths] dockwright_repo from dockwright.toml, ~-expanded ("" when unset)."""
     value = config_toml_str("paths", "dockwright_repo")
@@ -177,6 +213,7 @@ PROPOSAL_REQUIRED_FIELDS = ("id", "run_id", "cluster", "targets", "lane",
                             "expectation", "check_window_days", "revert")
 LANES = ("digest", "frontier")
 EVIDENCE_KINDS = ("findings", "ops", "external")
+FLOW_COST_VERDICTS = ("none", "adds", "removes")
 FINDING_MEMBER_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 PROPOSAL_REQUIRED_PRESENT = ("always_on_bytes",)
 PROPOSAL_REQUIRED_SECTIONS = ("## Evidence", "## Diff")
@@ -245,6 +282,7 @@ def _as_list(value) -> list:
 
 
 _DIFF_HEADER_RE = re.compile(r"^(?:\+\+\+|---)\s+(\S+)", re.MULTILINE)
+_DIFF_FENCE_RE = re.compile(r"^```diff\s*$", re.MULTILINE)
 
 
 def diff_paths(body: str) -> list[str]:
@@ -272,6 +310,10 @@ def _diff_path_violations(body: str, declared_targets: list[str]) -> list[str]:
         if raw.startswith(("/", "~")):
             if not _target_in_scope(raw):
                 violations.append(f"diff patches path outside allowed roots (FR-8): {raw}")
+            elif str(Path(os.path.realpath(os.path.expanduser(raw)))) not in resolved_targets:
+                # in-roots but undeclared: symmetric with the a/<rel> rule below
+                violations.append(
+                    f"diff patches a path not declared in targets: {raw}")
             continue
         rel = re.sub(r"^[ab]/", "", raw)
         if not any(t == rel or t.endswith(os.sep + rel) for t in resolved_targets):
@@ -312,7 +354,293 @@ def validate_proposal(meta, body: str = "") -> list[str]:
         if not _target_in_scope(target):
             violations.append(f"target outside allowed roots (FR-8): {target}")
     violations.extend(_diff_path_violations(body, targets))
+    violations.extend(_always_on_bytes_violations(meta, body))
+    violations.extend(_flow_cost_violations(meta))
     return violations
+
+
+def _overlay_dir() -> str:
+    """[paths] overlay_dir from dockwright.toml, real-pathed, falling back to
+    the default exactly like config.py's overlay_dir() — this script stays
+    stdlib-only so it can't import that module directly."""
+    value = config_toml_str("paths", "overlay_dir") or "~/.claude/dockwright-overlay"
+    return os.path.realpath(os.path.expanduser(value))
+
+
+_OVERLAY_DIR = _overlay_dir()
+_LEGACY_OVERLAY_DIR = os.path.realpath(os.path.expanduser("~/.claude/orchestrator-overlay"))
+_ALWAYS_ON_PARTS = frozenset({"rules", "agents"})
+
+
+def _is_always_on(resolved_path: str) -> bool:
+    """Always-loaded context per the digest skill's own definition (rules/
+    agent files, or an overlay drop-in that composes into a rendered agent
+    file). Named approximation (spec M4): a surface without a rules/agents
+    path component and outside the overlay dir (e.g. a bare CLAUDE.md) earns
+    no eviction credit. False-negative credit is the conservative direction."""
+    if not _target_in_scope(resolved_path):
+        return False
+    if _ALWAYS_ON_PARTS.intersection(Path(resolved_path).parts):
+        return True
+    return any(resolved_path == root or resolved_path.startswith(root + os.sep)
+               for root in (_OVERLAY_DIR, _LEGACY_OVERLAY_DIR))
+
+
+def _hunk_body_bytes(body_lines) -> int:
+    """Net UTF-8 byte delta of ONE hunk's body lines (the `@@` header
+    excluded). A +/- line contributes its content bytes plus one newline; a
+    `\\ No newline at end of file` marker undoes the newline byte counted for
+    the line above it; context lines (' '-prefixed or blank) contribute
+    nothing and reset the running sign. Shared by the strict and lenient
+    walks so the two paths cannot drift."""
+    delta = 0
+    prev_sign = None
+    for ln in body_lines:
+        if ln.startswith("\\"):
+            if prev_sign == "+":
+                delta -= 1
+            elif prev_sign == "-":
+                delta += 1
+            prev_sign = None
+        elif ln.startswith("+"):
+            delta += len(ln[1:].encode("utf-8")) + 1
+            prev_sign = "+"
+        elif ln.startswith("-"):
+            delta -= len(ln[1:].encode("utf-8")) + 1
+            prev_sign = "-"
+        else:
+            prev_sign = None
+    return delta
+
+
+def _strict_hunk_bodies(flat_hunks) -> list:
+    """The strict FileDiff.hunks is a flat line list with `@@` headers
+    interleaved; regroup it into one body-line list per hunk (headers
+    dropped) so it matches the lenient parser's per-hunk shape and both feed
+    the same _hunk_body_bytes walk."""
+    bodies, cur = [], None
+    for ln in flat_hunks:
+        if ln.startswith("@@"):
+            cur = []
+            bodies.append(cur)
+        elif cur is not None:
+            cur.append(ln)
+    return bodies
+
+
+def compute_always_on_delta(body: str, declared_targets: list):
+    """Net UTF-8 byte delta this proposal's diff applies to ALWAYS-LOADED
+    files, computed with the ACTUATOR'S OWN parse pipeline — never a
+    re-derivation (spec C1: a delta computed over a different reading of the
+    document than the one that gets applied validates the wrong document).
+    Mirrors the actuator's full strict→lenient fallback: the strict
+    split_file_diffs is tried first, and when it refuses — a bare, unnumbered
+    `@@` hunk header (the form the generator historically emits) or any
+    structure only the lenient parser accepts — the actuator's LENIENT parser
+    reads the SAME extract_diff_text output, exactly as apply's resolve_plan
+    does, and the byte walk runs over its per-file hunk bodies with identical
+    arithmetic. Path resolution stays _resolve_one against the declared
+    targets on both paths.
+
+    Even when strict SUCCEEDS its FULL per-file structure — the (old_raw,
+    new_raw) pair AND the hunk-body line lists the byte walk consumes — is
+    cross-checked against the lenient parse, because a hand-written hunk count
+    silently truncates the strict body in TWO shapes:
+      * OVERCOUNT (boundary swallow): the count drives the consumption loop
+        across the NEXT file's `--- `/`+++ ` header and `@@` line into the
+        first file's hunk body — strict still succeeds (the swallowed `@@`
+        balances its total_headers==parsed_headers assertion) but the second
+        file drops out of attribution. The pair lists themselves diverge.
+      * UNDERCOUNT (intra-file truncation): the count is SATISFIED early, so
+        strict stops mid-hunk and silently drops the trailing `+`/`-` body
+        lines WITHIN one file — no boundary crossed, the pair lists are
+        IDENTICAL, and a pair-only check would keep the truncated strict walk.
+        Only comparing the body line lists catches it.
+    ANY divergence ⇒ recompute the delta from the lenient parse — what the
+    actuator's re-anchor applies whenever git refuses the hand-written counts
+    (spec C1: validate the ACT). An exactly-equal structure keeps the strict
+    walk (byte-identical attribution). Harmless divergence is possible — a
+    trailing blank line between a hunk and the next file header that lenient
+    absorbs as blank CONTEXT while strict drops it — and needs no special
+    case: routing those to lenient changes nothing, since a blank body line
+    contributes 0 bytes to the walk.
+
+    None ⇒ fail-closed (no negative credit; the consistency check skips):
+    reached when BOTH parsers refuse the diff (genuinely malformed — the birth
+    gate independently quarantines it as `malformed`), when strict parses but
+    the lenient cross-check parser cannot read the same text (no trusted
+    reading to validate against), or when a diff path resolves outside the
+    declared targets (the scope guard refuses it) — the same residual the
+    actuator itself refuses. A bare-`@@` diff no longer falls into this class;
+    it is exactly what the lenient fallback reads."""
+    try:
+        import gardener_apply  # lazy: gardener_apply imports THIS module
+        diff_text = gardener_apply.extract_diff_text(body)
+    except Exception:  # noqa: BLE001 — no ```diff fence ⇒ unknowable
+        return None
+    try:
+        strict = [(fd.old_raw, fd.new_raw, _strict_hunk_bodies(fd.hunks))
+                  for fd in gardener_apply.split_file_diffs(diff_text)]
+    except Exception:  # noqa: BLE001 — strict refuses (bare-@@ &c.)
+        strict = None
+    try:
+        lenient = [(fd.old_raw, fd.new_raw, list(fd.hunks))
+                   for fd in gardener_apply.lenient_parse(diff_text)]
+    except Exception:  # noqa: BLE001 — lenient refuses
+        lenient = None
+    if strict is None:
+        if lenient is None:
+            return None  # BOTH parsers fail ⇒ truly malformed
+        per_file = lenient
+    elif lenient is None:
+        # strict parsed but the actuator's own lenient reading cannot: no
+        # trusted reading to cross-check the swallow against ⇒ fail-closed
+        return None
+    elif strict == lenient:
+        # full per-file structure (pairs AND body line lists) identical —
+        # keep the strict walk (byte-identical attribution)
+        per_file = strict
+    else:
+        # ANY divergence ⇒ the lenient act: boundary swallow (overcount),
+        # intra-file truncation (undercount), or a harmless trailing-blank
+        # (0 bytes either way)
+        per_file = lenient
+    declared_abs = [os.path.realpath(os.path.expanduser(t))
+                    for t in declared_targets]
+    delta = 0
+    for old_raw, new_raw, bodies in per_file:
+        try:
+            old_abs = gardener_apply._resolve_one(old_raw, declared_abs)
+            new_abs = gardener_apply._resolve_one(new_raw, declared_abs)
+        except Exception:  # noqa: BLE001 — unresolvable ⇒ unknowable
+            return None
+        path = new_abs if new_abs is not None else old_abs
+        if path is None or not _is_always_on(path):
+            continue
+        for hunk_body in bodies:
+            delta += _hunk_body_bytes(hunk_body)
+    return delta
+
+
+_BYTES_TOLERANCE = 16
+
+
+def _bytes_tolerance() -> int:
+    """Noise floor in UTF-8 bytes: [gardener] bytes_tolerance, default 16
+    (EOF-newline edges). ONE value in TWO roles by design (spec I1): the 2b
+    declared-vs-computed mismatch tolerance AND the censor's
+    justification-free positive-delta floor — both mean "below this, a byte
+    delta is measurement noise", and the shared key keeps the roles from
+    drifting apart silently. A measurement parameter, never a byte budget:
+    the emission policy for positive deltas is the skill's structural
+    conditions + the human sitting, not this number."""
+    return config_toml_int("gardener", "bytes_tolerance", _BYTES_TOLERANCE)
+
+
+def _always_on_bytes_violations(meta, body: str) -> list:
+    """§7.4 extensions, one accumulating pass (spec M1): (2b) the declared
+    always_on_bytes must match the diff-computed act within tolerance
+    (PR #208 class — validate the act, not the declaration); (censor, PRD
+    A5) a diff netting positive always-on bytes beyond the same tolerance
+    must carry a non-empty cost_justification. Skipped entirely when there
+    is no ```diff fence (build-brief prose diffs); an uncomputable diff
+    skips everything except the non-integer-declared report (apply-check
+    owns malformed diffs)."""
+    if "always_on_bytes" not in meta:
+        return []  # presence is PROPOSAL_REQUIRED_PRESENT's job
+    if not _DIFF_FENCE_RE.search(body):
+        return []
+    violations = []
+    declared = None
+    declared_raw = str(meta.get("always_on_bytes", "")).strip()
+    try:
+        declared = int(declared_raw)
+    except (TypeError, ValueError):
+        violations.append(f"always_on_bytes is not an integer: {declared_raw!r}")
+    computed = compute_always_on_delta(body, _as_list(meta.get("targets")))
+    if computed is None:
+        return violations
+    tolerance = _bytes_tolerance()
+    if declared is not None and abs(declared - computed) > tolerance:
+        violations.append(f"always_on_bytes mismatch: declared {declared}, "
+                          f"diff computes {computed:+d} always-on bytes")
+    if computed > tolerance and not "".join(
+            _as_list(meta.get("cost_justification"))).strip():
+        violations.append(
+            f"positive always-on delta ({computed:+d} B) without "
+            "cost_justification — a proposal that grows always-loaded "
+            "context must declare the value claim + the cheaper home it "
+            "rejected (censor, PRD A5)")
+    return violations
+
+
+_FLOW_COST_RE = re.compile(r"([A-Za-z]+)(.*)", re.DOTALL)
+_FLOW_COST_PLACEHOLDER = re.compile(r"<(?:one )?clause>")
+_FLOW_COST_NOISE = " \t\n`*'\".,:;-\u2014\u2013"
+
+
+def _flow_cost_violations(meta) -> list:
+    """§7.4 extension (PRD A7): the flow_cost contract lives in the
+    dockwright-gardener-digest skill's "Flow-cost question" section.
+    _as_list coerces the `[...]`-shaped value parse_frontmatter returns as a
+    list; an uncoerced list raises here and leaves the rest of the run's
+    artifacts unvalidated."""
+    raw = "".join(_as_list(meta.get("flow_cost"))).strip(_FLOW_COST_NOISE)
+    raw = "" if _FLOW_COST_PLACEHOLDER.search(raw) else raw
+    if not raw:
+        return ["missing required field: flow_cost — answer what an ordinary "
+                "run that does NOT hit this problem pays "
+                f"({'|'.join(FLOW_COST_VERDICTS)})"]
+    match = _FLOW_COST_RE.match(raw)
+    verdict = match.group(1).lower() if match else raw
+    note = match.group(2) if match else ""
+    if verdict not in FLOW_COST_VERDICTS:
+        return [f"flow_cost verdict must be one of {FLOW_COST_VERDICTS}: "
+                f"{verdict!r}"]
+    if verdict != "none" and not note.strip(_FLOW_COST_NOISE):
+        return [f"flow_cost: {verdict} requires a one-line note naming the "
+                "recurring surface and the per-what (per review round / per "
+                "PR / per test run / per session)"]
+    return []
+
+
+_APPLY_CHECK_FAIL = ("drifted", "ambiguous", "missing-file", "malformed",
+                     "out-of-scope")
+
+BACKPRESSURE_EVERY_DEFAULT = 2
+BACKPRESSURE_MIN_BYTES_DEFAULT = 128
+_APPLY_CHECK_QUALIFY = ("clean", "reanchorable")
+
+
+def _apply_check(path: str, body: str):
+    """Apply-ability of a new pending proposal, via the actuator's own
+    classifier (the same parser/anchor pipeline apply uses — never a
+    re-derivation). Returns (verdict, detail): verdict is a pass token
+    (clean|reanchorable|no-diff|skipped-env) or a fail class from
+    _APPLY_CHECK_FAIL. Fence PRESENCE decides whether the gate fires —
+    kind: build-brief legitimately ships a prose ## Diff (gate on what the
+    body carries, not what the frontmatter declares). Environmental
+    problems must never quarantine a proposal (a generic install without
+    git-versioned roots would otherwise mass-reject on machine state)."""
+    if not _DIFF_FENCE_RE.search(body):
+        return "no-diff", ""
+    try:
+        import gardener_apply  # lazy: gardener_apply imports THIS module
+        # Scope-sync (module identity): gardener_apply resolves scope via
+        # the gardener_postrun instance BOUND at ITS import — under a fresh
+        # importlib load of this module (tests) that is a different object.
+        # Sync the bound module's roots to THIS module's for the call so
+        # classification always judges against the caller's scope.
+        bound = gardener_apply.gardener_postrun
+        saved = bound.ALLOWED_TARGET_ROOTS
+        bound.ALLOWED_TARGET_ROOTS = ALLOWED_TARGET_ROOTS
+        try:
+            cls = gardener_apply.classify_proposal(path, env_lenient=True)
+        finally:
+            bound.ALLOWED_TARGET_ROOTS = saved
+        return cls.klass, cls.detail
+    except Exception as exc:  # noqa: BLE001 — env problem, fail open+loud
+        return "skipped-env", f"{type(exc).__name__}: {exc}"
 
 
 def validate_check(meta) -> list[str]:
@@ -367,10 +695,62 @@ def known_from_ledger() -> set[str]:
     return known
 
 
+def _backpressure_stats():
+    """(streak, seen_run_ids) replayed over digest-lane backpressure events
+    in ledger order. Recomputed each call rather than trusted from the last
+    event — the ledger is small and replay is annotate-tolerant."""
+    streak, seen = 0, set()
+    for rec in _iter_ledger_events():
+        if _event_type(rec) != "backpressure" or rec.get("lane") != "digest":
+            continue
+        seen.add(rec.get("run_id"))
+        try:
+            proposals = int(rec.get("proposals") or 0)
+            negative = int(rec.get("negative") or 0)
+        except (TypeError, ValueError):
+            continue
+        if negative > 0:
+            streak = 0
+        elif proposals > 0:
+            streak += 1
+    return streak, seen
+
+
+def record_backpressure(run_id: str, proposals: int, negative: int):
+    """Digest-lane back-pressure heartbeat + violation flag (spec 2c).
+    ALWAYS appends one event per digest postrun — a gate that is silent when
+    it had nothing to check is indistinguishable from a broken one. Returns
+    None when this run_id already has an event (whole-ledger idempotency);
+    else {"streak": int, "violation": bool}. Violation response is
+    flag-loud, never quarantine: the wrapper swallows exit codes, and
+    rejecting good additive proposals would only pressure the analyst to
+    fabricate evictions."""
+    streak, seen = _backpressure_stats()
+    if run_id in seen:
+        return None
+    if negative > 0:
+        streak = 0
+    elif proposals > 0:
+        streak += 1
+    every = config_toml_int("gardener", "backpressure_every",
+                            BACKPRESSURE_EVERY_DEFAULT)
+    violation = streak >= every
+    if violation:
+        print(f"WARNING: back-pressure violation — {streak} consecutive "
+              "proposal-bearing digest runs carried zero negative-byte "
+              "proposals; the always-on corpus only grew (spec: "
+              "PRD v2 Amendment A4)", file=sys.stderr)
+    ledger_append("backpressure", run_id=run_id, lane="digest",
+                  proposals=proposals, negative=negative,
+                  streak=streak, violation=violation)
+    return {"streak": streak, "violation": violation}
+
+
 def process_run_artifacts(run_id: str, known: set[str], lane: str = "") -> dict:
     """Validate every artifact the ledger doesn't know yet. `known` is the
     ledger-derived set (plus any --known supplement)."""
-    summary = {"proposals": 0, "checks": 0, "rejected": 0}
+    summary = {"proposals": 0, "checks": 0, "rejected": 0, "skipped_env": 0,
+               "digest_proposals": 0, "digest_negative": 0}
     for d in (PENDING_DIR, CHECKS_DIR, REJECTED_DIR):
         d.mkdir(parents=True, exist_ok=True)
     for path in sorted(PENDING_DIR.glob("*.md")):
@@ -383,6 +763,25 @@ def process_run_artifacts(run_id: str, known: set[str], lane: str = "") -> dict:
                         lane=str((meta or {}).get("lane") or lane or "digest"))
             summary["rejected"] += 1
             continue
+        # Birth gate: a newly-emitted proposal whose diff the actuator cannot
+        # apply is quarantined here, never silently enqueued. Runs only for
+        # proposals the ledger doesn't already know (the loop skips known ones
+        # above), so the live pending backlog is never retro-quarantined.
+        verdict, detail = _apply_check(str(path), body)
+        if verdict == "skipped-env":
+            # count it: a machine-wide vacuous birth gate (every proposal
+            # skipped-env) must be visible in the one-line postrun summary,
+            # not just on scattered stderr WARNINGs (M5).
+            summary["skipped_env"] += 1
+            print(f"WARNING: apply-check skipped (environment) for "
+                  f"{path.name}: {detail}", file=sys.stderr)
+        if verdict in _APPLY_CHECK_FAIL:
+            _quarantine(path,
+                        [f"apply-check failed at birth ({verdict}): {detail}"],
+                        run_id,
+                        lane=str((meta or {}).get("lane") or lane or "digest"))
+            summary["rejected"] += 1
+            continue
         members = _as_list(meta.get("members"))
         targets = _as_list(meta.get("targets"))
         ledger_append("proposal", run_id=run_id, proposal_id=str(meta.get("id")),
@@ -390,8 +789,18 @@ def process_run_artifacts(run_id: str, known: set[str], lane: str = "") -> dict:
                       members=",".join(members), targets=",".join(targets),
                       lane=str(meta.get("lane") or lane or "digest"),
                       evidence_kind=str(meta.get("evidence_kind") or "findings"),
+                      apply_check=verdict,
                       **{"class": str(meta.get("kind", ""))})
         summary["proposals"] += 1
+        eff_lane = str(meta.get("lane") or lane or "digest")
+        if eff_lane == "digest":
+            summary["digest_proposals"] += 1
+            if verdict in _APPLY_CHECK_QUALIFY:
+                min_bytes = config_toml_int("gardener", "backpressure_min_bytes",
+                                            BACKPRESSURE_MIN_BYTES_DEFAULT)
+                delta = compute_always_on_delta(body, targets)
+                if delta is not None and delta <= -min_bytes:
+                    summary["digest_negative"] += 1
     for path in sorted(CHECKS_DIR.glob("*.md")):
         if path.name in known:
             continue
@@ -452,12 +861,16 @@ def decide(proposal_path: str, kind: str, reason: str, applied_rev=None) -> int:
         return 2
     members = _as_list(meta.get("members"))
     evidence_kind = str(meta.get("evidence_kind") or "findings")
+    # A corpus-retire DECLINE is a vote to keep clustering the evidence, not
+    # to bury it — marking members reviewed here would make decline behave
+    # identically to accept (PRD §A5: "DECLINE keeps them as evidence").
+    keep_evidence = kind == "decline" and str(meta.get("kind", "")) == "corpus-retire"
     dest_dir = ACCEPTED_DIR if kind == "accept" else DECLINED_DIR
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = _unique_dest(dest_dir, path.name)
     shutil.move(str(path), str(dest))
     marked, ambiguous, missing = [], [], []
-    if evidence_kind == "findings":
+    if evidence_kind == "findings" and not keep_evidence:
         for sid in members:
             finding, how = _resolve_member(sid)
             if how == "ambiguous":
@@ -484,7 +897,8 @@ def decide(proposal_path: str, kind: str, reason: str, applied_rev=None) -> int:
     print(f"gardener-decide: {kind} {meta.get('id')} → {dest}; "
           f"marked reviewed: {len(marked)}/{len(members)} members"
           + (f"; AMBIGUOUS prefixes left unmarked: {','.join(ambiguous)}" if ambiguous else "")
-          + (f"; no finding file for: {','.join(missing)}" if missing else ""))
+          + (f"; no finding file for: {','.join(missing)}" if missing else "")
+          + ("; members kept as evidence (corpus-retire decline)" if keep_evidence else ""))
     return 0
 
 
@@ -717,6 +1131,18 @@ def evaluate(verdicts_path, dry_run: bool, now: float) -> int:
     return 2 if anomaly else 0
 
 
+def annotate(ref: str, note: str) -> int:
+    """Append a correction/annotation event referencing an earlier ledger
+    entry. The ledger is an APPEND-ONLY audit record: the correct response to a
+    stray or erroneous event is an appended `annotate`, NEVER an in-place edit
+    of the audit file — editing the record is the DEEPER error the disclosed
+    incident warns against. Carries no top-level `path` key (known_from_ledger
+    keys on `path`; an annotation must not shadow a pending artifact)."""
+    ledger_append("annotate", ref=ref, note=note)
+    print(f"gardener-annotate: appended annotate ref={ref!r}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     if not _HOME_ENV:
         print("gardener-postrun: HOME is not set — refusing to guess paths", file=sys.stderr)
@@ -744,6 +1170,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="Print planned appends without writing the ledger.")
     p_eval.add_argument("--now", type=float, default=None,
                         help="Override the maturity clock (epoch seconds; tests/replay).")
+    p_ann = sub.add_parser("annotate")
+    p_ann.add_argument("--ref", required=True,
+                       help="ts or id of the ledger event being annotated.")
+    p_ann.add_argument("--note", required=True,
+                       help="The correction/annotation text.")
     args = parser.parse_args(argv)
 
     if args.cmd == "postrun":
@@ -752,12 +1183,27 @@ def main(argv: list[str] | None = None) -> int:
             known |= {line.strip() for line in Path(args.known).read_text().splitlines()
                       if line.strip()}
         summary = process_run_artifacts(args.run_id, known, lane=args.lane)
-        print(f"gardener-postrun: proposals={summary['proposals']} "
-              f"checks={summary['checks']} rejected={summary['rejected']}")
+        line = (f"gardener-postrun: proposals={summary['proposals']} "
+                f"checks={summary['checks']} rejected={summary['rejected']} "
+                f"skipped_env={summary['skipped_env']}")
+        if args.lane in ("", "digest"):
+            bp = record_backpressure(args.run_id,
+                                     summary["digest_proposals"],
+                                     summary["digest_negative"])
+            if bp is None:
+                line += " backpressure=already-recorded"
+            else:
+                line += (f" backpressure={summary['digest_negative']}"
+                         f"/{summary['digest_proposals']} streak={bp['streak']}")
+                if bp["violation"]:
+                    line += " VIOLATION"
+        print(line)
         return 0
     if args.cmd == "evaluate":
         now = args.now if args.now is not None else time.time()
         return evaluate(args.verdicts, args.dry_run, now)
+    if args.cmd == "annotate":
+        return annotate(args.ref, args.note)
     return decide(args.proposal, args.kind, args.reason, applied_rev=args.applied_rev)
 
 

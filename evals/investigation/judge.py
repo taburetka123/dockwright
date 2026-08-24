@@ -23,7 +23,7 @@ def judge_score(
     findings: str,
     rubric: str,
     *,
-    model: str = "opus",
+    model: str = "claude-opus-5",
     timeout: int = 300,
     runner=subprocess.run,
 ) -> int:
@@ -38,6 +38,7 @@ def judge_score(
             "claude", "-p", prompt, "--model", model,
             "--settings", verifier.settings_path(), "--output-format", "json",
             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+            "--setting-sources", "project",
         ]
         proc = runner(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
         if proc.returncode != 0:

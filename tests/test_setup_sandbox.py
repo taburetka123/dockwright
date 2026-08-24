@@ -141,10 +141,17 @@ def test_migration_relocates_preseeded_orchestrator_state(tmp_path):
     """A pre-existing legacy orchestrator/ state dir is migrated to dockwright/
     with a compat symlink left at the old path — setup.sh runs `migrate-state`
     before any deploy copy. RENDER_BIN-gated, so it fires only with a render
-    binary (DOCKWRIGHT_ORCH_BIN in the sandbox)."""
+    binary (DOCKWRIGHT_ORCH_BIN in the sandbox).
+
+    Fixture lives under legacy orchestrator/done/, not orchestrator/active/ —
+    migrate.py's ROWS relocate the whole orchestrator/ dir in one os.rename, so
+    seeding done/ exercises the identical migration path while keeping the
+    fleet-liveness gate LIVE (no DOCKWRIGHT_SETUP_FORCE) in this test. The
+    gate's legacy-tree lookup itself is covered by the fleet-gate tests in
+    test_setup_sh_guard.py."""
     claude_dir = tmp_path / "claude"
-    (claude_dir / "orchestrator" / "active").mkdir(parents=True)
-    (claude_dir / "orchestrator" / "active" / "seed.json").write_text('{"seed": 1}')
+    (claude_dir / "orchestrator" / "done").mkdir(parents=True)
+    (claude_dir / "orchestrator" / "done" / "seed.json").write_text('{"seed": 1}')
     overlay = tmp_path / "empty-overlay"; overlay.mkdir()
     cfg = tmp_path / "dockwright.toml"
     cfg.write_text(
@@ -160,7 +167,7 @@ def test_migration_relocates_preseeded_orchestrator_state(tmp_path):
     assert orch.is_symlink()
     assert orch.resolve() == (claude_dir / "dockwright").resolve()
     # …and the pre-seeded state moved with it.
-    assert (claude_dir / "dockwright" / "active" / "seed.json").read_text() == '{"seed": 1}'
+    assert (claude_dir / "dockwright" / "done" / "seed.json").read_text() == '{"seed": 1}'
 
 
 def test_no_codex_on_path_never_creates_codex_dir(tmp_path):

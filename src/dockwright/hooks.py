@@ -563,6 +563,19 @@ def session_start() -> None:
             "runtime": "claude",
         }
     else:
+        if agent == "manager" and os.environ.get("DOCKWRIGHT_PENDING_TAKEOVER") == "1":
+            # Recovery-lane tab (ghost-manager guard): identity is acquired only
+            # when the model actually calls become_manager_with_takeover /
+            # become_manager — registering here would mint a ghost record for a
+            # tab that may never take a turn (auth-bricked launch target), which
+            # then reads as a legitimate peer in list_managers. Must live INSIDE
+            # this fresh-registration branch: post-takeover re-fires (resume /
+            # compaction / /clear rotation) take the branches above and must keep
+            # doing so — the env var persists for the session's whole life.
+            # Exact "1": the launcher is the only writer. Manager-only: a leaked
+            # var on a worker spawn must not suppress worker registration.
+            _emit_session_context(sid, agent)
+            return
         explicit_name = os.environ.get("CLAUDE_WORKER_NAME")
         if explicit_name:
             base_name = explicit_name
@@ -729,18 +742,19 @@ def stop_hook() -> None:
             _set_tab_color(WORKER_TAB_COLOR_IDLE)
 
 def _accumulate_record_spend(record: dict, log) -> None:
-    """Fold the just-ended turn's token usage into record["spend"].
-
-    Observability only — runs inside the Stop hook on every turn, so it must
-    stay cheap (64KB tail read, never the full transcript) and must NEVER
-    raise past this function: malformed/missing usage degrades to a no-op.
-    Claude transcript shape only; codex rollouts carry no message.usage.
+    """Recount record["spend"] from the whole transcript — a pure function of
+    the file (see transcript.recount_spend for semantics + the resume-replay
+    birth filter). Observability only — runs inside the Stop hook on every
+    turn, bounded by last_assistant_summary's existing full-file read in this
+    same hook, and must NEVER raise past this function: malformed/missing
+    usage degrades to a no-op. Claude transcript shape only; codex rollouts
+    carry no message.usage.
     """
     if (record.get("runtime") or "claude") != "claude":
         return
     try:
-        from .transcript import accumulate_spend, tail_usage_entries
-        spend = accumulate_spend(record.get("spend"), tail_usage_entries(log))
+        from .transcript import recount_spend
+        spend = recount_spend(log, record.get("spend"), record.get("started_at"))
         if spend is not None:
             record["spend"] = spend
     except Exception:
@@ -926,6 +940,16 @@ def session_end() -> None:
     # Nested sub-sessions aren't resumable either — archiving them would only
     # clutter list_closed_workers.
     if record is not None and record.get("agent") == "worker" and not record.get("nested"):
+        transcript_path = record.get("transcript_path")
+        if not transcript_path:
+            # Died before the first Stop ever cached it — resolve now, or the
+            # closed record loses its only recount source. Best-effort.
+            try:
+                from .transcript import find_session_log
+                log = find_session_log(sid, runtime=record.get("runtime") or "claude")
+                transcript_path = str(log) if log else None
+            except Exception:
+                transcript_path = None
         state.write_json_atomic(paths.CLOSED / f"{sid}.json", {
             "claude_sid": sid,
             "name": record.get("name") or "",
@@ -940,6 +964,7 @@ def session_end() -> None:
             "parent_manager_name": record.get("parent_manager_name"),
             "runtime": record.get("runtime") or "claude",
             "account": record.get("account"),
+            "transcript_path": transcript_path,
         })
     # Archive ANY spend before the record drops — managers and nested records
     # get no closed/ archive, and even the worker archive above is pruned at 7d.

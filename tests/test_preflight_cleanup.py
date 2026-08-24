@@ -402,6 +402,7 @@ def test_prune_closed_ledgers_only_autoclosed_spend(preflight, tmp_path, monkeyp
 
 
 def test_root_prefers_dockwright_home(tmp_path, monkeypatch):
+    monkeypatch.delenv("DOCKWRIGHT_STATE_DIR", raising=False)
     (tmp_path / ".claude" / "dockwright").mkdir(parents=True)
     (tmp_path / ".claude" / "orchestrator").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -411,10 +412,18 @@ def test_root_prefers_dockwright_home(tmp_path, monkeypatch):
 
 
 def test_root_falls_back_to_legacy_home(tmp_path, monkeypatch):
+    monkeypatch.delenv("DOCKWRIGHT_STATE_DIR", raising=False)
     (tmp_path / ".claude" / "orchestrator").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(tmp_path))
     mod = _load_preflight()
     assert mod.ROOT == tmp_path / ".claude" / "orchestrator"
+
+
+def test_root_env_override_wins(tmp_path, monkeypatch):
+    monkeypatch.setenv("DOCKWRIGHT_STATE_DIR", str(tmp_path / "elsewhere"))
+    mod = _load_preflight()
+    assert mod.ROOT == tmp_path / "elsewhere"
+    assert mod.SPEND_LEDGER == tmp_path / "elsewhere" / "spend-ledger.jsonl"
 
 
 def test_prune_active_keeps_dead_pid_with_live_pane(preflight, tmp_path, monkeypatch):
@@ -489,3 +498,44 @@ def test_live_pane_ids_parses_pane_lines(preflight, monkeypatch):
         return sp.CompletedProcess(args, returncode=0, stdout="%1\n%2\n", stderr="")
     monkeypatch.setattr(preflight.subprocess, "run", fake_run)
     assert preflight._live_pane_ids() == {"%1", "%2"}
+
+
+def test_gc_prunes_old_statusline_read_marks(preflight):
+    """.read-<sid> is the statusline's per-manager read mark. Only rewritten on
+    change, so a dead manager's mark would otherwise accumulate forever."""
+    old_age = preflight.STALE_CURSOR_SEC + 60
+    _write_old_raw(preflight.ROOT / ".read-dead-manager-sid", old_age)
+    _write_old_raw(preflight.ROOT / ".read-dead-manager-sid.tmp", old_age)
+    _write_old_raw(preflight.ROOT / ".read-live-manager-sid", 0)
+
+    preflight._gc_husks(time.time())
+
+    assert not (preflight.ROOT / ".read-dead-manager-sid").exists()
+    assert not (preflight.ROOT / ".read-dead-manager-sid.tmp").exists()
+    assert (preflight.ROOT / ".read-live-manager-sid").exists()
+
+
+def test_gc_prunes_every_declared_cursor_pattern(preflight):
+    """Binds the GC's BEHAVIOUR to the DECLARED set: a pattern that is declared
+    but not actually swept fails here, and a sixth pattern added later gets its
+    case for free. It is deliberately blind to delete-one — removing an entry
+    removes its own case — which is what test_gc_prunes_old_statusline_read_marks
+    above covers. Neither test alone is the guard; the pair is."""
+    old_age = preflight.STALE_CURSOR_SEC + 60
+    for pattern in preflight.STALE_CURSOR_PATTERNS:
+        _write_old_raw(preflight.ROOT / pattern.replace("*", "stale-x"), old_age)
+        _write_old_raw(preflight.ROOT / pattern.replace("*", "fresh-x"), 0)
+
+    # Canaries: real ROOT dotfiles that are NOT cursors. An over-broad pattern
+    # (".*", ".r*") passes every assertion below while sweeping live state.
+    canaries = (".deploy-stamp", ".account-flip.lock", ".readme-not-a-mark")
+    for name in canaries:
+        _write_old_raw(preflight.ROOT / name, old_age)
+
+    preflight._gc_husks(time.time())
+
+    for pattern in preflight.STALE_CURSOR_PATTERNS:
+        assert not (preflight.ROOT / pattern.replace("*", "stale-x")).exists(), pattern
+        assert (preflight.ROOT / pattern.replace("*", "fresh-x")).exists(), pattern
+    for name in canaries:
+        assert (preflight.ROOT / name).exists(), f"an over-broad pattern swept {name}"

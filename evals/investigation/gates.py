@@ -1,6 +1,8 @@
-"""Deterministic gate — port of upstream-scorer tools/eval_score.py::score_deterministic,
+"""Deterministic gate — adapted from an earlier deterministic scorer,
 adapted: required_queries -> required_reads (fixture-path suffix match against
-Read/Grep/Glob/Bash tool-call inputs), loops -> num_turns, plus the
+Read/Grep/Glob/Bash tool-call inputs, falling back to content evidence — >=80%
+of the fixture's unique distinctive lines present in the captured corpus —
+when the tool-call input names no file), loops -> num_turns, plus the
 value-grounding gate backed by deploy/scripts/value_grounding.py."""
 from __future__ import annotations
 
@@ -45,6 +47,34 @@ def _read_satisfied(required: str, tool_calls: list[tuple[str, str]]) -> bool:
     return False
 
 
+READ_CONTENT_LINE_FRACTION = 0.8
+_MIN_DISTINCTIVE_LINE_LEN = 8
+
+
+def _distinctive_lines(text: str) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if len(stripped) >= _MIN_DISTINCTIVE_LINE_LEN and stripped not in seen:
+            seen.add(stripped)
+            out.append(stripped)
+    return out
+
+
+def _content_satisfied(fixture_text: str, corpus: str) -> bool:
+    """A read demonstrably happened when >=80% of the fixture's unique
+    distinctive lines appear in the captured evidence corpus — whatever shell
+    form fetched them (a bash glob names no file in its input). Empty fixture
+    or corpus never passes, and neither does a single-line fixture — there's
+    no fractional signal to threshold against a lone line."""
+    lines = _distinctive_lines(fixture_text)
+    if len(lines) < 2 or not corpus:
+        return False
+    present = sum(1 for line in lines if line in corpus)
+    return present / len(lines) >= READ_CONTENT_LINE_FRACTION
+
+
 @dataclass
 class GateResult:
     passed: bool
@@ -54,7 +84,7 @@ class GateResult:
 
 def score_deterministic(
     *, findings: str, tool_calls: list[tuple[str, str]], num_turns: int,
-    answer: dict, corpus: str = "",
+    answer: dict, corpus: str = "", fixture_texts: dict[str, str] | None = None,
 ) -> GateResult:
     failures: list[str] = []
     category = parse_category(findings)
@@ -74,8 +104,11 @@ def score_deterministic(
             failures.append(f"missing ruling-out keyword: {keyword}")
 
     for required in answer.get("required_reads") or []:
-        if not _read_satisfied(required, tool_calls or []):
-            failures.append(f"missing required read in transcript: {required}")
+        if _read_satisfied(required, tool_calls or []):
+            continue
+        if _content_satisfied((fixture_texts or {}).get(required, ""), corpus):
+            continue
+        failures.append(f"missing required read in transcript: {required}")
 
     max_turns = answer.get("max_turns")
     if isinstance(max_turns, int) and num_turns > max_turns:

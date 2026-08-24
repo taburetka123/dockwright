@@ -285,7 +285,9 @@ def test_apply_clean_and_revert_roundtrip(wired, postrun_of, git_root, tmp_path)
     applied = [e for e in evs if e["type"] == "proposal_applied"]
     assert applied and applied[-1]["proposal_id"] == "r1-1"
     assert "path" not in applied[-1]          # I1: never a top-level path key
-    assert wired.main(["revert", "--proposal", str(prop)]) == 0
+    # apply left x.md uncommitted-dirty; revert now dirty-checks (M2), so the
+    # immediate undo needs --force-dirty (the documented flow commits first).
+    assert wired.main(["revert", "--proposal", str(prop), "--force-dirty"]) == 0
     assert (git_root / "rules" / "x.md").read_text() == "old line\nkeep\n"
     assert git(git_root, "status", "--porcelain").stdout.strip() == ""
     reverted = [e for e in events(postrun_of) if e["type"] == "proposal_reverted"]
@@ -337,11 +339,29 @@ def test_apply_dirty_target_force_dirty_succeeds(wired, git_root, tmp_path):
     assert (git_root / "rules" / "x.md").read_text() == "new line\nkeep\nuncommitted\n"
 
 
+def test_revert_dirty_target_refused_and_force_dirty(wired, git_root, tmp_path):
+    """M2: revert dirty-checks symmetric with apply. An unrelated uncommitted
+    edit refuses a plain revert; --force-dirty overrides. (The canon gate stays
+    OFF for revert by design — reverting can legitimately restore a repo to a
+    pre-existing red state.)"""
+    prop = make_proposal(tmp_path, [str(git_root / "rules" / "x.md")], DIFF_MOD)
+    assert wired.main(["apply", "--proposal", str(prop)]) == 0
+    git(git_root, "-c", "user.email=t@t", "-c", "user.name=t",
+        "commit", "-aqm", "applied")            # clean baseline for the revert
+    (git_root / "rules" / "x.md").write_text("new line\nkeep\nunrelated\n")
+    assert wired.main(["revert", "--proposal", str(prop)]) == 1
+    assert wired.main(
+        ["revert", "--proposal", str(prop), "--force-dirty"]) == 0
+
+
 def test_apply_rollback_failure_surfaces_loud_message(
         wired, postrun_of, git_root, tmp_path, monkeypatch, capsys):
-    """When the mid-apply failure path's own reverse-apply also fails, the
-    raised ApplyError message must say so loudly instead of silently
-    claiming the earlier root(s) were reverted."""
+    """When a mid-apply failure triggers the uniform snapshot restore and
+    that restore ITSELF fails, the raised ApplyError must say so loudly
+    ("ROLLBACK OF <path> FAILED — inspect git status") instead of silently
+    claiming the tree was restored. (Task-3 mechanism: the per-root
+    `git apply -R` rollback became a byte-exact snapshot restore; the loud
+    report keys on `_restore` returning a non-empty failed-path list.)"""
     root2 = tmp_path / "claude2"
     (root2 / "rules").mkdir(parents=True)
     (root2 / "rules" / "y.md").write_text("old line\nkeep\n")
@@ -368,13 +388,13 @@ def test_apply_rollback_failure_surfaces_loud_message(
     def fake_git_apply(root, patch, check=False, reverse=False):
         if check:
             return FakeProc(0)                      # both context-checks pass
-        if reverse:
-            return FakeProc(1, "cannot revert")      # rollback itself fails
         if root == real_git_root:
             return FakeProc(0)                       # first root applies fine
         return FakeProc(1, "apply boom")              # second root fails
 
     monkeypatch.setattr(wired, "git_apply", fake_git_apply)
+    # the uniform snapshot restore itself fails for every touched file
+    monkeypatch.setattr(wired, "_restore", lambda snapshot: list(snapshot))
     rc = wired.main(["apply", "--proposal", str(prop)])
     assert rc == 1
     err = capsys.readouterr().err
@@ -412,3 +432,423 @@ def test_prose_new_asset_distinct_error(wired, git_root, tmp_path, capsys):
                  "## Diff\nfull file content as prose\n")
     assert wired.main(["apply", "--proposal", str(p)]) == 2
     assert "pre-T11" in capsys.readouterr().err
+
+
+# ---- currency (review-time staleness probe) ------------------------------
+
+def make_currency_proposal(tmp_path, targets, base_rev="abc1234",
+                           kind="rule-edit", pid="cur-1", with_diff=True):
+    p = tmp_path / (pid + ".md")
+    tlist = ", ".join(targets)
+    diff = ("## Diff\n```diff\n" + DIFF_MOD + "```\n" if with_diff
+            else "## Diff\nprose brief, no fence\n")
+    p.write_text(
+        "---\n"
+        f"id: {pid}\nrun_id: r1\ncluster: c\nlane: digest\n"
+        f"evidence_kind: ops\nkind: {kind}\nalways_on_bytes: 0\n"
+        f"base_rev: {base_rev}\ntargets: [{tlist}]\n"
+        "expectation: e\ncheck_window_days: 7\nrevert: r\n"
+        "---\n\n## Evidence\nE\n\n" + diff + "\n## Rationale\nR\n")
+    return p
+
+
+def commit_all(root, message):
+    git(root, "-c", "user.email=t@t", "-c", "user.name=t", "add", "-A")
+    git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", message)
+
+
+@pytest.fixture()
+def remote_root(tmp_path):
+    origin = tmp_path / "origin.git"
+    work = tmp_path / "claude2"
+    (work / "rules").mkdir(parents=True)
+    (work / "rules" / "x.md").write_text("old line\nkeep\n")
+    git(work, "init", "-q")
+    commit_all(work, "init")
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)],
+                   capture_output=True, text=True)
+    git(work, "remote", "add", "origin", str(origin))
+    git(work, "push", "-q", "origin", "HEAD:refs/heads/main")
+    git(work, "fetch", "-q", "origin")
+    git(work, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    return work
+
+
+def write_reflog(root, ref, entries):
+    """Lay down a ref's reflog explicitly: [(old_sha, new_sha, epoch), ...],
+    oldest first. Fixtures must not depend on WHICH operations git chose to log
+    — that varies with git version and config, and a fixture whose reflog turned
+    out to hold one entry instead of two reads as a product defect."""
+    common = git(root, "rev-parse", "--path-format=absolute",
+                 "--git-common-dir").stdout.strip()
+    path = os.path.join(common, "logs", ref)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        for old, new, when in entries:
+            fh.write("%s %s t <t@t> %d +0000\tfixture\n" % (old, new, int(when)))
+
+
+def reflog_epoch(root, ref):
+    """When the ref last MOVED locally, in epoch seconds."""
+    line = git(root, "reflog", "show", "--date=unix", ref).stdout.splitlines()[0]
+    return int(line.split("@{")[1].split("}")[0])
+
+
+def fetch_after(mod, root, *proposals):
+    """Model the sitting's own fetch: it runs at review time, after every
+    proposal was drafted. The fixtures build the repo first, so without this
+    the ref reads as fetched-before-drafting."""
+    common = git(root, "rev-parse", "--path-format=absolute",
+                 "--git-common-dir").stdout.strip()
+    latest = max(os.path.getmtime(p) for p in proposals)
+    os.utime(os.path.join(common, "FETCH_HEAD"), (latest + 60, latest + 60))
+
+
+def run_currency(mod, capsys, *proposals):
+    rc = mod.main(["currency"] + [a for p in proposals
+                                  for a in ("--proposal", str(p))])
+    return rc, capsys.readouterr().out
+
+
+def verdict_of(out, pid):
+    """The verdict token on the proposal's own row — never the totals line,
+    which names every class unconditionally."""
+    for line in out.splitlines():
+        if line.startswith(pid + "  "):
+            return line[len(pid):].strip().split()[0]
+    raise AssertionError(f"no row for {pid} in:\n{out}")
+
+
+def rows_of(out, pid):
+    lines = out.splitlines()
+    start = next(i for i, l in enumerate(lines) if l.startswith(pid + "  "))
+    body = []
+    for line in lines[start + 1:]:
+        if not line.startswith("  "):
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
+def test_currency_unchanged_target_is_fresh(wired, git_root, tmp_path, capsys):
+    base = git(git_root, "rev-parse", "--short", "HEAD").stdout.strip()
+    prop = make_currency_proposal(tmp_path, [str(git_root / "rules" / "x.md")],
+                                  base_rev=base)
+    rc, out = run_currency(wired, capsys, prop)
+    assert rc == 0
+    assert verdict_of(out, "cur-1") == "fresh"
+
+
+def test_currency_changed_target_is_stale_and_prints_rederive(wired, git_root,
+                                                              tmp_path, capsys):
+    base = git(git_root, "rev-parse", "--short", "HEAD").stdout.strip()
+    prop = make_currency_proposal(tmp_path, [str(git_root / "rules" / "x.md")],
+                                  base_rev=base)
+    (git_root / "rules" / "x.md").write_text("changed\nkeep\n")
+    commit_all(git_root, "move it")
+    rc, out = run_currency(wired, capsys, prop)
+    assert rc == 0
+    assert verdict_of(out, "cur-1") == "STALE"
+    body = rows_of(out, "cur-1")
+    assert "rules/x.md  1  (key=base " + base in body
+    assert f"re-derive: git -C {git_root} log -p {base}..HEAD -- rules/x.md" in body
+
+
+def test_currency_prefers_remote_branch_over_local_head(mod, postrun_of, remote_root,
+                                                        tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(postrun_of, "ALLOWED_TARGET_ROOTS", [remote_root])
+    base = git(remote_root, "rev-parse", "--short", "HEAD").stdout.strip()
+    git(remote_root, "checkout", "-q", "-b", "side")
+    (remote_root / "rules" / "x.md").write_text("remote change\nkeep\n")
+    commit_all(remote_root, "remote move")
+    git(remote_root, "push", "-q", "origin", "side:main")
+    git(remote_root, "fetch", "-q", "origin")
+    git(remote_root, "checkout", "-q", base)
+    prop = make_currency_proposal(tmp_path, [str(remote_root / "rules" / "x.md")],
+                                  base_rev=base)
+    fetch_after(mod, remote_root, prop)
+    assert git(remote_root, "rev-list", "--count",
+               f"{base}..HEAD", "--", "rules/x.md").stdout.strip() == "0"
+    rc, out = run_currency(mod, capsys, prop)
+    assert rc == 0
+    assert verdict_of(out, "cur-1") == "STALE"
+    assert "ref=origin/main" in rows_of(out, "cur-1")
+
+
+def test_currency_no_remote_at_all_uses_head_and_still_verdicts(wired, git_root,
+                                                                tmp_path, capsys):
+    base = git(git_root, "rev-parse", "--short", "HEAD").stdout.strip()
+    prop = make_currency_proposal(tmp_path, [str(git_root / "rules" / "x.md")],
+                                  base_rev=base)
+    rc, out = run_currency(wired, capsys, prop)
+    assert rc == 0
+    assert verdict_of(out, "cur-1") == "fresh"
+    assert "ref=HEAD" in rows_of(out, "cur-1")
+
+
+def test_currency_remote_without_branch_is_unknown(mod, postrun_of, remote_root,
+                                                   tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(postrun_of, "ALLOWED_TARGET_ROOTS", [remote_root])
+    base = git(remote_root, "rev-parse", "--short", "HEAD").stdout.strip()
+    git(remote_root, "update-ref", "-d", "refs/remotes/origin/HEAD")
+    git(remote_root, "update-ref", "-d", "refs/remotes/origin/main")
+    prop = make_currency_proposal(tmp_path, [str(remote_root / "rules" / "x.md")],
+                                  base_rev=base)
+    rc, out = run_currency(mod, capsys, prop)
+    assert rc == 0
+    assert verdict_of(out, "cur-1") == "unknown"
+    assert "never fetched" in rows_of(out, "cur-1")
+
+
+def test_currency_base_rev_on_a_side_branch_counts_what_the_drafter_lacked(
+        mod, postrun_of, remote_root, tmp_path, monkeypatch, capsys):
+    """`base_rev` comes from the drafter's LOCAL HEAD, which routinely sits on a
+    side branch, so it is often not an ancestor of the comparison ref. The span
+    must still be the set difference `base_rev..ref` — commits reachable from the
+    ref that the drafter did not have. Keying this case on base_rev's commit DATE
+    instead misses every such commit that predates the side commit."""
+    monkeypatch.setattr(postrun_of, "ALLOWED_TARGET_ROOTS", [remote_root])
+    fork = git(remote_root, "rev-parse", "--short", "HEAD").stdout.strip()
+    (remote_root / "rules" / "x.md").write_text("main moved once\nkeep\n")
+    commit_all(remote_root, "main t1")
+    (remote_root / "rules" / "x.md").write_text("main moved twice\nkeep\n")
+    commit_all(remote_root, "main t2")
+    git(remote_root, "push", "-q", "origin", "HEAD:main")
+    git(remote_root, "fetch", "-q", "origin")
+    git(remote_root, "checkout", "-q", "-b", "side", fork)
+    (remote_root / "unrelated.md").write_text("side work\n")
+    commit_all(remote_root, "side, committed after t1 and t2")
+    side = git(remote_root, "rev-parse", "--short", "HEAD").stdout.strip()
+    assert git(remote_root, "merge-base", "--is-ancestor", side,
+               "refs/remotes/origin/main").returncode != 0
+    prop = make_currency_proposal(tmp_path, [str(remote_root / "rules" / "x.md")],
+                                  base_rev=side)
+    fetch_after(mod, remote_root, prop)
+    rc, out = run_currency(mod, capsys, prop)
+    assert rc == 0
+    assert verdict_of(out, "cur-1") == "STALE"
+    assert "rules/x.md  2  (key=base " + side in rows_of(out, "cur-1")
+
+
+def test_currency_non_commit_base_rev_falls_back_to_mtime(wired, git_root, tmp_path,
+                                                          capsys):
+    """A `base_rev` that resolves to a blob or tree is not a revision. It must not
+    reach the commit-span path, where a failed date lookup would become an empty
+    `--since` — which git reads as "now" and reports as zero commits."""
+    blob = git(git_root, "rev-parse", "HEAD:rules/x.md").stdout.strip()[:7]
+    assert git(git_root, "cat-file", "-t", blob).stdout.strip() == "blob"
+    prop = make_currency_proposal(tmp_path, [str(git_root / "rules" / "x.md")],
+                                  base_rev=blob)
+    rc, out = run_currency(wired, capsys, prop)
+    assert rc == 0
+    assert "key=base " not in rows_of(out, "cur-1")
+
+
+def test_currency_base_rev_absent_from_root_uses_mtime(wired, git_root, tmp_path,
+                                                       capsys):
+    prop = make_currency_proposal(tmp_path, [str(git_root / "rules" / "x.md")],
+                                  base_rev="deadbee")
+    rc, out = run_currency(wired, capsys, prop)
+    assert rc == 0
+    assert "key=ref-at " in rows_of(out, "cur-1")
+
+
+def test_currency_missing_target_splits_by_kind(wired, git_root, tmp_path, capsys):
+    absent = str(git_root / "rules" / "not-yet.md")
+    creating = make_currency_proposal(tmp_path, [absent], kind="new-asset",
+                                      pid="cur-new")
+    editing = make_currency_proposal(tmp_path, [absent], kind="rule-edit",
+                                     pid="cur-edit")
+    rc, out = run_currency(wired, capsys, creating, editing)
+    assert rc == 0
+    assert verdict_of(out, "cur-new") == "n/a"
+    assert "target not yet created" in rows_of(out, "cur-new")
+    assert verdict_of(out, "cur-edit") == "unknown"
+    assert "target absent from" in rows_of(out, "cur-edit")
+
+
+def test_currency_target_in_local_index_but_absent_from_ref_is_not_fresh(
+        mod, postrun_of, remote_root, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(postrun_of, "ALLOWED_TARGET_ROOTS", [remote_root])
+    base = git(remote_root, "rev-parse", "--short", "HEAD").stdout.strip()
+    (remote_root / "rules" / "local-only.md").write_text("local\n")
+    commit_all(remote_root, "local only, never pushed")
+    prop = make_currency_proposal(
+        tmp_path, [str(remote_root / "rules" / "local-only.md")], base_rev=base)
+    assert git(remote_root, "ls-files", "--error-unmatch",
+               "rules/local-only.md").returncode == 0
+    fetch_after(mod, remote_root, prop)
+    rc, out = run_currency(mod, capsys, prop)
+    assert rc == 0
+    assert verdict_of(out, "cur-1") == "unknown"
+    assert "target absent from origin/main" in rows_of(out, "cur-1")
+
+
+def test_currency_ref_fetched_before_drafting_is_unknown(mod, postrun_of, remote_root,
+                                                         tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(postrun_of, "ALLOWED_TARGET_ROOTS", [remote_root])
+    base = git(remote_root, "rev-parse", "--short", "HEAD").stdout.strip()
+    prop = make_currency_proposal(tmp_path, [str(remote_root / "rules" / "x.md")],
+                                  base_rev=base)
+    fetched = mod.last_fetch_epoch(str(remote_root))
+    assert fetched is not None
+    os.utime(prop, (fetched + 3600, fetched + 3600))
+    rc, out = run_currency(mod, capsys, prop)
+    assert rc == 0
+    assert verdict_of(out, "cur-1") == "unknown"
+    assert "ref-stale" in rows_of(out, "cur-1")
+
+
+def test_currency_quiet_repo_is_fresh_not_ref_stale(mod, postrun_of, remote_root,
+                                                    tmp_path, monkeypatch, capsys):
+    """A ref whose newest COMMIT predates drafting is not stale — only a ref
+    last FETCHED before drafting is. Keying the gate on the tip commit date
+    flagged every quiet repository."""
+    monkeypatch.setattr(postrun_of, "ALLOWED_TARGET_ROOTS", [remote_root])
+    base = git(remote_root, "rev-parse", "--short", "HEAD").stdout.strip()
+    prop = make_currency_proposal(tmp_path, [str(remote_root / "rules" / "x.md")],
+                                  base_rev=base)
+    tip = int(git(remote_root, "log", "-1", "--format=%ct",
+                  "refs/remotes/origin/main").stdout.strip())
+    os.utime(prop, (tip + 7200, tip + 7200))
+    fetched = mod.last_fetch_epoch(str(remote_root))
+    os.utime(os.path.join(git(remote_root, "rev-parse", "--path-format=absolute",
+                              "--git-common-dir").stdout.strip(), "FETCH_HEAD"),
+             (tip + 10800, tip + 10800))
+    assert fetched is not None
+    rc, out = run_currency(mod, capsys, prop)
+    assert rc == 0
+    assert verdict_of(out, "cur-1") == "fresh"
+
+
+def test_currency_multi_root_mixed_keys_takes_worst_verdict(mod, postrun_of, git_root,
+                                                            remote_root, tmp_path,
+                                                            monkeypatch, capsys):
+    monkeypatch.setattr(postrun_of, "ALLOWED_TARGET_ROOTS", [git_root, remote_root])
+    (git_root / "rules" / "only-here.md").write_text("distinct history\n")
+    commit_all(git_root, "diverge this root")
+    base = git(git_root, "rev-parse", "--short", "HEAD").stdout.strip()
+    assert git(remote_root, "cat-file", "-t", base).returncode != 0
+    before = git(remote_root, "rev-parse", "HEAD").stdout.strip()
+    (remote_root / "rules" / "x.md").write_text("moved on the other root\nkeep\n")
+    commit_all(remote_root, "other root moves")
+    after = git(remote_root, "rev-parse", "HEAD").stdout.strip()
+    git(remote_root, "push", "-q", "origin", "HEAD:main")
+    git(remote_root, "fetch", "-q", "origin")
+    prop = make_currency_proposal(
+        tmp_path,
+        [str(git_root / "rules" / "x.md"), str(remote_root / "rules" / "x.md")],
+        base_rev=base)
+    moved_at = int(git(remote_root, "log", "-1", "--format=%ct",
+                       "refs/remotes/origin/main").stdout.strip())
+    drafted = moved_at - 86400
+    write_reflog(remote_root, "refs/remotes/origin/main",
+                 [("0" * 40, before, moved_at - 172800), (before, after, moved_at)])
+    os.utime(prop, (drafted, drafted))
+    fetch_after(mod, remote_root, prop)
+    rc, out = run_currency(mod, capsys, prop)
+    assert rc == 0
+    body = rows_of(out, "cur-1")
+    assert "key=base " + base in body
+    assert "key=ref-at " in body
+    assert verdict_of(out, "cur-1") == "STALE"
+
+
+def test_currency_prose_diff_proposal_still_gets_a_verdict(wired, git_root, tmp_path,
+                                                           capsys):
+    base = git(git_root, "rev-parse", "--short", "HEAD").stdout.strip()
+    prop = make_currency_proposal(tmp_path, [str(git_root / "rules" / "x.md")],
+                                  base_rev=base, kind="build-brief",
+                                  with_diff=False)
+    assert wired.main(["check", "--proposal", str(prop)]) == 2
+    capsys.readouterr()
+    rc, out = run_currency(wired, capsys, prop)
+    assert rc == 0
+    assert verdict_of(out, "cur-1") == "fresh"
+
+
+def test_currency_unreadable_proposal_does_not_blind_the_batch(wired, git_root,
+                                                              tmp_path, capsys):
+    base = git(git_root, "rev-parse", "--short", "HEAD").stdout.strip()
+    good = make_currency_proposal(tmp_path, [str(git_root / "rules" / "x.md")],
+                                  base_rev=base, pid="cur-good")
+    bad = tmp_path / "cur-bad.md"
+    bad.write_text("no frontmatter here\n")
+    rc, out = run_currency(wired, capsys, good, bad)
+    assert rc == 0
+    assert verdict_of(out, "cur-good") == "fresh"
+    assert verdict_of(out, "cur-bad") == "unknown"
+
+
+def test_currency_backdated_commit_arriving_after_drafting_is_stale(
+        mod, postrun_of, remote_root, tmp_path, monkeypatch, capsys):
+    """A date filter asks "was this commit AUTHORED after drafting"; the question
+    is "did it ARRIVE on the ref after drafting". A long-lived branch merged in
+    later carries an older committer date, so `--since <drafting>` excludes it and
+    the target reads fresh while its content on the ref has changed. The span is
+    keyed on where the ref POINTED at drafting instead.
+
+    Drafting is pinned a day back, between the reflog horizon and the fetch that
+    brought the merge, so no wall-clock gap decides the outcome. An earlier
+    version also asserted the premise directly (`--since <drafting>` counts 0):
+    that assertion depended on git's date-traversal semantics rather than on this
+    code, was green 30x locally, and went red on CI."""
+    monkeypatch.setattr(postrun_of, "ALLOWED_TARGET_ROOTS", [remote_root])
+    env = {"GIT_COMMITTER_DATE": "2026-08-05T10:00:00Z",
+           "GIT_AUTHOR_DATE": "2026-08-05T10:00:00Z"}
+    git(remote_root, "checkout", "-q", "-b", "longlived")
+    (remote_root / "rules" / "x.md").write_text("moved on a backdated branch\nkeep\n")
+    git(remote_root, "-c", "user.email=t@t", "-c", "user.name=t", "add", "-A")
+    git(remote_root, "-c", "user.email=t@t", "-c", "user.name=t",
+        "commit", "-qm", "backdated", env={**os.environ, **env})
+    git(remote_root, "checkout", "-q", "main")
+    before = git(remote_root, "rev-parse", "HEAD").stdout.strip()
+    prop = make_currency_proposal(tmp_path, [str(remote_root / "rules" / "x.md")],
+                                  base_rev="deadbee")
+    git(remote_root, "-c", "user.email=t@t", "-c", "user.name=t",
+        "merge", "-q", "--no-ff", "longlived", "-m", "merge it")
+    after = git(remote_root, "rev-parse", "HEAD").stdout.strip()
+    assert after != before, "merge did not land — a commit-creating git call " \
+                            "needs -c user.email/-c user.name; a runner has no " \
+                            "global identity and git only warns"
+    git(remote_root, "push", "-q", "origin", "HEAD:main")
+    git(remote_root, "fetch", "-q", "origin")
+    now = int(git(remote_root, "log", "-1", "--format=%ct", "HEAD").stdout.strip())
+    drafted = now - 86400
+    write_reflog(remote_root, "refs/remotes/origin/main",
+                 [("0" * 40, before, now - 172800), (before, after, now)])
+    os.utime(prop, (drafted, drafted))
+    fetch_after(mod, remote_root, prop)
+    assert mod._ref_at(str(remote_root), "refs/remotes/origin/main",
+                       mod._mtime_iso(drafted)) == before
+    rc, out = run_currency(mod, capsys, prop)
+    assert rc == 0
+    assert verdict_of(out, "cur-1") == "STALE"
+
+
+def test_currency_truncated_reflog_degrades_to_the_declared_weak_key(
+        mod, postrun_of, remote_root, tmp_path, monkeypatch, capsys):
+    """`<ref>@{<stamp>}` does NOT fail when the stamp predates the reflog's
+    horizon: git exits 0, returns the OLDEST value it still remembers, and warns
+    on stderr. Suppressing that warning made the probe treat a value NEWER than
+    the drafter's as the drafter's, losing every commit in between and reporting
+    fresh. The reconstruction must refuse instead, falling through to the key
+    whose own label declares it is weak."""
+    monkeypatch.setattr(postrun_of, "ALLOWED_TARGET_ROOTS", [remote_root])
+    (remote_root / "rules" / "x.md").write_text("moved after drafting\nkeep\n")
+    commit_all(remote_root, "the change the drafter never saw")
+    git(remote_root, "push", "-q", "origin", "HEAD:main")
+    git(remote_root, "fetch", "-q", "origin")
+    prop = make_currency_proposal(tmp_path, [str(remote_root / "rules" / "x.md")],
+                                  base_rev="deadbee")
+    horizon = reflog_epoch(remote_root, "refs/remotes/origin/main")
+    os.utime(prop, (horizon - 86400, horizon - 86400))
+    fetch_after(mod, remote_root, prop)
+    assert mod._ref_at(str(remote_root), "refs/remotes/origin/main",
+                       mod._mtime_iso(horizon - 86400)) == ""
+    rc, out = run_currency(mod, capsys, prop)
+    assert rc == 0
+    body = rows_of(out, "cur-1")
+    assert "key=since " in body
+    assert "blind to a backdated commit" in body
+    assert verdict_of(out, "cur-1") == "STALE"
