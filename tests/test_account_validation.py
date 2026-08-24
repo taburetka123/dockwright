@@ -21,4 +21,5 @@ def test_mcp_manager_model_pin_from_config():
     from dockwright import mcp_server
     src = inspect.getsource(mcp_server)
     assert '"--model", "opus[1m]"' not in src
+    assert '"--model", "claude-opus-5[1m]"' not in src
     assert "config.manager_model()" in src

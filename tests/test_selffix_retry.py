@@ -23,7 +23,7 @@ SCRIPTS = REPO_ROOT / "deploy" / "scripts"
 
 FAILING_CLAUDE_STUB = (
     "#!/usr/bin/env bash\n"
-    "echo \"You've hit your session limit · resets 12am (Etc/UTC)\"\n"
+    "echo \"You've hit your session limit · resets 12am (Etc/GMT-9)\"\n"
     "exit 1\n"
 )
 # >200 bytes of findings so the stub-size guard does not classify success as a stub.
@@ -41,10 +41,17 @@ def retry_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(home))
     scripts_dir = home / ".claude" / "scripts"
     scripts_dir.mkdir(parents=True)
-    for name in ("selffix-trigger.sh", "selffix-run.sh", "runlock.sh", "selffix-retry-lib.sh"):
+    for name in ("selffix-trigger.sh", "selffix-run.sh", "runlock.sh",
+                 "selffix-retry-lib.sh", "transcript_signal.py"):
         dst = scripts_dir / name
         shutil.copy(SCRIPTS / name, dst)
         dst.chmod(0o755)
+    # The retro child runs default-deny (--setting-sources ""), which also drops
+    # user-level skill discovery — so the worker passes the skill BODY as the
+    # prompt and refuses to spawn without it. See test_headless_lane_lockdown.py.
+    skill = home / ".claude" / "skills" / "dockwright-selffix"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# dockwright-selffix\nstub body\n")
     (home / ".claude" / "selffix-debug").touch()
     bin_dir = home / "bin"
     bin_dir.mkdir()
@@ -242,8 +249,16 @@ def test_run_passes_add_dir_and_allowed_tools(retry_home):
     assert argv[argv.index("--add-dir") + 1] == str(transcript.parent)
     assert "--allowedTools" in argv
     allowed = argv[argv.index("--allowedTools") + 1]
-    for frag in ("Bash(jq:*)", "Bash(wc:*)", "Bash(head:*)", "Bash(grep:*)", "Read"):
+    for frag in ("Bash(jq:*)", "Bash(wc:*)", "Bash(head:*)", "Bash(grep:*)"):
         assert frag in allowed, f"{frag} missing from --allowedTools: {allowed}"
+    # `Read` is deliberately NOT here. A bare tool name in --allowedTools grants
+    # that tool for EVERY path and overrides --add-dir — measured, it let the
+    # child read ~/.claude.json and ~/.ssh/config. --add-dir (asserted above)
+    # already grants Read within scope, so the bare form bought nothing.
+    # Exact-set enforcement lives in test_headless_lane_lockdown.py.
+    assert "Read" not in allowed.split(), (
+        f"bare Read re-granted whole-filesystem read: {allowed}"
+    )
 
 
 def test_zero_exit_status_error_is_not_success(retry_home):

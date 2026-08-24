@@ -542,6 +542,103 @@ def test_uninstall_removes_both_homes_and_compat_symlinks(tmp_path, monkeypatch)
     assert not (claude / "statusline-command.sh").exists()  # deployed, removed
 
 
+def _drift_notes(plan):
+    return [n for n in plan.notes if "drift backup" in n]
+
+
+def test_drift_backups_are_reported_and_never_removed(fake_install, capsys):
+    """compose writes <agent>.md.bak(.N) when a deployed agent file held text that
+    exists in NEITHER the repo core NOR the operator overlay. Deleting those is the
+    exact silent destruction the drift guard prevents — so uninstall must preserve
+    them AND say so; preserve-and-hide only moves the surprise later."""
+    fx = fake_install
+    agents = fx["claude"] / "agents"
+    (agents / "manager.md.bak").write_text("PRECIOUS operator text\n")
+    (agents / "manager.md.bak.2").write_text("PRECIOUS second copy\n")
+    (agents / "worker.md.bak").write_text("PRECIOUS worker text\n")
+
+    plan = un.build_plan(_roots_from(fx))
+
+    for bak in ("manager.md.bak", "manager.md.bak.2", "worker.md.bak"):
+        assert agents / bak not in plan.remove, bak
+    note = _drift_notes(plan)
+    assert len(note) == 1, plan.notes
+    assert "3" in note[0]                                  # how many
+    assert str(agents) in note[0]                          # where
+    for bak in ("manager.md.bak", "manager.md.bak.2", "worker.md.bak"):
+        assert bak in note[0], (bak, note[0])
+    assert "no home in the repo or your overlay" in note[0]   # what they contain
+    assert "your call" in note[0]                             # whose decision it is
+
+    assert un.main(fx["argv"], run=FakeRunner()) == 0
+    assert "drift backup" in capsys.readouterr().out       # the operator actually sees it
+    assert (agents / "manager.md.bak").read_text() == "PRECIOUS operator text\n"
+    assert (agents / "manager.md.bak.2").read_text() == "PRECIOUS second copy\n"
+    assert (agents / "worker.md.bak").read_text() == "PRECIOUS worker text\n"
+
+
+def test_no_drift_backups_means_no_extra_note(fake_install):
+    assert _drift_notes(un.build_plan(_roots_from(fake_install))) == []
+
+
+def test_kept_baks_are_announced_even_when_the_plan_is_empty(tmp_path, monkeypatch, capsys):
+    """The R8 corner: a drift .bak is never planned for removal, so on a host with
+    neither CLI on PATH and everything else already gone, plan.empty() is True while
+    the backup sits there. Preserve-and-hide is exactly the surprise this branch
+    forbids, so the Nothing-to-uninstall path must still name the backup."""
+    home = tmp_path / "home"
+    claude = home / ".claude"
+    agents = claude / "agents"
+    agents.mkdir(parents=True)
+    # A re-run: the deployed manager.md AND the compose stamp are already gone; only
+    # the bak survives. core_names then comes from the repo glob, not the stamp — so
+    # nothing is left to remove, yet the backup must still be named.
+    (agents / "manager.md.bak").write_text("PRECIOUS operator text\n")
+    monkeypatch.setenv("HOME", str(home))
+    cfg = tmp_path / "dockwright.toml"
+    cfg.write_text(f'[paths]\noverlay_dir = "{tmp_path / "no-overlay"}"\n')
+    monkeypatch.setenv("DOCKWRIGHT_CONFIG", str(cfg))
+    monkeypatch.setattr(un.shutil, "which", lambda name: None)  # no claude/codex -> no mcp
+
+    repo = tmp_path / "repo"
+    (repo / "deploy" / "agents").mkdir(parents=True)
+    (repo / "deploy" / "agents" / "manager.core.md").write_text("core")
+    roots = un.Roots(
+        claude_dir=claude, codex_dir=home / ".codex",
+        launch_agents_dir=home / "LaunchAgents", local_bin_dir=home / ".local" / "bin",
+        repo_dir=repo, state_root=claude / "orchestrator",
+        manager_memory_root=claude / "manager-memory", xdg_config_dir=home / ".config" / "dockwright")
+    plan = un.build_plan(roots)
+
+    assert plan.empty()                                        # the corner: nothing to remove
+    assert plan.kept_baks == [agents / "manager.md.bak"]
+    argv = ["--yes", "--claude-dir", str(claude), "--codex-dir", str(home / ".codex"),
+            "--launch-agents-dir", str(home / "LaunchAgents"),
+            "--local-bin-dir", str(home / ".local" / "bin"), "--repo-dir", str(repo),
+            "--state-root", str(claude / "orchestrator"),
+            "--manager-memory-root", str(claude / "manager-memory"),
+            "--xdg-config-dir", str(home / ".config" / "dockwright")]
+    assert un.main(argv, run=FakeRunner()) == 0
+    out = capsys.readouterr().out
+    assert "Nothing to uninstall." in out
+    assert "manager.md.bak" in out                             # announced, not hidden
+    assert (agents / "manager.md.bak").read_text() == "PRECIOUS operator text\n"
+
+
+def test_a_foreign_agents_bak_is_not_claimed_as_a_drift_backup(fake_install):
+    """The claim is DERIVED, like every other path in the plan: only backups of an
+    agent file this tool deploys are named. A bak beside a foreign agent is not ours
+    to describe, and never to remove."""
+    fx = fake_install
+    foreign = fx["claude"] / "agents" / "foreign-agent.md.bak"
+    foreign.write_text("SOMEONE ELSE'S\n")
+    plan = un.build_plan(_roots_from(fx))
+    assert foreign not in plan.remove
+    assert _drift_notes(plan) == []
+    assert un.main(fx["argv"], run=FakeRunner()) == 0
+    assert foreign.read_text() == "SOMEONE ELSE'S\n"
+
+
 def test_strip_removes_selffix_sessionend_hook():
     foreign = _hook("bash /other/native-hook.sh")          # genuinely foreign → survives
     settings = {"hooks": {"SessionEnd": [

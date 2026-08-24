@@ -132,7 +132,7 @@ def test_worker_model_from_config(sp, monkeypatch):
     assert "--model sonnet" in cmd
     monkeypatch.setenv(config.ENV_CONFIG_PATH, str(sp / "no-config.toml"))
     cmd = spawner._runtime_command("claude", "hi", None, None)
-    assert "--model 'opus[1m]'" in cmd or "--model opus[1m]" in cmd
+    assert "--model 'claude-opus-5[1m]'" in cmd or "--model claude-opus-5[1m]" in cmd
 
 
 def test_env_weight_override_generalizes(sp, monkeypatch):

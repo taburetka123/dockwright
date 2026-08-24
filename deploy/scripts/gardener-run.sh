@@ -331,6 +331,26 @@ finish_run() {
   postrun_summary=$(/usr/bin/python3 "$HOMEDIR/.claude/scripts/gardener_postrun.py" postrun \
       --run-id "$RUN_ID" --lane "$LANE" 2>&1) || true
   run_log "postrun" "$postrun_summary"
+  # Surface the birth gate: gardener_postrun.py quarantines apply-check
+  # failures to proposals/rejected/ SILENTLY, and the `|| true` above swallows
+  # a crashed postrun. Fires only on real rejections or an unparseable
+  # summary — postrun's pass classes (env-lenient skips, prose-diff briefs)
+  # stay quiet.
+  local postrun_rejected=""
+  case "$postrun_summary" in
+    *"gardener-postrun:"*rejected=*)
+      postrun_rejected="${postrun_summary##*rejected=}"
+      postrun_rejected="${postrun_rejected%%[^0-9]*}"
+      ;;
+  esac
+  if [ -z "$postrun_rejected" ]; then
+    local postrun_head="${postrun_summary%%$'\n'*}"
+    run_log "applycheck" "postrun-unparseable: ${postrun_head:0:120}"
+    notify "gardener $RUN_ID: postrun failed/unparseable — apply-check did not run"
+  elif [ "$postrun_rejected" -gt 0 ]; then
+    run_log "applycheck" "REJECTED:$postrun_rejected"
+    notify "gardener $RUN_ID: $postrun_rejected proposal(s) quarantined by the birth gate — see proposals/rejected/"
+  fi
   # $spend is deliberately unquoted: it word-splits into key=value args for
   # ledger_append (digit values only, no quoting hazard).
   ledger_append run_end run_id="$RUN_ID" status="$status" audit="$audit" detail="$detail" lane="$LANE" postrun="$postrun_summary" $spend
@@ -338,6 +358,41 @@ finish_run() {
     touch "$MARKER"
     run_log "finished" "digest=$DIGEST audit=$audit"
     notify "gardener digest ready: $RUN_ID ($audit)"
+    # Backlog-escalation notify: six consecutive digests (07-09..07-20) each wrote
+    # a "backlog growing" Notes line nobody acted on, because the routine notify()
+    # above fires identically regardless of size — this is the size/age-gated
+    # second signal those Notes lines were asking for.
+    PENDING_DIR="$GARDENER_DIR/proposals/pending"
+    PENDING_COUNT=$(ls "$PENDING_DIR"/*.md 2>/dev/null | wc -l | tr -d ' ')
+    OLDEST_FILE=$(ls -t "$PENDING_DIR"/*.md 2>/dev/null | tail -1)
+    OLDEST_AGE_DAYS=0
+    if [ -n "${OLDEST_FILE:-}" ]; then
+      OLDEST_MTIME=$(date -r "$OLDEST_FILE" +%s 2>/dev/null || date +%s)
+      OLDEST_AGE_DAYS=$(( ($(date +%s) - OLDEST_MTIME) / 86400 ))
+    fi
+    if [ "${PENDING_COUNT:-0}" -gt 20 ] || [ "$OLDEST_AGE_DAYS" -gt 14 ]; then
+      notify "gardener backlog: $PENDING_COUNT pending proposals, oldest ~${OLDEST_AGE_DAYS}d — run /dockwright-selffix-review"
+    fi
+    # Six digests' "backlog growing" Notes lines compounded to nothing — the
+    # size/age-gated second signal those Notes were asking for. date -r, not
+    # stat: the platform-split stat-probe class is banned under deploy/
+    # (tests/test_mtime_probe.py, the rc.2 N-1 Linux-boot bug class).
+    local pending_dir="$GARDENER_DIR/proposals/pending"
+    local pending_list pending_count=0 oldest_file oldest_mtime oldest_age_days=0
+    pending_list=$(ls -t "$pending_dir"/*.md 2>/dev/null)
+    if [ -n "$pending_list" ]; then
+      pending_count=$(printf '%s\n' "$pending_list" | wc -l | tr -d ' ')
+    fi
+    oldest_file="${pending_list##*$'\n'}"
+    if [ -n "${oldest_file:-}" ]; then
+      oldest_mtime=$(date -r "$oldest_file" +%s 2>/dev/null || date +%s)
+      oldest_age_days=$(( ($(date +%s) - oldest_mtime) / 86400 ))
+    fi
+    if [ "${pending_count:-0}" -gt 20 ] || [ "$oldest_age_days" -gt 14 ]; then
+      run_log "backlog" "pending=$pending_count oldest_days=$oldest_age_days"
+      notify "gardener backlog: $pending_count pending proposals, oldest ~${oldest_age_days}d — run /dockwright-selffix-review"
+      ledger_append backlog run_id="$RUN_ID" pending="$pending_count" oldest_days="$oldest_age_days" lane="$LANE"
+    fi
   else
     run_log "finished-$status" "audit=$audit $detail"
   fi
@@ -345,12 +400,79 @@ finish_run() {
 
 if [ "$MODE" = "headless" ]; then
   # --- DEFERRED-SPIKE path (PRD §12): not exercised in Phase 0. -------------
+  # Tool-surface lockdown, VERBATIM the quadruple in selffix-run.sh (see the long
+  # rationale there: untrusted-input child, the 2026-07-29 manager-kill incident,
+  # and why the denylist below is no longer the primary defence). Duplicated
+  # inline rather than sourced because a helper would be fail-open;
+  # tests/test_headless_lane_lockdown.py runs both scripts for real and fails if
+  # they drift.
+  #
+  # --add-dir / --allowedTools are as load-bearing here as in selffix-run.sh, and
+  # for the same reason: --setting-sources "" means the operator's blanket allow
+  # rules no longer paper over missing grants. Without them this lane was
+  # measurably HOLLOW — on the exact prior argv, `ls` and `Read` of the findings
+  # corpus were both DENIED and the model printed `Status: ok` anyway, which the
+  # old join condition accepted: run recorded ok, cadence MARKER touched (which
+  # SUPPRESSES the next digest), operator notified that a digest was ready. That
+  # is the "gate passes because it had nothing to check" shape from
+  # ~/.claude/rules/drift-guard-tests.md, with a suppression and a false success
+  # notice on top. Hence BOTH the grants below and the content check at the join:
+  # a model's self-reported Status: line is never evidence the lane worked.
+  # Scope is deliberately the two dockwright state dirs, NOT ~/.claude — the
+  # child reads untrusted evidence and must not reach settings.json/.claude.json.
+  # That boundary is real ONLY because --allowedTools carries NO BARE TOOL NAMES:
+  # a bare `Read`/`Grep`/`Glob` pre-approves that tool for ANY path and overrides
+  # --add-dir entirely. Measured with the bare tail present, the child read
+  # ~/.claude/settings.json, ~/.claude.json (oauthAccount, the project trust list,
+  # MCP approvals) and ~/.ssh/config; with it removed those are DENIED and every
+  # in-scope read still works, because --add-dir already grants Read/Grep/Glob
+  # within scope. Grant by path (`Read(<dir>/**)`) or not at all.
+  #
+  # STILL DEFERRED, and NOT fixed here (both pre-date this change): the digest
+  # skill's secondary sweeps (closed/, manager-memory/, rules+agents byte counts)
+  # fall outside those two dirs, and `--tools` has no Write, so proposals can only
+  # arrive via the skill's `=== ARTIFACT: <path> ===` stdout fallback — which
+  # nothing here parses (stdout goes straight into $DIGEST). Whoever flips the
+  # spike (PRD §12 / §16 Q5) owns those two together with a per-lane surface.
+  #
+  # --lane frontier stays REFUSED: its skill is deliberately web-heavy
+  # (WebSearch/WebFetch, research subagents) and cannot work under this surface.
+  if [ "$LANE" != "digest" ]; then
+    run_log "error" "headless-unsupported-lane lane=$LANE — only digest is supported headless"
+    echo "Status: error (headless lane=$LANE unsupported)" >> "$DIGEST"
+    finish_run error "headless-unsupported-lane lane=$LANE"
+    exit 0
+  fi
+  GARDENER_SKILL_FILE="$HOMEDIR/.claude/skills/dockwright-gardener-digest/SKILL.md"
+  if [ ! -f "$GARDENER_SKILL_FILE" ]; then
+    run_log "error" "skill-missing $GARDENER_SKILL_FILE — run setup.sh"
+    echo "Status: error (skill-missing)" >> "$DIGEST"
+    finish_run error "skill-missing"
+    exit 0
+  fi
+  # STDIN, not `-p <arg>`: the skill body opens with YAML frontmatter, and an
+  # argument starting with `---` is parsed as an option (`error: unknown option`).
+  HEADLESS_PROMPT_FILE="$RUN_DIR/headless-prompt.md"
+  {
+    cat "$GARDENER_SKILL_FILE"
+    printf '\n\n---\nExecute the skill above now, in headless mode, with: '
+    cat "$PROMPT_FILE"
+  } > "$HEADLESS_PROMPT_FILE"
+  mkdir -p "$FINDINGS_DIR" "$GARDENER_DIR" 2>/dev/null || true
   set -m
   ( exec env -u CLAUDE_AGENT -u CLAUDE_WORKER_NAME -u CLAUDE_PARENT_MANAGER -u CLAUDE_DOMAIN \
-      claude -p "$(cat "$PROMPT_FILE")" \
+      claude -p \
       --model claude-sonnet-5 \
+      --add-dir "$FINDINGS_DIR" \
+      --add-dir "$GARDENER_DIR" \
+      --allowedTools 'Bash(cat:*) Bash(ls:*) Bash(wc:*) Bash(head:*) Bash(tail:*) Bash(grep:*) Bash(jq:*)' \
+      --tools "Bash,Read,Grep,Glob" \
+      --strict-mcp-config \
+      --mcp-config '{"mcpServers":{}}' \
+      --setting-sources "" \
       --no-session-persistence \
-      --disallowedTools "Write,Edit,NotebookEdit" > "$DIGEST" 2>&1 ) &
+      --disallowedTools "Write,Edit,NotebookEdit" \
+      < "$HEADLESS_PROMPT_FILE" > "$DIGEST" 2>&1 ) &
   CHILD_PID=$!
   PGID=$CHILD_PID
   ( sleep "$TIMEOUT_SEC"; kill -TERM "-$PGID" 2>/dev/null
@@ -359,11 +481,30 @@ if [ "$MODE" = "headless" ]; then
   wait "$CHILD_PID"; EC=$?
   kill "$WATCHDOG_PID" 2>/dev/null; wait "$WATCHDOG_PID" 2>/dev/null
   set +m
-  if grep -q '^Status:' "$DIGEST" 2>/dev/null && [ "$EC" -eq 0 ]; then
+  # A `Status:` line alone is the child's self-report and proves nothing: a run
+  # that could read nothing still printed it. Require real digest CONTENT before
+  # recording ok — otherwise the marker would suppress the next digest on the
+  # strength of an empty file. Two independent checks because `^## ` alone is a
+  # SHAPE check and the prompt itself instructs the model to emit those headings:
+  # a child that read nothing could echo the template's section titles over empty
+  # bodies. The byte floor is the same idea as selffix-run.sh's 200-byte stub
+  # guard — real digests run to several KB.
+  DIGEST_BYTES=$(wc -c < "$DIGEST" 2>/dev/null | awk '{print $1}')
+  DIGEST_MIN_BYTES="${GARDENER_DIGEST_MIN_BYTES:-800}"
+  if grep -q '^Status:' "$DIGEST" 2>/dev/null && grep -q '^## ' "$DIGEST" 2>/dev/null \
+     && [ "${DIGEST_BYTES:-0}" -ge "$DIGEST_MIN_BYTES" ] && [ "$EC" -eq 0 ]; then
     finish_run ok "exit=$EC"
   else
-    echo "" >> "$DIGEST"; echo "Status: error (exit=$EC)" >> "$DIGEST"
-    finish_run error "exit=$EC"
+    echo "" >> "$DIGEST"
+    if [ "$EC" -eq 0 ] && { ! grep -q '^## ' "$DIGEST" 2>/dev/null \
+         || [ "${DIGEST_BYTES:-0}" -lt "$DIGEST_MIN_BYTES" ]; }; then
+      echo "Status: error (empty digest: no '## ' sections, or under ${DIGEST_MIN_BYTES}B — the child produced no real content)" >> "$DIGEST"
+      run_log "error" "empty-digest exit=$EC bytes=${DIGEST_BYTES:-0} — refusing to mark the run ok or touch the cadence marker"
+      finish_run error "empty-digest exit=$EC"
+    else
+      echo "Status: error (exit=$EC)" >> "$DIGEST"
+      finish_run error "exit=$EC"
+    fi
   fi
   exit 0
 fi

@@ -103,7 +103,10 @@ def test_manager_agent_wires_verifier_preset_on_verifier_spawns():
     # The orchestrator-era home retired with the compat symlink — an operator
     # toml re-pinning it must fail HERE, not resolve silently at spawn time.
     assert LEGACY_VERIFIER_PATH not in text
-    assert "read-only by construction" in text
+    # 2026-08-03: "by construction" was an absolute claim the preset does not
+    # honour — its deny list is tool-scoped, so a Bash `python3` writes through
+    # it. The wiring is still pinned; only the overstatement changed.
+    assert "read-only by settings" in text
     # Guard against the tempting-but-broken tilde form reappearing.
     assert "~/.claude/dockwright/presets/verifier-settings.json" not in text
     assert "~/.claude/orchestrator/presets/verifier-settings.json" not in text
@@ -323,3 +326,50 @@ def test_manager_settings_preset_excludes_mutating_fleet_tools():
         "mcp__dockwright__send_manager_to_worker",
     ):
         assert banned not in allow, f"{banned} must stay off the manager allowlist"
+
+
+def test_headless_preset_allows_the_ISOLATED_playwright_server_only():
+    """A spawned worker may drive `playwright-isolated`, and may NOT drive `playwright`.
+
+    Both halves are load-bearing and they pull in opposite directions.
+
+    ALLOW the isolated server: measured 2026-08-14, two `claude -p` workers under this preset
+    both stalled on "Awaiting permission to access the playwright browser tool" and never
+    navigated. `defaultMode: auto` does NOT cover MCP tools — that is the non-obvious fact
+    here, and without this entry the whole storage-state fan-out is unreachable for the only
+    population it was built for. With it, the same two workers return TITLE=Reporting.
+
+    DENY the extension server: `playwright` IS the engineer's real logged-in Chrome, and its
+    relay is single-client, so a worker touching it evicts him mid-task. The permission prompt
+    there is the last brake between a headless worker and his browser. It is friction doing
+    its job, not an oversight to tidy up alongside the entry above.
+    """
+    settings = json.loads((PRESETS / "worker-headless-settings.json").read_text())
+    allow = settings["permissions"]["allow"]
+
+    assert "mcp__playwright-isolated__*" in allow, (
+        "headless preset must allow the isolated playwright server, or spawned workers "
+        "stall on a permission prompt they cannot answer"
+    )
+
+    # DERIVE the server segment; do not hand-list spellings. The hand-list missed
+    # `mcp__playwright` — the vendor's FIRST-listed form for "any tool from this server"
+    # (code.claude.com/docs/en/permissions: "`mcp__puppeteer` matches any tool provided by
+    # the `puppeteer` server"). Appending it to the preset left the suite 21-green while
+    # granting every headless worker the engineer's real Chrome. Two of the three forms the
+    # list DID carry (`mcp__*`, `mcp__*__*`) are inert in an allow list anyway — unanchored
+    # allow globs are skipped with a warning — so it spent its specificity on non-grants.
+    def _mcp_server(rule):
+        return rule[len("mcp__"):].split("__", 1)[0] if rule.startswith("mcp__") else None
+
+    # Allowlist, not denylist: the next MCP server someone grants has to be named here on
+    # purpose, rather than sailing past a list of forbidden spellings.
+    permitted_servers = {"dockwright", "playwright-isolated"}
+    ungoverned = sorted({
+        _mcp_server(r) for r in allow if _mcp_server(r) not in permitted_servers | {None}
+    })
+    assert not ungoverned, (
+        "headless preset grants MCP servers this test does not govern: "
+        f"{ungoverned}. If that is intended, add it to permitted_servers ON PURPOSE — and "
+        "never add `playwright`, which is the engineer's real single-client browser."
+    )

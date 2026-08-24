@@ -3,6 +3,16 @@
 User-facing release notes for dockwright. Entries describe what an adopter
 gets, not internal development history.
 
+## v1.4.0 — 2026-08-25
+
+- **Per-session spend attribution.** `dockwright spend-report <worker|session-id>` breaks one session's cost down from its own transcripts, with cache-read called out as the dominant component rather than buried — so an expensive worker is identifiable instead of merely suspected.
+- **`dockwright lanes` — tell a quiet fleet from a dead one.** Silence is both the healthy state and the failure mode of a monitor lane. This reports whether a manager can still hear its fleet, which previously could not be distinguished from everything being fine.
+- **An adversarial reviewer agent.** `dockwright-reviewer` reviews a PR whose author is the dispatching session: reads the diff, runs the tests, returns a verdict. ⚠️ Its `tools:` withholds write access, and the agent file states plainly that this was measured NOT to bind — read-only is a convention you state in the brief, not a guarantee the runtime enforces.
+- **Headless spawn audit.** `headless_scan.py` finds every `claude`/`codex` spawn in a tree and reports which ones nothing vouches for. It detects convention violations and enforces nothing; the file says so in its own first lines.
+- **Typed proposals with a deterministic executor.** A machine-written proposal file is validated item by item before anything runs, so the authorization step is separated from the acting step.
+- **Corpus-watch trigger gate**, LLM-free: watches for direct edits to gate-mapped instruction surfaces, closing a wiring hole where nothing invoked the eval gate.
+- **Shadow graduation ledger.** A capability running in shadow — drafting what a human disposes of — is armed with its graduation criteria *before* data collection, so the bar cannot be moved after seeing the results.
+
 ## v1.3.0 — 2026-07-21
 
 - **Zero-touch headless workers.** Worker spawns now default to a scoped headless permission preset (auto permission mode + the protocol MCP allowlist + config-derived writable directories), so a headless/no-human fleet runs without stalling on permission dialogs. The stale monitor detects and pages a pane sitting on an approval prompt, and headless `claude -p` lanes (retrospective/distill) are locked down to disallow `Write`/`Edit`/`NotebookEdit`.

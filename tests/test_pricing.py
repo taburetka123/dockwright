@@ -72,3 +72,28 @@ def test_cost_breakdown_unknown_model_is_unpriced_zero():
     b2 = pricing.cost_breakdown("some-future-model", output_tokens=1_000_000)
     assert b2["priced"] is False
     assert b2["total"] == 0.0
+
+
+def test_exact_key_rate_prices_unknown_family():
+    from dockwright import pricing
+    rates = dict(pricing.MODEL_RATES)
+    rates["claude-newfamily-7"] = (2.0, 4.0)
+    b = pricing.cost_breakdown("claude-NewFamily-7-20270101[1m]",
+                               rates=rates, output_tokens=1_000_000)
+    assert b["priced"] is True
+    assert b["total"] == 4.0
+
+
+def test_exact_key_wins_over_family_key():
+    from dockwright import pricing
+    rates = dict(pricing.MODEL_RATES)
+    rates["claude-opus-5"] = (1.0, 1.0)
+    b = pricing.cost_breakdown("claude-opus-5", rates=rates,
+                               output_tokens=1_000_000)
+    assert b["total"] == 1.0  # exact key, not the family (5.0, 25.0)
+
+
+def test_unknown_model_still_unpriced_with_default_rates():
+    from dockwright import pricing
+    b = pricing.cost_breakdown("claude-newfamily-7", output_tokens=5)
+    assert b["priced"] is False and b["total"] == 0.0

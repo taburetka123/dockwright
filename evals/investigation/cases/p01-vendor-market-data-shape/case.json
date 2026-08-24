@@ -3,5 +3,5 @@
   "tags": ["investigation", "data-shape"],
   "adversarial_signals": ["recent_mapper_commit_looks_guilty", "green_tests_stub_the_dao"],
   "difficulty": 3,
-  "provenance": "the vendor-market data-shape incident (investigation-evidence.md §5): design assumed supplier_sites.MARKET, prod had 0 such rows; real source supplier_to_regions"
+  "provenance": "synthetic scenario: a design assumed a column the real data never populates; the true source is a different table (investigation-evidence.md data-shape check)"
 }

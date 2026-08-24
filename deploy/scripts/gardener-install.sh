@@ -75,12 +75,17 @@ FRONTIER_MARKER="$GARDENER_DIR/last-frontier-run"
 
 # Shared prelude — runs for EVERY lane. $GARDENER_DIR must exist even for
 # --lane frontier because the frontier plist's StandardOut/ErrPath point into
-# it and launchd will not mkdir a missing log dir. The selffix-debug flag is
-# the trigger.log denominator both lanes' analysts read (PRD §6).
+# it and launchd will not mkdir a missing log dir. trigger.log's OUTCOME line —
+# the denominator both lanes' analysts read (PRD §6) — is written unconditionally
+# by selffix-trigger.sh; the flag below only adds the verbose extras on top.
+# The touch is KEPT deliberately: those extras are the retry:*/worker:* lifecycle
+# verbs the digest skill's debugging recipe reads, and selffix-run.sh +
+# gardener_gate.py still gate their own writes on this flag. Cost is one extra
+# prune line per SessionEnd on gardener machines — unchanged from before.
 echo "→ Creating $GARDENER_DIR/{digests,proposals,runs}"
 mkdir -p "$GARDENER_DIR/digests" "$GARDENER_DIR/proposals" "$GARDENER_DIR/runs"
 
-echo "→ Enabling selffix debug logging (trigger.log denominator, PRD §6)"
+echo "→ Enabling selffix verbose logging (trigger.log extras on top of the always-on outcome line)"
 mkdir -p "$HOMEDIR/.claude/dockwright/selffix"
 touch "$HOMEDIR/.claude/dockwright/selffix/debug"
 

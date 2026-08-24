@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -83,40 +84,62 @@ def check_account_pointer() -> Check:
                  f"or add the account to [accounts] pool in dockwright.toml")
 
 
-def check_accounts_login() -> Check:
-    """Every declared NON-DEFAULT pool account should show login evidence: its
-    farm .claude.json carrying oauthAccount. Farm assembly pops oauthAccount on
-    every rebuild (spawner._ensure_account_claude_json), so PRESENCE can only
-    come from a real /login in that config dir. ABSENCE is weaker — a corrupt
-    farm rebuild drops the marker while the keychain login survives — hence a
-    doctor flag with that caveat, never a spawn-time gate. Closes the
-    declared-but-never-logged-in residual: spawns routed to such an account
-    brick with AUTH_401 (reactive); this check is the proactive half."""
+def _login_fix_command(name: str, default: str) -> str:
+    """Exact re-login command for an account. The default account rides the
+    HOME-root login: pointing the CLI at ~/.claude via CLAUDE_CONFIG_DIR reads
+    a directory that never held the config, reports a healthy login as dead,
+    and seeds a stray skeleton there (2026-07-29 incident) — so the default's
+    command carries NO CLAUDE_CONFIG_DIR."""
+    if name == default:
+        return "claude"
+    farm = paths.account_config_dir(name)
+    return f"CLAUDE_CONFIG_DIR={shlex.quote(str(farm))} claude"
+
+
+def check_accounts_login(host_claude_json: "Path | None" = None) -> Check:
+    """Every declared pool account should show login evidence. A non-default
+    account's evidence is oauthAccount in its farm .claude.json — farm
+    assembly pops oauthAccount on every rebuild
+    (spawner._ensure_account_claude_json), so PRESENCE can only come from a
+    real /login in that config dir. The DEFAULT account rides the HOME-root
+    ~/.claude.json (the file a no-CLAUDE_CONFIG_DIR login actually writes;
+    paths.HOST_CLAUDE_JSON models it, but the path is resolved HERE at call
+    time so tests can fake HOME); its registry config_dir, if any, is ignored,
+    mirroring spawner._build_account_prefix. ABSENCE is weaker than presence
+    (a corrupt farm rebuild drops the marker while the keychain login
+    survives), and presence is login EVIDENCE, not liveness — an expired
+    token 401s with the marker intact; the reactive AUTH_401 lane owns
+    liveness. Hence a doctor flag, never a spawn-time gate. Missing or
+    unreadable files FAIL loud — never skip (the pre-2026-07-29 check skipped
+    the default account entirely and PASSed through a dead default login)."""
     default = config.default_account()
+    host = host_claude_json if host_claude_json is not None else Path.home() / ".claude.json"
     missing = []
     for account in config.accounts():
-        if account.name == default:
-            continue
-        farm = paths.account_config_dir(account.name)
+        is_default = account.name == default
+        marker_file = host if is_default else paths.account_config_dir(account.name) / ".claude.json"
+        fix = f"fix: {_login_fix_command(account.name, default)}, then /login"
         try:
-            data = json.loads((farm / ".claude.json").read_text())
-            has_marker = isinstance(data, dict) and "oauthAccount" in data
+            data = json.loads(marker_file.read_text())
+            # bool(): a present-but-null/empty marker is not login evidence
+            has_marker = isinstance(data, dict) and bool(data.get("oauthAccount"))
         except FileNotFoundError:
-            missing.append(f"{account.name} (no {farm / '.claude.json'} — never logged in?)")
+            missing.append(f"{account.name} (no {marker_file} — never logged in? — {fix})")
             continue
         except (OSError, ValueError):
-            missing.append(f"{account.name} (unreadable {farm / '.claude.json'})")
+            missing.append(f"{account.name} (unreadable {marker_file} — {fix})")
             continue
         if not has_marker:
-            missing.append(
-                f"{account.name} (no oauthAccount in {farm / '.claude.json'} — "
-                f"either never logged in, or a farm rebuild dropped the marker)")
+            reason = ("logged out, or never logged in" if is_default
+                      else "either never logged in, or a farm rebuild dropped the marker")
+            missing.append(f"{account.name} (no oauthAccount in {marker_file} — {reason} — {fix})")
     if not missing:
-        return Check("accounts:login",
-                     True, "all non-default pool accounts show login evidence")
+        return Check("accounts:login", True,
+                     f"all {len(config.accounts())} pool account(s) carry an oauthAccount "
+                     f"marker (default '{default}' via {host}) — marker presence only; "
+                     f"an expired token still 401s with the marker intact")
     return Check("accounts:login", False,
-                 "; ".join(missing) + " — fix: CLAUDE_CONFIG_DIR=<farm> claude, then /login "
-                 "(a re-login also refreshes a dropped marker)")
+                 "; ".join(missing) + " (a re-login also refreshes a dropped marker)")
 
 
 def check_config() -> Check:
@@ -166,6 +189,10 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Verify canonical dockwright env wiring.")
     p.add_argument("--orch-bin", default=_default_orch_bin())
     p.add_argument("--claude-json", type=Path, default=Path.home() / ".claude.json")
+    # Deliberately separate from --claude-json (which feeds only the mcp:claude
+    # parse check): pointing --claude-json at a farm file to debug its MCP
+    # wiring must not make that farm read as the DEFAULT account's login evidence.
+    p.add_argument("--host-claude-json", type=Path, default=None)
     p.add_argument("--settings", type=Path,
                    default=config.claude_config_home() / "settings.json")
     p.add_argument("--codex-hooks", type=Path,
@@ -185,7 +212,7 @@ def main(argv=None) -> int:
               check_no_brew_editable(args.brew_prefix, args.dist_name),
               check_config(),
               check_account_pointer(),
-              check_accounts_login()]
+              check_accounts_login(args.host_claude_json)]
 
     if args.compose_out_dir:
         core = args.compose_core_dir or compose._default_core_dir()

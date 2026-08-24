@@ -13,10 +13,20 @@
 # Managers are Claude-only; the replacement always launches `claude`.
 #
 # Usage:
-#   bootstrap-recreate.sh --narrative "<prose>" --from-sid <sid> [--reason <string>] [--dry-run]
+#   bootstrap-recreate.sh --narrative "<prose>" --from-sid <sid> \
+#       [--manager-name <name>] [--domain <domain>] [--reason <string>] [--dry-run]
 #
 # Defaults:
 #   --reason   bootstrap
+#
+# Identity: the handoff carries the predecessor's manager_name + domain —
+# resolved per field from the explicit CLI flag, else the predecessor's active
+# record ($HOME/.claude/dockwright/active/<from-sid>.json, manager records
+# only). Unresolvable → exit 4, before any write or spawn: a handoff without
+# them makes the takeover silently re-roll the successor's identity/domain,
+# stranding every in-flight worker (parent_manager_name routing) and booting
+# into the wrong memory pool. --dry-run writes NOTHING (no handoff file); it
+# prints the payload it would write as `handoff_payload: {...}`.
 #
 # ⚠️  Executing this script SPAWNS A REAL MANAGER onto the LIVE tmux socket by
 #     default (TMUX_SOCK defaults to `dockwright`; -L namespaces by uid, not HOME,
@@ -30,29 +40,49 @@ set -euo pipefail
 
 NARRATIVE=""
 FROM_SID=""
+MANAGER_NAME=""
+DOMAIN=""
 REASON="bootstrap"
 DRY_RUN=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --narrative)
-            NARRATIVE="$2"; shift 2 ;;
-        --from-sid)
-            FROM_SID="$2"; shift 2 ;;
-        --reason)
-            REASON="$2"; shift 2 ;;
+        # Every value-taking flag rejects a missing value or a flag-shaped
+        # (--*) one. Without this, `--narrative --dry-run` swallows the probe
+        # flag as the VALUE and drops the dry-run — under the operator's real
+        # HOME (sandbox guard silent, live socket) that spawns a REAL manager
+        # from a believed probe: the 2026-07-17 incident shape the ⚠️ header
+        # exists to prevent. The identity flags additionally protect against
+        # stamping "--dry-run" into the handoff as the successor's name.
+        --narrative|--from-sid|--reason|--manager-name|--domain)
+            if [ $# -lt 2 ] || [ "${2#--}" != "$2" ]; then
+                echo "ERROR: $1 requires a value (got '${2:-}')" >&2
+                echo "Usage: $0 --narrative <prose> --from-sid <sid> [--manager-name <name>] [--domain <domain>] [--reason <string>] [--dry-run]" >&2
+                exit 2
+            fi
+            case "$1" in
+                --narrative) NARRATIVE="$2" ;;
+                --from-sid) FROM_SID="$2" ;;
+                --reason) REASON="$2" ;;
+                --manager-name) MANAGER_NAME="$2" ;;
+                --domain) DOMAIN="$2" ;;
+                # A flag in the outer accept-list but not dispatched here would
+                # otherwise be consumed and silently ignored.
+                *) echo "internal: unhandled value flag $1" >&2; exit 2 ;;
+            esac
+            shift 2 ;;
         --dry-run)
             DRY_RUN=1; shift ;;
         *)
             echo "ERROR: unknown arg '$1'" >&2
-            echo "Usage: $0 --narrative <prose> --from-sid <sid> [--reason <string>] [--dry-run]" >&2
+            echo "Usage: $0 --narrative <prose> --from-sid <sid> [--manager-name <name>] [--domain <domain>] [--reason <string>] [--dry-run]" >&2
             exit 2 ;;
     esac
 done
 
 if [ -z "$NARRATIVE" ] || [ -z "$FROM_SID" ]; then
     echo "ERROR: --narrative and --from-sid are required" >&2
-    echo "Usage: $0 --narrative <prose> --from-sid <sid> [--reason <string>] [--dry-run]" >&2
+    echo "Usage: $0 --narrative <prose> --from-sid <sid> [--manager-name <name>] [--domain <domain>] [--reason <string>] [--dry-run]" >&2
     exit 2
 fi
 
@@ -61,7 +91,39 @@ HANDOFFS_DIR="$ORCH_DIR/handoffs"
 ACTIVE_DIR="$ORCH_DIR/active"
 QUESTIONS_DIR="$ORCH_DIR/questions"
 
-mkdir -p "$HANDOFFS_DIR"
+# Identity resolution — BEFORE the dry-run exit, the sandbox guard, any write,
+# and any spawn. The successor inherits the predecessor's manager_name + domain
+# through this handoff; that inheritance is the SOLE mechanism keeping in-flight
+# workers routed (parent_manager_name), and managers have no closed/ archive to
+# recover an identity from after the fact. Per field: explicit flag wins, else
+# the predecessor's active record — manager records only (a typo'd --from-sid
+# hitting a worker sid, or a corrupt/unreadable record, must never donate an
+# identity). Empty string counts as unresolved: `jq // empty` passes "" through,
+# so the -z checks are the real gate.
+FROM_RECORD="$ACTIVE_DIR/$FROM_SID.json"
+RECORD_AGENT=""
+if [ -f "$FROM_RECORD" ]; then
+    RECORD_AGENT=$(jq -r '.agent // empty' "$FROM_RECORD" 2>/dev/null || true)
+fi
+if [ "$RECORD_AGENT" = "manager" ]; then
+    if [ -z "$MANAGER_NAME" ]; then
+        MANAGER_NAME=$(jq -r '.name // empty' "$FROM_RECORD" 2>/dev/null || true)
+    fi
+    if [ -z "$DOMAIN" ]; then
+        DOMAIN=$(jq -r '.domain // empty' "$FROM_RECORD" 2>/dev/null || true)
+    fi
+fi
+MISSING=""
+if [ -z "$MANAGER_NAME" ]; then MISSING="manager_name"; fi
+if [ -z "$DOMAIN" ]; then MISSING="${MISSING:+$MISSING and }domain"; fi
+if [ -n "$MISSING" ]; then
+    echo "ERROR: cannot resolve $MISSING for predecessor $FROM_SID (probed $FROM_RECORD)." >&2
+    echo "A handoff without them silently re-rolls the successor's identity/domain and strands its workers." >&2
+    echo "Pass --manager-name <name> / --domain <domain> explicitly (recover the name from workers'" >&2
+    echo "parent_manager_name in ~/.claude/dockwright/active/*.json, done/<name>/ bucket names, the" >&2
+    echo "domain notebook, or spend-ledger drop events)." >&2
+    exit 4
+fi
 
 HANDOFF_ID=$(uuidgen | tr -d - | tr '[:upper:]' '[:lower:]')
 NOW=$(python3 -c 'import time; print(time.time())')
@@ -93,12 +155,17 @@ fi
 
 HANDOFF_PATH="$HANDOFFS_DIR/$HANDOFF_ID.json"
 
-jq -n \
+# Compose only — the write happens after the sandbox guard, just before the
+# spawn, so --dry-run and a refused sandbox run leave no file behind.
+# --arg (never --argjson) for the two identity fields: string-safe.
+HANDOFF_JSON=$(jq -cn \
     --arg handoff_id "$HANDOFF_ID" \
     --arg from_sid "$FROM_SID" \
     --argjson prepared_at "$NOW" \
     --arg trigger_reason "$REASON" \
     --arg narrative "$NARRATIVE" \
+    --arg manager_name "$MANAGER_NAME" \
+    --arg domain "$DOMAIN" \
     --argjson workers "$WORKERS_JSON" \
     --argjson questions "$QUESTIONS_JSON" \
     '{
@@ -109,10 +176,11 @@ jq -n \
         consumed_at: null,
         trigger_reason: $trigger_reason,
         narrative_summary: $narrative,
+        manager_name: $manager_name,
+        domain: $domain,
         workers_snapshot: $workers,
         questions_snapshot: $questions
-    }' > "$HANDOFF_PATH.tmp"
-mv "$HANDOFF_PATH.tmp" "$HANDOFF_PATH"
+    }')
 
 CWD=$(pwd)
 # Manager lane is pinned (orch-audit model-allocation): never inherit the
@@ -143,9 +211,9 @@ fi
 # every future recreate skip-permissions.
 unset DOCKWRIGHT_MANAGER_SKIP_PERMS
 if [ -f "$MANAGER_SETTINGS" ]; then
-    RUNTIME_CMD="claude ${RC_ARG}${SKIP_ARG}--model 'opus[1m]' --settings '$MANAGER_SETTINGS' '/manager-resume $HANDOFF_ID'"
+    RUNTIME_CMD="claude ${RC_ARG}${SKIP_ARG}--model 'claude-opus-5[1m]' --settings '$MANAGER_SETTINGS' '/manager-resume $HANDOFF_ID'"
 else
-    RUNTIME_CMD="claude ${RC_ARG}${SKIP_ARG}--model 'opus[1m]' '/manager-resume $HANDOFF_ID'"
+    RUNTIME_CMD="claude ${RC_ARG}${SKIP_ARG}--model 'claude-opus-5[1m]' '/manager-resume $HANDOFF_ID'"
 fi
 
 # Login model: the recreated manager rides the active pointer against the
@@ -194,7 +262,8 @@ elif [ -f "$TMUX_CONF_LEGACY2" ]; then FFLAG=(-f "$TMUX_CONF_LEGACY2"); fi
 if [ -n "$DRY_RUN" ]; then
     echo "DRY_RUN: no spawn. socket=$TMUX_SOCK config_prefix=[$CONFIG_PREFIX] cmd=[$RUNTIME_CMD]"
     echo "handoff_id: $HANDOFF_ID"
-    echo "handoff_path: $HANDOFF_PATH"
+    echo "handoff_path: (dry-run, not written) $HANDOFF_PATH"
+    echo "handoff_payload: $HANDOFF_JSON"
     exit 0
 fi
 # Refuse the incident shape: a sandboxed HOME does NOT isolate tmux (-L
@@ -211,6 +280,9 @@ if [ "$HOME" != "$(eval echo ~"$(id -un)")" ]; then
             exit 3 ;;
     esac
 fi
+mkdir -p "$HANDOFFS_DIR"
+printf '%s\n' "$HANDOFF_JSON" > "$HANDOFF_PATH.tmp"
+mv "$HANDOFF_PATH.tmp" "$HANDOFF_PATH"
 if tmux -L "$TMUX_SOCK" has-session -t mgr 2>/dev/null; then
     TMUX_HEAD=(new-window -d -t mgr)
 else

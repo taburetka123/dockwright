@@ -13,6 +13,10 @@ Tokens only: no $-cost field exists anywhere in the captured data, so the
 report reports tokens and says so instead of inventing conversion rates.
 Day attribution is the period's END time (ledger ts / closed_at / today for
 live), local timezone — a long-running session lands entirely on its end day.
+
+A positional worker-name/sid switches to the per-session report (spend_session),
+which reads that one session's TRANSCRIPT — where per-call usage does exist — and
+so can report money. The fleet view above has no transcript to read.
 """
 import argparse
 import json
@@ -296,7 +300,9 @@ def main(argv=None) -> int:
         prog="dockwright spend-report",
         description="Fleet token-spend report (tokens only — no $-cost data exists). "
                     "Spend is attributed to the day a session period ENDED (local time); "
-                    "live sessions count toward today.")
+                    "live sessions count toward today. "
+                    "With a worker name / sid, reports that ONE session's time and "
+                    "money from its transcript instead.")
     window = parser.add_mutually_exclusive_group()
     window.add_argument("--days", type=int, default=None,
                         help="window size in days, today inclusive (default 7)")
@@ -304,10 +310,39 @@ def main(argv=None) -> int:
                         help="window start date YYYY-MM-DD (until today)")
     parser.add_argument("--json", action="store_true", dest="as_json",
                         help="machine-readable output")
+    parser.add_argument("session", nargs="?", default=None,
+                        help="worker name or sid — switches to the per-session report")
+    parser.add_argument("--include-replayed", action="store_true",
+                        help="per-session mode: count replayed pre-session history")
+    parser.add_argument("--transcript", type=str, default=None,
+                        help="per-session mode: report an arbitrary transcript .jsonl")
     try:
         args = parser.parse_args(argv)
     except SystemExit as e:
         return int(e.code or 0)
+    if args.session or args.transcript:
+        if args.days is not None or args.since is not None:
+            print("--days/--since are fleet-mode flags; the per-session report "
+                  "covers the whole session", file=sys.stderr)
+            return 2
+        from .spend_session import run as session_run
+        # Flags first, then the `--` escape, then the name: a worker name that
+        # starts with a dash would otherwise reach the session parser as an
+        # unknown option, and a flag placed after `--` becomes a positional.
+        forwarded = []
+        if args.as_json:
+            forwarded.append("--json")
+        if args.include_replayed:
+            forwarded.append("--include-replayed")
+        if args.transcript:
+            forwarded += ["--transcript", args.transcript]
+        if args.session:
+            forwarded += ["--", args.session]
+        return session_run(forwarded)
+    if args.include_replayed:
+        print("--include-replayed is a per-session flag; pass a worker name/sid "
+              "or --transcript", file=sys.stderr)
+        return 2
     until = date.today()
     if args.since is not None:
         try:

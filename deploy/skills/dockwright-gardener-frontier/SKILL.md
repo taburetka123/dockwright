@@ -56,7 +56,9 @@ lane: frontier
 evidence_kind: external
 targets: [<absolute path of each file the change touches — or the docs/ path of the build-brief for larger adoptions>]
 kind: <rule-edit|skill-edit|agent-edit|code-change|new-asset|build-brief>
-always_on_bytes: <bytes added to always-loaded context; 0 otherwise>
+always_on_bytes: <UTF-8 BYTES added to always-loaded context (compute via len(text.encode()), not len(text) — the postrun gate quarantines a >16-byte mismatch vs the diff); 0 otherwise>
+cost_justification: <REQUIRED when the diff nets positive always-on bytes beyond the noise floor ([gardener] bytes_tolerance, default 16) — the postrun quarantines it otherwise. Frontier has no digest-side clusters/priors: state the value claim against the external evidence + the cheaper home rejected; the human judges the content at the sitting, the machine only checks non-emptiness. Omit for ≤0>
+flow_cost: <none | adds — <one clause> | removes — <one clause>> — REQUIRED. What does this cost on every ordinary run that does NOT hit the problem it solves? Full contract: the dockwright-gardener-digest skill's "Flow-cost question" section.
 base_rev: <short git rev of the primary target's repo — `git -C <repo> rev-parse --short HEAD`>
 expectation: <one falsifiable sentence — what observable changes if adopted (used-by date, incident class stops, tokens saved)>
 check_window_days: <14 or 28>
@@ -79,6 +81,8 @@ why this home, cost accounting, and what the baseline said about it (cite sectio
 ```
 
 NO `members` — external evidence has no finding files; the validator enforces `evidence_kind: external` semantics. Updating the baseline document itself is a legitimate proposal (kind: rule-edit-style diff against the baseline maintained in the development repo) — that is how the baseline evolves under human control.
+
+Diff hunk headers MUST be numbered (`@@ -<start>,<count> +<start>,<count> @@` — never a bare `@@`), and every change needs ≥1 context line on BOTH sides (git anchors a hunk with no trailing context at end-of-file; mid-file appends with leading-only context can never apply). After writing each diff-bearing proposal, self-check it: `python3 ~/.claude/scripts/gardener_apply.py check --proposal <path>` (read-only) and fix any `check BLOCKED (<class>)` before finishing. `kind: build-brief` proposals carry no diff and skip the self-check.
 
 ## Step 5 — The frontier digest
 

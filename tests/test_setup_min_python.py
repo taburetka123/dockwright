@@ -103,6 +103,7 @@ def test_adequate_python_passes_the_check(tmp_path):
                        text=True, cwd=str(repo), timeout=180)
     assert "requires Python" not in r.stderr
     assert "python3 not found" not in r.stderr
+    assert "cannot create virtualenvs" not in r.stderr
 
 
 # --- N-6: stale/broken .venv self-recovery (full-tree hermetic runs) --------
@@ -198,5 +199,82 @@ def test_healthy_venv_is_not_recreated(tmp_path):
     sentinel.write_text("keep me\n")
     r = _run_full(tmp_path, repo)
     assert r.returncode == 0, r.stdout + r.stderr
+    assert "recreating" not in r.stdout
+    assert sentinel.read_text() == "keep me\n"
+
+
+# --- I-1: missing venv/ensurepip module preflight (linux E2E A0) -------------
+
+# Stub python whose stdlib lacks ensurepip (Debian/Ubuntu without the
+# python3.X-venv package): the venv-capability probe fails, the min-version
+# probe passes (falls through to the default exit 0), and the error hint's
+# minor-version derivation (the only -c that pairs `print` with
+# `version_info`) reports a fixed 3.14.
+STUB_PYTHON_NO_ENSUREPIP = """#!/bin/sh
+if [ "$1" = "-c" ]; then
+    case "$2" in
+        *ensurepip*) echo "No module named 'ensurepip'" >&2; exit 1 ;;
+        *print*version_info*) echo "3.14"; exit 0 ;;
+    esac
+fi
+exit 0
+"""
+
+
+def _run_full_no_ensurepip(tmp_path, repo):
+    stub_bin = tmp_path / "stub-bin"
+    stub_bin.mkdir()
+    stub = stub_bin / "python3"
+    stub.write_text(STUB_PYTHON_NO_ENSUREPIP)
+    stub.chmod(0o755)
+    path = f"{stub_bin}:/usr/bin:/bin"
+    return subprocess.run([shutil.which("bash"), str(repo / "setup.sh")],
+                          env=_env(tmp_path, path), capture_output=True,
+                          text=True, cwd=str(repo), timeout=180)
+
+
+def test_missing_ensurepip_fails_fast_before_venv_create(tmp_path):
+    """A0 (linux E2E I-1): fresh box, no .venv, python3 without ensurepip →
+    a dockwright-level error naming the exact apt package BEFORE any venv
+    creation — not Python's raw 'ensurepip is not available' mid-setup."""
+    repo = _full_tree(tmp_path)
+    r = _run_full_no_ensurepip(tmp_path, repo)
+    assert r.returncode == 1
+    assert "cannot create virtualenvs" in r.stderr
+    assert "apt install python3.14-venv" in r.stderr
+    assert not (repo / ".venv").exists()
+
+
+def test_missing_ensurepip_with_healthy_venv_still_passes(tmp_path):
+    """The probe is scoped to runs that NEED system ensurepip: a healthy .venv
+    (working python + pip present) must sail through on a box whose
+    python3.X-venv package vanished after install (A2 idempotent re-run)."""
+    repo = _full_tree(tmp_path)
+    vbin = repo / ".venv" / "bin"
+    vbin.mkdir(parents=True)
+    for name in ("python", "pip", "dockwright"):
+        f = vbin / name
+        f.write_text("#!/bin/sh\nexit 0\n")
+        f.chmod(0o755)
+    r = _run_full_no_ensurepip(tmp_path, repo)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "cannot create virtualenvs" not in r.stderr
+
+
+def test_missing_ensurepip_with_stale_venv_fails_without_deleting_it(tmp_path):
+    """Fail-before-mutate: a stale .venv due for recreation + no ensurepip →
+    the probe kills the run BEFORE `rm -rf .venv` (and before printing the
+    'recreating' line), so the old venv survives for diagnosis."""
+    repo = _full_tree(tmp_path)
+    vbin = repo / ".venv" / "bin"
+    vbin.mkdir(parents=True)
+    old = vbin / "python"
+    old.write_text("#!/bin/sh\nexit 1\n")   # fails every version probe → stale
+    old.chmod(0o755)
+    sentinel = repo / ".venv" / "sentinel"
+    sentinel.write_text("keep me\n")
+    r = _run_full_no_ensurepip(tmp_path, repo)
+    assert r.returncode == 1
+    assert "cannot create virtualenvs" in r.stderr
     assert "recreating" not in r.stdout
     assert sentinel.read_text() == "keep me\n"

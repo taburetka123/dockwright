@@ -24,4 +24,4 @@ AGENTS_DIR = REPO_ROOT / "deploy" / "agents"
 
 def test_canon_agents_exist():
     assert sorted(p.name for p in AGENTS_DIR.glob("*.md")) == [
-        "manager.core.md", "worker.core.md"]
+        "dockwright-reviewer.core.md", "manager.core.md", "worker.core.md"]

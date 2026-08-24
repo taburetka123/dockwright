@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import time
 import types
@@ -18,6 +19,17 @@ def _load_stale_monitor():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _IDLE_PROC_INDEX():
+    """A WORKING `ps` snapshot that sees no background work anywhere.
+
+    The hermetic default for every test that is not about the busy guard. Its
+    predecessor was `lambda: None`, which the closer now reads as "cannot tell"
+    and answers by HOLDING the worker to the cap — so a None default would arm
+    the guard in tests that never meant to exercise it.
+    """
+    return {"command_by_pid": {1: "/sbin/launchd"}, "child_commands": {}}
 
 
 @pytest.fixture
@@ -42,6 +54,19 @@ def stale(tmp_path, monkeypatch):
                         tmp_path / "gardener" / "live-windows", raising=False)
     # Squash IDLE threshold so tests can use small elapsed values.
     monkeypatch.setattr(mod, "IDLE_THRESHOLD_SEC", 100)
+    # Hermetic process snapshot: without this a test whose elapsed lands inside
+    # the busy-shell window and which does not mock subprocess.run shells out
+    # to the REAL `ps` (conftest's no_live_tmux only absorbs tmux/osascript
+    # argv), and the guard's verdict starts depending on whether the dev
+    # machine happens to run a pid equal to the record's.
+    #
+    # A WORKING index that sees no background work, deliberately — not `None`.
+    # `None` means "cannot tell", and the closer holds a worker it cannot
+    # clear, so a None default would silently arm the busy guard in every
+    # autoclose test that is not about the busy guard. Guard tests override
+    # this with an explicit index; "a broken ps holds to the cap" has its own
+    # explicit test.
+    monkeypatch.setattr(mod, "_process_index", _IDLE_PROC_INDEX)
     for d in ("active", "questions", "closed"):
         (tmp_path / d).mkdir()
     monkeypatch.setattr(mod, "ACCOUNT_ACTIVE", tmp_path / "account-active")
@@ -477,6 +502,7 @@ def test_autoclose_preserves_account(stale, monkeypatch):
         pid=12345,
         iterm_sid="7",
         account="b",
+        transcript_path="/tmp/x/s1.jsonl",
         last_turn_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 10_000)),
     )
     monkeypatch.setattr(stale.subprocess, "run", lambda *a, **k: type("R", (), {"returncode": 0})())
@@ -485,6 +511,7 @@ def test_autoclose_preserves_account(stale, monkeypatch):
     assert rc == 0
     closed_data = json.loads((stale.CLOSED / "s1.json").read_text())
     assert closed_data["account"] == "b"
+    assert closed_data["transcript_path"] == "/tmp/x/s1.jsonl"
 
 
 def test_autoclose_swallows_window_close_failure(stale, monkeypatch):
@@ -749,7 +776,7 @@ def test_last_assistant_text_missing_or_empty(stale, tmp_path):
     assert stale._last_assistant_text(empty) is None
 
 
-SESSION_LIMIT_TEXT = "You’ve hit your session limit · resets 2:20am (Etc/UTC)"
+SESSION_LIMIT_TEXT = "You’ve hit your session limit · resets 2:20am (Etc/GMT-9)"
 
 
 # Genuine session-limit banner whose reset clause does not parse (drifted/absent
@@ -1416,7 +1443,7 @@ def test_resumed_emitted_once_when_transcript_grows_after_nudge(nudgy, capsys, m
 
 
 # --- banner-parsed scheduled nudges + limit-aware manager handling ------------
-# The session-limit banner carries a reset time ("resets 2:20am (Etc/UTC)").
+# The session-limit banner carries a reset time ("resets 2:20am (Etc/GMT-9)").
 # Parsing is best-effort (wording is fragile): success schedules a nudge at
 # reset+2min; failure falls back to the ladder (workers) or a flat 10min retry
 # (managers — they have no ladder). The owning manager, when itself limited,
@@ -1431,8 +1458,8 @@ def test_parse_limit_reset_ts_valid_variants(stale):
     # Each variant's `now` sits a couple of hours before the reset wall-time —
     # a parse further out than the 5h session window is a stale banner (None).
     for text, h24, minute, tzname, now_dt in [
-        ("You’ve hit your session limit · resets 2:20am (Etc/UTC)",
-         2, 20, "Etc/UTC", datetime(2026, 6, 11, 1, 0, tzinfo=ZoneInfo("Etc/UTC"))),
+        ("You’ve hit your session limit · resets 2:20am (Etc/GMT-9)",
+         2, 20, "Etc/GMT-9", datetime(2026, 6, 11, 1, 0, tzinfo=ZoneInfo("Etc/GMT-9"))),
         ("You've hit your session limit · resets 6pm (UTC)",
          18, 0, "UTC", datetime(2026, 6, 11, 15, 0, tzinfo=ZoneInfo("UTC"))),
         ("hit your session limit · resets 12:05am (UTC)",
@@ -1937,7 +1964,7 @@ def test_manager_banner_match_is_strict(nudgy, capsys, monkeypatch):
                           name="mgr-A", window_id="9")
     os.utime(mpath, (t0, t0))
     quoting = ("Worker alpha is stuck: its transcript ends with 'You've hit your "
-               "session limit · resets 2:20am (Etc/UTC)' — I'll nudge it "
+               "session limit · resets 2:20am (Etc/GMT-9)' — I'll nudge it "
                "once the limit clears. Meanwhile, which PR should beta pick up next?")
     log = _write_transcript(nudgy, "mgr1", quoting)
     os.utime(log, (t0, t0))
@@ -1963,7 +1990,7 @@ def test_manager_short_relay_quote_is_not_limited(nudgy, capsys, monkeypatch):
     mpath = _write_record(nudgy, "mgr1", agent="manager", state="processing",
                           name="mgr-A", window_id="9")
     os.utime(mpath, (t0, t0))
-    relay = "worker-1: You’ve hit your session limit · resets 2:20am (Etc/UTC)"
+    relay = "worker-1: You’ve hit your session limit · resets 2:20am (Etc/GMT-9)"
     log = _write_transcript(nudgy, "mgr1", relay)
     os.utime(log, (t0, t0))
     clock = {"now": t0 + 30 * 60}
@@ -2169,6 +2196,72 @@ def test_autoclose_closed_record_carries_spend(stale, monkeypatch):
     )
 
 
+def test_autoclose_resolves_transcript_path_when_record_lacks_it(monkeypatch, tmp_path):
+    """A worker autoclosed before its first Stop never had transcript_path
+    cached on its active record, and autoclose unlinks active/ before the
+    window close — so hooks.session_end's own fallback resolve never runs for
+    this lane. _autoclose_idle_worker must fall back to
+    _resolve_transcript_path(record) itself.
+    """
+    sm = _load_stale_monitor()
+    monkeypatch.setattr(sm, "CLOSED", tmp_path / "closed")
+    (tmp_path / "closed").mkdir()
+    monkeypatch.setattr(sm, "_close_window", lambda wid: None)
+    log = tmp_path / "t.jsonl"
+    log.write_text("{}\n")
+    monkeypatch.setattr(sm, "_resolve_transcript_path", lambda record: log)
+    record = {"claude_sid": "sid-x", "name": "w", "pid": 1,
+              "window_id": "w1", "spend": None}
+    record_path = tmp_path / "active.json"
+    record_path.write_text(json.dumps(record))
+    monkeypatch.setattr(sm, "_process_index", _IDLE_PROC_INDEX)
+    sm._autoclose_idle_worker(record_path, record, 7300)
+    closed = json.loads((tmp_path / "closed" / "sid-x.json").read_text())
+    assert closed["transcript_path"] == str(log)
+
+
+def test_autoclose_transcript_path_none_when_unresolvable(monkeypatch, tmp_path):
+    """When _resolve_transcript_path can't resolve anything, the closed record
+    must carry a real None — never the literal string "None"."""
+    sm = _load_stale_monitor()
+    monkeypatch.setattr(sm, "CLOSED", tmp_path / "closed")
+    (tmp_path / "closed").mkdir()
+    monkeypatch.setattr(sm, "_close_window", lambda wid: None)
+    monkeypatch.setattr(sm, "_resolve_transcript_path", lambda record: None)
+    record = {"claude_sid": "sid-y", "name": "w", "pid": 1,
+              "window_id": "w1", "spend": None}
+    record_path = tmp_path / "active.json"
+    record_path.write_text(json.dumps(record))
+    monkeypatch.setattr(sm, "_process_index", _IDLE_PROC_INDEX)
+    sm._autoclose_idle_worker(record_path, record, 7300)
+    closed = json.loads((tmp_path / "closed" / "sid-y.json").read_text())
+    assert closed["transcript_path"] is None
+
+
+def test_autoclose_survives_transcript_resolve_raising(monkeypatch, tmp_path):
+    """A raising _resolve_transcript_path (e.g. OSError mid projects-dir scan)
+    must not abort the autoclose — the record would be stranded in active/.
+    Best-effort parity with the hooks.py session_end sibling."""
+    sm = _load_stale_monitor()
+    monkeypatch.setattr(sm, "CLOSED", tmp_path / "closed")
+    (tmp_path / "closed").mkdir()
+    monkeypatch.setattr(sm, "_close_window", lambda wid: None)
+
+    def _boom(record):
+        raise OSError("projects dir vanished mid-scan")
+
+    monkeypatch.setattr(sm, "_resolve_transcript_path", _boom)
+    record = {"claude_sid": "sid-z", "name": "w", "pid": 1,
+              "window_id": "w1", "spend": None}
+    record_path = tmp_path / "active.json"
+    record_path.write_text(json.dumps(record))
+    monkeypatch.setattr(sm, "_process_index", _IDLE_PROC_INDEX)
+    sm._autoclose_idle_worker(record_path, record, 7300)
+    closed = json.loads((tmp_path / "closed" / "sid-z.json").read_text())
+    assert closed["transcript_path"] is None
+    assert not record_path.exists()
+
+
 # ---- account auto-switch pool helpers ---------------------------------------
 
 def _arm_pool(stale, letter="a"):
@@ -2191,6 +2284,22 @@ def _ledger_events(stale):
     if not stale.ACCOUNT_LEDGER.exists():
         return []
     return [json.loads(l) for l in stale.ACCOUNT_LEDGER.read_text().splitlines() if l]
+
+
+def test_login_fix_command_exact_per_account(stale, tmp_path, monkeypatch):
+    """D2: the /login page must name the exact resolved command — plain
+    `claude` for the default account (no CLAUDE_CONFIG_DIR: pointing the CLI
+    at ~/.claude reports a healthy login as dead, 2026-07-29), the resolved
+    absolute farm path for everyone else."""
+    monkeypatch.setenv("HOME", str(tmp_path))    # convention farm resolves under tmp
+    stale.ACCOUNT_REGISTRY.write_text(json.dumps({
+        "pool": [{"name": "a"}, {"name": "b"},
+                 {"name": "c", "config_dir": str(tmp_path / "farm c")}],
+        "default": "a"}))
+    assert stale._login_fix_command("a") == "claude"
+    assert stale._login_fix_command("b") == f"CLAUDE_CONFIG_DIR={tmp_path}/.claude-b claude"
+    # shlex.quote engages on the space in the override path
+    assert stale._login_fix_command("c") == f"CLAUDE_CONFIG_DIR='{tmp_path}/farm c' claude"
 
 
 def test_pool_account_reads_pointer(stale):
@@ -2448,6 +2557,76 @@ def test_limited_manager_flips_and_launches_recovery(stale, capsys, monkeypatch,
     clock["now"] = t_flip + 2 * stale.TAKEOVER_GUARD_SEC + 240
     stale.main(manager_name="mgr-A")
     assert len(_launch_calls(calls)) == 2
+
+
+def test_limited_manager_flip_refuses_401ing_target(stale, capsys, monkeypatch):
+    """The _flip_target exclusion governs the rate-limit lane too: flipping
+    the POINTER onto a mid-401 account would spawn every subsequent worker
+    dead. A limited manager whose only flip target is mid-401 stays put (the
+    banner-reset/nudge lanes recover it); no recovery tab is launched."""
+    calls = _capture_runs(stale, monkeypatch)
+    monkeypatch.setattr(stale, "_keychain_unlocked", lambda: True)
+    _arm_pool(stale, "a")
+    t0 = 1_000_000
+    _write_limited_manager(stale, "mgr1", "mgr-A", t0)
+    clock = {"now": t0 + 30 * 60}
+    monkeypatch.setattr(stale.time, "time", lambda: clock["now"])
+    # Record b's 401 episode AFTER computing the scan clock — t0 + 30*60 is
+    # past AUTH_401_WINDOW_SEC (300s), so seeding at t0 would make the episode
+    # expired by scan time. Seeded at clock-60 it is 60s old at scan time,
+    # well inside the 300s window.
+    stale._record_auth_401("b", "u-b-401", clock["now"] - 60)   # b: live 401 episode
+    stale.main(manager_name="mgr-A")
+    assert stale.ACCOUNT_ACTIVE.read_text() == "a\n", "no flip onto a 401ing account"
+    assert _flips(stale) == []
+    assert _launch_calls(calls) == []
+
+
+def test_rate_limit_flip_unstalls_after_dead_worker_episode_ages_out(
+        stale, capsys, monkeypatch):
+    """B-1 measured shape: a dead 401'd worker on b re-reports the same uuid
+    every scan while a's manager is rate-limited. Early scans refuse the flip
+    (b's episode live) AND leave a throttled flip-refused-auth401 ledger
+    line (residual 3); once b's last DISTINCT 401 ages past the window the
+    flip fires — the fleet is not permanently stalled."""
+    calls = _capture_runs(stale, monkeypatch)
+    monkeypatch.setattr(stale, "_keychain_unlocked", lambda: True)
+    _arm_pool(stale, "a")
+    t0 = 1_000_000
+    w_path = _write_record(stale, "w1", agent="worker", state="processing",
+                           name="worker-b", window_id="42", account="b")
+    w_log = _write_auth_401_transcript(stale, "w1", uuid="u-dead")
+    m_path, m_log = _write_limited_manager(stale, "mgr1", "mgr-A", t0)
+    clock = {"now": t0}
+    monkeypatch.setattr(stale.time, "time", lambda: clock["now"])
+
+    def scan(minute):
+        clock["now"] = t0 + minute * 60
+        for p in (w_path, w_log, m_path, m_log):
+            os.utime(p, (clock["now"] - 31 * 60, clock["now"] - 31 * 60))
+        stale.main()                       # worker lane: keeps b's episode re-reported
+        stale.main(manager_name="mgr-A")   # manager lane: limit-brick flip attempt
+
+    scan(31)   # b's first 401 lands here (fresh) → flip refused
+    assert _flips(stale) == [], "b mid-401: flip refused"
+    refusals = [e for e in _ledger_events(stale) if e["event"] == "flip-refused-auth401"]
+    assert len(refusals) == 1 and refusals[0]["excluded"] == ["b"], \
+        "the refusal leaves a ledger trace (residual 3)"
+    scan(32)   # duplicate re-report only — episode must NOT stay live off this
+    scan(33)
+    assert _flips(stale) == [], "still within b's distinct-401 window"
+    # Geometry: keep re-reporting at <=300s gaps through 35/38 so `last_seen`
+    # (duplicate-refreshed) never itself lapses past AUTH_401_WINDOW_SEC — a
+    # >300s gap between worker-lane touches would make the NEXT report read
+    # as a FRESH distinct 401 (resetting last_distinct to "now" and reviving
+    # liveness), defeating the aging-out this test exists to prove. Only
+    # last_distinct (frozen since scan(31), never a duplicate target) is
+    # meant to age past the window.
+    scan(35)
+    scan(38)
+    scan(40)   # > AUTH_401_WINDOW_SEC past b's last DISTINCT 401
+    assert len(_flips(stale)) == 1, "episode aged out: the flip lane unstalls"
+    assert stale.ACCOUNT_ACTIVE.read_text() == "b\n"
 
 
 def test_recovery_rollup_mentions_switch(stale, capsys, monkeypatch):
@@ -3350,33 +3529,173 @@ def test_auth_failure_signature_never_raises(stale, tmp_path, monkeypatch):
 
 def test_record_auth_401_bounded_attempts_and_dedup(stale):
     now = 1_000_000
-    assert stale._record_auth_401("a", "u-1", now) == "recover"
+    assert stale._record_auth_401("a", "u-1", now) == ("recover", 1)
     # Same uuid (the resume hasn't fired yet) ⇒ duplicate, no count bump.
-    assert stale._record_auth_401("a", "u-1", now + 30) == "duplicate"
+    assert stale._record_auth_401("a", "u-1", now + 30) == ("duplicate", 1)
     # Fresh uuid within the window ⇒ attempt 2, still <= N.
-    assert stale._record_auth_401("a", "u-2", now + 60) == "recover"
+    assert stale._record_auth_401("a", "u-2", now + 60) == ("recover", 2)
     # Fresh uuid within the window ⇒ attempt 3 > N ⇒ escalate.
-    assert stale._record_auth_401("a", "u-3", now + 120) == "escalate"
+    assert stale._record_auth_401("a", "u-3", now + 120) == ("escalate", 3)
 
 
 def test_record_auth_401_window_resets(stale):
     now = 1_000_000
-    assert stale._record_auth_401("a", "u-1", now) == "recover"
+    assert stale._record_auth_401("a", "u-1", now) == ("recover", 1)
     last_seen = now + 60
-    assert stale._record_auth_401("a", "u-2", last_seen) == "recover"
+    assert stale._record_auth_401("a", "u-2", last_seen) == ("recover", 2)
     # Beyond the M-window since the LAST sighting ⇒ a fresh incident; counter resets.
     later = last_seen + stale.AUTH_401_WINDOW_SEC + 1
-    assert stale._record_auth_401("a", "u-3", later) == "recover"
-    assert stale._record_auth_401("a", "u-4", later + 60) == "recover"
+    assert stale._record_auth_401("a", "u-3", later) == ("recover", 1)
+    assert stale._record_auth_401("a", "u-4", later + 60) == ("recover", 2)
+    assert stale.AUTH_401_WINDOW_SEC == 300, \
+        "absolute pin: a widened window silently extends cross-incident suspicion"
 
 
 def test_record_auth_401_per_account_independent(stale):
     now = 1_000_000
-    assert stale._record_auth_401("a", "u-1", now) == "recover"
-    assert stale._record_auth_401("b", "u-2", now) == "recover"
-    assert stale._record_auth_401("a", "u-3", now + 10) == "recover"
-    assert stale._record_auth_401("a", "u-4", now + 20) == "escalate"   # a's 3rd
-    assert stale._record_auth_401("b", "u-5", now + 20) == "recover"    # b's 2nd
+    assert stale._record_auth_401("a", "u-1", now) == ("recover", 1)
+    assert stale._record_auth_401("b", "u-2", now) == ("recover", 1)
+    assert stale._record_auth_401("a", "u-3", now + 10) == ("recover", 2)
+    assert stale._record_auth_401("a", "u-4", now + 20) == ("escalate", 3)   # a's 3rd
+    assert stale._record_auth_401("b", "u-5", now + 20) == ("recover", 2)    # b's 2nd
+
+
+def test_healthy_takeover_target(stale):
+    """The shared recover/escalate invariant: a takeover target is the fresh
+    flip letter, else the pointer when it already differs from the suspect
+    account, else nothing — never the suspect account itself."""
+    assert stale._healthy_takeover_target("a", "a", "b") == "b"    # fresh flip wins
+    assert stale._healthy_takeover_target("a", "b", None) == "b"   # prior flip: pointer moved off suspect
+    assert stale._healthy_takeover_target("b", "a", None) == "a"   # symmetric
+    assert stale._healthy_takeover_target("a", "a", None) is None  # pointer still on suspect: no target
+    assert stale._healthy_takeover_target("a", "b", "c") == "c"   # fresh flip outranks a differing pointer
+    assert stale._healthy_takeover_target("a", "b", None, pool_suspect=True) is None, \
+        "a pointer that is itself mid-401 is not a healthy target"
+    assert stale._healthy_takeover_target("a", "a", "c", pool_suspect=True) == "c", \
+        "the flipped letter arm is _flip_target-vetted; pool_suspect does not gate it"
+
+
+def test_auth_401_active(stale):
+    now = 1_000_000
+    assert stale._auth_401_active("b", now) is False, "no state file ⇒ not active"
+    stale._record_auth_401("b", "u-b", now - 60)
+    assert stale._auth_401_active("b", now) is True, "in-window episode ⇒ active"
+    assert stale._auth_401_active("a", now) is False, "other account unaffected"
+    assert stale._auth_401_active(
+        "b", now + stale.AUTH_401_WINDOW_SEC + 61) is False, "expired episode ⇒ inactive"
+
+
+def test_auth_401_active_ages_out_despite_duplicate_reports(stale):
+    """B-1: a dead unreaped 401'd session re-reports the SAME uuid every
+    scan; the duplicate path refreshes last_seen (attempt-count
+    anti-rollover) but must NOT extend destination-health liveness — else one
+    dead worker disqualifies its account as a flip target forever."""
+    t0 = 1_000_000
+    assert stale._record_auth_401("b", "u-dead", t0) == ("recover", 1)
+    for minute in range(1, 11):   # duplicates for 10 minutes, every 60s
+        assert stale._record_auth_401("b", "u-dead", t0 + minute * 60)[0] == "duplicate"
+    late = t0 + 10 * 60
+    assert stale._auth_401_active("b", late) is False, \
+        "liveness keys on last_distinct: aged out despite fresh last_seen"
+    # Anti-rollover preserved: last_seen is fresh, so a NEW uuid is still the
+    # same episode — attempts continue, they do not reset.
+    assert stale._record_auth_401("b", "u-new", late + 1) == ("recover", 2)
+    assert stale._auth_401_active("b", late + 2) is True, \
+        "a fresh distinct 401 re-arms liveness"
+
+
+def test_flip_target_excludes_auth_401_active_account(stale):
+    now = 1_000_000
+    stale._record_auth_401("b", "u-b", now - 30)
+    state = stale._load_account_state()
+    assert stale._flip_target("a", state, now) is None, \
+        "an account with a live 401 episode is not a flip destination"
+    later = now + stale.AUTH_401_WINDOW_SEC + 31
+    assert stale._flip_target("a", state, later) == "b", \
+        "an expired episode no longer disqualifies"
+
+
+def test_flip_refusal_auth401_writes_throttled_ledger_line(stale, monkeypatch):
+    monkeypatch.setattr(stale, "_keychain_unlocked", lambda: True)
+    _arm_pool(stale, "a")
+    now = 1_000_000
+    stale._record_auth_401("b", "u-b", now - 30)
+    assert stale._maybe_flip_account("a", "test refusal", now) is None
+    refusals = [e for e in _ledger_events(stale) if e["event"] == "flip-refused-auth401"]
+    assert len(refusals) == 1
+    assert refusals[0]["from"] == "a" and refusals[0]["excluded"] == ["b"]
+    # Throttled: a second refusal within FLIP_COOLDOWN_SEC adds no line.
+    assert stale._maybe_flip_account("a", "test refusal", now + 60) is None
+    assert len([e for e in _ledger_events(stale)
+                if e["event"] == "flip-refused-auth401"]) == 1
+
+
+def test_notify_macos_shape_and_pytest_guard(stale, monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(stale.subprocess, "run",
+                        lambda argv, **kw: calls.append((argv, kw)) or None)
+    stale._notify_macos('hello "quoted" world')
+    assert calls == [], "no-op under pytest (PYTEST_CURRENT_TEST guard)"
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    stale._notify_macos('hello "quoted" world')
+    assert len(calls) == 1
+    assert calls[0][0][0] == "osascript"
+    assert 'hello quoted world' in calls[0][0][2], "double quotes stripped"
+    assert calls[0][1].get("timeout") == 2
+    assert calls[0][1].get("check") is False
+    assert calls[0][1].get("capture_output") is True
+    # Failures are swallowed.
+    monkeypatch.setattr(stale.subprocess, "run",
+                        lambda argv, **kw: (_ for _ in ()).throw(OSError("boom")))
+    stale._notify_macos("x")   # must not raise
+    err = capsys.readouterr().err
+    assert "notify" in err and "boom" in err, "failure leaves a stderr trace"
+    # Non-zero exit (the real permissions-denied shape) also warns.
+    class _R:
+        returncode = 1
+        stderr = b"not allowed"
+    monkeypatch.setattr(stale.subprocess, "run", lambda argv, **kw: _R())
+    stale._notify_macos("x")
+    assert "notify" in capsys.readouterr().err
+
+
+def test_notify_macos_subprocess_call_matches_hooks_inline_copy(stale):
+    """_notify_macos is an inline copy of hooks._notify_macos (this file is
+    standalone). Pin parity so a future edit to either diverges loudly
+    (precedent: test_bootstrap_recreate_guard.py).
+
+    DESIGN CHOICE (per the brief's CAUTION on this test): the brief's
+    primary proposal — subsequence-containment over top-level statement
+    dumps — was tried and found not merely awkward but structurally
+    non-viable here: both functions' entire logic after the docstring lives
+    inside ONE top-level `Try` node (`if guard: return` + one `try/except`).
+    stale_monitor's copy assigns the subprocess.run result and adds warning
+    branches inside that same try — so the whole `Try` statement differs the
+    instant those branches exist, and a top-level-statement subsequence
+    check would never find a match for ANY implementation, not just a real
+    drift (there is no partial-match granularity above "the whole
+    try/except block"). So per the brief's documented fallback, this test
+    compares only the shared `subprocess.run` call's AST (function target +
+    positional args + keywords) extracted from wherever it appears in each
+    function body — unaffected by whether the call result is assigned
+    (stale) or bare (hooks), or by follow-on statements added after it. This
+    is the drift that matters most: the actual osascript invocation shape."""
+    import ast, inspect, textwrap
+    from dockwright import hooks
+
+    def run_call_dump(fn):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "run"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "subprocess"):
+                return ast.dump(node)
+        raise AssertionError(f"no subprocess.run(...) call found in {fn!r}")
+
+    assert run_call_dump(hooks._notify_macos) == run_call_dump(stale._notify_macos), \
+        "the shared subprocess.run(...) invocation (argv + keywords) has diverged"
 
 
 # -- worker path ---------------------------------------------------------------
@@ -3489,7 +3808,8 @@ def test_worker_auth_401_escalates_after_bound(stale, capsys, monkeypatch):
     assert "AUTH_401 worker-tab" in out2 and "SWITCHED" not in out2
     out3 = scan_401("u-3", 10)
     assert "SWITCHED account a→b" in out3
-    assert "AUTH_401_ESCALATED" in out3
+    assert "AUTH_401_ESCALATED" in out3 and "PAGE: run claude, then /login" in out3
+    assert "CLAUDE_CONFIG_DIR" not in out3
     assert stale.ACCOUNT_ACTIVE.read_text() == "b\n"
     assert len(_flips(stale)) == 1
     actions = [e["action"] for e in _auth_events(stale)]
@@ -3559,11 +3879,340 @@ def test_manager_auth_401_recovers_same_account_no_flip(stale, capsys, monkeypat
     assert len(_launch_calls(calls)) == 1
 
 
-def test_manager_auth_401_escalates_after_bound(stale, capsys, monkeypatch):
-    """When the same-account takeover keeps 401'ing (credential genuinely
-    suspect), escalation STOPS launching dead takeover tabs and instead flips +
-    pages."""
+def test_manager_auth_401_second_attempt_no_healthy_target_escalates_now(
+        stale, capsys, monkeypatch, tmp_path):
+    """From the episode's SECOND distinct 401 the account is suspect: never
+    launch the takeover onto it. With the pointer still on the suspect account
+    there is no healthy target, and waiting for attempt 3 can starve the
+    ladder (a deaf manager re-presents the same uuid forever), so the decision
+    is promoted to escalate NOW: flip + /login page + takeover on the healthy
+    letter."""
     calls = _capture_runs(stale, monkeypatch)
+    monkeypatch.setattr(stale, "_keychain_unlocked", lambda: True)
+    _seed_farm(monkeypatch, tmp_path, "b")
+    _arm_pool(stale, "a")
+    t0 = 1_000_000
+    # Another session (e.g. a worker) already burned attempt 1 on account a.
+    stale._record_auth_401("a", "u-prev", t0)
+    # account="a" stamp: keeps the follow-up scan attributed to the suspect
+    # account after the flip. An UNSTAMPED record re-attributes the same 401
+    # to the flipped pointer (b) via the _account_of pool fallback — that
+    # shape is covered by the rewritten escalates_after_bound test below.
+    path, log = _write_auth_401_manager(stale, "mgr1", "mgr-A", t0, uuid="u-fresh",
+                                        account="a")
+    clock = {"now": t0 + 130}   # past the manager silence floor
+    monkeypatch.setattr(stale.time, "time", lambda: clock["now"])
+    stale.main(manager_name="mgr-A")
+    assert stale.ACCOUNT_ACTIVE.read_text() == "b\n", "promoted escalate flips off the suspect account"
+    assert len(_flips(stale)) == 1
+    launches = _launch_calls(calls)
+    assert len(launches) == 1, "exactly one launch — and not on the suspect account"
+    inner = launches[0][0][-1]
+    assert "/manager-takeover-recovery mgr1" in inner
+    assert "CLAUDE_ORCH_ACCOUNT=b" in inner
+    assert f"CLAUDE_CONFIG_DIR={tmp_path}/.claude-b" in inner
+    assert "CLAUDE_ORCH_ACCOUNT=a" not in inner
+    assert [e["action"] for e in _auth_events(stale)] == ["escalate"], \
+        "the recover decision is PROMOTED — no recover ledger line"
+    # Idempotence: the SAME 401 on the next scan is a duplicate — no second
+    # launch, flip, or ledger line.
+    clock["now"] += 60
+    os.utime(log, (clock["now"] - 130, clock["now"] - 130))
+    os.utime(path, (clock["now"] - 130, clock["now"] - 130))
+    stale.main(manager_name="mgr-A")
+    assert len(_launch_calls(calls)) == 1
+    assert len(_flips(stale)) == 1
+    assert [e["action"] for e in _auth_events(stale)] == ["escalate"]
+
+
+def test_manager_auth_401_promoted_escalate_never_flips_to_401ing_account(
+        stale, capsys, monkeypatch, tmp_path):
+    """Tier-2 I-1, the 2026-07-29 shape: account b already carries a live 401
+    episode when a's manager hits attempt 2. The promoted escalate must NOT
+    flip to b nor launch onto it (that is the zombie factory one account
+    over) — no healthy target exists, so it pages the human directly."""
+    calls = _capture_runs(stale, monkeypatch)
+    notified = []
+    monkeypatch.setattr(stale, "_notify_macos", lambda text: notified.append(text))
+    monkeypatch.setattr(stale, "_keychain_unlocked", lambda: True)
+    _seed_farm(monkeypatch, tmp_path, "b")
+    _arm_pool(stale, "a")
+    t0 = 1_000_000
+    stale._record_auth_401("b", "u-b-401", t0)         # b: live episode
+    stale._record_auth_401("a", "u-prev", t0)          # a: attempt 1 burned
+    _write_auth_401_manager(stale, "mgr1", "mgr-A", t0, uuid="u-fresh",
+                            account="a")
+    clock = {"now": t0 + 130}
+    monkeypatch.setattr(stale.time, "time", lambda: clock["now"])
+    stale.main(manager_name="mgr-A")
+    assert stale.ACCOUNT_ACTIVE.read_text() == "a\n", "no flip onto a 401ing account"
+    assert _flips(stale) == []
+    assert _launch_calls(calls) == [], "no takeover launch anywhere — b is mid-401"
+    assert [e["action"] for e in _auth_events(stale)
+            if e["account"] == "a"] == ["escalate"]
+    assert len(notified) == 1 and "AUTH_401_ESCALATED a" in notified[0]
+
+
+def test_manager_auth_401_second_attempt_pointer_401ing_pages_no_launch(
+        stale, capsys, monkeypatch, tmp_path):
+    """Attempt 2 with the pointer already off the suspect account — but the
+    pointer account is ITSELF mid-401 (both-accounts-dead window). The
+    recover must not launch onto it; the decision promotes to escalate,
+    which can neither flip (pointer != suspect blocks guard 1) nor launch —
+    the direct notification is the only remaining channel."""
+    calls = _capture_runs(stale, monkeypatch)
+    notified = []
+    monkeypatch.setattr(stale, "_notify_macos", lambda text: notified.append(text))
+    monkeypatch.setattr(stale, "_keychain_unlocked", lambda: True)
+    _seed_farm(monkeypatch, tmp_path, "b")
+    _arm_pool(stale, "b")
+    t0 = 1_000_000
+    stale._record_auth_401("b", "u-b-401", t0)         # pointer b: live episode
+    stale._record_auth_401("a", "u-prev", t0)          # suspect a: attempt 1
+    _write_auth_401_manager(stale, "mgr1", "mgr-A", t0, uuid="u-fresh",
+                            account="a")
+    clock = {"now": t0 + 130}
+    monkeypatch.setattr(stale.time, "time", lambda: clock["now"])
+    stale.main(manager_name="mgr-A")
+    assert _launch_calls(calls) == [], "pointer b is mid-401 — not a launch target"
+    assert stale.ACCOUNT_ACTIVE.read_text() == "b\n"
+    assert _flips(stale) == []
+    assert [e["action"] for e in _auth_events(stale)
+            if e["account"] == "a"] == ["escalate"]
+    assert len(notified) == 1 and "AUTH_401_ESCALATED a" in notified[0]
+
+
+def test_manager_auth_401_escalate_both_no_target_and_keychain_locked_notifies(
+        stale, capsys, monkeypatch, tmp_path):
+    """Escalate arm, both causes at once: the pointer is itself mid-401 (no
+    healthy target) AND the keychain is locked. The composed notification
+    must name BOTH causes — naming only one would hide the other from the
+    human."""
+    calls = _capture_runs(stale, monkeypatch)
+    notified = []
+    monkeypatch.setattr(stale, "_notify_macos", lambda text: notified.append(text))
+    monkeypatch.setattr(stale, "_keychain_unlocked", lambda: False)
+    _seed_farm(monkeypatch, tmp_path, "b")
+    _arm_pool(stale, "b")
+    t0 = 1_000_000
+    stale._record_auth_401("b", "u-b-401", t0)         # pointer b: live episode
+    stale._record_auth_401("a", "u-prev", t0)          # suspect a: attempt 1
+    _write_auth_401_manager(stale, "mgr1", "mgr-A", t0, uuid="u-fresh",
+                            account="a")
+    clock = {"now": t0 + 130}
+    monkeypatch.setattr(stale.time, "time", lambda: clock["now"])
+    stale.main(manager_name="mgr-A")
+    assert _launch_calls(calls) == [], "no healthy target AND keychain locked — no launch"
+    assert stale.ACCOUNT_ACTIVE.read_text() == "b\n"
+    assert _flips(stale) == []
+    assert [e["action"] for e in _auth_events(stale)
+            if e["account"] == "a"] == ["escalate"]
+    assert len(notified) == 1
+    assert "no healthy account" in notified[0] and "keychain locked" in notified[0]
+
+
+def test_manager_auth_401_first_attempt_never_launches_onto_401ing_pointer(
+        stale, capsys, monkeypatch, tmp_path):
+    """Residual 1 (reviewer-measured REACHABLE): a prior flip left the
+    pointer on b, b is itself mid-401, and a's manager hits its FIRST 401.
+    The attempt-1 arm gates on `pool == account or not pool_suspect` — the
+    same-account blip bet survives (pool == account), but a mid-401 FOREIGN
+    pointer is not a launch target; the decision promotes to escalate,
+    which can neither flip (pointer != suspect) nor launch ⇒ notify."""
+    calls = _capture_runs(stale, monkeypatch)
+    notified = []
+    monkeypatch.setattr(stale, "_notify_macos", lambda text: notified.append(text))
+    monkeypatch.setattr(stale, "_keychain_unlocked", lambda: True)
+    _seed_farm(monkeypatch, tmp_path, "b")
+    _arm_pool(stale, "b")
+    t0 = 1_000_000
+    stale._record_auth_401("b", "u-b-401", t0)     # pointer b: live episode
+    _write_auth_401_manager(stale, "mgr1", "mgr-A", t0, uuid="u-first",
+                            account="a")           # a's FIRST 401 (no pre-seed)
+    clock = {"now": t0 + 130}
+    monkeypatch.setattr(stale.time, "time", lambda: clock["now"])
+    stale.main(manager_name="mgr-A")
+    assert _launch_calls(calls) == [], "attempt 1 must not launch onto mid-401 b"
+    assert [e["action"] for e in _auth_events(stale)
+            if e["account"] == "a"] == ["escalate"], "promoted, not recover"
+    assert _flips(stale) == []
+    assert len(notified) == 1
+
+
+def test_manager_auth_401_incident_replay_worker_then_manager(
+        stale, capsys, monkeypatch, tmp_path):
+    """The 2026-07-29 15:22/15:24 zombie, replayed: a worker's 401 is the
+    account's attempt 1 (same-account kill+resume duty fires as today), so the
+    manager's own 401 two minutes later is attempt 2 — under the fix the
+    takeover must NOT launch onto the suspect account; it escalates (flip +
+    page + healthy-letter launch) instead."""
+    calls = _capture_runs(stale, monkeypatch)
+    monkeypatch.setattr(stale, "_keychain_unlocked", lambda: True)
+    _seed_farm(monkeypatch, tmp_path, "b")
+    _arm_pool(stale, "a")
+    t0 = 1_000_000
+    w_path = _write_record(stale, "w1", agent="worker", state="processing",
+                           name="worker-tab", window_id="42")
+    os.utime(w_path, (t0, t0))
+    w_log = _write_auth_401_transcript(stale, "w1", uuid="u-worker")
+    os.utime(w_log, (t0, t0))
+    clock = {"now": t0 + 6 * 60}   # past the 5-min pool-lane floor
+    monkeypatch.setattr(stale.time, "time", lambda: clock["now"])
+    stale.main()                    # worker scan: attempt 1, AUTH_401 emit
+    assert "AUTH_401 worker-tab" in capsys.readouterr().out
+    _write_auth_401_manager(stale, "mgr1", "mgr-A", clock["now"], uuid="u-mgr")
+    clock["now"] += 2 * 60 + 10
+    stale.main(manager_name="mgr-A")   # manager scan: attempt 2 → promoted escalate
+    assert stale.ACCOUNT_ACTIVE.read_text() == "b\n"
+    assert len(_flips(stale)) == 1
+    launches = _launch_calls(calls)
+    assert len(launches) == 1
+    inner = launches[0][0][-1]
+    assert "/manager-takeover-recovery mgr1" in inner
+    assert "CLAUDE_ORCH_ACCOUNT=b" in inner
+    assert "CLAUDE_ORCH_ACCOUNT=a" not in inner, "today's zombie: takeover onto the 401ing account"
+    assert [e["action"] for e in _auth_events(stale)] == ["recover", "escalate"]
+    assert _auth_events(stale)[0]["source"] == "worker:worker-tab"
+
+
+def test_manager_auth_401_second_attempt_launches_on_healthy_pointer(
+        stale, capsys, monkeypatch, tmp_path):
+    """Attempt 2 with the pointer ALREADY off the suspect account (a prior
+    flip landed) is not promoted: the recover decision launches onto the
+    healthy pointer — no flip, no escalate page. Guards against over-promoting
+    'attempts >= 2' into a blanket escalate."""
+    calls = _capture_runs(stale, monkeypatch)
+    monkeypatch.setattr(stale, "_keychain_unlocked", lambda: True)
+    _seed_farm(monkeypatch, tmp_path, "b")
+    _arm_pool(stale, "b")
+    t0 = 1_000_000
+    stale._record_auth_401("a", "u-prev", t0)          # attempt 1 on suspect a
+    _write_auth_401_manager(stale, "mgr1", "mgr-A", t0, uuid="u-fresh",
+                            account="a")               # manager stamped on a
+    clock = {"now": t0 + 130}
+    monkeypatch.setattr(stale.time, "time", lambda: clock["now"])
+    stale.main(manager_name="mgr-A")
+    assert stale.ACCOUNT_ACTIVE.read_text() == "b\n", "pointer untouched"
+    assert _flips(stale) == [], "no new flip — the pointer is already healthy"
+    launches = _launch_calls(calls)
+    assert len(launches) == 1
+    inner = launches[0][0][-1]
+    assert "/manager-takeover-recovery mgr1" in inner
+    assert "CLAUDE_ORCH_ACCOUNT=b" in inner
+    assert "CLAUDE_ORCH_ACCOUNT=a" not in inner
+    assert [e["action"] for e in _auth_events(stale)] == ["recover"], \
+        "healthy-pointer attempt-2 stays a recover, not an escalate"
+
+
+def test_manager_auth_401_second_attempt_no_target_notifies_human_directly(
+        stale, capsys, monkeypatch):
+    """C1 trajectory, honest version (Tier-2 I-2): dead login, flip blocked
+    by cooldown, attempt 2 → promoted escalate. Nothing launches, so no
+    successor will ever take the record over and flush the buffered page —
+    the direct macOS notification is what reaches the human, WITHOUT any
+    takeover. Duplicate scans do not re-notify. If a successor does appear
+    (record unlinked), the buffered page still replays as a complement."""
+    calls = _capture_runs(stale, monkeypatch)
+    notified = []
+    monkeypatch.setattr(stale, "_notify_macos", lambda text: notified.append(text))
+    monkeypatch.setattr(stale, "_keychain_unlocked", lambda: True)
+    _arm_pool(stale, "a")
+    t0 = 1_000_000
+    stale.ACCOUNT_STATE.write_text(json.dumps(
+        {"accounts": {}, "last_flip": {"ts": t0 - 30, "from": "b", "to": "a"}}))
+    stale._record_auth_401("a", "u-prev", t0)
+    path, log = _write_auth_401_manager(stale, "mgr1", "mgr-A", t0, uuid="u-fresh")
+    clock = {"now": t0 + 130}
+    monkeypatch.setattr(stale.time, "time", lambda: clock["now"])
+    stale.main(manager_name="mgr-A")
+    assert stale.ACCOUNT_ACTIVE.read_text() == "a\n", "flip blocked by cooldown"
+    assert _flips(stale) == []
+    assert _launch_calls(calls) == []
+    assert [e["action"] for e in _auth_events(stale)] == ["escalate"]
+    assert len(notified) == 1, "the human is paged directly, no takeover required"
+    assert "AUTH_401_ESCALATED a" in notified[0] and "/login" in notified[0]
+    assert capsys.readouterr().out == "", "manager-stream page still buffered"
+    # Duplicate scan: no re-notification, no launch, no extra ledger line.
+    clock["now"] += 60
+    os.utime(log, (clock["now"] - 130, clock["now"] - 130))
+    os.utime(path, (clock["now"] - 130, clock["now"] - 130))
+    stale.main(manager_name="mgr-A")
+    assert len(notified) == 1
+    assert _launch_calls(calls) == []
+    assert [e["action"] for e in _auth_events(stale)] == ["escalate"]
+    # Successor-relay complement: if something else DOES take the record over,
+    # the buffered page replays on the rollup flush.
+    (stale.ACTIVE / "mgr1.json").unlink()
+    clock["now"] += 60
+    stale.main(manager_name="mgr-A")
+    out = capsys.readouterr().out
+    assert "AUTH_401_ESCALATED" in out and "PAGE: run claude, then /login" in out
+    assert len(notified) == 1, "replay is the manager-stream channel, not a re-notification"
+
+
+def test_manager_auth_401_escalate_keychain_locked_notifies(
+        stale, capsys, monkeypatch, tmp_path):
+    """B-2: healthy target exists but the keychain gate blocks the launch —
+    previously silence, forever (duplicates never re-enter the arm). The
+    notification now derives from the OUTCOME: launch wanted, none happened,
+    no successor exists ⇒ notify with the concrete reason. No retry
+    machinery: the launch itself resumes only on the next fresh 401 or human
+    action — the human loop is the recovery here."""
+    calls = _capture_runs(stale, monkeypatch)
+    notified = []
+    monkeypatch.setattr(stale, "_notify_macos", lambda text: notified.append(text))
+    monkeypatch.setattr(stale, "_keychain_unlocked", lambda: False)
+    _seed_farm(monkeypatch, tmp_path, "b")
+    _arm_pool(stale, "a")
+    t0 = 1_000_000
+    stale._record_auth_401("a", "u-prev1", t0)
+    stale._record_auth_401("a", "u-prev2", t0 + 10)   # at the ceiling → escalate
+    path, log = _write_auth_401_manager(stale, "mgr1", "mgr-A", t0, uuid="u-fresh",
+                                        account="a")
+    clock = {"now": t0 + 130}
+    monkeypatch.setattr(stale.time, "time", lambda: clock["now"])
+    stale.main(manager_name="mgr-A")
+    assert _launch_calls(calls) == [], "keychain locked: no launch"
+    assert len(notified) == 1 and "keychain" in notified[0], \
+        "…but never silent: outcome-derived notification names the reason"
+    # Duplicate scan: no re-notification storm.
+    clock["now"] += 60
+    os.utime(log, (clock["now"] - 130, clock["now"] - 130))
+    os.utime(path, (clock["now"] - 130, clock["now"] - 130))
+    stale.main(manager_name="mgr-A")
+    assert len(notified) == 1 and _launch_calls(calls) == []
+
+
+def test_manager_auth_401_recover_keychain_locked_notifies(stale, capsys, monkeypatch):
+    """B-2, recover arm: the attempt-1 same-account takeover blocked by a
+    locked keychain was the same silent class one door over. A deaf manager
+    with a locked keychain needs the human regardless of blip-vs-dead."""
+    calls = _capture_runs(stale, monkeypatch)
+    notified = []
+    monkeypatch.setattr(stale, "_notify_macos", lambda text: notified.append(text))
+    monkeypatch.setattr(stale, "_keychain_unlocked", lambda: False)
+    _arm_pool(stale, "a")
+    t0 = 1_000_000
+    _write_auth_401_manager(stale, "mgr1", "mgr-A", t0, uuid="u-1")
+    clock = {"now": t0 + 130}
+    monkeypatch.setattr(stale.time, "time", lambda: clock["now"])
+    stale.main(manager_name="mgr-A")
+    assert _launch_calls(calls) == []
+    assert [e["action"] for e in _auth_events(stale)] == ["recover"]
+    assert len(notified) == 1 and "keychain" in notified[0]
+
+
+def test_manager_auth_401_escalates_after_bound(stale, capsys, monkeypatch):
+    """Same-sid episode shape under the suspect-account guard: attempt 1 takes
+    the same-account bet (one launch); attempt 2 — the bet demonstrably lost —
+    is PROMOTED to escalate (flip + page; no second launch, the sid's guard
+    key and ledger bound are already burned); attempt 3 counts against the
+    now-current pointer (unstamped record ⇒ pool fallback) as that account's
+    attempt 1, with the launch still blocked by the per-sid guard. Exactly one
+    launch across the episode."""
+    calls = _capture_runs(stale, monkeypatch)
+    notified = []
+    monkeypatch.setattr(stale, "_notify_macos", lambda text: notified.append(text))
     monkeypatch.setattr(stale, "_keychain_unlocked", lambda: True)
     _arm_pool(stale, "a")
     t0 = 1_000_000
@@ -3578,16 +4227,21 @@ def test_manager_auth_401_escalates_after_bound(stale, capsys, monkeypatch):
         os.utime(path, (clock["now"] - 20 * 60, clock["now"] - 20 * 60))
         stale.main(manager_name="mgr-A")
 
-    scan_401("u-1", 1)     # recover → 1 launch
-    scan_401("u-2", 2)     # recover (guarded sid) → no new launch
-    scan_401("u-3", 3)     # escalate → flip + page, NO launch
-    # Exactly one launch across the episode (the escalate path does not relaunch).
-    assert len(_launch_calls(calls)) == 1
+    scan_401("u-1", 1)     # attempt 1 → same-account launch (the blip bet)
+    launches = _launch_calls(calls)
+    assert len(launches) == 1 and "CLAUDE_ORCH_ACCOUNT=a" in launches[0][0][-1]
+    scan_401("u-2", 2)     # attempt 2 → promoted escalate: flip + page, no launch
     assert stale.ACCOUNT_ACTIVE.read_text() == "b\n"
     assert len(_flips(stale)) == 1
-    out = capsys.readouterr().out  # manager_limited buffers events; rollup not asserted here
-    actions = [e["action"] for e in _auth_events(stale)]
-    assert actions == ["recover", "recover", "escalate"]
+    assert len(_launch_calls(calls)) == 1
+    scan_401("u-3", 3)     # attempt 3 → counted against b (pool fallback): recover, launch still sid-guarded
+    assert len(_launch_calls(calls)) == 1, "exactly one launch across the episode"
+    assert stale.ACCOUNT_ACTIVE.read_text() == "b\n"
+    assert len(_flips(stale)) == 1
+    capsys.readouterr()    # buffered rollup not asserted here
+    assert [(e["account"], e["action"]) for e in _auth_events(stale)] == \
+        [("a", "recover"), ("a", "escalate"), ("b", "recover")]
+    assert notified == [], "successor launched at scan 1 — no notification"
 
 
 def test_manager_auth_401_escalate_launches_on_flipped_account(stale, capsys, monkeypatch, tmp_path):
@@ -3640,7 +4294,8 @@ def test_manager_auth_401_escalate_page_survives_recovery_rollup(stale, capsys, 
     stale.main(manager_name="mgr-A")
     out = capsys.readouterr().out
     assert "limit cleared" in out
-    assert "AUTH_401_ESCALATED" in out and "/login" in out
+    assert "AUTH_401_ESCALATED" in out and "PAGE: run claude, then /login" in out
+    assert "CLAUDE_CONFIG_DIR" not in out and "rides ~/.claude" not in out
 
 
 def test_manager_auth_401_escalate_page_only_when_flip_blocked(stale, capsys, monkeypatch):
@@ -3675,7 +4330,8 @@ def test_manager_auth_401_escalate_page_only_when_flip_blocked(stale, capsys, mo
     clock["now"] += 60
     stale.main(manager_name="mgr-A")
     out = capsys.readouterr().out
-    assert "AUTH_401_ESCALATED" in out and "/login" in out, "page reaches the human"
+    assert "AUTH_401_ESCALATED" in out and "PAGE: run claude, then /login" in out, "page reaches the human"
+    assert "CLAUDE_CONFIG_DIR" not in out and "rides ~/.claude" not in out
     assert _launch_calls(calls) == [], "still no recovery launch on the suspect account"
 
 
@@ -3813,8 +4469,62 @@ def test_launch_recovery_manager_pins_manager_opus(stale, monkeypatch):
     out = stale._launch_recovery_manager(rec, "sid-1", "a")
     assert out == "%9"
     inner = captured["argv"][-1]
-    assert "--model 'opus[1m]'" in inner
+    assert "--model 'claude-opus-5[1m]'" in inner
     assert inner.index("--model") < inner.index("/manager-takeover-recovery")
+
+
+def test_launch_recovery_manager_marks_pending_takeover(stale, monkeypatch):
+    """The recovery tab must carry DOCKWRIGHT_PENDING_TAKEOVER=1 in its inner
+    command (ghost-manager guard: the SessionStart hook defers registration to
+    the takeover call). Anchored to the argv actually handed to the driver."""
+    captured = {}
+
+    class FakeDrv:
+        async def spawn(self, **kw):
+            captured.update(kw)
+            return "%9"
+
+    monkeypatch.setattr(stale, "_get_driver", lambda: FakeDrv())
+    rec = {"cwd": "/c", "name": "m", "window_id": "%14"}
+    assert stale._launch_recovery_manager(rec, "sid-1", "a") == "%9"
+    inner = captured["argv"][-1]
+    assert "DOCKWRIGHT_PENDING_TAKEOVER=1 " in inner
+    assert inner.index("DOCKWRIGHT_PENDING_TAKEOVER=1") < inner.index("claude ")
+
+
+def test_recovery_command_composed_only_in_launcher(stale):
+    """ADD-ONE pin (Tier-2 Minor, widened round 2): the pending-takeover env
+    contract holds only because every recovery launch goes through
+    _launch_recovery_manager's composer — a bypassing launcher would mint ghost
+    records again with every argv-level test green, and a realistic bypass
+    lives in a SIBLING module (spawner.py is already a manager-launching lane).
+    Pin the funnel on EXECUTABLE code across the launcher modules: among
+    non-docstring string constants (comments never reach the AST) of
+    stale_monitor.py, spawner.py, and mcp_server.py, the command literal
+    appears exactly once, inside the composer's line span. Split-literal
+    concatenation could still evade — contrived, accepted."""
+    import ast
+    import inspect
+    from dockwright import mcp_server, spawner
+    all_hits = []
+    for mod in (stale, spawner, mcp_server):
+        tree = ast.parse(Path(mod.__file__).read_text())
+        doc_nodes = set()
+        for node in ast.walk(tree):
+            body = getattr(node, "body", None)
+            if (body and isinstance(node, (ast.Module, ast.FunctionDef,
+                                           ast.AsyncFunctionDef, ast.ClassDef))
+                    and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                doc_nodes.add(id(body[0].value))
+        all_hits.extend(
+            (mod.__name__, n.lineno) for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+            and "/manager-takeover-recovery" in n.value and id(n) not in doc_nodes)
+    assert len(all_hits) == 1, all_hits
+    lines, start = inspect.getsourcelines(stale._launch_recovery_manager)
+    assert start <= all_hits[0][1] < start + len(lines)
 
 
 def test_recovery_launch_carries_manager_settings(stale, monkeypatch):
@@ -4514,3 +5224,619 @@ def test_approval_driver_absent_is_noop(monkeypatch, tmp_path):
     monkeypatch.setattr(stale_monitor, "ACTIVE", active)
     monkeypatch.setattr(stale_monitor, "_get_driver", None)
     stale_monitor._scan_approval_prompts("mgr-x", 1_000_000, {}, {}, lambda *a, **k: None)
+
+
+# --- autoclose: live background shell extends the deadline --------------------
+#
+# The `ps` command lines below are real shapes captured off the live fleet; the
+# docker row's connection string is a placeholder, never a real credential.
+
+_MCP_CHILDREN = (
+    "caffeinate -i -t 300",
+    "/opt/homebrew/bin/uv tool uvx elasticsearch-mcp-server",
+    "npm exec @playwright/mcp@latest --extension",
+    "docker run -i --rm --init crystaldba/postgres-mcp postgresql://USER:PASS@host:5432/db",
+    "npm exec nx mcp",
+)
+_BASH_TOOL_SHELL = (
+    "/bin/zsh -c source /Users/dev/.claude/shell-snapshots/"
+    "snapshot-zsh-1786677333041-byreh7.sh 2>/dev/null || true && setopt NO_EXTENDED_GLOB "
+    "&& eval 'uv run pytest -q' < /dev/null && pwd -P >| /tmp/claude-92e4-cwd"
+)
+# A nested `claude -p` child quoting a snapshot path inside its PROMPT: measured
+# on the fleet (1 of 28 marker-carrying rows had argv[0] = claude, marker at
+# offset 1865). The marker alone would read this as a busy shell.
+_NESTED_SESSION_CHILD = (
+    "claude -p check that /Users/dev/.claude/shell-snapshots/"
+    "snapshot-zsh-1786677333041-byreh7.sh is quoted verbatim in this prompt"
+)
+_WORKER_ARGV = "claude --resume 0f3a1c7e-worker"
+_WORKER_PID = 4242
+_BUSY_T0 = 1_000_000
+
+
+def _proc_index(children=(), own=_WORKER_ARGV, pid=_WORKER_PID):
+    """Mirrors what _process_index() really builds: EVERY row lands in
+    command_by_pid AND child_commands is keyed by ppid. A fixture that
+    registered only the parent would make "scan every process instead of the
+    direct children" look harmless — measured: that mutation left the
+    grandchild case green until this helper matched the real parser."""
+    command_by_pid = {pid: own}
+    for offset, command in enumerate(children, start=1):
+        command_by_pid[pid + offset] = command
+    return {"command_by_pid": command_by_pid,
+            "child_commands": {pid: list(children)} if children else {}}
+
+
+def _arm_busy_scan(stale, monkeypatch, index):
+    """Deadline = max(100*3, 100+60*3) = 300, so cases read as 150/300/400.
+
+    AUTOCLOSE_CADENCE_SEC is squashed here on purpose: at the real 3600 the
+    floor would widen the window to 10900 and swallow the over-cap case. The
+    floor itself is proven separately, against the real constant.
+    """
+    monkeypatch.setattr(stale, "AUTOCLOSE_CADENCE_SEC", 60)
+    monkeypatch.setattr(stale.time, "time", lambda: _BUSY_T0)
+    monkeypatch.setattr(stale, "_process_index", lambda: index)
+
+
+def _busy_worker(stale, elapsed, sid="busy-1", **overrides):
+    overrides.setdefault("pid", _WORKER_PID)
+    overrides.setdefault("iterm_sid", "7")
+    return _write_record(
+        stale, sid,
+        last_turn_at=time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                   time.gmtime(_BUSY_T0 - elapsed)),
+        **overrides)
+
+
+def test_busy_shell_under_cap_keeps_worker(stale, monkeypatch):
+    _arm_busy_scan(stale, monkeypatch,
+                   _proc_index((*_MCP_CHILDREN, _BASH_TOOL_SHELL)))
+    path = _busy_worker(stale, 150)
+    stale.main()
+    assert path.exists(), "a live Bash-tool shell under the cap must not be reaped"
+
+
+def _world(stale):
+    """Every observable byte under ROOT, keyed by path — no named surface list.
+    A surface added by a later release is compared without anyone listing it."""
+    return {str(p.relative_to(stale.ROOT)): p.read_bytes()
+            for p in sorted(stale.ROOT.rglob("*")) if p.is_file()}
+
+
+def _busy_scan_world(stale, monkeypatch, capsys, manager_name, index, *,
+                     skipped_upstream):
+    """One scan of one busy worker in a pristine ROOT.
+
+    Returns (files, stdout, rc, terminal_calls). The terminal is in there
+    because the pane close is the one observable side effect that is NOT a file
+    under ROOT: `_close_window` goes through the driver, `no_live_tmux` absorbs
+    it, and a comparison over files alone stays green while a refused worker's
+    pane is killed.
+
+    skipped_upstream=True drops the record from evaluation ONE BRANCH EARLIER,
+    at _is_delegation_live: the control world, in which nothing about this
+    worker was ever decided.
+    """
+    for child in list(stale.ROOT.iterdir()):
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+    for d in ("active", "questions", "closed"):
+        (stale.ROOT / d).mkdir()
+    _arm_busy_scan(stale, monkeypatch, index)
+    monkeypatch.setattr(stale, "_is_delegation_live",
+                        lambda record, log=None: skipped_upstream)
+    terminal = _capture_runs(stale, monkeypatch)
+    if manager_name:
+        _write_limited_manager(stale, "mgr-sid", manager_name, _BUSY_T0 - 600)
+    _busy_worker(stale, 150, sid="quiet", parent_manager_name=manager_name)
+    capsys.readouterr()
+    rc = stale.main(manager_name=manager_name)
+    return _world(stale), capsys.readouterr().out, rc, list(terminal)
+
+
+@pytest.mark.parametrize("manager_name", [None, "mgr"],
+                         ids=["global", "manager-limited"])
+def test_a_refused_worker_is_indistinguishable_from_a_never_candidate(
+        stale, monkeypatch, capsys, manager_name):
+    """A refusal must be invisible on every surface — and the surface set is
+    DERIVED here, not named.
+
+    Its predecessor asserted three absences: no AUTOCLOSED on stdout, no
+    closed/ record, no outbox entry. That is a hand-maintained list and it was
+    short in three separate ways. The outbox assertion is VACUOUS on the lane it
+    drove (the sole _outbox_write site sits behind `if manager_name:`); the
+    stdout assertion is a substring test that fires when a leak happens to spell
+    AUTOCLOSED, so `emit(..., "")` and `emit(..., "refused")` both pass it; and
+    the manager-limited rollup counter — a live surface `emit` feeds — was
+    covered by none of the three.
+
+    So compare WORLDS instead. Run the same busy record twice, once refused by
+    the guard and once skipped one branch earlier at _is_delegation_live, and
+    require every file under ROOT, stdout, the return code AND the terminal
+    driver calls to match. Both lanes are driven because the reachable surfaces
+    differ between them: stdout on the global lane,
+    limited_buffer["autoclosed"] on the manager-limited one.
+
+    ⚠️ Say what this does NOT cover, because the claim is what justified
+    deleting the predecessor: it compares those four channels, not "every
+    surface". A side effect through none of them — a network call, a signal —
+    would still be invisible. The terminal channel is here because round 6
+    shipped without it and a `_close_window()` on the refusal path left all 303
+    tests green.
+    """
+    index = _proc_index((*_MCP_CHILDREN, _BASH_TOOL_SHELL))
+    reached = []
+    real_closer = stale._autoclose_idle_worker
+
+    def counting_closer(*args, **kwargs):
+        reached.append(1)
+        return real_closer(*args, **kwargs)
+
+    monkeypatch.setattr(stale, "_autoclose_idle_worker", counting_closer)
+    control_files, control_out, control_rc, control_term = _busy_scan_world(
+        stale, monkeypatch, capsys, manager_name, index, skipped_upstream=True)
+    assert reached == [], "the control must be dropped BEFORE the closer"
+    subject_files, subject_out, subject_rc, subject_term = _busy_scan_world(
+        stale, monkeypatch, capsys, manager_name, index, skipped_upstream=False)
+    assert reached == [1], "the subject must reach the closer and be refused"
+
+    changed = sorted(k for k in set(control_files) | set(subject_files)
+                     if control_files.get(k) != subject_files.get(k))
+    assert changed == [], f"a refusal left a trace under ROOT: {changed}"
+    assert subject_out == control_out, f"a refusal reached stdout: {subject_out!r}"
+    assert subject_term == control_term, f"a refusal drove the terminal: {subject_term}"
+    assert subject_rc == control_rc
+
+
+def test_busy_shell_over_cap_reaps_worker(stale, monkeypatch):
+    _arm_busy_scan(stale, monkeypatch,
+                   _proc_index((*_MCP_CHILDREN, _BASH_TOOL_SHELL)))
+    # Absolute literal, NOT IDLE * MULTIPLIER + 1: a test parameterized by the
+    # constant cannot see the constant move, and raising the multiplier is
+    # exactly how "extend, don't veto" would be lost while staying green.
+    path = _busy_worker(stale, 400)
+    stale.main()
+    assert not path.exists(), "the cap must still reap a permanently-busy worker"
+
+
+def test_busy_shell_exactly_at_cap_keeps_worker(stale, monkeypatch):
+    _arm_busy_scan(stale, monkeypatch,
+                   _proc_index((*_MCP_CHILDREN, _BASH_TOOL_SHELL)))
+    path = _busy_worker(stale, 300)
+    stale.main()
+    assert path.exists(), "the cap is inclusive (elapsed <= deadline)"
+
+
+def test_busy_shell_no_children_reaps_worker(stale, monkeypatch):
+    _arm_busy_scan(stale, monkeypatch, _proc_index())
+    path = _busy_worker(stale, 150)
+    stale.main()
+    assert not path.exists()
+
+
+def test_busy_shell_only_mcp_children_reaps_worker(stale, monkeypatch):
+    _arm_busy_scan(stale, monkeypatch, _proc_index(_MCP_CHILDREN))
+    path = _busy_worker(stale, 150)
+    stale.main()
+    assert not path.exists(), "MCP servers and caffeinate are not background work"
+
+
+def test_busy_shell_codex_runtime_reaps_worker(stale, monkeypatch):
+    _arm_busy_scan(stale, monkeypatch,
+                   _proc_index((*_MCP_CHILDREN, _BASH_TOOL_SHELL)))
+    path = _busy_worker(stale, 150, runtime="codex")
+    stale.main()
+    assert not path.exists(), "the snapshot marker is a Claude CLI detail"
+
+
+def test_busy_shell_future_runtime_reaps_worker(stale, monkeypatch):
+    """Pins today's behaviour for a runtime that does not exist yet: its
+    background work IS killed silently. Adding a runtime must not pass green."""
+    _arm_busy_scan(stale, monkeypatch,
+                   _proc_index((*_MCP_CHILDREN, _BASH_TOOL_SHELL)))
+    path = _busy_worker(stale, 150, runtime="gemini")
+    stale.main()
+    assert not path.exists()
+
+
+def test_busy_shell_non_int_pid_reaps_worker(stale, monkeypatch):
+    _arm_busy_scan(stale, monkeypatch,
+                   _proc_index((*_MCP_CHILDREN, _BASH_TOOL_SHELL)))
+    path = _busy_worker(stale, 150, pid="4242")
+    stale.main()
+    assert not path.exists()
+
+
+def test_busy_shell_zero_pid_reaps_worker(stale, monkeypatch):
+    """_write_record defaults pid to 0 and 0 is a valid int — the `> 0`
+    threshold states the intent instead of leaning on pid 0's absence."""
+    _arm_busy_scan(stale, monkeypatch,
+                   {"command_by_pid": {0: _WORKER_ARGV},
+                    "child_commands": {0: [_BASH_TOOL_SHELL]}})
+    path = _busy_worker(stale, 150, pid=0)
+    stale.main()
+    assert not path.exists()
+
+
+def test_busy_shell_recycled_pid_reaps_worker(stale, monkeypatch):
+    _arm_busy_scan(stale, monkeypatch,
+                   _proc_index((*_MCP_CHILDREN, _BASH_TOOL_SHELL),
+                               own="/opt/homebrew/bin/uv tool uvx elasticsearch-mcp-server"))
+    path = _busy_worker(stale, 150)
+    stale.main()
+    assert not path.exists(), "a dead record must not inherit a recycled pid's children"
+
+
+def test_busy_shell_nested_session_child_reaps_worker(stale, monkeypatch):
+    _arm_busy_scan(stale, monkeypatch,
+                   _proc_index((*_MCP_CHILDREN, _NESTED_SESSION_CHILD)))
+    path = _busy_worker(stale, 150)
+    stale.main()
+    assert not path.exists(), "a claude child carries prompt text, marker included"
+
+
+def test_busy_shell_sh_dash_c_without_marker_keeps_worker(stale, monkeypatch):
+    """The OR branch: the marker is a vendor path that can be renamed in a CLI
+    release, silently and with every test still green. The `sh -c` SHAPE cannot."""
+    _arm_busy_scan(stale, monkeypatch,
+                   _proc_index((*_MCP_CHILDREN,
+                                "/bin/zsh -c until curl -sf http://localhost:8080; do sleep 5; done")))
+    path = _busy_worker(stale, 150)
+    stale.main()
+    assert path.exists()
+
+
+def test_busy_shell_shell_without_dash_c_reaps_worker(stale, monkeypatch):
+    _arm_busy_scan(stale, monkeypatch, _proc_index((*_MCP_CHILDREN, "/bin/zsh -i")))
+    path = _busy_worker(stale, 150)
+    stale.main()
+    assert not path.exists(), "an interactive shell is not a running command"
+
+
+def test_busy_shell_broken_process_index_holds_worker_to_the_cap(stale, monkeypatch):
+    """THE behaviour change of round 7, tested in both directions.
+
+    A broken `ps` cannot tell whether the worker is busy, and the guard is now
+    default-deny: it holds. That reverses the earlier "cannot tell -> close",
+    which was what let five rounds of unenumerated shapes reach a close. The
+    cost is bounded by the cap and the second half of this test IS the bound —
+    without it "hold" would read as "uncloseable", which it is not.
+    """
+    _arm_busy_scan(stale, monkeypatch, None)
+    under = _busy_worker(stale, 150, sid="under-cap")
+    over = _busy_worker(stale, 400, sid="over-cap", pid=_WORKER_PID + 10)
+    stale.main()
+    assert under.exists(), "a broken ps must hold, not close, under the cap"
+    assert not over.exists(), "the cap still closes regardless — hold is bounded"
+
+
+def test_a_raising_process_index_holds_the_worker_and_never_aborts_the_scan(
+        stale, monkeypatch, capsys):
+    """`_process_index` is crash-proof today, so nothing in production reaches
+    the closer's `except` — which is exactly why it needs its own test rather
+    than inheriting coverage from a hostile-getter corpus that no longer exists.
+
+    Two properties: a raise must not propagate out of `main()` and kill every
+    later record in the scan (the original Critical shape), and it must HOLD
+    this worker rather than close it, because a raise is the strongest possible
+    "cannot tell"."""
+    _arm_busy_scan(stale, monkeypatch, None)
+    monkeypatch.setattr(stale, "_process_index",
+                        lambda: (_ for _ in ()).throw(RuntimeError("ps exploded")))
+    busy = _busy_worker(stale, 150, sid="raiser")
+    later = _busy_worker(stale, 400, sid="later", pid=_WORKER_PID + 10)
+    assert stale.main() == 0, "a raising ps must not abort the scan"
+    assert busy.exists(), "a raise is 'cannot tell' and must hold"
+    assert not later.exists(), "the scan continued and the over-cap worker closed"
+
+
+def test_busy_shell_marker_on_grandchild_reaps_worker(stale, monkeypatch):
+    kid = _WORKER_PID + 1
+    _arm_busy_scan(stale, monkeypatch,
+                   {"command_by_pid": {_WORKER_PID: _WORKER_ARGV,
+                                       kid: "npm exec nx mcp",
+                                       kid + 1: _BASH_TOOL_SHELL},
+                    "child_commands": {_WORKER_PID: ["npm exec nx mcp"],
+                                       kid: [_BASH_TOOL_SHELL]}})
+    path = _busy_worker(stale, 150)
+    stale.main()
+    assert not path.exists(), "only DIRECT children count"
+
+
+
+
+def test_busy_shell_process_index_not_taken_past_cap(stale, monkeypatch):
+    """The only check of the claimed ORDER: a worker past the cap never pays
+    for the snapshot."""
+    calls = []
+    _arm_busy_scan(stale, monkeypatch, None)
+    monkeypatch.setattr(stale, "_process_index",
+                        lambda: calls.append(1) or _proc_index((_BASH_TOOL_SHELL,)))
+    path = _busy_worker(stale, 400)
+    stale.main()
+    assert calls == [], "the cap is checked before the snapshot is taken"
+    assert not path.exists()
+
+
+def test_busy_shell_deadline_floor_outruns_autoclose_sampling_gap(stale, monkeypatch):
+    """Derived, not three hand-picked TTLs. A window narrower than the gap
+    between two autoclose evaluations is stepped over entirely and the guard
+    is a silent no-op.
+
+    The gap is AUTOCLOSE_SKEW_CADENCES * (CADENCE + 60). Each re-opening of
+    the hourly gate lands on the first 60s tick at or after `last + CADENCE`,
+    and under one skew event there are TWO such re-openings, so the scan step
+    is charged TWICE. Charging it once (2*CADENCE + 60) understates the gap by
+    60s and would ratify a steppable floor: a floor of 2*CADENCE + 119 leaves
+    a window of 7319s, one second under the true worst gap, and would pass.
+
+    Both the skew count and the cadence come from source constants, so a third
+    skew source is a one-line edit in stale_monitor.py and this test moves."""
+    max_gap = stale.AUTOCLOSE_SKEW_CADENCES * (stale.AUTOCLOSE_CADENCE_SEC + 60)
+    for idle in range(60, 3 * stale.AUTOCLOSE_CADENCE_SEC + 60, 60):
+        monkeypatch.setattr(stale, "IDLE_THRESHOLD_SEC", idle)
+        window = stale._busy_shell_deadline() - idle
+        assert window > max_gap, f"TTL={idle}s: window of {window}s can be stepped over"
+
+
+def test_busy_shell_deadline_zero_ttl_leaves_window_empty(stale, monkeypatch):
+    """CLAUDE_ORCH_IDLE_TTL_HOURS is parsed with a bare float(), so 0 and
+    negatives reach here. TTL<=0 is an operator saying "close immediately"; the
+    floor would silently overrule it with a multi-hour hold."""
+    for idle in (0, -3600):
+        monkeypatch.setattr(stale, "IDLE_THRESHOLD_SEC", idle)
+        assert stale._busy_shell_deadline() == idle
+
+
+def test_busy_shell_zero_ttl_reaps_worker_with_live_shell(stale, monkeypatch):
+    """Deliberately NOT via _arm_busy_scan: at the REAL cadence, dropping the
+    TTL<=0 carve-out floors the deadline at 10800s and holds this worker — which
+    is exactly the operator override being refused. A squashed cadence makes
+    the mutation invisible (measured)."""
+    monkeypatch.setattr(stale.time, "time", lambda: _BUSY_T0)
+    monkeypatch.setattr(stale, "_process_index",
+                        lambda: _proc_index((*_MCP_CHILDREN, _BASH_TOOL_SHELL)))
+    monkeypatch.setattr(stale, "IDLE_THRESHOLD_SEC", 0)
+    path = _busy_worker(stale, 150)
+    stale.main()
+    assert not path.exists()
+
+
+def test_busy_shell_idle_multiplier_is_three(stale):
+    assert stale.BUSY_SHELL_IDLE_MULTIPLIER == 3
+
+
+def test_a_new_close_lane_inherits_the_guard_by_construction(stale, monkeypatch):
+    """THE acceptance bar for putting the guard in the closer.
+
+    Add a caller the way a real contributor would — a new lane that knows
+    nothing about busy shells, passes no process index, and does nothing to opt
+    in — and it must be REFUSED anyway.
+
+    Since the `process_index_getter` parameter was deleted this is the whole
+    proof, and it is stronger than the corpus it replaced: the lane below is
+    not merely refused, it has NO WAY to be wrong. Six rounds of findings all
+    entered through an index a caller supplied, and the signature no longer
+    accepts one (test_the_closer_takes_no_index_from_its_caller pins that).
+
+    This replaces an AST test that counted call sites in the source. That test
+    was a classifier over syntax and three ordinary refactors walked past it,
+    each shipping a second unguarded lane with the whole suite green: an alias
+    binding, a one-line wrapper, and `globals()[...]` with a concatenated name.
+    It also went RED on a wrapper that ENFORCED the check while passing the one
+    that did not, so it punished the correct shape. Deleted rather than patched
+    a fourth time — the property now holds at the closer, so there is no
+    spelling to enumerate.
+    """
+    index = _proc_index((*_MCP_CHILDREN, _BASH_TOOL_SHELL))
+    _arm_busy_scan(stale, monkeypatch, index)
+    path = _busy_worker(stale, 150)
+    record = json.loads(path.read_text())
+
+    def _autoclose_orphaned_workers(pairs):
+        # A brand-new lane. No busy check anywhere in it.
+        return [stale._autoclose_idle_worker(rp, rec, 150) for rp, rec in pairs]
+
+    assert _autoclose_orphaned_workers([(path, record)]) == [None]
+    assert path.exists(), "a new lane must be refused without opting in"
+
+
+def test_new_lane_refused_through_every_shape_that_defeated_the_ast_guard(
+        stale, monkeypatch):
+    """The three refactors that walked past the deleted AST test, plus a
+    parameterised choke point it wrongly rejected. All four are refused now,
+    because the check is in the callee rather than in the source text."""
+    index = _proc_index((*_MCP_CHILDREN, _BASH_TOOL_SHELL))
+    _arm_busy_scan(stale, monkeypatch, index)
+
+    closer = stale._autoclose_idle_worker                      # alias binding
+
+    def one_line_wrapper(rp, rec, el):                         # extract-helper
+        return stale._autoclose_idle_worker(rp, rec, el)
+
+    def via_globals(rp, rec, el):                              # computed name
+        return vars(stale)["_autoclose" + "_idle_worker"](rp, rec, el)
+
+    def choke_point(fn, rp, rec, el):                          # the shape the
+        return fn(rp, rec, el)                                 # AST test REDded
+
+    for i, lane in enumerate((closer, one_line_wrapper, via_globals,
+                              lambda rp, rec, el: choke_point(
+                                  stale._autoclose_idle_worker, rp, rec, el))):
+        path = _busy_worker(stale, 150, sid=f"lane-{i}")
+        record = json.loads(path.read_text())
+        assert lane(path, record, 150) is None, f"lane {i} was not refused"
+        assert path.exists(), f"lane {i} closed a busy worker"
+
+
+
+
+# ⛔ The 26-shape hostile-getter corpus that stood here is DELETED, together
+# with the `process_index_getter` parameter it existed to defend. Six rounds of
+# it — `0`, a truthy non-mapping, `{}`, then three ordinary caller mistakes —
+# and every list was beaten by the shape nobody wrote down. Removing the
+# parameter removes the class: a lane cannot pass a wrong index when it cannot
+# pass one at all. Deleting these tests is not lost coverage; the thing they
+# covered no longer exists, and what replaces them is
+# test_a_new_close_lane_inherits_the_guard_by_construction, which adds a real
+# caller and shows there is nothing left for it to get wrong.
+
+
+
+
+
+
+
+
+
+
+
+
+def test_new_close_lane_still_closes_a_worker_that_is_not_busy(stale, monkeypatch):
+    """The guard must refuse the BUSY case only. A new lane closing an idle
+    worker with no live shell still works — otherwise the fix is a blanket veto
+    rather than a guard, and every lane would silently stop closing anything."""
+    _arm_busy_scan(stale, monkeypatch, _proc_index(_MCP_CHILDREN))
+    path = _busy_worker(stale, 150)
+    record = json.loads(path.read_text())
+    assert stale._autoclose_idle_worker(path, record, 150) is not None
+    assert not path.exists()
+
+
+def test_new_close_lane_closes_past_the_cap_even_when_busy(stale, monkeypatch):
+    """Extend, do not veto — enforced at the closer now. Past the deadline a
+    live shell no longer holds the worker, for a new lane as for the old one."""
+    _arm_busy_scan(stale, monkeypatch,
+                   _proc_index((*_MCP_CHILDREN, _BASH_TOOL_SHELL)))
+    path = _busy_worker(stale, 400)
+    record = json.loads(path.read_text())
+    assert stale._autoclose_idle_worker(path, record, 400) is not None
+    assert not path.exists()
+
+
+def test_the_closer_resolves_the_index_itself(stale, monkeypatch):
+    """The closer takes NO index from anyone — it runs its own `ps`.
+
+    That is the guard, not an implementation detail: six rounds of defects came
+    from a caller supplying the index, and there is no longer a parameter to
+    supply one through. A caller cannot pass a wrong index because it cannot
+    pass one at all."""
+    calls = []
+    _arm_busy_scan(stale, monkeypatch, None)
+    monkeypatch.setattr(
+        stale, "_process_index",
+        lambda: calls.append(1) or _proc_index((*_MCP_CHILDREN, _BASH_TOOL_SHELL)))
+    path = _busy_worker(stale, 150)
+    record = json.loads(path.read_text())
+    assert stale._autoclose_idle_worker(path, record, 150) is None
+    assert calls == [1], "the closer must resolve the index itself"
+    assert path.exists()
+
+
+def test_the_closer_takes_no_index_from_its_caller(stale):
+    """The parameter is GONE, pinned by signature rather than by convention.
+
+    A prose note saying "do not pass an index" is what the previous six rounds
+    effectively had. This reds if anyone re-adds the parameter — which is the
+    only way the whole malformed-index class can come back.
+    """
+    import inspect
+    params = list(inspect.signature(stale._autoclose_idle_worker).parameters)
+    assert params == ["record_path", "record", "elapsed_sec"], params
+
+
+def test_looks_like_session_matches_sweep_inline_copy(stale):
+    """stale_monitor is stdlib-only and cannot import sweep, so
+    _looks_like_session is an inline copy. Pin parity so an edit to either
+    diverges loudly (same idiom as
+    test_notify_macos_subprocess_call_matches_hooks_inline_copy)."""
+    import ast, inspect, textwrap
+    from dockwright import sweep
+
+    def body_dump(fn):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        body = tree.body[0].body
+        if (body and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            body = body[1:]     # docstrings are allowed to differ
+        assert body, f"{fn!r} has no body beyond its docstring"
+        return [ast.dump(stmt) for stmt in body]
+
+    assert body_dump(stale._looks_like_session) == body_dump(sweep._looks_like_session), \
+        "the inline argv[0]-is-a-session copy has diverged from sweep's"
+
+
+def test_process_index_parses_ps_rows(monkeypatch):
+    # Loaded outside the `stale` fixture on purpose: that fixture default-denies
+    # _process_index, and these are the tests that must run the real one.
+    mod = _load_stale_monitor()
+    captured = {}
+    rows = "\n".join((
+        f" {_WORKER_PID}     1 {_WORKER_ARGV}",
+        f" {_WORKER_PID + 1}  {_WORKER_PID} {_BASH_TOOL_SHELL}",
+        "not-a-row",
+        "  77  xx  ppid is not a number",
+    ))
+
+    def fake_run(argv, **kw):
+        captured["argv"] = argv
+        captured["kw"] = kw
+        return types.SimpleNamespace(returncode=0, stdout=rows)
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    index = mod._process_index()
+    assert captured["argv"] == ["ps", "-axo", "pid=,ppid=,command="]
+    assert captured["kw"]["capture_output"] is True
+    assert captured["kw"]["text"] is True
+    # errors=replace: text=True decodes strictly and one live process with
+    # non-UTF-8 argv raises UnicodeDecodeError (a ValueError, not an OSError).
+    assert captured["kw"]["errors"] == "replace"
+    # timeout: a hung ps would otherwise block the WHOLE scan, not this branch.
+    assert captured["kw"]["timeout"] == 10
+    assert index["command_by_pid"][_WORKER_PID] == _WORKER_ARGV
+    # command kept whole: split(None, 2) must not chop at the argv spaces.
+    assert index["command_by_pid"][_WORKER_PID + 1] == _BASH_TOOL_SHELL
+    assert index["child_commands"][_WORKER_PID] == [_BASH_TOOL_SHELL]
+    assert 77 not in index["command_by_pid"], "a non-numeric ppid row is skipped"
+
+
+@pytest.mark.parametrize("failure", [
+    "nonzero", "oserror", "timeout", "unicode", "empty", "unparseable", "no_stdout",
+])
+def test_process_index_returns_none_on_failure(monkeypatch, failure):
+    mod = _load_stale_monitor()
+
+    def fake_run(argv, **kw):
+        if failure == "nonzero":
+            return types.SimpleNamespace(returncode=1, stdout="")
+        if failure == "oserror":
+            raise OSError("ps: command not found")
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=10)
+        if failure == "unicode":
+            # Reproduced on a live fleet: a process with non-UTF-8 bytes in argv.
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        if failure == "empty":
+            return types.SimpleNamespace(returncode=0, stdout="")
+        if failure == "unparseable":
+            return types.SimpleNamespace(returncode=0, stdout="garbage\nrows only\n")
+        # The shape existing tests stub: returncode but NO .stdout -> AttributeError.
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    assert mod._process_index() is None
+
+
+def test_process_index_real_ps_lists_own_pid():
+    """The ONE test that crosses the real subprocess boundary. conftest's
+    no_live_tmux absorbs only tmux/osascript argv, so `ps` runs for real; the
+    running pid is always in the table, so the assertion is deterministic."""
+    mod = _load_stale_monitor()
+    index = mod._process_index()
+    assert index is not None, "real ps must parse"
+    assert os.getpid() in index["command_by_pid"]

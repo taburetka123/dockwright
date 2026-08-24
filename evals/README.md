@@ -32,8 +32,8 @@ python -m pytest evals/tests -q
 | `scoring.py` | Pure verdict-parsing + confusion-matrix / metric math. Unit-tested. |
 | `run_eval.py` | Orchestrates the run, scores it, prints the headline, writes results + traces. |
 | `observability.py` | Local JSONL traces (always on) + optional Langfuse spans. |
-| `results/latest.json` | Last real run's full metrics. |
-| `traces/<run-id>.jsonl` | Per-call trace (prompt, raw verdict, cost, latency, tokens). |
+| `results/latest.json` | Last real run's full metrics. Written by a run — absent until you make one. |
+| `traces/<run-id>.jsonl` | Per-call trace (prompt, raw verdict, cost, latency, tokens). Written by a run. |
 
 ## What "flagged" means
 

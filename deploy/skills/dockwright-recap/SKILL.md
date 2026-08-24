@@ -11,7 +11,7 @@ Catch the user up on everything that happened since their previous **typed** mes
 
 1. Find the user's previous **typed** message. Ignore `<task-notification>`, `<system-reminder>`, and other harness-injected blocks — those are events, not user turns. Recap only what happened AFTER it.
 2. Recap what happened since then, scannable, in this order (lead each line with its category emoji when in manager mode — ✅ done / 🔍 finding / ⚠️ flag / ❓ decision / 🚀 dispatch / 📋 status):
-   - **Events received** — worker `done`, `FINISHED_SILENTLY`, `STALE_*`, questions, account flips: what fired + what it said.
+   - **Events received** — worker `done`, `FINISHED_SILENTLY`, `STALE_*`, questions, account flips: what fired + what it said. ⚠️ A `FINISHED_SILENTLY` can be a design-gate park (a worker blocked in plannotator waiting on the engineer), not a finish — confirm with `get_worker_tail` before reporting, and report a park as still waiting on the engineer, never as done.
    - **Actions taken** — workers spawned/killed/resumed/merged, PRs opened/merged, commits pushed, configs deployed, decisions made: each with its concrete artifact (SHA / PR# / file path).
    - **Current state** — in-flight workers + state, open PRs + mergeability, pending questions.
 3. Ground it in live state, don't recap from memory: in manager mode call `list_workers(manager_sid=<your sid>)` + `list_pending_questions(...)`, and `gh pr view <n>` for any PR touched; verify claimed artifacts before relaying (per the manager agent file § Verify before relay).

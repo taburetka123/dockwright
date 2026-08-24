@@ -1,8 +1,53 @@
+import json
 import sys
 
 import pytest
 
 from dockwright import distill
+
+
+def _transcript(tmp_path, monkeypatch, events):
+    log = tmp_path / "transcript.jsonl"
+    log.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    monkeypatch.setattr(distill, "find_session_log", lambda sid: log)
+    return log
+
+
+def test_distill_cli_exits_0_when_the_session_never_ran(tmp_path, monkeypatch, capsys):
+    """A bricked predecessor is the recovery lane's whole reason to exist, and
+    it is exactly the shape the no-model-turn gate skips. Exiting 1 there makes
+    every recovery-lane distill look like a broken tool, so the step-9 subagent
+    reports a failure against a correctly-working guard.
+    """
+    _transcript(tmp_path, monkeypatch, [
+        {"type": "user", "message": {"content": "/manager-takeover-recovery ..."}},
+        {"type": "assistant", "isApiErrorMessage": True, "message": {
+            "content": [{"type": "text", "text": "Login expired · Please run /login"}]}},
+    ])
+
+    def fail_if_called(*a, **kw):
+        raise AssertionError("must not attempt to distill a session that never ran")
+
+    monkeypatch.setattr(distill, "_distill_manager_session", fail_if_called)
+
+    assert distill.main(["sid-zombie"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("skipped:"), f"expected a skipped: line, got {out!r}"
+    assert "no model turn" in out
+
+
+def test_distill_cli_still_exits_1_on_a_real_failure(tmp_path, monkeypatch, capsys):
+    """The skip must not swallow genuine failures: a session that DID run and
+    whose distill fails is still an error the caller needs to see.
+    """
+    _transcript(tmp_path, monkeypatch, [
+        {"type": "user", "message": {"content": "go"}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
+    ])
+    monkeypatch.setattr(distill, "distill_and_write_memory", lambda sid, domain=None: None)
+
+    assert distill.main(["sid-ran"]) == 1
+    assert capsys.readouterr().out == ""
 
 
 def test_distill_cli_success(monkeypatch, capsys):

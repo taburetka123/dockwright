@@ -3,5 +3,5 @@
   "tags": ["investigation", "dlq", "sample-size"],
   "adversarial_signals": ["two_sample_ticket_blames_null_check", "plausible_code_fix_suggested"],
   "difficulty": 4,
-  "provenance": "FIFO chat NOT_FOUND incident (investigation-evidence.md): 2-SR root cause was wrong; 30-day/489-chatId reanalysis found the real pattern"
+  "provenance": "synthetic scenario: a FIFO replay race where a 2-sample root cause was wrong and a 30-day reanalysis found the real pattern (investigation-evidence.md)"
 }

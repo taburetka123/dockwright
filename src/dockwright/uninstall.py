@@ -72,6 +72,7 @@ class Plan:
     remove: list[Path] = field(default_factory=list)
     prune_if_empty: list[Path] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    kept_baks: list[Path] = field(default_factory=list)
 
     def empty(self) -> bool:
         return not (self.launchd or self.mcp or self.hook_edits or self.remove)
@@ -229,9 +230,26 @@ def build_plan(roots: Roots) -> Plan:
     if not core_names:
         core_names = sorted(p.name.replace(".core.md", ".md")
                             for p in (roots.repo_dir / "deploy" / "agents").glob("*.core.md"))
+    drift_baks: list[Path] = []
     for name in core_names:
         _add(plan, agents_dir / name)
         _add(plan, roots.codex_dir / "agents" / (Path(name).stem + ".toml"))
+        # compose writes <agent>.md.bak(.N) when the deployed file held text living
+        # in NEITHER the core NOR the overlay. Removing those would recreate the very
+        # loss the drift guard exists to prevent — so they are reported, never planned
+        # for removal. Derived per deployed agent name, like every other claim here:
+        # a .bak beside a FOREIGN agent file is not ours to describe.
+        solo = agents_dir / (name + ".bak")
+        if solo.is_file():
+            drift_baks.append(solo)
+        drift_baks += _numeric_baks(agents_dir, name)
+    if drift_baks:
+        plan.kept_baks = sorted(drift_baks)
+        plan.notes.append(
+            f"kept {len(drift_baks)} drift backup(s) in {agents_dir} "
+            f"({', '.join(p.name for p in sorted(drift_baks))}) — each holds text "
+            f"that existed only in your deployed agent files and has no home in the "
+            f"repo or your overlay; whether to keep or delete them is your call")
     _add(plan, stamp)
 
     command_names = sorted(p.name for p in (roots.repo_dir / "deploy" / "commands").glob("*.md"))
@@ -435,6 +453,14 @@ def main(argv=None, run=subprocess.run) -> int:
         return 1
     if plan.empty():
         print("Nothing to uninstall.")
+        # A drift .bak is never planned for removal, so plan.empty() can be true
+        # while backups sit in ~/.claude/agents. Preserve-and-ANNOUNCE: silently
+        # leaving the operator's only copy of that text is the very hide this
+        # branch exists to prevent, so report them even on the nothing-to-do path.
+        for bak in plan.kept_baks:
+            print(f"note: kept drift backup {bak} — it holds text that existed only "
+                  f"in your deployed agent files and has no home in the repo or your "
+                  f"overlay; whether to keep or delete it is your call")
         return 0
     _print_plan(plan)
     if args.dry_run:

@@ -31,6 +31,10 @@ from dockwright import paths, terminal
 
 _REAL_SUBPROCESS_RUN = subprocess.run
 
+# The operator's real ledger path, captured before any test patches paths —
+# the forbidden target the _no_live_spend_ledger guard checks against.
+_LIVE_SPEND_LEDGER = paths.SPEND_LEDGER
+
 # TmuxDriver.socket() defaults to "dockwright" when DOCKWRIGHT_TMUX_SOCKET and
 # CLAUDE_ORCH_TMUX_SOCKET are both unset — the LIVE orchestrator server the
 # manager/workers run on. The live fleet still rides the legacy "claude-orch"
@@ -348,6 +352,46 @@ def _no_live_account_state(monkeypatch, tmp_path, request):
 
 
 @pytest.fixture(autouse=True)
+def _no_live_spend_ledger(monkeypatch, tmp_path):
+    """No test may write the operator's LIVE spend-ledger.jsonl — 446 suite
+    runs silently appended 1784 synthetic prune rows to it (2026-07-28; same
+    incident class as the ACCOUNT_REGISTRY clobber). Three prongs:
+      (a) redirect paths.SPEND_LEDGER to tmp for every test (per-test fixtures
+          that re-patch run later and win);
+      (b) DOCKWRIGHT_STATE_DIR redirects any FRESH importlib/subprocess load of
+          the standalone preflight_cleanup.py, whose own SPEND_LEDGER binds
+          from HOME at import — invisible to (a);
+      (c) fail-loud: spend_ledger._append_line is wrapped to SUPPRESS + RECORD
+          any write still aimed at the live path (append_* swallow exceptions
+          by contract, so raising here would be silenced) — the teardown assert
+          fails the offending test. tests/test_spend_ledger_isolation.py pins
+          all three prongs."""
+    from dockwright import spend_ledger
+    monkeypatch.setattr(paths, "SPEND_LEDGER", tmp_path / "no-live-spend-ledger.jsonl")
+    state_dir = tmp_path / "no-live-state"
+    state_dir.mkdir()          # preflight's ledger append does no parent mkdir
+    monkeypatch.setenv("DOCKWRIGHT_STATE_DIR", str(state_dir))
+    violations: list[str] = []
+    real_append = spend_ledger._append_line
+
+    def guarded(entry):
+        target = paths.SPEND_LEDGER
+        try:
+            is_live = target.resolve().is_relative_to(_LIVE_SPEND_LEDGER.parent.resolve())
+        except OSError:
+            is_live = True   # unresolvable target: fail safe, treat as live
+        if is_live:
+            violations.append(f"live-ledger write attempted: {entry!r}")
+            return
+        real_append(entry)
+
+    monkeypatch.setattr(spend_ledger, "_append_line", guarded)
+    yield violations
+    assert not violations, (
+        "test attempted to write the LIVE spend ledger: " + "; ".join(violations))
+
+
+@pytest.fixture(autouse=True)
 def _fast_spawn_registration(monkeypatch):
     """Shrink spawn_worker_impl's post-launch registration poll so the ~36 existing
     spawn tests (which mock spawn_worker_tab and never register) don't each wait the
@@ -393,6 +437,37 @@ def real_tmux(monkeypatch, request, tmp_path):
     monkeypatch.setenv("CLAUDE_ORCH_TMUX_SOCKET", sock)
     terminal._DRIVER = None
     return sock
+
+
+@pytest.fixture(autouse=True)
+def _isolate_gardener_ledger(monkeypatch, tmp_path):
+    """Gardener ledger/state isolation BY CONSTRUCTION (I3): no test may write
+    the operator's live ~/.claude/dockwright/gardener/ ledger. Two prongs:
+      (a) DOCKWRIGHT_GARDENER_DIR redirects any FRESH importlib load or CLI
+          SUBPROCESS to a per-test tmp root — gardener_postrun reads it at
+          import, so redirection is structural, not by-memory.
+      (b) every ALREADY-cached gardener_postrun* module in sys.modules gets its
+          derived path attrs repointed at the same tmp root — a cached instance
+          predates this test's env and would otherwise write the prior tmp (or,
+          on the very first load, the live path).
+    Per-test fixtures that redirect LEDGER_PATH/etc. further run AFTER this
+    autouse fixture and win (monkeypatch reverts in reverse order)."""
+    import sys as _sys
+    root = tmp_path / "gardener-state"
+    monkeypatch.setenv("DOCKWRIGHT_GARDENER_DIR", str(root))
+    derived = {
+        "GARDENER_DIR": root,
+        "PENDING_DIR": root / "proposals" / "pending",
+        "ACCEPTED_DIR": root / "proposals" / "accepted",
+        "DECLINED_DIR": root / "proposals" / "declined",
+        "REJECTED_DIR": root / "proposals" / "rejected",
+        "CHECKS_DIR": root / "checks",
+        "LEDGER_PATH": root / "ledger.jsonl",
+    }
+    for name, module in list(_sys.modules.items()):
+        if name.startswith("gardener_postrun") and hasattr(module, "GARDENER_DIR"):
+            for attr, val in derived.items():
+                monkeypatch.setattr(module, attr, val, raising=False)
 
 
 @pytest.fixture(autouse=True)

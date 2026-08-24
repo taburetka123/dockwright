@@ -55,8 +55,6 @@ def test_statusline_counts_delegating_idle_worker_as_processing(tmp_path):
         "claude_sid": "w-idle", "agent": "worker", "name": "rest",
         "parent_manager_name": "boss", "pid": os.getpid(), "state": "idle",
     })
-    # delegating worker: idle record + stamped transcript_path + subagent file
-    # written AFTER the record (find -newer) and fresh (find -mmin -2)
     project_dir = tmp_path / ".claude" / "projects" / "-Users-test"
     log = project_dir / "w-del.jsonl"
     log.parent.mkdir(parents=True)
@@ -487,3 +485,59 @@ def test_usage_written_to_legacy_home_when_unmigrated(tmp_path):
     assert legacy_f.exists()
     assert json.loads(legacy_f.read_text())["five_hour_pct"] == 23.5
     assert not _dockwright_usage_file(tmp_path, "b").exists()
+
+
+def test_statusline_counts_a_subagent_paused_past_two_minutes_as_processing(tmp_path):
+    active = tmp_path / ".claude" / "orchestrator" / "active"
+    _write(active / "mgr-1.json", {
+        "claude_sid": "mgr-1", "agent": "manager", "name": "boss",
+        "domain": "general", "pid": os.getpid(),
+    })
+    project_dir = tmp_path / ".claude" / "projects" / "-Users-test"
+    log = project_dir / "w-del.jsonl"
+    log.parent.mkdir(parents=True)
+    log.write_text("")
+    record = active / "w-del.json"
+    _write(record, {
+        "claude_sid": "w-del", "agent": "worker", "name": "deleg",
+        "parent_manager_name": "boss", "pid": os.getpid(), "state": "idle",
+        "transcript_path": str(log),
+    })
+    agent = project_dir / "w-del" / "subagents" / "agent-aaa.jsonl"
+    agent.parent.mkdir(parents=True)
+    agent.write_text("{}")
+    now = time.time()
+    os.utime(record, (now - 900, now - 900))
+    os.utime(log, (now - 400, now - 400))
+    os.utime(agent, (now - 200, now - 200))
+
+    out = _run_statusline(tmp_path, "mgr-1")
+    assert "0i / 1p" in out
+
+
+def test_statusline_ignores_a_subagent_older_than_the_worker_own_log(tmp_path):
+    active = tmp_path / ".claude" / "orchestrator" / "active"
+    _write(active / "mgr-1.json", {
+        "claude_sid": "mgr-1", "agent": "manager", "name": "boss",
+        "domain": "general", "pid": os.getpid(),
+    })
+    project_dir = tmp_path / ".claude" / "projects" / "-Users-test"
+    log = project_dir / "w-del.jsonl"
+    log.parent.mkdir(parents=True)
+    log.write_text("")
+    record = active / "w-del.json"
+    _write(record, {
+        "claude_sid": "w-del", "agent": "worker", "name": "deleg",
+        "parent_manager_name": "boss", "pid": os.getpid(), "state": "idle",
+        "transcript_path": str(log),
+    })
+    agent = project_dir / "w-del" / "subagents" / "agent-aaa.jsonl"
+    agent.parent.mkdir(parents=True)
+    agent.write_text("{}")
+    now = time.time()
+    os.utime(record, (now - 1500, now - 1500))
+    os.utime(agent, (now - 780, now - 780))
+    os.utime(log, (now - 12, now - 12))
+
+    out = _run_statusline(tmp_path, "mgr-1")
+    assert "1i / 0p" in out

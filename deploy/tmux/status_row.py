@@ -17,6 +17,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import unicodedata
 from pathlib import Path
 
@@ -30,6 +31,12 @@ def _prefer_new(new: Path, legacy: Path) -> Path:
 
 
 MANAGER_COLOR = ("#aa0066", "#ffffff")
+UNREAD_COLOR = ("#aa3300", "#ffffff")  # manager wrote something unseen; same vocabulary as a worker's pending question
+# Carried as well as the color: _styled discards the color on a SELECTED chip.
+# VS15 (text presentation) pins the glyph to ONE cell, which is what tmux counts
+# it as — without it an emoji-presentation terminal draws two, and every
+# #[range=user|…] click boundary to the right of a lit chip drifts a column.
+UNREAD_MARKER = "\u2709\ufe0e"
 IDLE_COLOR = ("#444444", "#ffffff")
 BUSY_COLOR = ("#aa8800", "#ffffff")
 QUESTION_COLOR = ("#aa3300", "#ffffff")
@@ -88,17 +95,257 @@ def _manager_label(record):
     return f"{_label(record)} · {domain}" if domain else _label(record)
 
 
-def classify_worker(record, question_sids):
+EPISODE_GRACE_SEC_DEFAULT = 900
+EPISODE_GRACE_ENV = "CLAUDE_ORCH_EPISODE_GRACE_SEC"
+TURN_END_GRACE_SEC_DEFAULT = 120
+TURN_END_GRACE_ENV = "CLAUDE_ORCH_TURN_END_GRACE_SEC"
+
+
+def _turn_end_grace_sec():
+    try:
+        value = int(os.environ.get(TURN_END_GRACE_ENV, str(TURN_END_GRACE_SEC_DEFAULT)))
+    except ValueError:
+        return TURN_END_GRACE_SEC_DEFAULT
+    return value if value >= 0 else TURN_END_GRACE_SEC_DEFAULT
+
+
+def _episode_grace_sec():
+    try:
+        value = int(os.environ.get(EPISODE_GRACE_ENV, ""))
+    except ValueError:
+        value = EPISODE_GRACE_SEC_DEFAULT
+    if value <= 0:
+        value = EPISODE_GRACE_SEC_DEFAULT
+    return max(value, _turn_end_grace_sec())
+
+
+def _is_delegating(record, now=None):
+    try:
+        if (record.get("runtime") or "claude") != "claude":
+            return False
+        sid = record.get("claude_sid")
+        transcript_path = record.get("transcript_path")
+        if not sid or not transcript_path or not isinstance(transcript_path, str):
+            return False
+        log = Path(transcript_path)
+        newest = 0.0
+        for entry in (log.parent / sid / "subagents").glob("agent-*.jsonl"):
+            try:
+                newest = max(newest, entry.stat().st_mtime)
+            except OSError:
+                continue
+        if newest <= 0:
+            return False
+        if now is None:
+            now = time.time()
+        return newest > log.stat().st_mtime and now - newest < _episode_grace_sec()
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def classify_worker(record, question_sids, now=None):
     if record.get("claude_sid") in question_sids:
         return "question"
-    # default: anything not "processing" (incl. idle / missing / unknown) ->
-    # idle, so it collapses into the 💤N count rather than expanding.
-    return "processing" if record.get("state") == "processing" else "idle"
+    if record.get("state") == "processing":
+        return "processing"
+    if _is_delegating(record, now):
+        return "processing"
+    return "idle"
 
 
-def render_managers(records, selected_pane=""):
+def _signature(record):
+    """Opaque identity of the manager's last message to the engineer.
+
+    ⛔ Compared with != ONLY. Never parsed, never compared to a clock:
+    last_turn_at is an ISO-UTC string lifted verbatim out of the transcript
+    (transcript.py:118) while any clock-derived mark would be a local epoch, and
+    comparing the two scales yields a chip that is always-on or never-on — off
+    by hours and invisible to the eye. != also sidesteps ordering: ISO strings
+    of differing sub-second precision do not sort ("…33.039Z" < "…33Z").
+
+    Both fields, because hooks.py:689-692 writes them under SEPARATE conditions
+    — a transcript event carrying no timestamp moves last_summary alone. Either
+    one moving means he has something unseen. Each side is str()'d and stripped
+    so the file round-trips exactly."""
+    ts = record.get("last_turn_at")
+    summary = record.get("last_summary")
+    if not ts and not summary:
+        return ""
+    return f"{str(ts).strip()}\x00{str(summary).strip()}"
+
+
+def _mark_path(orch, record):
+    """Mark file for this manager, or None when there is nowhere to put one.
+    The key is sanitised: a '/' in it would escape `orch`, and the mkdir below
+    would then create a `.read-..` DIRECTORY that preflight's file-only GC can
+    never sweep."""
+    key = record.get("claude_sid") or record.get("name")
+    if orch is None or not key:
+        return None
+    safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in str(key))
+    return orch / f".read-{safe}" if safe.strip("_") else None
+
+
+def _read_mark(path):
+    try:
+        return path.read_text().strip()
+    except Exception:
+        return ""
+
+
+def _write_mark(path, signature):
+    """Write-then-replace, on a tmp name unique to THIS process: a target-derived
+    tmp name lets two tmux clients' render jobs interleave on one file and
+    publish a torn mark (src/dockwright/state.py:43-48 documents the same
+    defect). The `.read-<key>.<pid>.tmp` form still matches preflight's
+    `.read-*` sweep, which a dot-prefixed form would not.
+
+    Swallows everything: a failed mark write must never blank the status row,
+    and the failure mode it degrades to — the chip stays lit — is the safe one."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(signature)
+        os.replace(tmp, path)
+        _clear_mark_failure(path)
+    except Exception as exc:
+        _log_mark_failure(path, exc)
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+
+
+def _clear_mark_failure(path):
+    """A stale reason beside a working mark reads as a live fault."""
+    try:
+        path.with_name(path.name + ".err").unlink()
+    except Exception:
+        pass
+
+
+def _log_mark_failure(path, exc):
+    """A failed mark write degrades to "the chip stays lit". That is the safe
+    direction, but it says nothing about WHY, and this render path has no
+    stderr — tmux discards a #() job's. Leave the reason beside the mark it
+    belongs to, one file per manager so two failures in one pass do not
+    overwrite each other, and overwritten rather than appended so neither can
+    grow.
+
+    ⚠️ Covers the failures where the DIRECTORY is still writable — a bad value
+    in the record (the observed case: a lone surrogate in last_summary), or the
+    mark path being a directory. It cannot cover the filesystem class, because
+    an unwritable or missing orch dir defeats this write too; there the cause is
+    the directory itself and is visible by looking at it.
+
+    `.read-<key>.err` cannot collide with any mark: the sanitiser strips "."
+    from every key, so no mark filename ever contains one — pinned by
+    test_sanitised_key_never_contains_a_dot. preflight's `.read-*` sweep
+    collects it like the marks."""
+    try:
+        path.with_name(path.name + ".err").write_text(
+            f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
+            f"{type(exc).__name__}: {exc}\n")
+    except Exception:
+        pass
+
+
+def _live_pane_ids():
+    """Pane ids alive on this tmux server; None when tmux cannot answer, set()
+    when no server is running.
+
+    ⛔ None and set() are NOT interchangeable. None means "I cannot tell" and
+    _unread keeps lighting on it; returning set() there instead would make
+    `wid in panes` False for every manager and darken every unread chip
+    permanently — the failure this feature exists to remove. No consumer-side
+    test can catch that, because they stub this function; the producer tests
+    (test_live_pane_ids_*) are what pin it.
+
+    Mirrors preflight_cleanup._live_pane_ids, itself a deliberate stdlib-only
+    duplicate of registry._live_pane_ids — this script may not import the
+    package. Two deliberate deltas from that sibling: no `-L <socket>`, because
+    this runs inside tmux's #() job where $TMUX already targets the running
+    server (and the socket name is not available here); and a 2s rather than 5s
+    timeout, because a status row must redraw."""
+    try:
+        out = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id}"],
+                             capture_output=True, text=True, timeout=2, check=False)
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return set() if "no server" in (out.stderr or "").lower() else None
+    return {line.strip() for line in out.stdout.splitlines() if line.strip()}
+
+
+def _unread(record, selected_pane, orch, resolve_live_panes=None):
+    """True when this manager wrote something the engineer has not seen.
+
+    STAMPS the read mark as a side effect when his client's current pane is this
+    manager's pane — which is what makes opening the tab clear the chip, and
+    watching the tab never light it (the stamp lands in the same render pass as
+    the draw). A pane switch re-runs this job at once rather than at the next
+    5s tick, because #{pane_id} is baked into the #() command string
+    (dockwright.conf:89-102), so the chip clears immediately.
+
+    Missing mark -> UNREAD, deliberately: a spurious light costs one glance, a
+    missed message costs the whole feature."""
+    path = _mark_path(orch, record)
+    signature = _signature(record)
+    if path is None or not signature:
+        return False
+    wid = record.get("window_id")
+    # THE PROPERTY: never light a chip that nothing could ever clear. A chip
+    # that stays lit forever is worse than a missed message — it trains him to
+    # ignore the whole row. Two shapes break the clearing path, and guarding
+    # only the first leaves the second:
+    #   - no window_id at all. hooks.py:472 falls back to "" when neither
+    #     CLAUDE_ITERM_SID nor the driver yields a pane id, and :620 stores that
+    #     (:488/:526 overwrite only when truthy, so "" persists).
+    #   - a window_id naming a pane that has since died. #{pane_id} only ever
+    #     names a LIVE pane, so the equality below can never match it, and
+    #     handle_click's switch-client fails silently. preflight_cleanup.py
+    #     :269-285 keeps such a record on purpose when its pid was recycled.
+    # The falsy check must come FIRST: selected_pane is "" whenever tmux cannot
+    # resolve the client's pane, and "" == "" would otherwise stamp a paneless
+    # record as read — silently eating the message. Same reason _switch_chip
+    # guards its own comparison with bool(wid).
+    if not wid:
+        return False
+    if wid == selected_pane:
+        if _read_mark(path) != signature:
+            _write_mark(path, signature)
+        return False
+    if _read_mark(path) == signature:
+        return False
+    # tmux unanswerable (None) -> keep lighting: absence of evidence is not a
+    # dead pane, and the loud direction is the safe one.
+    # Resolve it here when the caller did not: the guard must not be opt-in, or
+    # a future caller that omits the argument lights dead-pane chips again.
+    # render_managers passes a memoised resolver so the pass costs one lookup.
+    panes = (resolve_live_panes or _live_pane_ids)()
+    return panes is None or wid in panes
+
+
+def render_managers(records, selected_pane="", orch=None):
+    """orch=None -> no mark I/O at all (the row renders exactly as before).
+
+    The live-pane lookup is lazy and memoised for the pass: it costs a
+    subprocess only on a tick where a chip would otherwise light, and nothing at
+    all once everything is read."""
     mgrs = [r for r in records if r.get("agent") == "manager"]
-    return " ".join(_switch_chip(f"🎯 {_manager_label(r)}", MANAGER_COLOR, r, selected_pane) for r in mgrs)
+    cached = []
+
+    def resolve_live_panes():
+        if not cached:
+            cached.append(_live_pane_ids())
+        return cached[0]
+
+    parts = []
+    for r in mgrs:
+        unread = _unread(r, selected_pane, orch, resolve_live_panes)
+        label = f"{UNREAD_MARKER} 🎯 {_manager_label(r)}" if unread else f"🎯 {_manager_label(r)}"
+        parts.append(_switch_chip(label, UNREAD_COLOR if unread else MANAGER_COLOR, r, selected_pane))
+    return " ".join(parts)
 
 
 def render_workers(records, question_sids, idle_expanded=False, selected_pane=""):
@@ -394,7 +641,7 @@ def main(argv, home):
         # tell clients apart, so it mis-highlights when >1 client is attached.
         selected = argv[2] if len(argv) > 2 and argv[2] else _selected_pane()
         if which == "managers":
-            sys.stdout.write(render_managers(records, selected))
+            sys.stdout.write(render_managers(records, selected, orch))
         else:
             sys.stdout.write(render_workers(records, qsids, _idle_expanded(orch), selected))
     except Exception:

@@ -33,21 +33,32 @@
 
 set -u
 
-# Debug logging is OFF by default. Turn on by either:
+# The OUTCOME line is UNCONDITIONAL — this file is the loop's ledger
+# (loops-registry `ledger_path` + `event_paths`), and the freshness gate over it
+# is only meaningful if every fire leaves a mark. A ledger written only in debug
+# mode is a permanently-STALE gate that trains you to ignore the fleet report.
+# DEBUG adds the verbose EXTRAS (housekeeping counters) on top. Turn it on with:
 #   touch ~/.claude/dockwright/selffix/debug
 #   or export SELFFIX_DEBUG=1 in your shell rc
 LOG="$HOME/.claude/dockwright/selffix/trigger.log"
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
 DEBUG=0
 # deprecated, one release: legacy debug flag honored while docs/habits migrate
 if [ -f "$HOME/.claude/dockwright/selffix/debug" ] || [ -f "$HOME/.claude/selffix-debug" ] || [ "${SELFFIX_DEBUG:-}" = "1" ]; then
   DEBUG=1
-  mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
 fi
 TS() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log_line() {
-  # log_line <outcome> <session> <reasons-or-detail>
+  # log_line <outcome> <session> <reasons-or-detail> — one per invocation, always.
+  # `|| true` keeps a failed write from ever failing session close. Deliberately
+  # NOT silenced: bash reports an unopenable >> target before any redirect here
+  # could apply, so a 2>/dev/null would suppress nothing and only imply it did.
+  echo "$(TS)  $1  ${2:--}  ${3:-}" >> "$LOG" || true
+}
+log_debug() {
+  # Verbose extras (prune counters): DEBUG-only, so the ledger stays one line per fire.
   [ "$DEBUG" = "1" ] || return 0
-  echo "$(TS)  $1  ${2:--}  ${3:-}" >> "$LOG"
+  log_line "$@"
 }
 
 # [modules] gardener toggle: this SessionEnd retro is the head of the Gardener
@@ -80,7 +91,16 @@ if command -v dockwright_high_skills >/dev/null 2>&1; then
   SELFFIX_HIGH_SKILLS="$(dockwright_high_skills 2>/dev/null || true)"
 fi
 
-DETECT=$(SELFFIX_PAYLOAD="$PAYLOAD" SELFFIX_HIGH_SKILLS="$SELFFIX_HIGH_SKILLS" /usr/bin/python3 - <<'PY' 2>/dev/null
+# The human-fix-flag predicate is CANONICAL in transcript_signal.py and imported
+# by the detect heredoc below — this script decides whether to SPAWN the retro,
+# selffix-run.sh's gate decides whether it may RUN, and two hand-written matchers
+# for one concept drift silently (measured: whitespace / case / window shapes
+# where one fires and the other does not, dropping the flagged session with no
+# visible signal). A missing helper surfaces as a `fix-predicate-unavailable`
+# REASON on this fire's single outcome line — deliberately not a second log line,
+# because `loops-registry` promises exactly one ledger line per fire.
+DETECT=$(SELFFIX_PAYLOAD="$PAYLOAD" SELFFIX_HIGH_SKILLS="$SELFFIX_HIGH_SKILLS" \
+  SELFFIX_SIGNAL_DIR="$_SELFFIX_SD" /usr/bin/python3 - <<'PY' 2>/dev/null
 import hashlib, json, os, re, sys
 
 def bail(level, detail):
@@ -152,18 +172,36 @@ HARSH_RE = re.compile(
 # <command-name>/fix</command-name>
 # (verified across 845 real command records). Keying on the structural tag —
 # not a textual sigil — defeats prose/backtick mentions (`/dockwright-fix`) and
-# the old @fix/@gardener text. But a distillation/handoff session embeds a
-# PRIOR session's transcript as THIS message's content, and that transcript
-# can carry a real <command-name>/dockwright-fix</command-name> tag — so the
-# structural tag ALONE still false-fires (observed on manager-distill retros).
-# The position invariant closes it: a genuine invocation's content STARTS with
-# <command-message…>; an embedded transcript has the tag buried mid-string.
-# We require BOTH below. The note rides in <command-args>; the
-# dockwright-selffix retro reads it. \s* tolerates incidental whitespace, and the
-# regex form (not the literal tag) means pasting THIS code does not self-match.
-FIX_CMD_RE = re.compile(r"<command-name>\s*/(?:dockwright-fix|fix)\s*</command-name>", re.IGNORECASE)
+# the old @fix/@gardener text. The full predicate (position invariant + the
+# first-<command-name> structural check that keeps another command's
+# <command-args> from forging a flag) is CANONICAL in transcript_signal.py and
+# imported here: selffix-run.sh's gate applies the SAME function to decide
+# whether the spawned retro may run, and two hand-written matchers for one
+# concept drift silently.
+# Degrade LOUDLY, never silently, and never into a second matcher: if the helper
+# is missing (a broken deploy) the fix-flag leg is reported as unavailable in the
+# detect reasons rather than re-implemented here, and the rest of detection —
+# pushback, harsh, edits, gh pr create, manager — is unaffected. An import error
+# must not be able to switch off every retro on the machine.
+# Guarded on non-empty: an empty entry resolves to the CURRENT WORKING DIRECTORY,
+# which at SessionEnd is the dying session's repo — a repo shipping its own
+# transcript_signal.py would then be imported and executed here. Not reachable
+# today (the caller always passes an absolute _SELFFIX_SD), hardening only.
+_signal_dir = os.environ.get("SELFFIX_SIGNAL_DIR", "")
+if _signal_dir:
+    sys.path.insert(0, _signal_dir)
+try:
+    from transcript_signal import is_human_fix_invocation  # noqa: E402
+    fix_predicate_available = True
+except Exception:
+    def is_human_fix_invocation(content):
+        return False
+    fix_predicate_available = False
 
 high_reasons = []
+# Degradations ride the ledger line but must never influence the LEVEL — see the
+# fix-predicate-unavailable note below for what happens when the two are conflated.
+degradations = []
 pushback_count = 0
 harsh_count = 0
 already_ran_selffix = False
@@ -195,7 +233,7 @@ with open(transcript, "r", errors="ignore") as f:
                     pushback_count += 1
                 if HARSH_RE.search(content):
                     harsh_count += 1
-                if FIX_CMD_RE.search(content) and stripped.startswith("<command-message"):
+                if is_human_fix_invocation(content):
                     fix_command_flagged = True
 
         elif t == "assistant":
@@ -241,6 +279,16 @@ if harsh_count >= 1 and user_msgs >= 2:
 # The /dockwright-fix command = a deliberate human request to retrospect this
 # session. Unlike pushback/harsh (reactions, gated on user_msgs>=2), a single
 # one-shot /dockwright-fix invocation must fire — NO turn-count gate.
+if not fix_predicate_available:
+    # Named on the fire's ledger line so a broken deploy is visible — but
+    # DELIBERATELY NOT in high_reasons, which IS the spawn decision rather than a
+    # label. Appending it there turned the trigger from selective into
+    # spawn-on-every-SessionEnd: measured, a boring low-signal session went
+    # `none` -> `spawn` with the helper absent. Each spawn is a real `claude -p`
+    # serialising on the analyst mutex at up to 25 min against a 2 h queue
+    # budget, so the queue would grow faster than it drains, fleet-wide, with
+    # unbounded spend and nothing rate-limiting it.
+    degradations.append("fix-predicate-unavailable")
 if fix_command_flagged:
     high_reasons.append("fix-command")
 
@@ -283,8 +331,11 @@ else:
 print(level)
 print(session_id)
 print(transcript)
-print("; ".join(sorted(set(high_reasons))) if high_reasons
-      else f"users={user_msgs} tools={assistant_tool_uses} pushback={pushback_count} harsh={harsh_count}")
+reasons = ("; ".join(sorted(set(high_reasons))) if high_reasons
+           else f"users={user_msgs} tools={assistant_tool_uses} pushback={pushback_count} harsh={harsh_count}")
+if degradations:
+    reasons = f"{reasons} [{' '.join(sorted(set(degradations)))}]"
+print(reasons)
 print(dedup_key)
 PY
 )
@@ -319,7 +370,7 @@ while IFS= read -r marker; do
 done < <(find "$FINDINGS_DIR" -maxdepth 1 -type f -name '*.reviewed' -mtime +14 2>/dev/null)
 PRUNED_DEDUP=$(find "$DEDUP_DIR" -maxdepth 1 -type f -mtime +14 -print 2>/dev/null | wc -l | tr -d ' ')
 find "$DEDUP_DIR" -maxdepth 1 -type f -mtime +14 -delete 2>/dev/null || true
-log_line "prune" "-" "findings=$PRUNED_FINDINGS dedup=$PRUNED_DEDUP"
+log_debug "prune" "-" "findings=$PRUNED_FINDINGS dedup=$PRUNED_DEDUP"
 
 # If a findings file already exists (even empty = in-flight worker), never
 # re-spawn for this session. -f covers both "worker running" and "worker done".

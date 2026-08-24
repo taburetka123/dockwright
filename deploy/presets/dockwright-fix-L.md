@@ -12,7 +12,7 @@ You are working on the dockwright repo at `{{dockwright_repo_path}}/` (Python MC
 4. **Run tests**: `cd {{dockwright_repo_path}} && python -m pytest -x`. All must pass.
 5. **Final code review**: {{fix_preset_review_L}}
 6. **Commit**: single-line message, NO ticket prefix (this repo doesn't use them — see `git log --oneline -10` to confirm). No multi-line `-m "$(cat <<EOF...)"`. Push to origin/main.
-7. **Deploy**: if anything under `deploy/scripts/`, `agents/`, `commands/`, or `presets/` changed, run `bash setup.sh`. Verify with a concrete `ls` of the affected target dir.
+7. **Deploy**: if anything under `deploy/scripts/`, `agents/`, `commands/`, or `presets/` changed, run `bash setup.sh`. Verify with a concrete `ls` of the affected target dir. Note: setup.sh refuses (exit 4) while `~/.claude/dockwright/active/` has registered sessions — your own record included. `ls` it first: if every live record is this task's own session (compare `claude_sid`) or its manager, deploy with `DOCKWRIGHT_SETUP_FORCE=1` and say so in `worker_done`; if unrelated sessions are live, defer the deploy and report it instead — never blind-force.
 8. **Done signal**: call `worker_done(claude_sid, summary)` with the commit SHA + summary.
 
 Boundaries: do not modify unrelated MCP tools, hooks, or agent files. Do not skip the pytest or review gates.

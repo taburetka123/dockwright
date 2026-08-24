@@ -13,6 +13,7 @@
       "mcp__dockwright__artifact_view",
       "mcp__dockwright__pipeline_event",
       "mcp__dockwright__pipeline_status",
+      "mcp__playwright-isolated__*",
       "Bash(printenv:*)",
       "Bash(cd:*)",
       "Bash(git status:*)",

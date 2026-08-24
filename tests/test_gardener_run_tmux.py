@@ -99,6 +99,12 @@ def _seed_gardener_home(home):
     presets = home / ".claude" / "dockwright" / "presets"
     presets.mkdir(parents=True)
     (presets / "gardener-analyst-settings.json").write_text("{}")
+    # The headless lane runs default-deny (--setting-sources ""), which also
+    # drops user-level skill discovery — so it passes the skill BODY as the
+    # prompt and refuses to spawn without it. See test_headless_lane_lockdown.py.
+    skill = home / ".claude" / "skills" / "dockwright-gardener-digest"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# dockwright-gardener-digest\nstub body\n")
     return home / ".claude" / "dockwright" / "gardener"
 
 

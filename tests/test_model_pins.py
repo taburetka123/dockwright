@@ -45,13 +45,14 @@ def test_bootstrap_recreate_pins_manager_opus():
     # Manager lane (orch-audit model-allocation): recreate must never inherit
     # the user's interactive default. Quoted so zsh -ic can't glob the [1m].
     # F-2 split RUNTIME_CMD into a --settings / no-settings if-else pair — both
-    # branches must still pin opus[1m] before /manager-resume.
+    # branches must still pin claude-opus-5[1m] before /manager-resume
+    # (explicit id per the model roster; bare aliases drift across releases).
     src = BOOTSTRAP_RECREATE.read_text()
     runtime_cmds = [l for l in src.splitlines()
                     if l.strip().startswith("RUNTIME_CMD=")]
     assert runtime_cmds, "no RUNTIME_CMD assignment found"
     for runtime_cmd in runtime_cmds:
-        assert "--model 'opus[1m]'" in runtime_cmd
+        assert "--model 'claude-opus-5[1m]'" in runtime_cmd
         assert runtime_cmd.index("--model") < runtime_cmd.index("/manager-resume")
 
 

@@ -103,6 +103,30 @@ if [ ! -f "$TRANSCRIPT" ]; then
   exit 0
 fi
 
+# --- Input-side gate: never retrospect a session whose model never ran --------
+# A dead-login / 401-storm session leaves a transcript that is ~100% embedded
+# instructions and ~0% conversation — the 2026-07-29 shape that drove the sibling
+# distill child to EXECUTE a /manager-takeover-recovery procedure it was asked to
+# summarise (a live manager's pane closed; 2h09m with no manager on `general`).
+# There is nothing to retrospect in such a session, and it is the single worst
+# input to hand a model, so it never reaches the child at all. This is the belt to
+# the tool-surface brace below; distill.py got the same gate under PR #245 and the
+# two lanes fire on the SAME SessionEnd over the SAME transcript, so they must
+# agree. Discrimination lives in transcript_signal.py (raw-JSONL assistant EVENTS,
+# not rendered text — a projection's "ASSISTANT:" prefix is forgeable by content).
+# Fail-open on a MISSING helper (a deploy gap must not silently stop all retros);
+# fail-closed on its verdict.
+SIGNAL_LIB="$_SELFFIX_RUN_SD/transcript_signal.py"
+[ -f "$SIGNAL_LIB" ] || SIGNAL_LIB="$HOME/.claude/scripts/transcript_signal.py"
+if [ -f "$SIGNAL_LIB" ]; then
+  if ! /usr/bin/python3 "$SIGNAL_LIB" worth-retrospecting "$TRANSCRIPT" 2>/dev/null; then
+    worker_log "skip" "no-model-turn — instruction-only transcript, not retrospected"
+    exit 0
+  fi
+else
+  worker_log "warn" "transcript-signal-missing $SIGNAL_LIB — run setup.sh; retro proceeding ungated"
+fi
+
 # --- Single-runner mutex --------------------------------------------------
 # Only one selffix worker runs `claude -p` at a time. SessionEnd can fire many
 # retros at once; running their `claude -p` calls concurrently stampedes the
@@ -156,15 +180,102 @@ set -m
 # and the model apologizes into the findings file (E2E L-5). --add-dir grants
 # the file scope officially; --allowedTools covers the skill's own fixed
 # projection recipe (`jq -r … | grep -vE … | head -c`, `wc -c`), which a fresh
-# install's default settings would otherwise deny. Additive-only on machines
-# with broader operator allowlists.
+# install's default settings would otherwise deny. Note --allowedTools
+# PRE-APPROVES; it does not remove anything from the session — the availability
+# cut is --tools, below.
+#
+# NO BARE TOOL NAMES in --allowedTools. A bare `Read`/`Grep`/`Glob` pre-approves
+# that tool for ANY path and OVERRIDES --add-dir scoping: measured on the sibling
+# lane, the bare tail let the child read ~/.claude/settings.json, ~/.claude.json
+# (oauthAccount, the project trust list, MCP approvals) and ~/.ssh/config. They
+# bought nothing — --add-dir already grants Read/Grep/Glob WITHIN scope, verified
+# by A/B: with the bare tokens removed, in-scope reads still succeed and
+# ~/.claude/settings.json is DENIED. Grant a tool by path (`Read(<dir>/**)`) or
+# not at all.
+#
+# Tool-surface lockdown: the transcript is UNTRUSTED and imperative — on
+# 2026-07-29 the sibling distill lane, reading a transcript that was ~100%
+# verbatim /manager-takeover-recovery text, EXECUTED it via the MCP tools the old
+# `--disallowedTools "Write,Edit,NotebookEdit"` denylist admitted, killing a live
+# manager's pane (2h09m outage). That denylist named 3 tools and admitted the
+# other 62 this machine offers, including 33 mcp__* tools across 19 servers. So:
+#   --tools               availability-level default-deny, narrowed to what the
+#                         skill documents it needs (Bash projection, Read
+#                         fallback, Grep; Glob for the gardener sibling).
+#   --strict-mcp-config   + an empty --mcp-config makes the MCP surface
+#   --mcp-config          UNREACHABLE rather than merely forbidden — MCP servers
+#                         load from the global ~/.claude.json regardless of the
+#                         env strip above.
+# BOTH halves are load-bearing: measured against CLI 2.1.220, --tools alone still
+# reached MCP and the MCP flags alone still reached Bash.
+#
+#   --setting-sources ""  is the THIRD half, and without it the other two are a
+#                         false closure. --tools keeps Bash (the skill's
+#                         projection needs it), and with the operator's
+#                         ~/.claude/settings.json loaded the child inherits
+#                         defaultMode "auto" plus an allow list carrying
+#                         Bash(python3:*) — so `python3 -c "…subprocess…tmux
+#                         kill-pane…"` reproduces the 2026-07-29 manager-kill with
+#                         MCP fully closed. Measured: with the operator's settings
+#                         loaded a child ran arbitrary python3 AND enumerated the
+#                         live fleet via `tmux -L dockwright list-windows`; with
+#                         this flag both are DENIED (headless has no approver).
+#                         Deny-rules were rejected deliberately: enumerating
+#                         interpreters (perl/ruby/node/osascript/sh -c/env …) is a
+#                         denylist that fails open on the next one, and permission
+#                         arrays MERGE across sources so an allow rule cannot be
+#                         removed — only not loaded.
+#
+# The prompt is the skill BODY, not `/dockwright-selffix`: dropping the setting
+# sources also drops user-level skill discovery, so the slash command no longer
+# resolves (measured: 45 commands visible, none of them selffix). Inlining the
+# skill keeps the child's instructions identical while its permissions stay
+# default-deny — verified end-to-end: a real run produced 3.2 KB of correctly
+# formatted ranked findings with the jq projection recipe working.
+#
+# This block is duplicated VERBATIM in gardener-run.sh's headless lane (a shared
+# sourced helper would be fail-open like loop-label-prefix.sh above — a missing lib
+# would silently strip the lockdown); tests/test_headless_lane_lockdown.py runs
+# both scripts for real and fails if the two ever drift apart.
+SKILL_FILE="$HOME/.claude/skills/dockwright-selffix/SKILL.md"
+if [ ! -f "$SKILL_FILE" ]; then
+  # Fail LOUD, never silently ungated: without the body there is no retro to run,
+  # and falling back to the slash command would silently need the settings the
+  # lockdown deliberately withholds.
+  worker_log "error" "skill-missing $SKILL_FILE — run setup.sh"
+  echo "Status: error (skill-missing $SKILL_FILE)" >> "$OUT"
+  enqueue_retry "skill-missing"
+  exit 0
+fi
+# The prompt goes on STDIN, not as `-p <arg>`: the skill body opens with YAML
+# frontmatter, and an argument starting with `---` is parsed as an option
+# (`error: unknown option '---\nname: dockwright-selffix…'`, caught by an E2E run
+# against a real transcript). stdin has no such hazard for any body.
+PROMPT_FILE="$(mktemp "${TMPDIR:-/tmp}/selffix-prompt.XXXXXX")" || {
+  worker_log "error" "prompt-file-mktemp-failed"
+  echo "Status: error (prompt-file-mktemp-failed)" >> "$OUT"
+  enqueue_retry "prompt-file"
+  exit 0
+}
+_selffix_cleanup() { rm -f "$PROMPT_FILE" 2>/dev/null; runlock_release; }
+trap _selffix_cleanup EXIT INT TERM
+{
+  cat "$SKILL_FILE"
+  printf '\n\n---\nExecute the skill above now, in headless mode, with --transcript %s\n' \
+    "$TRANSCRIPT"
+} > "$PROMPT_FILE"
 ( exec env -u CLAUDE_AGENT -u CLAUDE_WORKER_NAME -u CLAUDE_PARENT_MANAGER -u CLAUDE_DOMAIN \
-    claude -p "/dockwright-selffix --transcript $TRANSCRIPT" \
+    claude -p \
     --model claude-sonnet-5 \
     --add-dir "$(dirname "$TRANSCRIPT")" \
-    --allowedTools 'Bash(jq:*) Bash(wc:*) Bash(head:*) Bash(tail:*) Bash(grep:*) Read Grep' \
+    --allowedTools 'Bash(jq:*) Bash(wc:*) Bash(head:*) Bash(tail:*) Bash(grep:*)' \
+    --tools "Bash,Read,Grep,Glob" \
+    --strict-mcp-config \
+    --mcp-config '{"mcpServers":{}}' \
+    --setting-sources "" \
     --no-session-persistence \
-    --disallowedTools "Write,Edit,NotebookEdit" > "$OUT" 2>&1 ) &
+    --disallowedTools "Write,Edit,NotebookEdit" \
+    < "$PROMPT_FILE" > "$OUT" 2>&1 ) &
 CHILD_PID=$!
 PGID=$CHILD_PID
 

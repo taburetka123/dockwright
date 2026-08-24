@@ -143,3 +143,38 @@ def test_tmux_conf_not_in_ensure_dirs(tmp_path, monkeypatch):
     paths.ensure_dirs()
     assert not (tmp_path / "dockwright.tmux.conf").exists()
     assert not (tmp_path / "claude-orch.tmux.conf").exists()  # NEW
+
+
+# A manager name must resolve to EXACTLY ONE path segment. "/" and "\" were
+# already swapped; "." and ".." survived the swap and are traversal, not names
+# — `DONE / ".."` is DONE's parent. Every per-manager directory helper routes
+# through _event_bucket, so this is guarded once for all of them.
+@pytest.mark.parametrize("hostile,expected", [
+    ("..", "_.."),
+    (".", "_."),
+    ("a/b", "a_b"),
+    ("a\\b", "a_b"),
+    ("../../etc", ".._.._etc"),
+    ("normal-name", "normal-name"),
+])
+def test_event_bucket_is_always_a_single_harmless_segment(hostile, expected):
+    bucket = paths._event_bucket(hostile)
+    assert bucket == expected
+    assert "/" not in bucket and "\\" not in bucket
+    assert bucket not in (".", "..")
+
+
+@pytest.mark.parametrize("helper", [
+    "done_dir_for", "turn_ends_dir_for", "question_dir_for",
+    "notify_outbox_dir_for",
+])
+def test_per_manager_dirs_cannot_escape_their_root(helper, tmp_path, monkeypatch):
+    """Enumerated broadly on purpose: every helper that turns a manager name
+    into a directory, not just the ones that looked risky."""
+    monkeypatch.setattr(paths, "ROOT", tmp_path)
+    monkeypatch.setattr(paths, "DONE", tmp_path / "done")
+    monkeypatch.setattr(paths, "TURN_ENDS", tmp_path / "turn-ends")
+    monkeypatch.setattr(paths, "QUESTIONS", tmp_path / "questions")
+    resolved = getattr(paths, helper)("..").resolve()
+    assert resolved.parent.resolve().is_relative_to(tmp_path.resolve())
+    assert resolved.resolve() != tmp_path.resolve()

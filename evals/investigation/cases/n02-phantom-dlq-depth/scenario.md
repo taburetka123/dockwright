@@ -1,6 +1,6 @@
-# PagerDuty: chat-events-dlq depth 1,558
+# PagerDuty: orders-events-dlq depth 1,558
 
-**System:** chat-events-dlq (SQS). **Alert time:** 2026-07-13 16:04 UTC.
+**System:** orders-events-dlq (SQS). **Alert time:** 2026-07-13 16:04 UTC.
 **Now:** 16:25 UTC.
 
 PagerDuty fired on DLQ depth. Triage: is there an incident, what drove the

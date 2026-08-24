@@ -34,8 +34,8 @@ def test_defaults_without_any_config_file(no_config):
     assert config.claude_config_home() == home / ".claude"
     assert config.worker_home_default() == home / "projects" / "work" / "worker"
     assert config.manager_memory_root() == home / ".claude" / "dockwright" / "manager-memory"
-    assert config.worker_model() == "opus[1m]"
-    assert config.manager_model() == "opus[1m]"
+    assert config.worker_model() == "claude-opus-5[1m]"
+    assert config.manager_model() == "claude-opus-5[1m]"
     assert config.distill_model() == "claude-sonnet-4-6"
     assert config.assign_command_hint() == "/manager-assign"
     assert config.worktree_cleanup_hint() == ""
@@ -79,7 +79,7 @@ def test_env_path_missing_file_means_no_config(no_config, monkeypatch, tmp_path)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     monkeypatch.setenv(config.ENV_CONFIG_PATH, str(tmp_path / "missing.toml"))
     assert config.config_path() is None
-    assert config.worker_model() == "opus[1m]"
+    assert config.worker_model() == "claude-opus-5[1m]"
 
 
 def test_xdg_beats_claude_home(no_config, monkeypatch):
@@ -110,7 +110,7 @@ def test_corrupt_toml_is_fail_open_but_load_error_reports(no_config, monkeypatch
     monkeypatch.setenv(config.ENV_CONFIG_PATH, str(bad))
     assert config.load() == {}
     assert config.load_error() is not None
-    assert config.worker_model() == "opus[1m]"
+    assert config.worker_model() == "claude-opus-5[1m]"
     assert config.accounts() == [config.Account(name="a")]
 
 
@@ -314,8 +314,8 @@ def test_default_toml_parses_and_matches_code_defaults(no_config, monkeypatch, t
     assert config.claude_config_home() == home / ".claude"
     assert config.worker_home_default() == home / "projects" / "work" / "worker"
     assert config.manager_memory_root() == home / ".claude" / "dockwright" / "manager-memory"
-    assert config.worker_model() == "opus[1m]"
-    assert config.manager_model() == "opus[1m]"
+    assert config.worker_model() == "claude-opus-5[1m]"
+    assert config.manager_model() == "claude-opus-5[1m]"
     assert config.distill_model() == "claude-sonnet-4-6"
     assert config.worker_headless_preset() is True
     assert config.assign_command_hint() == "/manager-assign"

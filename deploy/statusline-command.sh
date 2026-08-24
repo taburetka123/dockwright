@@ -140,11 +140,11 @@ if [ "$agent" = "manager" ]; then
       | while IFS=$(printf '\t') read -r pid state sid tp; do
           [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || continue
           # Delegating workers read as processing: a background-subagent
-          # transcript that grew since the record's last Stop write (-newer)
-          # and is fresh (-mmin -2 ≈ the monitor's 120s grace).
+          # transcript newer than the worker's own main log (-newer "$tp") and
+          # still alive (-mmin -15 ~ transcript.episode_grace_sec's 900s).
           if [ "$state" = "idle" ] && [ -n "$tp" ] && [ -n "$sid" ]; then
             subagents_dir="$(dirname "$tp")/$sid/subagents"
-            if [ -n "$(find "$subagents_dir" -name 'agent-*.jsonl' -newer "$active_dir/$sid.json" -mmin -2 2>/dev/null | head -n 1)" ]; then
+            if [ -n "$(find "$subagents_dir" -name 'agent-*.jsonl' -newer "$tp" -mmin -15 2>/dev/null | head -n 1)" ]; then
               state="processing"
             fi
           fi

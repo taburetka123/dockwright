@@ -72,7 +72,7 @@ dockwright manager        # bring up the tmux server, open Claude, promote it to
 dockwright doctor         # verify wiring (MCP registration, hooks, venv, compose freshness)
 dockwright init           # write a dockwright.toml with every default spelled out
 dockwright compose        # recompose agent files (cores + overlay + vars) standalone
-dockwright spend-report   # token spend per session / account
+dockwright spend-report   # token spend per account, or money-first per-session detail (<worker-name|sid>)
 dockwright migrate-state  # move a legacy state tree into ~/.claude/dockwright/ (setup.sh runs this for you)
 dockwright uninstall      # provenance-driven removal; --dry-run to preview
 ```

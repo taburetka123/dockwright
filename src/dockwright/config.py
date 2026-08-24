@@ -40,8 +40,8 @@ DEFAULT_MANAGER_MEMORY = "~/.claude/dockwright/manager-memory"
 LEGACY_MANAGER_MEMORY = "~/.claude/manager-memory"    # deprecated, one release
 DEFAULT_OVERLAY_DIR = "~/.claude/dockwright-overlay"
 LEGACY_OVERLAY_DIR = "~/.claude/orchestrator-overlay" # deprecated, one release
-DEFAULT_WORKER_MODEL = "opus[1m]"
-DEFAULT_MANAGER_MODEL = "opus[1m]"
+DEFAULT_WORKER_MODEL = "claude-opus-5[1m]"
+DEFAULT_MANAGER_MODEL = "claude-opus-5[1m]"
 DEFAULT_DISTILL_MODEL = "claude-sonnet-4-6"
 DEFAULT_ASSIGN_COMMAND = "/manager-assign"
 DEFAULT_WORKTREE_CLEANUP = ""
@@ -246,7 +246,7 @@ def worktree_cleanup_hint() -> str:
 
 def loop_label_prefix() -> str:
     """launchd label namespace for background loops (bootlite-watchdog,
-    gardener-gate/-frontier, worktree-prune, dlq-cookie-refresh, ...).
+    gardener-gate/-frontier, worktree-prune, ...).
     Labels are rendered as "<prefix>.<loop-name>" at install time
     (deploy/scripts/*-install.sh); see deploy/loops-registry.md."""
     return _str_key(_section(load(), "loops"), "label_prefix",
@@ -276,9 +276,10 @@ def gardener_module_enabled() -> bool:
 
 def task_key_regex() -> str | None:
     """[task_keys] key_regex — regex matching a valid task key (e.g. an
-    issue-tracker key like "ABC-1234"), used to recognize task references in
-    free text. Unset, empty, or non-string falls back to None (no key
-    derivation)."""
+    issue-tracker key like "ABC-1234"). Advisory recognition ONLY: feeds the
+    unkeyed-spawn `task_key_hint` and doc-level tooling. It never derives a
+    filing key — keying is explicit task_key= at spawn. Unset, empty, or
+    non-string falls back to None (no recognition)."""
     val = _str_key(_section(load(), "task_keys"), "key_regex", "")
     return val if val else None
 
@@ -414,9 +415,9 @@ repo_roots = "~/projects/work,~/projects/personal"
 
 [spawn]
 # Default --model for claude worker spawns.
-worker_model = "opus[1m]"
+worker_model = "claude-opus-5[1m]"
 # Pinned --model for manager tabs (kept independent of the worker default).
-manager_model = "opus[1m]"
+manager_model = "claude-opus-5[1m]"
 # Model for the headless manager-memory distill (`claude -p`).
 distill_model = "claude-sonnet-4-6"
 # When true (default), claude worker spawns/resumes default to the deployed
@@ -480,8 +481,9 @@ gardener = true
 
 [task_keys]
 # Regex matching a valid task key (e.g. an issue-tracker key like "ABC-1234"),
-# used to recognize task references in free text. Default: unset — no
-# key derivation. Example:
+# used to RECOGNIZE task references (the unkeyed-spawn task_key_hint,
+# doc-level tooling). Never used to derive a filing key — keying is explicit
+# task_key= at spawn. Default: unset — no recognition. Example:
 # key_regex = '[A-Za-z]{2,}-\\d+'
 
 [gardener]
@@ -497,4 +499,5 @@ gardener = true
 # Per-model [input, output] USD/MTok overrides, merged over the built-in
 # table in pricing.py (fable/opus/sonnet/haiku). Example:
 # opus = [5.0, 25.0]
+# Keys may also be full stripped model ids (e.g. "claude-newfamily-7" = [2.0, 4.0]).
 '''

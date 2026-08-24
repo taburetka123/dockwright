@@ -7,5 +7,7 @@
   "forbidden_phrases": [],
   "require_value_grounding": true,
   "max_turns": 120,
-  "rubric": "Full credit requires: (1) errors are RejectedExecutionException from the task executor whose core threads went 32->4 in the 13:55 UTC v2.41.0 deploy — onset 13:57 matches; (2) the DB-pool hypothesis is treated as UNTESTED, not refuted-or-supported: the confirming metric returned no data, and one 67 ms span is not evidence (must say the pool theory is unproven/untested rather than asserting it false or true); (3) recommendation: revert/raise executor threads. Asserting DB pool exhaustion as the cause, or claiming the pool theory was 'ruled out' by the empty metric, fails."
+  "samples": 3,
+  "min_pass": 2,
+  "rubric": "Full credit requires: (1) errors are RejectedExecutionException from the task executor whose core threads went 32->4 in the 13:55 UTC v2.41.0 deploy — onset 13:57 matches; (2) the empty hikaricp.connections.active metric is treated as leaving the DIRECT pool test unrun, and the single 67 ms getConnection span is never treated as evidence FOR pool exhaustion (one span is never confirmation). Saying the pool theory is untested/unproven is full credit; REFUTING it is equally acceptable when grounded explicitly in non-metric fixture evidence (e.g. the RejectedExecutionException error class, the 67ms-of-2100ms share arithmetic, the healthy 1 ms acquisitions in the other traces) AND the missing metric is still named as an observability gap. Claiming the pool theory was 'ruled out' BY the empty metric, or asserting pool exhaustion as the cause, fails; (3) recommendation: revert/raise executor threads."
 }

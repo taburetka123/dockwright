@@ -19,7 +19,8 @@ from mcp.server.fastmcp import FastMCP
 from . import config, names, paths, state
 from .state import _pid_alive
 from .terminal import get_driver
-from .transcript import find_session_log, is_delegating, last_assistant_summary
+from .transcript import (find_session_log, is_delegating, last_assistant_summary,
+                         last_assistant_ends_in_tool_use)
 # Re-exported for the MANY internal call sites + existing test imports; the
 # canonical home is registry.py so the hook path never touches this module.
 from .registry import (
@@ -225,11 +226,12 @@ def register_self_impl(
     # become_manager re-registers through here minutes later; rebuilding the
     # record must not erase it. Neither present (user-launched keychain-auth
     # session) ⇒ None.
+    prior = state.read_json(paths.ACTIVE / f"{claude_sid}.json")
     env_account = os.environ.get("CLAUDE_ORCH_ACCOUNT")
     if env_account in config.account_names():
         account = env_account
     else:
-        prior_account = (state.read_json(paths.ACTIVE / f"{claude_sid}.json") or {}).get("account")
+        prior_account = (prior or {}).get("account")
         account = prior_account if prior_account in config.account_names() else None
     record = {
         "claude_sid": claude_sid,
@@ -238,7 +240,7 @@ def register_self_impl(
         "cwd": cwd,
         "window_id": iterm_sid,
         "pid": pid,
-        "started_at": time.time(),
+        "started_at": (prior or {}).get("started_at") or time.time(),
         "state": "idle",
         "last_turn_at": None,
         "last_summary": None,
@@ -273,16 +275,70 @@ def _humanize_tokens(count: int) -> str:
     return str(count)
 
 
+def _spend_money(by_model) -> tuple[float, bool] | None:
+    """(usd_total, all_priced) from a spend dict's per-model buckets, or None.
+
+    Priced at DISPLAY time via the current rate table, so a dockwright.toml
+    rate edit reaches live records immediately and the stored spend stays
+    token-truth. all_priced=False when an unknown model carried tokens — the
+    caller renders the total as a lower bound.
+    """
+    if not isinstance(by_model, dict) or not by_model:
+        return None
+    from .pricing import cost_breakdown, get_rates
+
+    def _num(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 0
+        return value
+
+    rates = get_rates()
+    total, all_priced = 0.0, True
+    for model, bucket in by_model.items():
+        if not isinstance(bucket, dict):
+            continue
+        breakdown = cost_breakdown(
+            model, rates=rates,
+            output_tokens=_num(bucket.get("out_tokens")),
+            input_tokens=_num(bucket.get("in_tokens")),
+            cache_read_tokens=_num(bucket.get("cache_read_tokens")),
+            cache_creation_5m_tokens=_num(bucket.get("cache_creation_5m_tokens")),
+            cache_creation_1h_tokens=_num(bucket.get("cache_creation_1h_tokens")))
+        total += breakdown["total"]
+        if not breakdown["priced"] and any(
+                _num(bucket.get(key)) for key in (
+                    "out_tokens", "in_tokens", "cache_read_tokens",
+                    "cache_creation_5m_tokens", "cache_creation_1h_tokens")):
+            all_priced = False
+    return total, all_priced
+
+
 def _format_spend(spend) -> str | None:
-    """Compact spend line for list output, e.g. '12 turns / 340k out'."""
+    """Compact spend line for list output, e.g. '$11.05 / 340k out / 5.1M cache-rd'.
+
+    Money leads when the record carries per-model buckets (recount_spend
+    stores them; older records fall back to tokens only). '≥' marks a lower
+    bound when some model is unpriced. Deliberately NO turn/episode count:
+    the ledger's Stop-derived `turns` and the session report's prompt-derived
+    episode count are different measures that legitimately diverge — a shared
+    label here misread as agreement. `dockwright spend-report <worker>` has
+    the honest per-episode breakdown.
+    """
     if not isinstance(spend, dict):
         return None
-    turns = spend.get("turns")
     out_tokens = spend.get("out_tokens")
-    if not isinstance(turns, int) or not isinstance(out_tokens, int):
+    if not isinstance(out_tokens, int):
         return None
-    turn_label = "turn" if turns == 1 else "turns"
-    return f"{turns} {turn_label} / {_humanize_tokens(out_tokens)} out"
+    parts = []
+    money = _spend_money(spend.get("by_model"))
+    if money is not None:
+        total, all_priced = money
+        parts.append(f"{'' if all_priced else '≥'}${total:,.2f}")
+    parts.append(f"{_humanize_tokens(out_tokens)} out")
+    cache_read = spend.get("cache_read_tokens")
+    if isinstance(cache_read, int) and cache_read > 0:
+        parts.append(f"{_humanize_tokens(cache_read)} cache-rd")
+    return " / ".join(parts)
 
 
 def _spend_totals(spend) -> dict | None:
@@ -290,7 +346,8 @@ def _spend_totals(spend) -> dict | None:
     if not isinstance(spend, dict):
         return None
     return {key: spend.get(key)
-            for key in ("turns", "out_tokens", "in_tokens", "cache_read_tokens")}
+            for key in ("turns", "out_tokens", "in_tokens", "cache_read_tokens",
+                        "cache_creation_tokens")}
 
 
 def _reclaim_closed_spend(closed_record: dict) -> None:
@@ -1321,6 +1378,13 @@ def become_manager_impl(
     - Managers are Claude-only; the record is always stamped runtime="claude".
     """
     paths.ensure_dirs()
+    # The recovery launcher exports DOCKWRIGHT_PENDING_TAKEOVER=1 to the tab's
+    # claude process; this MCP server inherits it. Registration IS the identity
+    # acquisition, so drop the var here — a later TmuxDriver.spawn from this
+    # process must never birth a tmux server with the var in its global env
+    # (which would silently suppress SessionStart registration for every future
+    # manager tab). Sibling of stale_monitor's SKIP_PERMS compose-then-pop.
+    os.environ.pop("DOCKWRIGHT_PENDING_TAKEOVER", None)
     _migrate_flat_manager_memory()
     _prune_stale_active_records()
     # /manager calls become_manager twice from one physical session: once with a
@@ -1417,6 +1481,69 @@ def prepare_handoff_impl(claude_sid: str, narrative_summary: str, trigger_reason
 
     return {"handoff_id": handoff_id, "path": str(handoff_path), "distill_path": distill_path}
 
+RECOVERY_TAKEOVER_MIN_SILENCE_SEC = 120  # mirror of stale_monitor.MANAGER_LIMIT_CHECK_FLOOR_SEC —
+                                         # same floor AND same clock (max of record/transcript mtime)
+                                         # (parity pinned by test_recovery_silence_floor_matches_stale_monitor)
+
+NEVER_TOOK_A_TURN_GRACE_SEC = 600  # > a takeover successor's routine 10-step first turn;
+                                   # advisory only — a >10-min first turn still flags transiently
+
+
+def _recovery_target_liveness(from_sid: str, record: dict) -> str | None:
+    """None when the recovery target looks safely dead/bricked; else a reason it
+    looks LIVE. A monitor-launched recovery always sees state=="processing" and
+    >=120s silence on max(record mtime, transcript mtime) at detection
+    (stale_monitor._last_activity) — so this guard measures the SAME quantity:
+    the record mtime alone freezes at turn start (user_prompt_submit); the
+    transcript mtime adds every CLI event, so a manager emitting events reads
+    live. A manager blocked inside one long tool call or holding an
+    AskUserQuestion open goes silent on BOTH files — the trailing-tool_use
+    check below is what distinguishes it from a latched brick (which always
+    ends in synthetic TEXT), independent of banner wording. Same quantity as
+    the launch gate (semantically, for the manager case — pinned by
+    test_liveness_clock_is_the_monitors_quantity), so "monitor fires =>
+    guard passes" holds.
+    Subagent transcript mtimes are deliberately NOT consulted: _last_activity
+    ignores them too, and a guard clock stricter than the launch gate's could
+    refuse a legitimate recovery. No pid, or a dead pid, is no liveness
+    evidence: fail open, the lane's job is only to protect LIVE managers from
+    a destructive takeover."""
+    pid = record.get("pid")
+    if not (isinstance(pid, int) and _pid_alive(pid)):
+        return None
+    log = None
+    try:
+        last_activity = (paths.ACTIVE / f"{from_sid}.json").stat().st_mtime
+        try:
+            log = find_session_log(from_sid, runtime=record.get("runtime") or "claude")
+            if log is not None:
+                last_activity = max(last_activity, log.stat().st_mtime)
+        except OSError:
+            pass
+        silence = time.time() - last_activity
+    except OSError:
+        silence = None
+    if (record.get("state") != "processing"
+            or (silence is not None and silence < RECOVERY_TAKEOVER_MIN_SILENCE_SEC)):
+        return (f"its process is alive and its record shows recent activity "
+                f"(state={record.get('state')!r}, last activity "
+                f"{'unknown' if silence is None else f'{silence:.0f}s'} ago)")
+    # Structural aliveness (Tier-2 round 3): a trailing tool_use in the last
+    # assistant event means the CLI is waiting on a tool or modal result
+    # (AskUserQuestion, a long Bash) — mid-turn and alive, merely quiet. A
+    # latched brick is appended as a synthetic assistant TEXT event, so a
+    # bricked transcript never ends in tool_use. Wording-independent, which
+    # is what survives the monitor's banner-offset false positive (a manager
+    # DISCUSSING a limit while blocked on a modal trips the banner check AND
+    # is silent on both files — the one autonomous route to killing a live
+    # manager, closed here).
+    if log is not None and last_assistant_ends_in_tool_use(log):
+        return ("its transcript's last assistant event ends in an unfinished "
+                "tool_use — the CLI is waiting on a tool or modal result "
+                "(mid-turn, alive), not latched on a brick banner")
+    return None
+
+
 def prepare_recovery_handoff_impl(from_sid: str, trigger_reason: str = "account-flip-recovery") -> dict:
     """Synthesize a handoff FOR a bricked predecessor that cannot take turns.
 
@@ -1432,6 +1559,12 @@ def prepare_recovery_handoff_impl(from_sid: str, trigger_reason: str = "account-
     if manager_record is None or manager_record.get("agent") != "manager":
         raise ValueError(
             f"session {from_sid} is not an active manager; cannot synthesize recovery handoff")
+    liveness = _recovery_target_liveness(from_sid, manager_record)
+    if liveness is not None:
+        raise ValueError(
+            f"session {from_sid} is not an active manager takeover target: {liveness}; "
+            "refusing to synthesize a recovery handoff against a live manager — if a live "
+            "manager owns the fleet, stand down")
     # A double-launch race creates two unconsumed handoff files, which is harmless —
     # handoffs/ has no pruning, so orphaned files accumulate like normal. The real
     # double-takeover guard is two-pronged: (1) become_manager_with_takeover unlinks
@@ -1491,8 +1624,64 @@ def become_manager_with_takeover_impl(claude_sid: str, takeover_from: str, hando
     old_record = state.read_json(paths.ACTIVE / f"{takeover_from}.json")
     old_pid = old_record.get("pid") if old_record else None
     old_iterm_sid = state.window_id_of(old_record or {})
+    # Guard point B (ghost-manager guard): a recovery-marked handoff whose
+    # target shows liveness NOW must refuse before the destructive acts below
+    # (window close, record unlink) — the target may have revived between the
+    # guarded synthesis and this call, or the handoff may be an orphaned
+    # replay. Scoped to recovery handoffs: a NON-recovery handoff consumed
+    # against a live predecessor is the designed /recreate-manager flow.
+    if handoff.get("recovery") and old_record is not None:
+        liveness = _recovery_target_liveness(takeover_from, old_record)
+        if liveness is not None:
+            raise ValueError(
+                f"refusing takeover: predecessor {takeover_from} looked bricked at "
+                f"handoff synthesis but now shows liveness ({liveness}); not closing a "
+                "live manager's window — stand down and re-verify")
+    # Identity inheritance is the SOLE mechanism keeping in-flight workers routed
+    # (parent_manager_name) and the domain memory pool correct — there is no
+    # re-parenting mechanism, and managers have no closed/ archive to recover an
+    # identity from after the fact. A predecessor record that's gone (normal:
+    # this function unlinks it below on first consumption) AND a handoff that
+    # omits either field must refuse the takeover rather than silently roll a
+    # fresh name or default the domain to "general".
     inherited_name = (old_record or {}).get("name") or handoff.get("manager_name")
-    inherited_domain = (old_record or {}).get("domain") or handoff.get("domain") or DEFAULT_DOMAIN
+    inherited_domain = (old_record or {}).get("domain") or handoff.get("domain")
+    missing = [f for f, v in (("manager_name", inherited_name), ("domain", inherited_domain)) if not v]
+    if missing:
+        raise ValueError(
+            f"handoff {handoff_id}: cannot establish predecessor identity — no usable active "
+            f"record for {takeover_from} and the handoff omits {', '.join(missing)}. Refusing "
+            "to roll a fresh identity/domain: workers' parent_manager_name routing and the "
+            "domain memory pool depend on inheritance and there is no re-parenting mechanism. "
+            "Re-create the handoff with a writer that stamps manager_name + domain "
+            "(prepare_handoff / prepare_recovery_handoff / bootstrap-recreate.sh "
+            "--manager-name <name> --domain <domain>)."
+        )
+    # Collision check: a live session may already hold the inherited name — the
+    # recovery double-launch race prepare_recovery_handoff_impl's docstring
+    # documents (two successors can consume two different handoffs for the same
+    # predecessor). Registering under that name would silently auto-suffix
+    # (become_manager_impl -> _resolve_unique_name), stranding every in-flight
+    # worker whose parent_manager_name still points at the un-suffixed name —
+    # the exact incident this function exists to prevent, re-entering through a
+    # different door. No mutation beyond the routine dead-record prune (which
+    # any registration path would run anyway): a dead corpse holding the name
+    # must be pruned here, or the recovery lane would deadlock on a permanent
+    # false refusal.
+    _prune_stale_active_records()
+    for record in state.list_json_in(paths.ACTIVE):
+        holder_sid = record.get("claude_sid")
+        if holder_sid in (takeover_from, claude_sid):
+            continue
+        if inherited_name in (record.get("name"), record.get("funny_name")):
+            raise ValueError(
+                f"handoff {handoff_id}: the inherited name '{inherited_name}' is already held by "
+                f"session {holder_sid} ({record.get('agent')}). Registering would silently roll a "
+                f"suffixed name (e.g. '{inherited_name}-2') and strand every in-flight worker whose "
+                "parent_manager_name still points at the un-suffixed name. If this is a duplicate "
+                "recovery launch, the takeover already happened here — stand down. Otherwise resolve "
+                "the name collision (kill or rename the other session) and retry the takeover."
+            )
     closed_window_id = ""
     if isinstance(old_pid, int) and _pid_alive(old_pid):
         # Closing the predecessor's window is a required handoff step. Prefer its recorded
@@ -1522,6 +1711,48 @@ def become_manager_with_takeover_impl(claude_sid: str, takeover_from: str, hando
         domain=inherited_domain,
         name=inherited_name,
     )
+    registered_name = bm_result.get("name")
+    if registered_name != inherited_name:
+        # The pre-mutation collision check above closes the common race, but a
+        # NEW collision can still land in the gap between that check and this
+        # registration (another session takes the name concurrently).
+        # become_manager_impl would then silently auto-suffix — unregister
+        # immediately rather than leave a wrongly-named successor active, and
+        # raise BEFORE the handoff is marked consumed so a retry can still
+        # consume it.
+        paths.ACTIVE.joinpath(f"{claude_sid}.json").unlink(missing_ok=True)
+        # become_manager_impl's own _backfill_legacy_workers call (inside the
+        # registration we're unwinding) may have just stamped every null-parent
+        # worker with THIS suffixed name — unregistering the successor alone
+        # leaves those workers pointing at a name nothing will ever register
+        # again, which is WORSE than None: None is wildcard-visible and
+        # re-adopted by the next single-manager boot; a dead suffixed name is
+        # neither. registered_name is freshly suffixed by this attempt, so
+        # exactly the workers backfill just touched (and nothing legitimately
+        # pre-existing) can carry it — revert them to unowned.
+        reverted = 0
+        for record in state.list_json_in(paths.ACTIVE):
+            if record.get("agent") != "worker" or record.get("parent_manager_name") != registered_name:
+                continue
+            worker_sid = record.get("claude_sid")
+            if not worker_sid:
+                continue
+            record["parent_manager_name"] = None
+            state.write_json_atomic(paths.ACTIVE / f"{worker_sid}.json", record)
+            reverted += 1
+        revert_note = (
+            f" Reverted {reverted} worker record(s) just stamped with that dead suffixed name back "
+            "to unowned (parent_manager_name=None) so the next single-manager boot re-adopts them."
+            if reverted else ""
+        )
+        raise ValueError(
+            f"handoff {handoff_id}: takeover raced a concurrent registration — registered as "
+            f"'{registered_name}' instead of the inherited '{inherited_name}'. Unregistered this "
+            "session; workers still route to the inherited name. The predecessor was already "
+            "closed and unlinked by THIS attempt, so a bare retry will hit the same collision — "
+            f"resolve the name collision (kill or rename the session now holding '{inherited_name}') "
+            f"before retrying the takeover.{revert_note}"
+        )
     # Verify the predecessor's pane is actually gone — replaces manager-resume.md's
     # un-allowlistable tmux-bash close-verification. If nothing was closed (predecessor
     # already dead or its window unresolvable), treat the pane as gone. best-effort:
@@ -1558,7 +1789,7 @@ def become_manager_with_takeover_impl(claude_sid: str, takeover_from: str, hando
         "trigger_reason": handoff.get("trigger_reason"),
         "narrative_excerpt": narrative[:200],
     })
-    return {"ok": True, "name": inherited_name, "domain": inherited_domain, "runtime": "claude",
+    return {"ok": True, "name": registered_name, "domain": inherited_domain, "runtime": "claude",
             "preflight": bm_result.get("preflight", ""),
             "predecessor_pane_closed": pane_closed}
 
@@ -1577,27 +1808,63 @@ def _manager_name_from_sid(manager_sid: str | None) -> str | None:
     return record.get("name")
 
 
-def _resolve_parent_manager(manager_sid: str | None) -> tuple[str | None, str | None]:
-    """Resolve manager_sid → (parent_manager_name, warning) for the spawn path.
+def _resolve_parent_manager(manager_sid: str | None) -> str | None:
+    """Resolve manager_sid → parent_manager_name for the spawn path, or raise.
 
-    - manager_sid falsy (None/empty)        → (None, None): intentional legacy
-      single-manager wildcard; no warning.
-    - manager_sid resolves to a live manager → (name, None).
-    - manager_sid truthy but unresolvable    → (None, warning): no ACTIVE record
-      for that sid, so the worker would register UNSCOPED (parent_manager_name=null)
-      and its turn-end/done/question events would route to _unscoped/ instead of
-      back to the manager. The usual cause is passing the manager's funny NAME
-      instead of its session UUID.
+    - falsy (None/"")               → None: the intentional unscoped/legacy
+      wildcard lane (recovery, _backfill_legacy_workers, single-manager
+      back-compat).
+    - live top-level manager record → its name.
+    - anything else                 → ValueError. parent_manager_name is
+      stamped at the worker's SessionStart registration and never rewritten,
+      so a worker spawned off a bad sid reports done/question/turn-end events
+      to buckets the intended manager never sees, for the worker's whole life
+      (linux E2E F-β1/C12) — the warn-and-spawn-anyway behavior this replaces
+      made the misroute visible but not preventable. Rejecting BEFORE the
+      tab/pending-assignment side effects costs a mistaken caller exactly one
+      corrective call. The `not nested` arm mirrors _find_manager_record: a
+      nested manager-agent ghost "resolves" to a name no monitor watches. A
+      manager record whose name is missing/empty is treated as unresolvable
+      too — a live manager always has one (become_manager/register_self_impl
+      write it synchronously), and returning a falsy name here would silently
+      degrade the spawn to the unscoped lane.
     """
-    parent_manager_name = _manager_name_from_sid(manager_sid)
-    if manager_sid and parent_manager_name is None:
-        warning = (
-            f"manager_sid {manager_sid!r} did not resolve to an active manager record; "
-            "worker spawned UNSCOPED (parent_manager_name=null) — its events will not "
-            "route to that manager. Pass the manager's session UUID, not its funny name."
+    if not manager_sid:
+        return None
+    record = state.read_json(paths.ACTIVE / f"{manager_sid}.json")
+    if record is None:
+        raise ValueError(
+            f"spawn_worker: manager_sid {manager_sid!r} does not match any active "
+            "manager record — the worker would register UNSCOPED "
+            "(parent_manager_name=null) and its done/question/turn-end events "
+            "would never route back to you. Pass your own session UUID (the "
+            "claude_sid from your boot context), not the funny name; "
+            "list_managers() shows live manager sids — if it shows none, your "
+            "own registration is gone: re-run become_manager. For a "
+            "deliberately unscoped spawn pass manager_sid=None."
         )
-        return None, warning
-    return parent_manager_name, None
+    if record.get("agent") != "manager" or record.get("nested"):
+        kind = ("nested manager-agent" if record.get("agent") == "manager"
+                else (record.get("agent") or "session"))
+        raise ValueError(
+            f"spawn_worker: manager_sid {manager_sid!r} belongs to an active "
+            f"{kind} record ({record.get('name')!r}), not a live top-level "
+            "manager — the worker would be parented to a name no manager "
+            "watches. Pass YOUR manager session UUID (list_managers() shows "
+            "live sids), or manager_sid=None for a deliberately unscoped spawn."
+        )
+    name = record.get("name")
+    if not name:
+        raise ValueError(
+            f"spawn_worker: manager_sid {manager_sid!r} resolves to a manager "
+            f"record with no name ({name!r}) — the registration is incomplete "
+            "or corrupt, and the worker would register UNSCOPED "
+            "(parent_manager_name=null) with its events routed to buckets no "
+            "manager watches. Re-run become_manager to rewrite your "
+            "registration, or pass manager_sid=None for a deliberately "
+            "unscoped spawn."
+        )
+    return name
 
 
 def _resolve_manager_name_for_filter(manager_sid: str | None, tool: str) -> str | None:
@@ -1846,6 +2113,10 @@ def list_managers() -> list[dict]:
             "iterm_sid": state.window_id_of(record),
             "runtime": record.get("runtime") or "claude",
             "started_at": record.get("started_at"),
+            "never_took_a_turn": (record.get("last_turn_at") is None
+                                  and record.get("last_turn_at_uptime") is None
+                                  and time.time() - (record.get("started_at") or 0)
+                                  > NEVER_TOOK_A_TURN_GRACE_SEC),
         })
     return out
 
@@ -2359,25 +2630,31 @@ async def spawn_worker_impl(
     from .spawner import (normalize_runtime, spawn_worker_tab, usage_spawn_gate,
                           write_registry_snapshot)
     runtime = normalize_runtime(runtime)
-    write_registry_snapshot()   # keep the standalone monitor's registry fresh
     _validate_task_key(task_key)
+    # Input validation first: resolution raises ahead of every side-effecting
+    # step in this function — write_registry_snapshot, the pending-assignment
+    # write, and the tab spawn.
+    parent_manager_name = _resolve_parent_manager(manager_sid)
+    write_registry_snapshot()   # keep the standalone monitor's registry fresh
     gate = usage_spawn_gate(force=force)
     if gate.get("status") == "paused":
         return gate
     if cwd is None:
         home = paths.ensure_worker_home()
         cwd = str(home) if home.is_dir() else os.getcwd()
+    raw_name = name
     if name is None:
         name = f"worker-{int(time.time())}"
     name = _resolve_unique_name(name)
     # The ownership record stores the caller's actual ask — capture BEFORE the
     # preset expansion below (boilerplate is reconstructable from the preset name).
     raw_prompt = initial_prompt
-    # Single resolution point for the grouping key: footer and assignment record
-    # must never diverge. Explicit task_key ALWAYS wins; derivation stays
-    # configured-regex-only (stretching it to arbitrary names is how the
-    # WORKER-<epoch> garbage-key bug happened).
-    ticket = task_key or _derive_ticket(name, raw_prompt)
+    # Keying is EXPLICIT-ONLY: the task_key param is the single keying path,
+    # resolved once so the footer and the assignment record can never diverge.
+    # Derivation from prompt/name prose is deliberately gone — a mention is not
+    # an assignment (a worker whose prompt cited an unrelated task in an
+    # anecdote got its report filed into that task's artifact dir).
+    ticket = task_key
     if preset is not None:
         initial_prompt = f"{_resolve_preset(preset)}\n\n---\n\n{initial_prompt}"
     if ticket and (raw_prompt or "").strip():
@@ -2394,14 +2671,11 @@ async def spawn_worker_impl(
     # wins; codex is excluded — it has its own protocol.
     if runtime == "claude":
         env = {**config.spawn_env(), **(env or {})}
-    # Stamp the spawning manager's name into the worker's env so its SessionStart
-    # hook can record parent_manager_name on the active record (and routing
-    # filters work). Default None = legacy single-manager behaviour. A non-empty
-    # manager_sid that doesn't resolve (e.g. the funny NAME passed instead of the
-    # UUID) yields a warning and an UNSCOPED worker rather than a silent drop.
-    parent_manager_name, manager_resolution_warning = _resolve_parent_manager(manager_sid)
-    if manager_resolution_warning:
-        print(f"spawn_worker: {manager_resolution_warning}", file=sys.stderr)
+    # Stamp the spawning manager's name into the worker's env so its
+    # SessionStart hook can record parent_manager_name on the active record
+    # (and routing filters work). None = the legacy single-manager /
+    # deliberately-unscoped lane (manager_sid=None); anything unresolvable was
+    # rejected up top before any side effect.
     if parent_manager_name:
         env = {**(env or {}), "CLAUDE_PARENT_MANAGER": parent_manager_name}
     _prune_stale_assignments()      # opportunistic, cold path — spawn is the pendings' write site
@@ -2464,6 +2738,10 @@ async def spawn_worker_impl(
         "parent_manager_name": parent_manager_name,
         "window_id": iterm_sid,
     }
+    if ticket is None:
+        hint = _unkeyed_key_hint(raw_name, raw_prompt)
+        if hint:
+            result["task_key_hint"] = hint
     if registered is not None:
         result["status"] = "registered"
         result["claude_sid"] = registered.get("claude_sid")
@@ -2479,8 +2757,6 @@ async def spawn_worker_impl(
             "Capture the pane at window_id and clear it; the pending assignment is left intact "
             "for late registration."
         )
-    if manager_resolution_warning:
-        result["warning"] = manager_resolution_warning
     return result
 
 
@@ -2531,10 +2807,15 @@ async def spawn_worker(
             Useful for shared workflow boilerplate (rebase-first, commit style, test
             invocation, worker_done at end) so callers stop retyping it on every spawn.
             Raises ValueError if the file is missing. Default: None (no preset).
-        manager_sid: Caller's own claude_sid. When supplied, the worker's active record
-            will have `parent_manager_name` set to this manager's name, scoping it to
-            this manager for routing (list_workers / wait_for_worker / questions).
-            Default None = legacy single-manager behaviour.
+        manager_sid: Caller's own claude_sid. When supplied, must match a live
+            top-level manager's ACTIVE record (written by become_manager); the
+            worker's active record then carries `parent_manager_name`, scoping
+            it to this manager for routing (list_workers / wait_for_worker /
+            questions / done events). A sid matching no live manager — or a
+            worker/nested record — raises ValueError BEFORE anything is
+            spawned (a mistyped sid used to spawn an UNSCOPED worker whose
+            events silently routed to _unscoped/). Default None = intentional
+            unscoped legacy single-manager behaviour.
         runtime: Worker CLI runtime: "claude" (default, backward compatible) or
             "codex". The runtime is stamped into active records via
             CLAUDE_WORKER_RUNTIME and returned by list_workers.
@@ -2543,17 +2824,17 @@ async def spawn_worker(
             store under `artifacts/<task_key>/`. Use a stable slug for personal
             multi-agent tasks with no tracker key (e.g. "yt-bot-public"); pass
             the SAME slug on every spawn of that task's workers. Explicit
-            task_key always wins over derivation; when omitted, the key is
-            derived from the first configured-key-shaped reference in name/prompt
-            (only when [task_keys] key_regex is set — arbitrary names are never
-            auto-derived, and the generic default derives nothing).
+            task_key is the ONLY keying path — nothing is ever derived from
+            prompt or name text (a mention is not an assignment). When omitted
+            the spawn is UNKEYED; if [task_keys] key_regex is configured and
+            matches the prompt or caller-supplied name, the result carries an
+            advisory `task_key_hint` (nothing is stamped or filed).
             Validated fail-fast: must be a stable [A-Za-z0-9_-] slug; blank
-            raises (omit entirely to derive).
-            Keyed spawns (explicit task_key or derived) get an
-            artifact-discipline footer appended to the prompt; every
-            non-blank prompt (keyed or not) additionally gets a repo-sync
-            footer (sync a repo once before reading it). Blank prompts are
-            left untouched.
+            raises (omit entirely for an unkeyed spawn).
+            Keyed spawns (explicit task_key) get an artifact-discipline footer
+            appended to the prompt; every non-blank prompt (keyed or not)
+            additionally gets a repo-sync footer (sync a repo once before
+            reading it). Blank prompts are left untouched.
         force: Bypass the usage breaker + the all-accounts-near-limit pause for THIS spawn only (still
             headroom-weighted, still skips bricked accounts). Use for a genuinely
             urgent spawn when the gate returned {"status":"paused"}. If the chosen
@@ -2576,38 +2857,200 @@ async def spawn_worker(
 #   artifacts/<task_key>/<phase>.<name>.md  — document plane, directory-as-index
 #   assignments/<sid>.json                — ownership plane, spawn-authored
 # Correctness reduces to per-file POSIX atomic rename: every artifact file has
-# exactly one writer (keyed (phase, name)), reads are lock-free snapshots, and
-# events.jsonl is the single shared append-only structure (atomic small-line
+# exactly one writer (keyed (phase, name) — ENFORCED by artifact_put's
+# no-clobber guard; overwrite=True is the explicit escape), reads are
+# lock-free snapshots, and events.jsonl is the single shared append-only
+# structure (atomic small-line
 # O_APPEND writes, state.append_event).
 
 
-def _write_artifact_atomic(path, text: str) -> None:
+def _write_artifact_atomic(path, text: str, exclusive: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # Unique tmp name (pid+uuid) so an accidental double-writer can't stomp one
     # tmp; os.replace is atomic regardless. Same temp+rename idiom as
     # state.write_json_atomic. Readers glob *.md only, so .tmp is invisible.
     tmp = path.parent / f".{path.stem}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     tmp.write_text(text)
+    if exclusive:
+        # Atomic no-clobber create: os.link fails EEXIST if anything landed at
+        # the path since the caller's guard read, so the caller re-guards
+        # instead of replacing blind. (macOS exposes no RENAME_EXCL through
+        # Python; link+unlink keeps whole-content atomicity, and a crash
+        # between the two leaves only an orphan tmp for the hourly sweep.)
+        try:
+            os.link(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return
     os.replace(tmp, path)
 
 
+def _archive_replaced(path, incoming_content: str) -> str | None:
+    """Before a content-replacing write, preserve the occupant's ORIGINAL
+    bytes (stamp included — provenance) at `<filename>.md.prev`. No-op when
+    the path is empty or the occupant's BODY byte-equals the incoming content
+    (idempotent re-put / pure stamping loses nothing). Latest-only: one
+    sidecar per path, replaced each time; readers glob *.md and never see it.
+    Deliberately status-independent — no future status value can route a
+    replacement around the archive. Failures are FAIL-CLOSED: exceptions
+    propagate and abort the put before the main write; never wrap this in
+    swallow-and-proceed. Inlines its own tmp+replace (NOT
+    _write_artifact_atomic) so the AST sole-writer tripwire's caller sets
+    stay exact."""
+    try:
+        old = path.read_text()
+    except FileNotFoundError:
+        return None
+    try:
+        _, old_body = state.parse_artifact(old)
+    except ValueError:
+        old_body = old
+    if old_body == incoming_content:
+        return None
+    prev = path.with_name(path.name + ".prev")
+    tmp = path.parent / f".{path.stem}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    tmp.write_text(old)
+    os.replace(tmp, prev)
+    return str(prev)
+
+
+def _put_clobber_verdict(path, phase, name, content, status, writer_sid) -> str:
+    """Classify the occupant of a put's canonical path: "absent" | "allowed" |
+    "colliding_record" | "foreign_record" | "own_complete_record" |
+    "demotes_final" | "non_record_file".
+
+    Fail-closed on every stamp axis (store spec v2 §correctness: every
+    artifact file has exactly one writer; the only designed same-file rewrite
+    is that writer's own partial→complete flip): a record is "own" only when
+    its stamp identity equals the put's raw (phase, name) AND its truthy
+    writer_sid equals the caller's; only the literal stamp status "partial"
+    keeps it freely replaceable — a missing/corrupt status is treated as
+    final. Byte-equal re-puts arriving with status="partial" refuse rather
+    than demote a final record (or a finished hand file) into a replaceable
+    one. Every refusal here stays reachable via an explicit overwrite=True."""
+    try:
+        existing = path.read_text()
+    except FileNotFoundError:
+        return "absent"
+    try:
+        stamp, body = state.parse_artifact(existing)
+    except ValueError:
+        if existing != content:
+            return "non_record_file"
+        return "demotes_final" if status == "partial" else "allowed"
+    if stamp.get("phase") != phase or stamp.get("name") != name:
+        return "colliding_record"
+    owner = stamp.get("writer_sid")
+    if not owner or owner != writer_sid:
+        return "foreign_record"
+    if stamp.get("status") == "partial":
+        return "allowed"
+    if body != content:
+        return "own_complete_record"
+    return "demotes_final" if status == "partial" else "allowed"
+
+
+_PUT_REFUSALS = {
+    "foreign_record": (
+        "an artifact record owned by a different writer_sid. Publish under a "
+        "different (phase, name), or pass overwrite=True to replace it "
+        "deliberately (e.g. a successor finishing a dead worker's phase)."),
+    "non_record_file": (
+        "a file the store did not write (likely a hand-authored report). "
+        "Publish under a different (phase, name), or pass overwrite=True to "
+        "replace it deliberately."),
+    "own_complete_record": (
+        "your own finalized record (status is not \"partial\") with different "
+        "content — a published record is final, and this refusal usually "
+        "means you are about to destroy your published deliverable. Publish "
+        "under a different (phase, name) instead; pass overwrite=True only "
+        "when discarding the existing content is the intent."),
+    "demotes_final": (
+        "byte-equal content arriving with status=\"partial\" — demoting a "
+        "final record (or stamping a finished hand-written report as partial) "
+        "would make it silently replaceable. Re-put with status=\"complete\", "
+        "or pass overwrite=True."),
+    "colliding_record": (
+        "a record stamped with a DIFFERENT (phase, name) — this put's pair "
+        "collides with it after filename sanitization. Publish under a "
+        "non-colliding (phase, name), or pass overwrite=True to replace it "
+        "deliberately."),
+}
+
+
 def artifact_put_impl(task_key, phase, name, content, status, writer_sid,
-                      contract_hash=None, read_set=None) -> dict:
+                      contract_hash=None, read_set=None, overwrite=False) -> dict:
     if status not in ("partial", "complete"):
         raise ValueError(f"status must be 'partial'|'complete', got {status!r}")
+    if not writer_sid:
+        raise ValueError(
+            f"writer_sid must be a non-empty session id, got {writer_sid!r} "
+            "(two callers passing the same falsy sid would alias into one "
+            "store owner)")
     paths.ensure_dirs()
     written_at = time.time()
     stamp = {"phase": phase, "name": name, "status": status, "writer_sid": writer_sid,
              "contract_hash": contract_hash, "written_at": written_at,
              "read_set": read_set or []}
     path = paths.artifact_path(task_key, phase, name)
+    text = state.serialize_artifact(stamp, content)
+
+    def _refuse(reason):
+        # Audit line first (the target dir exists — something occupies the
+        # path), then the loud, actionable error. Nothing is written.
+        state.append_event(paths.artifact_events_path(task_key), {
+            "type": "artifact_put_refused", "phase": phase, "name": name,
+            "actor_sid": writer_sid, "reason": reason})
+        what = _PUT_REFUSALS.get(reason, (
+            f"content the no-clobber guard could not classify "
+            f"(verdict {reason!r}) — refusing by default; pass "
+            "overwrite=True only for a deliberate replacement."))
+        raise ValueError(f"artifact_put refused: {path} already holds {what}")
+
     # FILE FIRST (authoritative), then audit (best-effort): a crash between the
     # two yields an artifact with no audit line — safe. Never the reverse.
-    _write_artifact_atomic(path, state.serialize_artifact(stamp, content))
-    state.append_event(paths.artifact_events_path(task_key), {
-        "type": "artifact_put", "phase": phase, "name": name,
-        "actor_sid": writer_sid, "status": status, "contract_hash": contract_hash})
-    return {"ok": True, "path": str(path), "written_at": written_at, "status": status}
+    # (The refuse branch inverts nothing: it writes ONLY its audit line — no
+    # file is ever created on refusal.)
+    archived = None
+    if overwrite:
+        archived = _archive_replaced(path, content)
+        _write_artifact_atomic(path, text)
+    else:
+        verdict = _put_clobber_verdict(path, phase, name, content, status, writer_sid)
+        if verdict == "allowed":
+            archived = _archive_replaced(path, content)
+            _write_artifact_atomic(path, text)
+        elif verdict == "absent":
+            try:
+                _write_artifact_atomic(path, text, exclusive=True)
+            except FileExistsError:
+                # Lost the create race: something landed after the guard read.
+                # Re-guard ONCE against it; if the path vanished AGAIN, one
+                # more exclusive attempt runs and a second EEXIST propagates
+                # loudly — no retry loop. Default-deny: any verdict this
+                # dispatch does not know refuses — it must never fall through
+                # to a blind replace.
+                verdict = _put_clobber_verdict(path, phase, name, content, status, writer_sid)
+                if verdict == "allowed":
+                    archived = _archive_replaced(path, content)
+                    _write_artifact_atomic(path, text)
+                elif verdict == "absent":
+                    _write_artifact_atomic(path, text, exclusive=True)
+                else:
+                    _refuse(verdict)
+        else:
+            _refuse(verdict)
+    event = {"type": "artifact_put", "phase": phase, "name": name,
+             "actor_sid": writer_sid, "status": status, "contract_hash": contract_hash}
+    if overwrite:
+        event["overwrite"] = True
+    if archived:
+        event["archived_previous"] = archived
+    state.append_event(paths.artifact_events_path(task_key), event)
+    result = {"ok": True, "path": str(path), "written_at": written_at, "status": status}
+    if archived:
+        result["archived_previous"] = archived
+    return result
 
 
 def artifact_get_impl(task_key, phase, name) -> dict:
@@ -2821,15 +3264,15 @@ def artifact_view_impl(task_key) -> str:
 
 
 def _validate_task_key(task_key: str | None) -> None:
-    """Fail-fast at the spawn/promote boundary. None = "derive" and is fine;
-    blank is an EXPLICIT error ("" is falsy and would silently fall through to
-    key derivation); a slug sanitization would alter ("yt bot") would store
-    raw in the assignment while the artifact dir gets the sanitized variant —
-    diverging the join key from the dir name."""
+    """Fail-fast at the spawn/promote boundary. None = unkeyed and is fine; blank
+    is an EXPLICIT error ("" is falsy and must not silently read as unkeyed); a
+    slug that sanitization would alter ("yt bot") would store raw in the
+    assignment while the artifact dir gets the sanitized variant — diverging the
+    join key from the dir name."""
     if task_key is None:
         return
     if not task_key.strip():
-        raise ValueError("task_key must not be blank; omit it entirely to derive from prompt/name")
+        raise ValueError("task_key must not be blank; omit it entirely for an unkeyed spawn")
     if paths._safe_segment(task_key) != task_key:
         raise ValueError(
             f"task_key {task_key!r} is not a stable slug; use only [A-Za-z0-9_-] so the "
@@ -2837,16 +3280,18 @@ def _validate_task_key(task_key: str | None) -> None:
         )
 
 
-def _derive_ticket(name: str, initial_prompt: str) -> str | None:
-    """First configured-key-shaped reference, uppercased, or None when no key
-    regex is configured ([task_keys] key_regex) — the generic default derives
-    nothing and explicit task_key is then the only keying path. PROMPT wins over
-    name: the canonical keyed dispatch carries the key in the prompt (<your
-    keyed-dispatch command> <KEY>), and spawn's auto-generated "worker-<epoch>"
-    default is itself key-shaped — name-first matching turned every name=None
-    keyed spawn into a garbage "WORKER-<epoch>" key. The auto-name shape never
-    contributes at all. A malformed operator regex fails open to None (never
-    crashes a spawn)."""
+def _unkeyed_key_hint(raw_name: str | None, raw_prompt: str) -> str | None:
+    """Advisory only — never files anything. For an UNKEYED spawn, surface the
+    first configured-key-shaped token mentioned in the prompt or the CALLER'S
+    raw name, so a manager who meant to key the spawn notices. Wording is
+    deliberately conditional: the hint fires on exactly the misfiling
+    incident's shape (a prose mention), so it must never read as a
+    recommendation to adopt the token; the token is quoted VERBATIM (the
+    deleted derivation uppercased — an advisory must quote what the text
+    actually contains). Judged on the caller's RAW name: _resolve_unique_name
+    collision suffixes never contribute, and the auto-name path never reaches
+    this function with a name (raw_name is None when the caller passed none).
+    A malformed operator regex fails open to None (never crashes a spawn)."""
     pattern = config.task_key_regex()
     if not pattern:
         return None
@@ -2854,10 +3299,15 @@ def _derive_ticket(name: str, initial_prompt: str) -> str | None:
         key_re = re.compile(rf"\b({pattern})\b")
     except re.error:
         return None
-    m = key_re.search(initial_prompt or "")
-    if m is None and not re.fullmatch(r"worker-\d+", name or ""):
-        m = key_re.search(name or "")
-    return m.group(1).upper() if m else None
+    m = key_re.search(raw_prompt or "") or key_re.search(raw_name or "")
+    if m is None:
+        return None
+    return (
+        f"this spawn is UNKEYED; its prompt/name mentions a key-shaped token "
+        f"({m.group(1)}). If this worker is actually ASSIGNED to that task, "
+        "respawn or continue it with explicit task_key=; if the token is "
+        "merely mentioned, ignore this hint — a mention is not an assignment."
+    )
 
 
 def _artifact_discipline_footer(task_key: str) -> str:
@@ -2871,7 +3321,14 @@ def _artifact_discipline_footer(task_key: str) -> str:
         f"waiting to be asked: `artifact_put(task_key=\"{task_key}\", "
         "phase=<spec|plan|implement|review|summary>, name=<repo-or-scope>, "
         "content=..., status=\"partial\"|\"complete\", writer_sid=<your sid>)`. "
-        "Flip final outputs to status=\"complete\" before worker_done. Store/publish "
+        "Publish final outputs (a brief-directed full report included) with "
+        "status=\"complete\"; flip any remaining partials before worker_done. "
+        "A put that would replace another writer's record — or a "
+        "hand-authored file with different content — or revise or "
+        "demote your own complete record, or demote a finished hand-written "
+        "report — is refused: publish under a different (phase, name), or "
+        "pass overwrite=True only for a deliberate "
+        "replacement (e.g. finishing a dead predecessor's phase). Store/publish "
         "failures are non-blocking — note them and continue; they must never fail "
         "your task. Long form: worker agent definition § \"Persist pipeline artifacts\"."
     )
@@ -3024,7 +3481,7 @@ def pipeline_event_impl(task_key, type, phase=None, name=None, reason=None, acto
 # lock guard the read-modify-write. Stale holders (sid evicted from active/ or
 # pid dead) are reaped on every acquire poll.
 
-DEFAULT_SLOT_COUNTS: dict[str, int] = {"mvn": 3}
+DEFAULT_SLOT_COUNTS: dict[str, int] = {"mvn": 5}
 
 _slots_thread_lock = threading.Lock()
 
@@ -3147,11 +3604,21 @@ def _resolve_task_key(task_key: str, ticket: str) -> str:
 @mcp.tool()
 def artifact_put(task_key: str = "", *, phase: str, name: str, content: str, status: str,
                  writer_sid: str, contract_hash: str | None = None,
-                 read_set: list[dict] | None = None, ticket: str = "") -> dict:
+                 read_set: list[dict] | None = None, overwrite: bool = False,
+                 ticket: str = "") -> dict:
     """[WORKER] Publish an artifact for a task_key's phase. status='partial'|'complete'.
-    Atomic, single-writer-per-(phase,name). `ticket=` is a deprecated alias for `task_key=`."""
+    Atomic, single-writer-per-(phase,name) — ENFORCED: a put that would replace a
+    record owned by another writer_sid, a file the store did not write with
+    different content, YOUR OWN finalized (non-partial) record with different
+    content, a byte-equal re-put demoting a final record (or a finished hand
+    file) to partial, or a sanitize-colliding (phase, name) pair is refused
+    unless overwrite=True (canonical use: a successor finishing a dead worker's
+    phase). Your own partial-record updates and partial→complete flips need no
+    flag. Content-replacing writes archive the previous file to
+    <phase>.<name>.md.prev (latest-only) and report it as archived_previous.
+    `ticket=` is a deprecated alias for `task_key=`."""
     return artifact_put_impl(_resolve_task_key(task_key, ticket), phase, name, content,
-                             status, writer_sid, contract_hash, read_set)
+                             status, writer_sid, contract_hash, read_set, overwrite)
 
 
 @mcp.tool()

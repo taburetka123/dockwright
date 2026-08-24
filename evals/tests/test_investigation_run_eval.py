@@ -106,6 +106,22 @@ def test_discover_cases_filters(tmp_path):
                                    only_ids=None, tags=["nope"]) == []
 
 
+def test_evaluate_case_feeds_fixture_content_to_gate(tmp_path):
+    """A glob-read sample (input names no file) passes the required-read gate
+    because evaluate_case loads the fixture content for the content check."""
+    case = _case(tmp_path, dict(ANSWER, samples=1, min_pass=1))
+    fixture_body = "metric window 13:00-14:00\nvalue returned to baseline entirely\n"
+    (tmp_path / "cases" / "n99-demo" / "fixtures" / "metrics.txt").write_text(fixture_body)
+    def glob_run(case, **kw):
+        return runner.RunRecord(
+            case_id=case["case_id"], findings=run_eval.dry_findings(case["answer"]),
+            tool_calls=[("Bash", '{"command": "cat fixtures/*"}')],
+            corpus="=== fixtures dump ===\n" + fixture_body, num_turns=1)
+    r = run_eval.evaluate_case(case, model="opus", timeout=5, repeats=None,
+                               skip_judge=True, run_case_fn=glob_run, judge_fn=None)
+    assert r["passed"], r
+
+
 def test_main_dry_run_exit_zero_and_no_latest(tmp_path, monkeypatch, capsys):
     _case(tmp_path)
     monkeypatch.setattr(run_eval, "CASES_DIR", str(tmp_path / "cases"))
@@ -115,3 +131,32 @@ def test_main_dry_run_exit_zero_and_no_latest(tmp_path, monkeypatch, capsys):
     assert rc == 0
     assert "n99-demo" in capsys.readouterr().out
     assert not (tmp_path / "results" / "latest.json").exists()
+
+
+def test_main_missing_binding_exits_2_without_running(tmp_path, monkeypatch, capsys):
+    _case(tmp_path)
+    monkeypatch.setattr(run_eval, "CASES_DIR", str(tmp_path / "cases"))
+    monkeypatch.setattr(run_eval, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(run_eval, "TRACES_DIR", str(tmp_path / "traces"))
+    monkeypatch.setenv("DOCKWRIGHT_INVESTIGATE_SKILL", str(tmp_path / "no-skill.md"))
+    called = {"n": 0}
+    def no_run(case, **kw):
+        called["n"] += 1
+        return runner.RunRecord(case_id=case["case_id"], error="must not run")
+    # Stub so the red phase never spawns a real `claude -p`; post-fix the
+    # binding check must exit BEFORE any sample runs (called stays 0).
+    monkeypatch.setattr(run_eval.runner, "run_case", no_run)
+    rc = run_eval.main([])
+    assert rc == 2
+    assert called["n"] == 0
+    assert not (tmp_path / "results" / "latest.json").exists()
+    assert "vacuous" in capsys.readouterr().err
+
+
+def test_main_dry_run_ignores_missing_binding(tmp_path, monkeypatch):
+    _case(tmp_path)
+    monkeypatch.setattr(run_eval, "CASES_DIR", str(tmp_path / "cases"))
+    monkeypatch.setattr(run_eval, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(run_eval, "TRACES_DIR", str(tmp_path / "traces"))
+    monkeypatch.setenv("DOCKWRIGHT_INVESTIGATE_SKILL", str(tmp_path / "no-skill.md"))
+    assert run_eval.main(["--dry-run"]) == 0

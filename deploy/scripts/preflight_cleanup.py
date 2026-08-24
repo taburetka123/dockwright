@@ -10,7 +10,8 @@ Prunes:
     odd-looking ones — no usable pid, or pid alive but not a claude/codex
     process — are kept and reported, never deleted)
   - unowned debris (arch review B5): monitor cursors
-    (.seen-* / .batch-turn-ends-* / .last-seen* / .fs-emitted-*) >7d, stale
+    (STALE_CURSOR_PATTERNS, currently .seen-* / .batch-turn-ends-* /
+    .last-seen* / .fs-emitted-* / .read-*) >7d, stale
     notify-outbox entries >7d, empty per-manager bucket dirs under done/
     turn-ends/ questions/ notify-outbox/, and the dead manager.lock husk
 
@@ -34,6 +35,17 @@ STALE_DONE_SEC = 24 * 60 * 60                 # 24 hours
 STALE_TURN_END_SEC = 24 * 60 * 60             # 24 hours
 STALE_CLOSED_SEC = 7 * 24 * 60 * 60           # 7 days
 STALE_CURSOR_SEC = 7 * 24 * 60 * 60           # 7 days
+# The dot-file cursors the husk GC sweeps. Hoisted out of _gc_husks so the test
+# iterates THIS tuple and a pattern added here gets its case for free. It is a
+# hand-maintained list and the test cannot see what is MISSING from it — a
+# cursor family nobody declared here is swept by nothing (`.stale-emitted-*`
+# from stale_monitor.py is one such family today, out of scope for this change).
+# .read-*: the statusline's per-manager "he has seen this message" marks (plus
+# their per-pid .tmp siblings). Only rewritten when the message changes, so a
+# live but silent manager's mark ages out — one spurious light per week of
+# silence, the safe direction.
+STALE_CURSOR_PATTERNS = (".seen-*", ".batch-turn-ends-*", ".last-seen*",
+                         ".fs-emitted-*", ".read-*")
 
 # os.kill raises OverflowError (not OSError) for pids above the C int range, so a
 # poisoned record would traceback the whole preflight — and never get cleaned, so
@@ -50,7 +62,14 @@ def _prefer_new(new: Path, legacy: Path) -> Path:
 
 
 _HOME = Path(os.environ.get("HOME", ""))
-ROOT = _prefer_new(_HOME / ".claude" / "dockwright", _HOME / ".claude" / "orchestrator")
+# Test-isolation + relocation seam (mirrors gardener's DOCKWRIGHT_GARDENER_DIR):
+# an explicit state dir wins over the HOME-derived default, so fresh loads under
+# pytest can never bind the live ledger/state. Honored by this script only —
+# the package's config.state_root() does not read it; a global relocation
+# still goes through dockwright.toml [paths] state_root.
+_ENV_STATE_DIR = os.environ.get("DOCKWRIGHT_STATE_DIR", "").strip()
+ROOT = (Path(_ENV_STATE_DIR) if _ENV_STATE_DIR
+        else _prefer_new(_HOME / ".claude" / "dockwright", _HOME / ".claude" / "orchestrator"))
 ACTIVE = ROOT / "active"
 HANDOFFS = ROOT / "handoffs"
 DONE = ROOT / "done"
@@ -232,6 +251,7 @@ def _append_spend_drop(record: dict, source: str) -> None:
             "source": source,
             "spend": totals,
         }
+        SPEND_LEDGER.parent.mkdir(parents=True, exist_ok=True)
         with open(SPEND_LEDGER, "a") as f:
             f.write(json.dumps(entry, separators=(",", ":")) + "\n")
     except Exception:
@@ -315,10 +335,23 @@ def _gc_husks(now: float) -> int:
     # Monitor cursors: live managers' cursors are touched on every append, so
     # only dead managers' cursors age past the threshold. The events they
     # index die at 24h, so losing a cursor at worst re-shows <24h of events.
-    for pattern in (".seen-*", ".batch-turn-ends-*", ".last-seen*", ".fs-emitted-*"):
+    for pattern in STALE_CURSOR_PATTERNS:
         for p in ROOT.glob(pattern):
             try:
                 if p.is_file() and now - p.stat().st_mtime > STALE_CURSOR_SEC:
+                    p.unlink(missing_ok=True)
+                    pruned += 1
+            except OSError:
+                continue
+    # Lane heartbeats: a live lane rewrites its own every poll interval, so
+    # only a dead manager's heartbeats age past the threshold. `dockwright
+    # lanes` treats a stale one as DEAD, which is correct while the manager
+    # exists and pure noise once it is gone.
+    lane_health = ROOT / "lane-health"
+    if lane_health.is_dir():
+        for p in lane_health.rglob("*.json"):
+            try:
+                if now - p.stat().st_mtime > STALE_CURSOR_SEC:
                     p.unlink(missing_ok=True)
                     pruned += 1
             except OSError:
@@ -335,7 +368,7 @@ def _gc_husks(now: float) -> int:
                 continue
     # Per-manager bucket dirs are mkdir'd on demand and never rmdir'd; every
     # scan walks all of them. rmdir refuses non-empty dirs by contract.
-    for bucket in (DONE, TURN_ENDS, QUESTIONS, NOTIFY_OUTBOX):
+    for bucket in (DONE, TURN_ENDS, QUESTIONS, NOTIFY_OUTBOX, lane_health):
         if not bucket.is_dir():
             continue
         for sub in bucket.iterdir():
