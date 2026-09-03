@@ -1,28 +1,3 @@
-"""dockwright.toml — dockwright's optional operator config.
-
-Single config surface for everything that used to be hardcoded: state root,
-worker home, account registry, model pins, hint strings, pricing overrides.
-
-Contract (Step 1 of the OSS split):
-- EVERY key is optional. A missing key — or a missing/corrupt file — yields
-  the documented default, which reproduces the pre-config hardcoded behavior
-  exactly. Fail-open: a bad config must never take down the fleet; `doctor`
-  surfaces the parse error loudly instead (doctor's config:dockwright check).
-  Exception (deprecated, one release): the three renamed path keys resolve
-  filesystem-dependently to their legacy homes while orchestrator-era state
-  migrates — see `_path_key_with_legacy`.
-- No caching: readers parse the (tiny) file fresh per call — like the
-  existing weight-env reads — so tests and live edits never fight a cache.
-- Leaf module: imports nothing from the package (paths.py imports US at
-  module level; a reverse import is a cycle).
-
-Discovery order (first existing file wins):
-  1. $DOCKWRIGHT_CONFIG — explicit path; when set it is authoritative
-     (a missing target means "no config", never a fallback to 2/3)
-  2. $XDG_CONFIG_HOME/dockwright/dockwright.toml (XDG_CONFIG_HOME default
-     ~/.config)
-  3. ~/.claude/dockwright.toml (the operator-overlay home)
-"""
 from __future__ import annotations
 
 import os
@@ -33,13 +8,13 @@ from pathlib import Path
 ENV_CONFIG_PATH = "DOCKWRIGHT_CONFIG"
 
 DEFAULT_STATE_ROOT = "~/.claude/dockwright"
-LEGACY_STATE_ROOT = "~/.claude/orchestrator"          # deprecated, one release
+LEGACY_STATE_ROOT = "~/.claude/orchestrator"
 DEFAULT_CLAUDE_CONFIG_HOME = "~/.claude"
 DEFAULT_WORKER_HOME = "~/projects/work/worker"
 DEFAULT_MANAGER_MEMORY = "~/.claude/dockwright/manager-memory"
-LEGACY_MANAGER_MEMORY = "~/.claude/manager-memory"    # deprecated, one release
+LEGACY_MANAGER_MEMORY = "~/.claude/manager-memory"
 DEFAULT_OVERLAY_DIR = "~/.claude/dockwright-overlay"
-LEGACY_OVERLAY_DIR = "~/.claude/orchestrator-overlay" # deprecated, one release
+LEGACY_OVERLAY_DIR = "~/.claude/orchestrator-overlay"
 DEFAULT_WORKER_MODEL = "claude-opus-5[1m]"
 DEFAULT_MANAGER_MODEL = "claude-opus-5[1m]"
 DEFAULT_DISTILL_MODEL = "claude-sonnet-4-6"
@@ -55,8 +30,6 @@ _DEFAULT_POOL = (("a", 1),)
 
 @dataclass(frozen=True)
 class Account:
-    """One pool entry. config_dir=None means the ~/.claude-<name> convention
-    (the default account runs on the default login and never consults it)."""
     name: str
     config_dir: Path | None = None
     weight: int = 1
@@ -73,7 +46,6 @@ def _expand(raw: str) -> Path:
 
 
 def config_path() -> Path | None:
-    """The dockwright.toml this process would read, or None when none exists."""
     env = os.environ.get(ENV_CONFIG_PATH, "").strip()
     if env:
         p = _expand(env)
@@ -88,7 +60,6 @@ def config_path() -> Path | None:
 
 
 def load() -> dict:
-    """Parsed config dict, or {} (missing, unreadable, or corrupt — fail-open)."""
     path = config_path()
     if path is None:
         return {}
@@ -100,8 +71,6 @@ def load() -> dict:
 
 
 def load_error() -> str | None:
-    """Read/parse error text for an EXISTING config file (doctor's loud
-    surface pairing with load()'s fail-open), else None."""
     path = config_path()
     if path is None:
         return None
@@ -129,12 +98,6 @@ def _path_key(section: dict, key: str, default: str) -> Path:
 
 def _path_key_with_legacy(section: dict, key: str, default_new: str,
                           default_legacy: str) -> Path:
-    """Explicit config value wins verbatim. Otherwise prefer the new default
-    path when it exists on disk, fall back to the legacy default when only it
-    exists (un-migrated install), else the new default (fresh install). The
-    on-disk stat makes the un-pinned resolution filesystem-dependent — a
-    deliberate one-release amendment of the parse-or-default contract while
-    orchestrator-era state migrates (see migrate.py)."""
     val = section.get(key)
     if isinstance(val, str):
         return _expand(val)
@@ -153,7 +116,6 @@ def state_root() -> Path:
 
 
 def legacy_state_root() -> Path:
-    """The pre-rename state root — monitor cursor normalization + migration."""
     return _expand(LEGACY_STATE_ROOT)
 
 
@@ -172,35 +134,24 @@ def manager_memory_root() -> Path:
 
 
 def overlay_dir() -> Path:
-    """Agent-file overlay drop-ins root (OUTSIDE state_root — that subtree is
-    rsync --delete-managed runtime state)."""
     return _path_key_with_legacy(_section(load(), "paths"), "overlay_dir",
                                  DEFAULT_OVERLAY_DIR, LEGACY_OVERLAY_DIR)
 
 
 def worktree_roots() -> str:
-    """[paths] worktree_roots — comma-separated worktree root directories
-    searched for existing worktrees (e.g. dockwright-general-work)."""
     return _str_key(_section(load(), "paths"), "worktree_roots", DEFAULT_WORKTREE_ROOTS)
 
 
 def repo_roots() -> str:
-    """[paths] repo_roots — comma-separated repo root directories for the
-    same lookup."""
     return _str_key(_section(load(), "paths"), "repo_roots", DEFAULT_REPO_ROOTS)
 
 
 def dockwright_repo() -> str:
-    """[paths] dockwright_repo — this dockwright checkout's own path, for
-    self-referential tooling (e.g. the Gardener digest/frontier skills).
-    Default: "" (unset). Expanded (~ resolved) when set."""
     raw = _str_key(_section(load(), "paths"), "dockwright_repo", "")
     return str(_expand(raw)) if raw else ""
 
 
 def agent_vars() -> dict[str, str]:
-    """[agent_vars] — `{{name}}` substitutions for composed agent files.
-    Non-string values are skipped (fail-open per entry)."""
     section = _section(load(), "agent_vars")
     return {k: v for k, v in section.items()
             if isinstance(k, str) and isinstance(v, str)}
@@ -211,9 +162,6 @@ def worker_model() -> str:
 
 
 def worker_headless_preset() -> bool:
-    """[spawn] worker_headless_preset — when true (default), claude worker
-    spawns/resumes default to `--settings <deployed worker-headless preset>`.
-    Only a literal boolean false disables; anything else fails open to True."""
     val = _section(load(), "spawn").get("worker_headless_preset", True)
     return val if isinstance(val, bool) else True
 
@@ -227,9 +175,6 @@ def distill_model() -> str:
 
 
 def spawn_env() -> dict[str, str]:
-    """[spawn.env] — extra environment variables merged into spawned worker
-    sessions (caller-supplied env still wins). Non-string values are skipped
-    (fail-open per entry)."""
     section = _section(_section(load(), "spawn"), "env")
     return {k: v for k, v in section.items()
             if isinstance(k, str) and isinstance(v, str)}
@@ -245,17 +190,11 @@ def worktree_cleanup_hint() -> str:
 
 
 def loop_label_prefix() -> str:
-    """launchd label namespace for background loops (bootlite-watchdog,
-    gardener-gate/-frontier, worktree-prune, ...).
-    Labels are rendered as "<prefix>.<loop-name>" at install time
-    (deploy/scripts/*-install.sh); see deploy/loops-registry.md."""
     return _str_key(_section(load(), "loops"), "label_prefix",
                     DEFAULT_LOOP_LABEL_PREFIX)
 
 
 def loop_status_overrides() -> dict[str, dict]:
-    """[loops.status_overrides.<loop>] tables: operator's per-loop status/status_why
-    overriding the core registry's neutral shipping defaults. {} when unset."""
     sec = _section(_section(load(), "loops"), "status_overrides")
     out = {}
     for name, val in sec.items():
@@ -267,27 +206,16 @@ def loop_status_overrides() -> dict[str, dict]:
 
 
 def gardener_module_enabled() -> bool:
-    """[modules] gardener — toggles the Gardener retrospective pipeline
-    (selffix/ops-evidence digest -> ranked improvement proposals). Non-bool
-    values fall back to the default (enabled)."""
     val = _section(load(), "modules").get("gardener")
     return val if isinstance(val, bool) else DEFAULT_GARDENER_MODULE_ENABLED
 
 
 def task_key_regex() -> str | None:
-    """[task_keys] key_regex — regex matching a valid task key (e.g. an
-    issue-tracker key like "ABC-1234"). Advisory recognition ONLY: feeds the
-    unkeyed-spawn `task_key_hint` and doc-level tooling. It never derives a
-    filing key — keying is explicit task_key= at spawn. Unset, empty, or
-    non-string falls back to None (no recognition)."""
     val = _str_key(_section(load(), "task_keys"), "key_regex", "")
     return val if val else None
 
 
 def gardener_high_skills() -> tuple[str, ...]:
-    """[gardener] high_skills — skill names treated as "high" complexity by
-    Gardener's task-triage heuristics. Non-string entries are skipped
-    (fail-open per entry); a non-list value falls back to ()."""
     raw = _section(load(), "gardener").get("high_skills")
     if not isinstance(raw, list):
         return ()
@@ -299,9 +227,6 @@ def _default_pool() -> list[Account]:
 
 
 def accounts() -> list[Account]:
-    """The account registry, pool order. ANY malformation (missing/empty/dup
-    name, weight not a positive int, non-string config_dir) falls back to the
-    whole default pool — fail-open, never a half-registry."""
     raw = _section(load(), "accounts").get("pool")
     if not isinstance(raw, list) or not raw:
         return _default_pool()
@@ -356,10 +281,6 @@ def default_account() -> str:
 
 
 def usage_pause_pct() -> float | None:
-    """[accounts] usage_pause_pct — the worker-spawn pause threshold, percent
-    of the 5h window. Positive number; anything else (missing/malformed/
-    non-positive) -> None so the caller applies its default. Values above 100
-    disable the pause in practice (used pcts never exceed 100)."""
     raw = _section(load(), "accounts").get("usage_pause_pct")
     if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
         return None
@@ -367,8 +288,6 @@ def usage_pause_pct() -> float | None:
 
 
 def pricing_overrides() -> dict[str, tuple[float, float]]:
-    """[pricing.rates] entries as {model_key: (input, output)} USD/MTok.
-    Invalid entries are skipped (fail-open per entry)."""
     rates = _section(_section(load(), "pricing"), "rates")
     out: dict[str, tuple[float, float]] = {}
     for key, val in rates.items():

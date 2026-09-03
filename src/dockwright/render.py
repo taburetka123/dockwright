@@ -1,23 +1,3 @@
-"""Render {{vars}} in deployed files — the deploy-time template seam (Step 7).
-
-A thin wrapper over compose.compose_text(text, [], vars): NO drop-ins, NO
-overlay markers. Commands and .md presets are single files that only ever
-carry {{name}} substitutions, never the overlay-composition surface agent
-files use — so render is just compose's var pass.
-
-Semantics (inherited from compose_text, unchanged):
-- `{{name}}` substitutes a merged-vars entry; an unbound `{{name}}` stays
-  literal and is reported as a warning, never an error.
-- IDENTITY: a var-free, token-free file renders byte-for-byte (trailing-
-  newline state included). `<absolute-home>` inside a var VALUE expands to
-  the installing user's absolute home; the literal token surviving in
-  rendered output raises ComposeError (see compose.py semantics — this
-  surface inherits them).
-
-The CLI mirrors `dockwright compose`'s var-merging: the defaults layer
-(<core-dir>/vars.defaults.toml) is overlaid by the operator's dockwright.toml
-[agent_vars] per-key.
-"""
 from __future__ import annotations
 
 import argparse
@@ -28,15 +8,11 @@ from . import compose, config
 
 
 def render_text(text: str, vars: dict[str, str]) -> str:
-    """Render `{{vars}}` in `text` (unbound left literal). Thin wrapper over
-    compose_text with no drop-ins/markers; discards warnings."""
     composed, _warnings = compose.compose_text(text, [], vars)
     return composed
 
 
 def render_file(src: Path, out: Path, vars: dict[str, str]) -> None:
-    """Read `src`, render `{{vars}}`, write to `out` (parent dirs created).
-    Unbound-var warnings surface on stderr (compose warning semantics)."""
     src, out = Path(src), Path(out)
     composed, warnings = compose.compose_text(src.read_text(), [], vars)
     out.parent.mkdir(parents=True, exist_ok=True)

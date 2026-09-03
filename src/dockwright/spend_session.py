@@ -1,23 +1,3 @@
-"""Per-session spend attribution: parse one session's transcripts into the
-report dict behind `dockwright spend-report <worker-name|sid>`.
-
-MONEY IS THE HEADLINE. Cache-read is the dominant cost component and $/tok
-differs 2x across model families, so any surface ranking sessions by tokens
-inverts real cost — every token figure this module emits travels with its $
-figure. Prices come from pricing.get_rates() (built-ins + dockwright.toml
-[pricing.rates]) and the report carries the table it used.
-
-Episode semantics: this report's "prompt-episodes" are PROMPT-DERIVED (user
-records opening a turn, transcript.py-side detection). The ledger's `turns`
-counter is a DIFFERENT measure — Stop-hook firings with changed totals — and
-the two legitimately diverge (3 of 41 real sessions measured; a Stop can fire
-without a qualifying prompt and vice versa). Neither is renamed to the other:
-fleet surfaces say "turns", this report says "prompt-episodes", and no surface
-renders one quantity under the other's name. An autonomous worker's whole task
-is often ONE episode, so the report always shows API calls / tool calls /
-wall-clock beside the count — a multi-hour single-episode worker cannot be
-misread as trivial.
-"""
 import json
 from pathlib import Path
 
@@ -46,8 +26,6 @@ def _iter_records(path: Path):
 
 
 def _is_prompt(record: dict) -> bool:
-    """A user record that could open a prompt-episode: non-meta, with content
-    beyond tool_results (plain-string content counts)."""
     if record.get("isMeta") is True:
         return False
     content = (record.get("message") or {}).get("content")
@@ -85,19 +63,9 @@ def _add_tokens(bucket: dict, entry: dict) -> None:
 
 def _parse_file(path: Path, *, sidecar: bool, birth_ts, seen_ids: set,
                 state: dict) -> None:
-    """One pass over one transcript file, accumulating into `state`.
-
-    Main file must be parsed FIRST (global dedup: an id inline in the main file
-    and repeated in a sidecar counts once, to the main file). Episode/tool/wall
-    tracking is main-chain-only; sidecar tool calls aggregate under
-    (tool, sidechain=True).
-    """
-    open_turn = False       # last non-None stop_reason was "tool_use"
+    open_turn = False
     for record in _iter_records(path):
         ts = _parse_event_ts(record.get("timestamp"))
-        # Birth filter drops EVERY replayed record type, not just assistant:
-        # a replayed user prompt would otherwise open a phantom episode and
-        # drag the wall-clock span back to the predecessor session.
         if birth_ts is not None and ts is not None and ts < birth_ts:
             state["excluded_replayed"] += 1
             continue
@@ -112,11 +80,6 @@ def _parse_file(path: Path, *, sidecar: bool, birth_ts, seen_ids: set,
                                           seen_ids, state)
         elif rtype == "user":
             _handle_user(record, ts, sidechain, open_turn, state)
-        # Any timestamped main-chain CONVERSATIONAL record advances the current
-        # episode's last_ts (after dispatch, so a prompt opens its episode
-        # first) — a trailing null-stop_reason assistant record must not
-        # under-report duration, but attachment/system/queue-operation records
-        # are post-stop idle bookkeeping and must not stretch it.
         if (rtype in ("assistant", "user") and not sidechain
                 and ts is not None and state["episodes"]):
             state["episodes"][-1]["last_ts"] = ts
@@ -124,7 +87,6 @@ def _parse_file(path: Path, *, sidecar: bool, birth_ts, seen_ids: set,
 
 def _handle_assistant(record: dict, ts, sidechain: bool, open_turn: bool,
                       seen_ids: set, state: dict) -> bool:
-    """Accumulate one assistant record; returns the updated open_turn flag."""
     entry = usage_totals_of(record)
     if entry is not None:
         state["unknown_usage_fields"].update(entry["unknown_usage_keys"])
@@ -133,9 +95,6 @@ def _handle_assistant(record: dict, ts, sidechain: bool, open_turn: bool,
         if entry["message_id"] not in seen_ids:
             seen_ids.add(entry["message_id"])
             _count_entry(record, entry, ts, sidechain, bucket, state)
-    # Tool blocks live OUTSIDE the message-id dedup gate (split API responses
-    # repeat the id with disjoint content), so a verbatim-replayed record needs
-    # its own tool_use-id dedup or it double-counts calls and timing.
     for block in _tool_use_blocks(record):
         tool_use_id = block.get("id")
         if tool_use_id is not None:
@@ -147,8 +106,6 @@ def _handle_assistant(record: dict, ts, sidechain: bool, open_turn: bool,
             "tool": name, "ts": ts, "sidechain": sidechain}
         _tool_row(state, name, sidechain)["calls"] += 1
     stop = (record.get("message") or {}).get("stop_reason")
-    # open_turn moves only on a non-None string stop_reason from a MAIN-chain
-    # record; a None stop_reason (mid-stream chunk) leaves the turn as-is.
     if isinstance(stop, str) and not sidechain:
         open_turn = stop == "tool_use"
         if stop == "end_turn":
@@ -158,15 +115,12 @@ def _handle_assistant(record: dict, ts, sidechain: bool, open_turn: bool,
 
 def _count_entry(record: dict, entry: dict, ts, sidechain: bool,
                  bucket: dict, state: dict) -> None:
-    """Fold one deduped usage entry into the totals/attribution buckets."""
     bucket["api_calls"] += 1
     _add_tokens(bucket, entry)
     model_bucket = state["by_model"].setdefault(
         (entry["model"], sidechain), _new_bucket())
     model_bucket["api_calls"] += 1
     _add_tokens(model_bucket, entry)
-    # Attribution buckets are keyed per (label..., model) so each bucket is
-    # single-model and priceable directly; _attr_rows merges rows by label.
     skill = record.get("attributionSkill")
     skill_label = skill if isinstance(skill, str) and skill else "(none)"
     skill_bucket = state["by_skill"].setdefault(
@@ -197,8 +151,6 @@ def _count_entry(record: dict, entry: dict, ts, sidechain: bool,
         ep["out_tokens"] += entry["out_tokens"]
         ep["entries"].append(entry)
     else:
-        # Assistant record with no episode open: the file starts mid-turn
-        # (birth filter cut the opening prompt) — open an implicit episode.
         state["episodes"].append(_new_episode(ts, entry))
 
 
@@ -214,11 +166,6 @@ def _handle_user(record: dict, ts, sidechain: bool, open_turn: bool,
             row["total_s"] += ts - started["ts"]
     if sidechain:
         return
-    # `not open_turn` suppresses mixed tool_result+text user records (manager
-    # messages injected MID-turn), which _is_prompt alone would admit. Known
-    # over-reach: a GENUINE interrupt prompt sent while a tool call is open
-    # also merges into the prior episode — money and API-call counts are
-    # unaffected, and 0 such prompts exist across the measured real corpus.
     if _is_prompt(record) and not open_turn:
         state["episodes"].append(_new_episode(ts, None))
 
@@ -249,8 +196,6 @@ def _price_bucket(bucket: dict, model, rates) -> dict:
 
 
 def _attr_rows(mapping: dict, label_keys: tuple, rates) -> list:
-    """(label..., model)-keyed buckets → rows merged by label, priced per
-    model bucket so a mixed-model label sums real per-model costs."""
     merged: dict = {}
     for key, bucket in mapping.items():
         *labels, model = key
@@ -268,12 +213,6 @@ def _attr_rows(mapping: dict, label_keys: tuple, rates) -> list:
 
 def build_report(main_log: Path, *, subagent_logs=None, started_at=None,
                  include_replayed=False, name=None, sid=None) -> dict:
-    """subagent_logs=None AUTO-DISCOVERS sidecars via the shared
-    transcript.subagent_logs_for — the SAME meaning None has in recount_spend,
-    deliberately: two money functions sharing a param name with opposite
-    None-defaults measured a 27% silent under-count for the bare
-    build_report(log) caller. Pass [] to deliberately scope to the main file.
-    """
     if subagent_logs is None:
         from .transcript import subagent_logs_for
         subagent_logs = subagent_logs_for(main_log, sid)
@@ -320,8 +259,6 @@ def build_report(main_log: Path, *, subagent_logs=None, started_at=None,
         row["cost"] += b["total"]
         row["api_calls"] += bucket["api_calls"]
         _add_tokens(row, bucket)
-    # Invariant: total == main + subagents exactly (same additions, no third
-    # accumulator to drift by float association).
     money["total"] = money["main"] + money["subagents"]
     by_model_rows = sorted(model_totals.values(),
                            key=lambda r: r["cost"], reverse=True)
@@ -396,22 +333,16 @@ def build_report(main_log: Path, *, subagent_logs=None, started_at=None,
 
 
 def _num(value, default=0.0) -> float:
-    """JSON-sourced timestamp → float; anything else (string, null, bool) →
-    default, so a malformed record can never break an ordering comparison."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return default
     return float(value)
 
 
 def _recency(primary, started_at) -> tuple:
-    """(recency, birth) ordering key. The birth leg is what breaks ties between
-    two LIVE records, which necessarily share the same synthetic `inf`
-    recency — without it their order is whatever the directory listed."""
     return (primary, _num(started_at))
 
 
 def _candidate_sources():
-    """Every place a session's identity can be recorded, newest-biased."""
     from . import paths, state
     from .spend_ledger import read_events
     for record in state.list_json_in(paths.ACTIVE):
@@ -420,7 +351,6 @@ def _candidate_sources():
                    "runtime": record.get("runtime") or "claude",
                    "started_at": record.get("started_at"),
                    "transcript_path": record.get("transcript_path"),
-                   # live sessions sort newest, whatever their clock says
                    "date": _recency(float("inf"), record.get("started_at"))}
     for record in state.list_json_in(paths.CLOSED):
         if isinstance(record, dict) and record.get("claude_sid"):
@@ -441,15 +371,6 @@ def _candidate_sources():
 
 
 def resolve_session(arg: str) -> dict | None:
-    """arg (sid or name) → {sid, name, runtime, started_at, log} or None.
-
-    Same-sid candidates merge (newer wins per field, older fills its gaps).
-    Distinct sids sharing a name: latest wins, others noted on stderr — the
-    report is read-only, so defaulting beats an error round-trip. That pick is
-    also reported structurally in `ambiguous_sids` (every sid the name matched,
-    newest first, picked one leading) so a --json consumer piping stdout is not
-    blind to it.
-    """
     import sys as _sys
     from .transcript import find_session_log
     by_sid: dict = {}
@@ -482,9 +403,6 @@ def resolve_session(arg: str) -> dict | None:
     if isinstance(recorded, str) and recorded and Path(recorded).is_file():
         log_path = Path(recorded)
     else:
-        # Report-time re-resolution: pre-#242 closed records carry no
-        # transcript_path; the transcript is still findable by sid while the
-        # file survives.
         log_path = find_session_log(match["sid"],
                                     runtime=match.get("runtime") or "claude")
     return {**match, "log": log_path}
@@ -513,10 +431,6 @@ def _fmt_tok(n) -> str:
 
 
 def _rate_keys_used(report: dict) -> list:
-    """Rate keys the money rows actually priced through — resolved by the same
-    lookup cost_breakdown used, so the printed table is what this session was
-    charged at rather than the whole catalogue. Falls back to the full table
-    when nothing resolved (every model unpriced)."""
     rates = report["prices"]["rates"]
     used = []
     for row in report["money"]["by_model"]:
@@ -526,7 +440,7 @@ def _rate_keys_used(report: dict) -> list:
     return used or sorted(rates)
 
 
-_TOOL_COL = 44   # fits an mcp__<server>__<tool> name without shifting the counts
+_TOOL_COL = 44
 
 
 def _render_text(report: dict) -> str:
@@ -591,8 +505,6 @@ def _render_text(report: dict) -> str:
                  f"{api_calls_str} · "
                  f"{sum(t['calls'] for t in report['tools'])} tool calls")
     if report["tools"]:
-        # Header and rows share one format string, so the column can never
-        # drift apart from the values it heads.
         lines.append(f"TOOLS         {'tool':<{_TOOL_COL}} {'calls':>5}  "
                      f"{'total-s':>7}  {'avg-s':>6}")
         for t in report["tools"]:
@@ -675,13 +587,9 @@ def run(argv=None) -> int:
                   "closed/, the spend ledger, or ~/.claude/projects)",
                   file=_sys.stderr)
             return 2
-    # Before the missing-transcript error: a codex session's transcript is
-    # findable but carries no usage, so "not found" would be the wrong story.
     if (resolved.get("runtime") or "claude") == "codex":
         note = "codex transcripts carry no usage data"
         if args.as_json:
-            # --json is parsed blind by its consumer: prose on stdout here
-            # would be a parse error, not a readable message.
             print(json.dumps({"session": {"name": resolved.get("name"),
                                           "sid": resolved.get("sid")},
                               "runtime": "codex", "note": note},

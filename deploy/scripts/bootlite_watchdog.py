@@ -1,69 +1,4 @@
 #!/usr/bin/env python3
-"""Boot-lite watchdog — LLM-free tick fallback for manager-less workers.
-
-All fleet self-healing (stale monitor, autonudge, limit recovery) runs inside
-the manager's Monitor task, so a manager that dies uncleanly leaves its
-surviving workers with zero supervision. The event half (hooks.session_end)
-catches manager closes that still fire the SessionEnd hook; THIS script is the
-fallback for the paths where no hook fires at all (SIGKILL, power loss,
-hardware crash). Design: deploy/loops-registry.md (bootlite-watchdog
-block; deployed to ~/.claude/dockwright/loops-registry.md).
-
-Invoked hourly by launchd (com.dockwright.bootlite-watchdog, installed by
-bootlite-install.sh) and manually with --dry-run. Zero tokens — every check is
-file/pid arithmetic, cloned from the gardener_gate.py pattern.
-
-Tick decision (run_tick):
-  stopped  — ~/.claude/dockwright/bootlite-stop exists. Nothing is scanned or written
-             beyond the check.log line.
-  ok       — no orphaned workers. Healthy sweep still runs: stretch-state
-             entries and orphans/<manager>.json flags whose group recovered
-             (manager alive again — e.g. a takeover inherited the name — or no
-             live workers remain) are dropped/unlinked with an orphan_cleared
-             ledger event. The sweep covers flags WITHOUT state entries too: a
-             flag whose stretch resolved before any tick saw it orphaned (the
-             takeover close-before-unlink race, a fast /manager-resume) must
-             not leak and poison a later same-name stretch's first_seen.
-  orphans  — live worker records whose parent manager has no live session:
-             parent_manager_name set and (no manager record with that name OR
-             its pid dead); legacy null-parent workers count only when NO live
-             manager exists at all (any live manager can adopt those via
-             _backfill_legacy_workers). Dead-pid worker records are sweep
-             debris, not orphans.
-
-Per orphan stretch (state.json entry keyed by manager name, "_unscoped" for
-the legacy group): first_seen is adopted from the event half's
-orphans/<manager>.json flag when present — and a source=session_end flag also
-seeds last_notified/notify_count=1, because the hook already notified at that
-moment. Notifications repeat at RENOTIFY_SEC (default 4h) up to
-MAX_NOTIFY_PER_STRETCH (default 6) per stretch — adoption of named orphans is
-manual today, so an unresolvable stretch must nag a bounded number of times,
-not forever. Past the cap the per-tick check.log keeps recording the orphan
-state (ledger events fire on transitions only).
-
-Autonudge (opt-in via CLAUDE_ORCH_AUTONUDGE=1, default OFF): each orphaned
-worker with a tmux window and NO pending question gets ONE typed message per
-stretch telling it the manager is gone and to bring its task to a durable
-checkpoint (commit/push, then worker_done — done events persist and any future
-manager reads them). Deliberately NOT "resume your task": the worker may be
-mid-flight and fine; what is broken is its control plane, so the correct move
-is durable completion, not a restart. Workers blocked inside ask_manager are
-skipped (typed text cannot submit into a blocked MCP call) — the human-facing
-notification covers those.
-
-Known limitations (accepted): pid reuse can pin a phantom "live" worker (EPERM
-reads alive — same exposure as the rest of the codebase), in which case the
-stretch clears only manually and the notify cap bounds the noise. A
-recreate-manager flow straddling a tick can notify spuriously once; the next
-tick's sweep clears it. Conversely, a tick racing a DYING manager (the hook
-just wrote the flag but the manager record+pid linger for a few more seconds)
-sees the group as healthy and sweeps the fresh flag — losing the first_seen
-seed, nothing else; the next tick re-detects with first_seen = then.
-Seconds-per-hour window, self-healing.
-
-Kill switch: touch ~/.claude/dockwright/bootlite-stop. Uninstall: launchctl bootout
-gui/$(id -u)/com.dockwright.bootlite-watchdog && rm the plist.
-"""
 from __future__ import annotations
 
 import argparse
@@ -89,7 +24,6 @@ HOME = Path(os.environ.get("HOME", ""))
 
 
 def _prefer_new(new: Path, legacy: Path) -> Path:
-    # deprecated, one release: legacy fallback while orchestrator-era state migrates
     if new.exists():
         return new
     if legacy.exists():
@@ -101,9 +35,6 @@ ORCH_ROOT = _prefer_new(HOME / ".claude" / "dockwright", HOME / ".claude" / "orc
 
 
 def _resolve_get_driver():
-    """Best-effort import of the terminal driver under /usr/bin/python3. terminal.py is
-    stdlib-only, so a sys.path insert of the repo src suffices. Returns the get_driver
-    callable or None (degrade to skip-nudge; never crash orphan detection)."""
     try:
         from dockwright.terminal import get_driver
         return get_driver
@@ -125,7 +56,6 @@ BOOTLITE_DIR = _prefer_new(HOME / ".claude" / "dockwright" / "bootlite", HOME / 
 STATE_PATH = BOOTLITE_DIR / "state.json"
 LEDGER_PATH = BOOTLITE_DIR / "ledger.jsonl"
 CHECK_LOG_PATH = BOOTLITE_DIR / "check.log"
-# deprecated, one release: operator stop-file honored at either home
 STOP_PATHS = (HOME / ".claude" / "dockwright" / "bootlite-stop", HOME / ".claude" / "bootlite-stop")
 
 RENOTIFY_SEC = _env_positive_int("BOOTLITE_RENOTIFY_SEC", 4 * 3600)
@@ -171,7 +101,6 @@ def _write_json_atomic(path: Path, data) -> None:
 
 
 def _bucket(manager_name) -> str:
-    """Group key / flag-file stem for a manager name (mirrors paths._event_bucket)."""
     if not manager_name:
         return UNSCOPED
     return str(manager_name).replace("/", "_").replace("\\", "_")
@@ -193,9 +122,6 @@ def _log_check(decision: str, detail: dict) -> None:
 
 
 def _notify_macos(message: str) -> None:
-    # No-op under pytest (PYTEST_CURRENT_TEST, inherited by child processes):
-    # a test exec'ing this deployed script must never fire a real desktop
-    # notification (the 2026-07-03 gardener-gate leak class).
     if os.environ.get("PYTEST_CURRENT_TEST"):
         return
     try:
@@ -221,9 +147,6 @@ def _pending_question_sids() -> set:
 
 
 def scan_orphans() -> dict[str, list[dict]]:
-    """Map group key -> live worker records whose parent manager has no live
-    session. Per-record defensive: corrupt JSON / non-int pid records are
-    skipped — one bad record must never abort the scan."""
     managers_alive: dict[str, bool] = {}
     workers: list[dict] = []
     if not ACTIVE.is_dir():
@@ -232,10 +155,6 @@ def scan_orphans() -> dict[str, list[dict]]:
         record = _read_json(record_path)
         if not isinstance(record, dict):
             continue
-        # Nested sub-sessions inherit CLAUDE_PARENT_MANAGER, so they'd read as
-        # a dead manager's workers (and a nested manager-ghost as a manager) —
-        # they're excluded from all lifecycle surfaces and die with their
-        # parent process; skip them entirely.
         if record.get("nested"):
             continue
         pid = record.get("pid")
@@ -259,10 +178,6 @@ def scan_orphans() -> dict[str, list[dict]]:
 
 
 def _load_state() -> dict:
-    """Stretch state, hostile-input safe BY SHAPE, not just by parse: a
-    valid-JSON-wrong-shape file ({"yak": 5}) would otherwise wedge every
-    subsequent tick with an AttributeError — and nothing repairs state.json
-    except this loader. Non-dict entries are dropped, not fatal."""
     data = _read_json(STATE_PATH)
     if not isinstance(data, dict):
         return {}
@@ -270,7 +185,6 @@ def _load_state() -> dict:
 
 
 def _sweep_resolved(groups: dict, state: dict, dry_run: bool) -> None:
-    """Drop stretch state + unlink orphan flags for groups that recovered."""
     flag_keys = set()
     if ORPHANS.is_dir():
         flag_keys = {p.stem for p in ORPHANS.glob("*.json")}
@@ -290,8 +204,6 @@ def _new_stretch_entry(key: str, now: float) -> dict:
     if isinstance(flag, dict) and isinstance(flag.get("orphaned_at"), (int, float)):
         entry["first_seen"] = float(flag["orphaned_at"])
         if flag.get("source") == "session_end":
-            # The hook already notified at that moment — don't double-notify
-            # inside the renotify window.
             entry["last_notified"] = float(flag["orphaned_at"])
             entry["notify_count"] = 1
     return entry

@@ -4,7 +4,6 @@ from dockwright import paths
 
 def test_root_under_dot_claude(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
-    # Re-import to pick up env change
     import importlib
     importlib.reload(paths)
     assert paths.ROOT == tmp_path / ".claude" / "dockwright"
@@ -42,8 +41,6 @@ def test_question_dir_for_scopes_parent_and_keeps_legacy_flat():
 def test_safe_segment_sanitizes_and_rejects():
     assert paths._safe_segment("TKT-SANDBOX-8353") == "TKT-SANDBOX-8353"
     assert paths._safe_segment("a b/c.d") == "a_b_c_d"
-    # Reject set is empty/whitespace only: dots sanitize to underscores, so the
-    # spec §5 "."/".." rejects are unreachable via the regex — they guard direct misuse.
     for bad in ("", "   "):
         with pytest.raises(ValueError):
             paths._safe_segment(bad)
@@ -106,7 +103,6 @@ def test_account_usage_path_uses_account_usage_dir(monkeypatch, tmp_path):
 
 
 def test_account_usage_not_in_ensure_dirs(tmp_path, monkeypatch):
-    # ACCOUNT_USAGE is lazy (statusline mkdir -p's it); ensure_dirs must NOT create it.
     from dockwright import paths
     monkeypatch.setattr(paths, "ROOT", tmp_path)
     for attr in ("ACTIVE","QUESTIONS","ANSWERS","DONE","CLOSED","HANDOFFS",
@@ -138,17 +134,13 @@ def test_tmux_conf_not_in_ensure_dirs(tmp_path, monkeypatch):
         monkeypatch.setattr(paths, attr, tmp_path / attr.lower())
     monkeypatch.setattr(paths, "MANAGER_MEMORY", tmp_path / "mm")
     monkeypatch.setattr(paths, "TMUX_CONF", tmp_path / "dockwright.tmux.conf")
-    monkeypatch.setattr(paths, "TMUX_CONF_LEGACY", tmp_path / "claude-orch.tmux.conf")  # NEW
+    monkeypatch.setattr(paths, "TMUX_CONF_LEGACY", tmp_path / "claude-orch.tmux.conf")
     monkeypatch.setattr(paths, "UNSCOPED_BUCKET", "_unscoped")
     paths.ensure_dirs()
     assert not (tmp_path / "dockwright.tmux.conf").exists()
-    assert not (tmp_path / "claude-orch.tmux.conf").exists()  # NEW
+    assert not (tmp_path / "claude-orch.tmux.conf").exists()
 
 
-# A manager name must resolve to EXACTLY ONE path segment. "/" and "\" were
-# already swapped; "." and ".." survived the swap and are traversal, not names
-# — `DONE / ".."` is DONE's parent. Every per-manager directory helper routes
-# through _event_bucket, so this is guarded once for all of them.
 @pytest.mark.parametrize("hostile,expected", [
     ("..", "_.."),
     (".", "_."),
@@ -169,8 +161,6 @@ def test_event_bucket_is_always_a_single_harmless_segment(hostile, expected):
     "notify_outbox_dir_for",
 ])
 def test_per_manager_dirs_cannot_escape_their_root(helper, tmp_path, monkeypatch):
-    """Enumerated broadly on purpose: every helper that turns a manager name
-    into a directory, not just the ones that looked risky."""
     monkeypatch.setattr(paths, "ROOT", tmp_path)
     monkeypatch.setattr(paths, "DONE", tmp_path / "done")
     monkeypatch.setattr(paths, "TURN_ENDS", tmp_path / "turn-ends")

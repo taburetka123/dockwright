@@ -1,20 +1,5 @@
-"""Behavioral tests for the finish_run() gates (gardener proposals 53614-1, 22586-7).
-
-Harness: exec the REAL script via the headless path (GARDENER_HEADLESS=1) with a
-scratch HOME — reaches finish_run() with no tmux. A stub `claude` on PATH writes
-the digest's Status line; the apply-check tests seed the REAL gardener_postrun.py
-+ gardener_apply.py (_seed_real_postrun), so the birth gate quarantines for real.
-run.log is the observable; quiet cases are anchored by "gardener-postrun:" in the
-log plus the surviving-proposal count in pending/ — quiet must be provably
-"postrun ran and rejected nothing", never "postrun absent" (drift-guard-tests).
-
-GARDENER_SCRIPT_UNDER_TEST exists for the boundary-mutation red proof: point it
-at a scratch copy whose `-gt` thresholds are flipped to `-ge` and the silent
-boundary cases MUST fail — proving they bind to the exact boundary, not to
-generic silence. Default always binds to the repo script.
-"""
+import json
 import os
-import re
 import shutil
 import subprocess
 import textwrap
@@ -35,34 +20,20 @@ def _headless_env(home, bindir):
         "PATH": f"{bindir}{os.pathsep}{env['PATH']}",
         "GARDENER_HEADLESS": "1",
         "GARDENER_CWD": str(home),
-        # Bounds the watchdog subshell's orphaned `sleep` (it inherits the
-        # script's stdio; a big value would stall pipe-reading callers).
         "GARDENER_TIMEOUT_SEC": "3",
     })
-    # loop-label-prefix.sh is sourced from the script's own repo dir, so
-    # dockwright_module_enabled IS defined here and resolves config via these
-    # vars BEFORE the scratch HOME — an ambient [modules] gardener=false would
-    # short-circuit every case at "module-off".
     env.pop("DOCKWRIGHT_CONFIG", None)
     env.pop("XDG_CONFIG_HOME", None)
-    # conftest's autouse isolation net sets DOCKWRIGHT_GARDENER_DIR for every
-    # test; gardener_postrun.py honors it while gardener-run.sh derives its
-    # dirs from HOME — pop it so every child process sees one scratch world.
     env.pop("DOCKWRIGHT_GARDENER_DIR", None)
     return env
 
 
-def _write_stub_claude(bindir, *, proposal_src=None, exit_code=0):
-    """Headless invocation is `claude -p --model … < <prompt-on-stdin>`.
-
-    The prompt moved to STDIN when the lane went default-deny: it now carries the
-    skill BODY (user-level skill discovery is gone with the settings sources), and
-    a body opening with YAML frontmatter cannot be an argument — `---…` parses as
-    an option. So scan argv AND stdin for run_id=. Optionally copies a prepared
-    proposal into pending/$RUN_ID-1.md so the postrun birth gate has this run's
-    proposal."""
+def _write_stub_claude(bindir, *, proposal_src=None, exit_code=0, stray_write=False):
     bindir.mkdir(parents=True, exist_ok=True)
     stub = bindir / "claude"
+    stray = ('mkdir -p "$HOME/.claude/rules"\n'
+             '        echo stray > "$HOME/.claude/rules/stray-fixture.md"\n'
+             if stray_write else "")
     write_proposal = ""
     if proposal_src is not None:
         write_proposal = textwrap.dedent(f"""\
@@ -81,14 +52,7 @@ def _write_stub_claude(bindir, *, proposal_src=None, exit_code=0):
         if [ -z "$RUN_ID" ] && [ ! -t 0 ]; then
           RUN_ID=$(sed -n 's/.*run_id=\\([^ ]*\\).*/\\1/p' | head -1)
         fi
-        {write_proposal}
-        # The headless join now requires real digest CONTENT, not just a
-        # self-reported Status line: a child that could read nothing still printed
-        # `Status: ok`, and accepting that touched the cadence marker and told the
-        # operator a digest was ready. Two independent checks guard it — a `## `
-        # section AND a byte floor — because the prompt itself instructs those
-        # headings, so a hollow child could echo them over empty bodies. A stub
-        # standing in for a SUCCESSFUL run must therefore look like one.
+        {write_proposal}{stray}
         echo "## Clusters"
         for i in $(seq 1 12); do
           echo "### $i. cluster-$i — 3 sessions"
@@ -111,18 +75,12 @@ TARGET_LINES = "alpha\nbeta\ngamma\n"
 
 
 def _seed_real_postrun(home):
-    """Real post-processor + actuator in the scratch home: gates downstream of
-    postrun must be tested in a world where postrun exists — its birth gate
-    quarantines failing proposals before finish_run ever sees them."""
     scripts = home / ".claude" / "scripts"
     shutil.copy(REPO_SCRIPTS / "gardener_postrun.py", scripts / "gardener_postrun.py")
     shutil.copy(REPO_SCRIPTS / "gardener_apply.py", scripts / "gardener_apply.py")
 
 
 def _git_init_claude_target(home):
-    """classify_proposal needs a git-versioned target root; a non-git root is
-    an env-lenient pass, so the quarantine tests git-init the scratch ~/.claude
-    and track one target file."""
     claude = home / ".claude"
     target = claude / "gardener-target.md"
     target.write_text(TARGET_LINES)
@@ -135,9 +93,6 @@ def _git_init_claude_target(home):
 
 
 def _proposal_text(target, *, drifted):
-    """Schema-valid proposal whose diff either applies to TARGET_LINES (clean)
-    or anchors on context that does not exist (drifted -> birth-gate
-    quarantine). Target sits outside rules//agents/ so always_on_bytes is 0."""
     ctx = ["WRONG-ONE", "WRONG-TWO", "WRONG-THREE"] if drifted \
         else ["alpha", "beta", "gamma"]
     return textwrap.dedent(f"""\
@@ -177,8 +132,6 @@ def _proposal_text(target, *, drifted):
 
 
 def _run_script(home, bindir, tmp_path):
-    """stdout/stderr go to FILES, not pipes: the headless watchdog's orphaned
-    `sleep` inherits the script's stdio and would hold a pipe open past exit."""
     out, err = tmp_path / "script-out.log", tmp_path / "script-err.log"
     with open(out, "w") as o, open(err, "w") as e:
         r = subprocess.run(["bash", str(SCRIPT), "--trigger", "force"],
@@ -192,13 +145,7 @@ def _run_log(gdir):
     return p.read_text() if p.exists() else ""
 
 
-# ---- Task 1: postrun quarantine surfacing (proposal 53614-1) ---------------
-
-
 def test_applycheck_surfaces_quarantine(tmp_path):
-    """A REAL postrun quarantine (drifted diff, real classifier, real git
-    root) must reach run.log as REJECTED:N — the file moves to rejected/
-    silently otherwise."""
     home = tmp_path / "home"
     gdir = _seed_gardener_home(home)
     _seed_real_postrun(home)
@@ -215,9 +162,6 @@ def test_applycheck_surfaces_quarantine(tmp_path):
 
 
 def test_applycheck_quiet_on_clean_run(tmp_path):
-    """Quiet must mean postrun-ran-and-rejected-nothing: no applycheck line,
-    but the parsed summary is provably present and the proposal survived
-    the birth gate into pending."""
     home = tmp_path / "home"
     gdir = _seed_gardener_home(home)
     _seed_real_postrun(home)
@@ -235,9 +179,6 @@ def test_applycheck_quiet_on_clean_run(tmp_path):
 
 
 def test_applycheck_surfaces_postrun_crash(tmp_path):
-    """The one genuine residual the old subprocess gate could not serve:
-    postrun absent/crashed is swallowed by `|| true` — the summary parse
-    must then fail LOUD, never read as a clean run."""
     home = tmp_path / "home"
     gdir = _seed_gardener_home(home)
     _write_stub_claude(tmp_path / "bin")
@@ -249,9 +190,6 @@ def test_applycheck_surfaces_postrun_crash(tmp_path):
 
 
 def _prose_brief_text(target):
-    """kind: build-brief legitimately ships a prose ## Diff (no ```diff
-    fence) — a postrun PASS class the old subprocess gate false-positived
-    on (strict CLI check exits 2 on no-diff)."""
     return textwrap.dedent(f"""\
         ---
         id: finish-gates-fixture-2
@@ -281,9 +219,6 @@ def _prose_brief_text(target):
 
 
 def test_applycheck_quiet_on_prose_diff_brief(tmp_path):
-    """Postrun's pass classes must NOT resurface as failures: a build-brief's
-    prose ## Diff is a deliberate no-diff PASS — the old subprocess gate
-    false-positived exactly here."""
     home = tmp_path / "home"
     gdir = _seed_gardener_home(home)
     _seed_real_postrun(home)
@@ -301,31 +236,37 @@ def test_applycheck_quiet_on_prose_diff_brief(tmp_path):
     assert len(list((gdir / "proposals" / "pending").glob("*.md"))) == 1, log
 
 
-def test_applycheck_notify_is_wired():
-    """notify() is un-exercisable under pytest — pin both branches' notify
-    calls to executed lines adjacent to their behaviorally-proven run_log
-    lines."""
-    lines = SCRIPT.read_text().splitlines()
-    rej = [i for i, l in enumerate(lines)
-           if re.match(r'\s*run_log "applycheck" "REJECTED:', l)]
-    unp = [i for i, l in enumerate(lines)
-           if re.match(r'\s*run_log "applycheck" "postrun-unparseable', l)]
-    assert len(rej) == 1 and len(unp) == 1, (rej, unp)
-    assert re.match(
-        r'\s*notify "gardener \$RUN_ID: \$postrun_rejected proposal\(s\) quarantined',
-        lines[rej[0] + 1]), lines[rej[0] + 1]
-    assert re.match(
-        r'\s*notify "gardener \$RUN_ID: postrun failed/unparseable',
-        lines[unp[0] + 1]), lines[unp[0] + 1]
+def test_applycheck_notifications_stay_loud(tmp_path):
+    home = tmp_path / "home"
+    gdir = _seed_gardener_home(home)
+    _seed_manager(home, "loud-quarantine", "general")
+    _seed_real_postrun(home)
+    target = _git_init_claude_target(home)
+    src = tmp_path / "fixture-proposal.md"
+    src.write_text(_proposal_text(target, drifted=True))
+    _write_stub_claude(tmp_path / "bin", proposal_src=src)
+    rc, _, _ = _run_script(home, tmp_path / "bin", tmp_path)
+    assert rc == 0
+    log = _run_log(gdir)
+    assert "REJECTED:1" in log, log
+    assert not _routed_lines(home, "loud-quarantine", "quarantined"), \
+        _outbox_lines(home, "loud-quarantine")
 
 
-# ---- Task 2: size/age-gated backlog escalation (proposal 22586-7) ----------
+def test_postrun_crash_notification_stays_loud(tmp_path):
+    home = tmp_path / "home"
+    gdir = _seed_gardener_home(home)
+    _seed_manager(home, "loud-unparseable", "general")
+    _write_stub_claude(tmp_path / "bin")
+    rc, _, _ = _run_script(home, tmp_path / "bin", tmp_path)
+    assert rc == 0
+    log = _run_log(gdir)
+    assert "postrun-unparseable" in log, log
+    assert not _routed_lines(home, "loud-unparseable", "postrun failed"), \
+        _outbox_lines(home, "loud-unparseable")
 
 
 def _seed_pending_backlog(gdir, count, oldest_age_days=None):
-    """Seed pending/*.md (names incidental — nothing in the script keys on
-    them; these tests run without postrun, so the seeded count stays stable).
-    oldest_age_days sets ONE file's mtime that many whole days + 1h back."""
     pending = gdir / "proposals" / "pending"
     pending.mkdir(parents=True, exist_ok=True)
     for i in range(count):
@@ -351,9 +292,6 @@ def test_backlog_fires_above_count_threshold(tmp_path):
 
 
 def test_backlog_silent_at_count_threshold(tmp_path):
-    """-gt 20: exactly 20 stays silent. The finished-line anchor proves the
-    silence is finish_run-ok silence, not an early exit (stop file, lock,
-    module-off, missing preset all exit 0 with no backlog line)."""
     home = tmp_path / "home"
     gdir = _seed_gardener_home(home)
     _seed_pending_backlog(gdir, 20)
@@ -368,8 +306,6 @@ def test_backlog_silent_at_count_threshold(tmp_path):
 
 
 def test_backlog_fires_above_age_threshold(tmp_path):
-    """15 whole days (integer division of now−mtime by 86400) > 14 → fires,
-    even with a tiny backlog (count 1)."""
     home = tmp_path / "home"
     gdir = _seed_gardener_home(home)
     _seed_pending_backlog(gdir, 1, oldest_age_days=15)
@@ -383,8 +319,6 @@ def test_backlog_fires_above_age_threshold(tmp_path):
 
 
 def test_backlog_silent_at_age_threshold(tmp_path):
-    """-gt 14: exactly 14 whole days stays silent; same ran-anchor as the
-    count-boundary case."""
     home = tmp_path / "home"
     gdir = _seed_gardener_home(home)
     _seed_pending_backlog(gdir, 1, oldest_age_days=14)
@@ -396,13 +330,228 @@ def test_backlog_silent_at_age_threshold(tmp_path):
     assert "  backlog  " not in log, log
 
 
-def test_backlog_notify_is_wired():
-    """Same executed-line + adjacency pin as the applycheck twin: the notify
-    half is unreachable behaviorally, so bind it to the run_log line whose
-    placement the behavioral cases prove (same branch, adjacent line)."""
-    lines = SCRIPT.read_text().splitlines()
-    hits = [i for i, l in enumerate(lines)
-            if re.match(r'\s*run_log "backlog" ', l)]
-    assert len(hits) == 1, hits
-    assert re.match(r'\s*notify "gardener backlog: ', lines[hits[0] + 1]), \
-        lines[hits[0] + 1]
+DEAD_PID = 0x7FFFFFFE
+
+
+def _seed_manager(home, name, domain, *, started_at=1000.0, pid=None, **extra):
+    active = home / ".claude" / "dockwright" / "active"
+    active.mkdir(parents=True, exist_ok=True)
+    record = {"claude_sid": name, "agent": "manager", "name": name,
+              "parent_manager_name": None, "started_at": started_at,
+              "pid": os.getpid() if pid is None else pid}
+    if domain is not None:
+        record["domain"] = domain
+    record.update(extra)
+    (active / f"{name}.json").write_text(json.dumps(record))
+
+
+def _outbox_lines(home, manager_name):
+    d = home / ".claude" / "dockwright" / "notify-outbox" / manager_name
+    if not d.is_dir():
+        return []
+    return [json.loads(p.read_text())["line"] for p in sorted(d.glob("*.json"))]
+
+
+def _routed_lines(home, manager_name, needle):
+    return [l for l in _outbox_lines(home, manager_name) if needle in l]
+
+
+def test_digest_ready_addresses_the_general_manager(tmp_path):
+    home = tmp_path / "home"
+    _seed_gardener_home(home)
+    _seed_manager(home, "green-otter", "general")
+    _write_stub_claude(tmp_path / "bin")
+    rc, _, _ = _run_script(home, tmp_path / "bin", tmp_path)
+    assert rc == 0
+    assert len(_routed_lines(home, "green-otter", "digest ready")) == 1, \
+        _outbox_lines(home, "green-otter")
+
+
+def test_peer_domain_managers_are_not_addressed(tmp_path):
+    home = tmp_path / "home"
+    _seed_gardener_home(home)
+    _seed_manager(home, "green-otter", "general")
+    _seed_manager(home, "blue-heron", "product")
+    _seed_manager(home, "grey-marten", "job-search")
+    _write_stub_claude(tmp_path / "bin")
+    rc, _, _ = _run_script(home, tmp_path / "bin", tmp_path)
+    assert rc == 0
+    assert len(_routed_lines(home, "green-otter", "digest ready")) == 1
+    assert _outbox_lines(home, "blue-heron") == []
+    assert _outbox_lines(home, "grey-marten") == []
+
+
+def test_manager_without_a_domain_key_counts_as_general(tmp_path):
+    home = tmp_path / "home"
+    _seed_gardener_home(home)
+    _seed_manager(home, "old-record", None)
+    _write_stub_claude(tmp_path / "bin")
+    rc, _, _ = _run_script(home, tmp_path / "bin", tmp_path)
+    assert rc == 0
+    assert len(_routed_lines(home, "old-record", "digest ready")) == 1, \
+        _outbox_lines(home, "old-record")
+
+
+def test_newest_general_manager_wins_a_recreate_overlap(tmp_path):
+    home = tmp_path / "home"
+    _seed_gardener_home(home)
+    _seed_manager(home, "old-mgr", "general", started_at=1000.0)
+    _seed_manager(home, "new-mgr", "general", started_at=2000.0)
+    _write_stub_claude(tmp_path / "bin")
+    rc, _, _ = _run_script(home, tmp_path / "bin", tmp_path)
+    assert rc == 0
+    assert len(_routed_lines(home, "new-mgr", "digest ready")) == 1
+    assert _outbox_lines(home, "old-mgr") == []
+
+
+def test_nested_manager_record_is_never_the_addressee(tmp_path):
+    home = tmp_path / "home"
+    _seed_gardener_home(home)
+    _seed_manager(home, "ghost-mgr", "general", started_at=9000.0, nested=True)
+    _seed_manager(home, "real-mgr", "general", started_at=1000.0)
+    _write_stub_claude(tmp_path / "bin")
+    rc, _, _ = _run_script(home, tmp_path / "bin", tmp_path)
+    assert rc == 0
+    assert len(_routed_lines(home, "real-mgr", "digest ready")) == 1
+    assert _outbox_lines(home, "ghost-mgr") == []
+
+
+def test_a_dead_managers_record_is_not_an_addressee(tmp_path):
+    home = tmp_path / "home"
+    gdir = _seed_gardener_home(home)
+    _seed_manager(home, "dead-mgr", "general", pid=DEAD_PID)
+    _write_stub_claude(tmp_path / "bin")
+    rc, _, _ = _run_script(home, tmp_path / "bin", tmp_path)
+    assert rc == 0
+    assert _outbox_lines(home, "dead-mgr") == []
+    assert list((home / ".claude" / "dockwright" / "notify-outbox"
+                 ).rglob("*.json")) == []
+    assert "fell back to a desktop notification" in _run_log(gdir)
+
+
+def test_a_dead_newer_manager_does_not_shadow_a_live_older_one(tmp_path):
+    home = tmp_path / "home"
+    _seed_gardener_home(home)
+    _seed_manager(home, "dead-successor", "general", started_at=2000.0, pid=DEAD_PID)
+    _seed_manager(home, "live-predecessor", "general", started_at=1000.0)
+    _write_stub_claude(tmp_path / "bin")
+    rc, _, _ = _run_script(home, tmp_path / "bin", tmp_path)
+    assert rc == 0
+    assert len(_routed_lines(home, "live-predecessor", "digest ready")) == 1
+    assert _outbox_lines(home, "dead-successor") == []
+
+
+def test_a_pid_we_may_not_signal_still_counts_as_alive(tmp_path):
+    home = tmp_path / "home"
+    _seed_gardener_home(home)
+    _seed_manager(home, "root-owned-mgr", "general", pid=1)
+    _write_stub_claude(tmp_path / "bin")
+    rc, _, _ = _run_script(home, tmp_path / "bin", tmp_path)
+    assert rc == 0
+    assert len(_routed_lines(home, "root-owned-mgr", "digest ready")) == 1, \
+        _outbox_lines(home, "root-owned-mgr")
+
+
+def test_a_boolean_pid_is_not_read_as_pid_one(tmp_path):
+    home = tmp_path / "home"
+    _seed_gardener_home(home)
+    _seed_manager(home, "bool-pid-mgr", "general", pid=True)
+    _write_stub_claude(tmp_path / "bin")
+    rc, _, _ = _run_script(home, tmp_path / "bin", tmp_path)
+    assert rc == 0
+    assert list((home / ".claude" / "dockwright" / "notify-outbox"
+                 ).rglob("*.json")) == []
+
+
+def test_no_general_manager_writes_no_outbox_entry(tmp_path):
+    home = tmp_path / "home"
+    gdir = _seed_gardener_home(home)
+    _seed_manager(home, "blue-heron", "product")
+    _write_stub_claude(tmp_path / "bin")
+    rc, _, _ = _run_script(home, tmp_path / "bin", tmp_path)
+    assert rc == 0
+    assert "  finished  " in _run_log(gdir)
+    assert _outbox_lines(home, "blue-heron") == []
+    outbox_root = home / ".claude" / "dockwright" / "notify-outbox"
+    assert list(outbox_root.rglob("*.json")) == []
+
+
+def test_backlog_escalation_addresses_the_general_manager_once(tmp_path):
+    home = tmp_path / "home"
+    gdir = _seed_gardener_home(home)
+    _seed_pending_backlog(gdir, 21)
+    _seed_manager(home, "green-otter", "general")
+    _write_stub_claude(tmp_path / "bin")
+    rc, _, _ = _run_script(home, tmp_path / "bin", tmp_path)
+    assert rc == 0
+    assert "  backlog  " in _run_log(gdir)
+    assert len(_routed_lines(home, "green-otter", "gardener backlog")) == 1, \
+        _outbox_lines(home, "green-otter")
+
+
+def test_stray_path_audit_addresses_the_general_manager(tmp_path):
+    home = tmp_path / "home"
+    gdir = _seed_gardener_home(home)
+    _seed_manager(home, "green-otter", "general")
+    _write_stub_claude(tmp_path / "bin", stray_write=True)
+    rc, _, _ = _run_script(home, tmp_path / "bin", tmp_path)
+    assert rc == 0
+    log = _run_log(gdir)
+    assert "unattributed writes outside gardener/" in log, log
+    assert len(_routed_lines(home, "green-otter", "writes outside gardener/")) == 1, \
+        _outbox_lines(home, "green-otter")
+    audit_files = list((gdir / "runs").rglob("audit-stray-paths.txt"))
+    assert len(audit_files) == 1 and "rules/stray-fixture.md" in audit_files[0].read_text()
+
+
+def test_clean_run_writes_no_audit_line(tmp_path):
+    home = tmp_path / "home"
+    gdir = _seed_gardener_home(home)
+    _seed_manager(home, "green-otter", "general")
+    _write_stub_claude(tmp_path / "bin")
+    rc, _, _ = _run_script(home, tmp_path / "bin", tmp_path)
+    assert rc == 0
+    assert "unattributed writes outside gardener/" not in _run_log(gdir)
+    assert _routed_lines(home, "green-otter", "writes outside gardener/") == []
+
+
+def test_outbox_entry_matches_the_drain_contract(tmp_path):
+    home = tmp_path / "home"
+    _seed_gardener_home(home)
+    _seed_manager(home, "green-otter", "general")
+    _write_stub_claude(tmp_path / "bin")
+    before = time.time()
+    rc, _, _ = _run_script(home, tmp_path / "bin", tmp_path)
+    assert rc == 0
+    entries = sorted((home / ".claude" / "dockwright" / "notify-outbox"
+                      / "green-otter").glob("*.json"))
+    assert entries, "no outbox entry written"
+    payload = json.loads(entries[0].read_text())
+    assert isinstance(payload["line"], str) and payload["line"]
+    assert payload["kind"] == "gardener"
+    assert before <= payload["buffered_at"] <= time.time()
+    assert not list((home / ".claude" / "dockwright" / "notify-outbox"
+                     / "green-otter").glob("*.tmp")), "atomic write leaked a temp file"
+
+
+def test_the_real_consumer_delivers_what_the_real_producer_wrote(tmp_path,
+                                                                 monkeypatch,
+                                                                 capsys):
+    from dockwright import monitor, paths
+
+    home = tmp_path / "home"
+    _seed_gardener_home(home)
+    _seed_manager(home, "green-otter", "general")
+    _write_stub_claude(tmp_path / "bin")
+    rc, _, _ = _run_script(home, tmp_path / "bin", tmp_path)
+    assert rc == 0
+
+    monkeypatch.setattr(paths, "ROOT", home / ".claude" / "dockwright")
+    capsys.readouterr()
+    monitor._drain_notify_outbox("green-otter")
+    out = capsys.readouterr()
+
+    assert "digest ready" in out.out, (out.out, out.err)
+    assert "outbox drain failed" not in out.err
+    assert list(paths.notify_outbox_dir_for("green-otter").glob("*.json")) == [], \
+        "a delivered entry must be unlinked, or it replays every drain"

@@ -3,6 +3,34 @@
 User-facing release notes for dockwright. Entries describe what an adopter
 gets, not internal development history.
 
+## v1.5.0 — 2026-09-03
+
+- **Four self-improvement gates are gone: the corpus-watch trigger gate and the headless spawn audit, plus two development-only CI gates.** Both named gates were v1.4.0 headline features. Nothing replaces them in reduced form and no check moved elsewhere. **If you ran `corpus-watch-install.sh`, clean it up by hand — `setup.sh` will not.** It copies files in and never deletes a script that left the release, and it never touches launchd, so both the plist and its gate script survive an upgrade and the loop keeps firing and keeps spending. Remove the scripts, which is what stops the spend:
+
+  ```
+  rm -f ~/.claude/scripts/{corpus_watch_gate.py,corpus-watch-run.sh,corpus-watch-install.sh,headless_scan.py}
+  ```
+
+  Then, if the installer had already bootstrapped the agent, unload the plist too (substitute your own `[loops] label_prefix` for `com.dockwright`):
+
+  ```
+  launchctl bootout gui/$(id -u)/com.dockwright.corpus-watch
+  rm -f ~/Library/LaunchAgents/com.dockwright.corpus-watch.plist
+  ```
+
+  Only an operator who deliberately ran that installer is affected: the loop shipped `status: pending-install` and never armed itself on a plain clone-and-install. `dockwright uninstall` finds the plist by label prefix and removes it, so a full uninstall needs no hand step.
+- **`dockwright.__version__` is gone. Use `importlib.metadata.version("dockwright")`.** The attribute had read `"0.3.0"` since 2026-07-07 and never tracked the real version, so it shipped saying `0.3.0` at v1.0.0 through v1.4.0. Anything you built on that value was working from a wrong number. `importlib.metadata` has always returned the right answer and now it is the only answer. Removed rather than corrected because nothing consumed it and a hand-maintained parallel copy of the version is what caused the problem.
+- **A worker reports to its manager through `worker_done`, not into its own pane.** A worker that took a turn after calling `worker_done` used to leave that output where only a human watching the pane would see it. Measured before the change: none of 70 completion records carried a report, while 5 of 13 live worker panes did.
+- **A peer manager's message names its sender.** `send_manager_to_manager` types straight into the recipient's pane, so a peer's message arrived indistinguishable from the operator typing. It now carries a sender header, matching the `[MANAGER]` prefix `send_manager_to_worker` has always used.
+- **The fleet reads a worker's own transcript to decide whether it is working.** A worker whose transcript was written in the last 120 seconds counts as working — for the fleet icon and for the idle auto-close sweep, which previously judged both from a state field that lags. An unmounted volume now counts as reapable rather than blocking the sweep.
+- **Idle fleet workers sort by last activity, freshest first**, instead of alphabetically. Active workers keep their stable order so they do not jump around while you read the list.
+- **A re-tasked worker's next finish reaches its manager.** A worker given new work after `worker_done` lost its following silent turn-end permanently, because a completion less than 10 minutes old suppressed it and suppression consumed the signal.
+- **`loops_status.py` reports a running loop correctly when `[loops] label_prefix` does not start with `com.`** It read `launchctl list` through a `com.`-only filter, so it called such a loop `not loaded` and flagged drift against it. The shipped default prefix is `com.dockwright`, so this only affected an install that changed the prefix.
+- **The manager notebook now ships with the skill that maintains it.** New `dockwright-notebook-hygiene` skill. A manager may no longer state a notebook entry as current fact without re-deriving it in the same session, and the notebook is verified and pruned before every handoff and every manager close. The mandate already shipped; the skill carrying it did not.
+- **Gardener run notifications address one manager instead of the whole machine.** A routine gardener run fired up to four desktop notifications, and a desktop popup has no addressee.
+- **A recap item that waits on you carries its own context** — what the thing is, what your answer unblocks, the options, and what happens if you do nothing — rather than a bare ticket key or PR number.
+- **The shipped code carries no comments or docstrings.** Roughly 10,000 lines of comment and docstring text left `src/` and `deploy/`. Tests that asserted over other tests, or over source text instead of behavior, went with them. This is a house style. Where a comment was carrying meaning the code did not carry itself, that meaning is now a gap.
+
 ## v1.4.0 — 2026-08-25
 
 - **Per-session spend attribution.** `dockwright spend-report <worker|session-id>` breaks one session's cost down from its own transcripts, with cache-read called out as the dominant component rather than buried — so an expensive worker is identifiable instead of merely suspected.

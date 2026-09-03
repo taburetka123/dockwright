@@ -1,11 +1,3 @@
-"""A scan that could not persist its dedup state must not claim it delivered.
-
-The heartbeat means "this lane is delivering". A `stale` scan whose
-emitted-state write failed is about to re-page everything it just paged and
-re-fire the acts it just performed — and `dockwright lanes` reading OK through
-that is the report claiming health while broken, which is the one failure this
-whole change exists to remove.
-"""
 import json
 
 import pytest
@@ -36,7 +28,6 @@ def test_no_heartbeat_when_the_cursor_write_failed(sm_root, monkeypatch):
 
 
 def test_heartbeat_is_written_on_a_clean_scan(sm_root):
-    """The other direction — otherwise 'never heartbeat' would pass."""
     assert stale_monitor.main(manager_name="mgr") == 0
     record = json.loads(
         stale_monitor._lane_heartbeat_path("mgr", "stale").read_text())

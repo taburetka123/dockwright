@@ -15,6 +15,6 @@ Catch the user up on everything that happened since their previous **typed** mes
    - **Actions taken** — workers spawned/killed/resumed/merged, PRs opened/merged, commits pushed, configs deployed, decisions made: each with its concrete artifact (SHA / PR# / file path).
    - **Current state** — in-flight workers + state, open PRs + mergeability, pending questions.
 3. Ground it in live state, don't recap from memory: in manager mode call `list_workers(manager_sid=<your sid>)` + `list_pending_questions(...)`, and `gh pr view <n>` for any PR touched; verify claimed artifacts before relaying (per the manager agent file § Verify before relay).
-4. End with **open threads / decisions still waiting on the user** — a short actionable list. That's the point of the recap.
+4. End with **open threads / decisions still waiting on the user** — a short actionable list. That's the point of the recap. Each item is self-contained: the user reads it cold, often hours later, with no other context open. Name what the thing is in plain words, what is blocked on the user's answer, the options, and what happens if the user does nothing — never a bare ticket key, PR number, or name alone (`~/.claude/agents/manager.md` § Message formatting (user-facing) owns the no-bare-number rule; it binds here too). This weight applies only to this list — keep everything above it as compressed as today.
 
 If nothing happened since the user's last message, say so in one line. Keep it tight: events → actions → state → what's-waiting-on-you. Skip routine/benign pings.

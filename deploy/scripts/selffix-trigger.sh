@@ -1,72 +1,22 @@
 #!/usr/bin/env bash
-# Canonical source: deploy/scripts/selffix-trigger.sh @ taburetka123/claude-orchestrator
-# — deployed to ~/.claude/scripts/ by setup.sh. Edit the repo copy, not the deployed one.
-#
-# SessionEnd hook: decide whether the just-ended session deserves a
-# /dockwright-selffix retrospective.
-#   - HIGH signal  -> spawn selffix-run.sh in the background (writes findings).
-#   - LOW / none   -> log a none line, no action.
-#   - SKIP reasons -> log a skip line with reason.
-# Always exits 0 fast; never blocks the session close.
-#
-# Historical note: this hook used to fire on Stop (every assistant turn) and
-# spawn on the first HIGH-signal Stop. That captured pre-PR work only — any
-# post-PR discussion (code-review handling, user pushback peeling back
-# over-engineered fixes, etc.) was always missed because subsequent Stops hit
-# the findings-exist gate. Moved to SessionEnd 2026-05-13: trigger fires
-# exactly once at session close with the full transcript in hand.
-# Trade-off: SIGKILL / power loss / hardware crash bypass SessionEnd and
-# leave no retro for that session. Accepted; rare and recoverable via manual
-# /dockwright-selffix on the saved transcript if needed.
-#
-# All outcomes land in ~/.claude/dockwright/selffix/trigger.log so the trigger
-# is traceable post-hoc — every SessionEnd fires the script, and every fire
-# writes exactly one line.
-#
-# Contract (see also ~/.claude/scripts/selffix-run.sh and
-# ~/.claude/skills/dockwright-selffix/SKILL.md):
-#   trigger  -> nohup spawn worker with (transcript-path, session-id)
-#   worker   -> claude -p "/dockwright-selffix --transcript <path>" > $OUT
-#               (spawned with --disallowedTools "Write,Edit,NotebookEdit")
-#   skill    -> emits findings to stdout ONLY; never calls Write/Edit
-# If you change one file, update the other two.
 
 set -u
 
-# The OUTCOME line is UNCONDITIONAL — this file is the loop's ledger
-# (loops-registry `ledger_path` + `event_paths`), and the freshness gate over it
-# is only meaningful if every fire leaves a mark. A ledger written only in debug
-# mode is a permanently-STALE gate that trains you to ignore the fleet report.
-# DEBUG adds the verbose EXTRAS (housekeeping counters) on top. Turn it on with:
-#   touch ~/.claude/dockwright/selffix/debug
-#   or export SELFFIX_DEBUG=1 in your shell rc
 LOG="$HOME/.claude/dockwright/selffix/trigger.log"
 mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
 DEBUG=0
-# deprecated, one release: legacy debug flag honored while docs/habits migrate
 if [ -f "$HOME/.claude/dockwright/selffix/debug" ] || [ -f "$HOME/.claude/selffix-debug" ] || [ "${SELFFIX_DEBUG:-}" = "1" ]; then
   DEBUG=1
 fi
 TS() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log_line() {
-  # log_line <outcome> <session> <reasons-or-detail> — one per invocation, always.
-  # `|| true` keeps a failed write from ever failing session close. Deliberately
-  # NOT silenced: bash reports an unopenable >> target before any redirect here
-  # could apply, so a 2>/dev/null would suppress nothing and only imply it did.
   echo "$(TS)  $1  ${2:--}  ${3:-}" >> "$LOG" || true
 }
 log_debug() {
-  # Verbose extras (prune counters): DEBUG-only, so the ledger stays one line per fire.
   [ "$DEBUG" = "1" ] || return 0
   log_line "$@"
 }
 
-# [modules] gardener toggle: this SessionEnd retro is the head of the Gardener
-# pipeline, so `[modules] gardener=false` must no-op it (design-gate: the toggle
-# cleanly disables the WHOLE chain, proven by tests). Bail before reading the
-# payload or running the detect. Sourcing the shared helper is best-effort — a
-# missing lib (e.g. a test that copied only this script) means fail-open =
-# module enabled, so the historic detect path is unaffected.
 _SELFFIX_SD="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=loop-label-prefix.sh
 . "$_SELFFIX_SD/loop-label-prefix.sh" 2>/dev/null || true
@@ -81,31 +31,16 @@ if [ -z "$PAYLOAD" ]; then
   exit 0
 fi
 
-# Resolve the HIGH-complexity skill set from [gardener] high_skills (empty
-# default → skill-based HIGH detection is OFF generically). Read here via the
-# sourced helper (bare python3, tomllib-or-scanner) and passed into the detect
-# heredoc as an env var — the heredoc runs under /usr/bin/python3, which on this
-# machine is 3.9 with NO tomllib, so it must NOT parse config itself.
 SELFFIX_HIGH_SKILLS=""
 if command -v dockwright_high_skills >/dev/null 2>&1; then
   SELFFIX_HIGH_SKILLS="$(dockwright_high_skills 2>/dev/null || true)"
 fi
 
-# The human-fix-flag predicate is CANONICAL in transcript_signal.py and imported
-# by the detect heredoc below — this script decides whether to SPAWN the retro,
-# selffix-run.sh's gate decides whether it may RUN, and two hand-written matchers
-# for one concept drift silently (measured: whitespace / case / window shapes
-# where one fires and the other does not, dropping the flagged session with no
-# visible signal). A missing helper surfaces as a `fix-predicate-unavailable`
-# REASON on this fire's single outcome line — deliberately not a second log line,
-# because `loops-registry` promises exactly one ledger line per fire.
 DETECT=$(SELFFIX_PAYLOAD="$PAYLOAD" SELFFIX_HIGH_SKILLS="$SELFFIX_HIGH_SKILLS" \
   SELFFIX_SIGNAL_DIR="$_SELFFIX_SD" /usr/bin/python3 - <<'PY' 2>/dev/null
 import hashlib, json, os, re, sys
 
 def bail(level, detail):
-    # Emit the same 4-line shape as a normal detect so the bash side can route
-    # the outcome through the standard log path with a distinguishable reason.
     print(level)
     print("-")
     print("-")
@@ -127,31 +62,11 @@ if not os.path.isfile(transcript):
 if not session_id:
     session_id = os.path.basename(transcript).rsplit(".jsonl", 1)[0]
 
-# cwd + first-user-message feed the dedup key (see end of script). cwd may be in
-# the payload; if not, it's filled from the active record below.
 cwd = payload.get("cwd") or ""
 
-# HIGH-complexity skills come from [gardener] high_skills (resolved by the bash
-# side, passed in via SELFFIX_HIGH_SKILLS — newline-separated). Empty default →
-# skill-based HIGH detection is OFF generically; an operator opts in via config.
 HIGH_SKILLS = {s for s in os.environ.get("SELFFIX_HIGH_SKILLS", "").splitlines() if s.strip()}
-# NOTE (2026-05-20): spawn_worker / worker_done were REMOVED from the HIGH gate.
-# Every orchestrator worker calls worker_done on its terminal turn, so gating on
-# it fired a retro for ~every worker session — 4x findings volume, and when a
-# manager teardown ended ~21 workers at once they spawned ~21 retro workers
-# simultaneously, stampeding the Anthropic rate limiter (each died with a
-# 131-byte "rate limited" stub). HIGH now = configured high_skills, gh pr create,
-# >=5 edits, or agent=manager. Manager sessions are rare enough not to stampede.
 EDIT_WRITE_HIGH_THRESHOLD = 5
 PR_CREATE_RE = re.compile(r"\bgh\s+pr\s+create\b")
-# User-pushback + harsh-language signals (EN+RU). ANY single match in a USER
-# message is a HIGH signal: a correction-heavy session is exactly the
-# transcript a retro learns from, and a false-positive retro costs one cheap
-# headless run (user decision 2026-06-13; the old >=3 MED tier fired 0 times
-# in the log's lifetime). Only str-content user records are scanned, so
-# assistant text and tool_results can never trigger. \b and IGNORECASE are
-# Unicode-aware: "\bне\s+то\b" does not match "не только"; "\bбля" does not
-# match "корабля".
 PUSHBACK_RE = re.compile(
     r"you'?re wrong|no,?\s+don'?t|stop doing|why u stopped|why did you stop|"
     r"i told you|that'?s wrong|not what i asked|"
@@ -165,28 +80,6 @@ HARSH_RE = re.compile(
     r"\bбля|\bху[йяеё]|\bпизд|[её]ба[лнт]|\bохуе|похуй|\bнаху|\bнахер|\bсук[аи]\b",
     re.IGNORECASE,
 )
-# Structural human-flag: the /dockwright-fix slash command (deprecated alias
-# /fix still recognized for one release). The harness records a
-# command invocation as a type=user record whose message.content (a STRING)
-# carries <command-name>/dockwright-fix</command-name> or
-# <command-name>/fix</command-name>
-# (verified across 845 real command records). Keying on the structural tag —
-# not a textual sigil — defeats prose/backtick mentions (`/dockwright-fix`) and
-# the old @fix/@gardener text. The full predicate (position invariant + the
-# first-<command-name> structural check that keeps another command's
-# <command-args> from forging a flag) is CANONICAL in transcript_signal.py and
-# imported here: selffix-run.sh's gate applies the SAME function to decide
-# whether the spawned retro may run, and two hand-written matchers for one
-# concept drift silently.
-# Degrade LOUDLY, never silently, and never into a second matcher: if the helper
-# is missing (a broken deploy) the fix-flag leg is reported as unavailable in the
-# detect reasons rather than re-implemented here, and the rest of detection —
-# pushback, harsh, edits, gh pr create, manager — is unaffected. An import error
-# must not be able to switch off every retro on the machine.
-# Guarded on non-empty: an empty entry resolves to the CURRENT WORKING DIRECTORY,
-# which at SessionEnd is the dying session's repo — a repo shipping its own
-# transcript_signal.py would then be imported and executed here. Not reachable
-# today (the caller always passes an absolute _SELFFIX_SD), hardening only.
 _signal_dir = os.environ.get("SELFFIX_SIGNAL_DIR", "")
 if _signal_dir:
     sys.path.insert(0, _signal_dir)
@@ -199,8 +92,6 @@ except Exception:
     fix_predicate_available = False
 
 high_reasons = []
-# Degradations ride the ledger line but must never influence the LEVEL — see the
-# fix-predicate-unavailable note below for what happens when the two are conflated.
 degradations = []
 pushback_count = 0
 harsh_count = 0
@@ -209,7 +100,7 @@ user_msgs = 0
 assistant_tool_uses = 0
 edit_write_count = 0
 first_user_msg = None
-fix_command_flagged = False  # set when a /dockwright-fix (or deprecated /fix) slash-command invocation is seen
+fix_command_flagged = False
 
 with open(transcript, "r", errors="ignore") as f:
     for line in f:
@@ -263,40 +154,16 @@ with open(transcript, "r", errors="ignore") as f:
 if edit_write_count >= EDIT_WRITE_HIGH_THRESHOLD:
     high_reasons.append(f"edits:{edit_write_count}")
 
-# Pushback/harsh are *reactions* — they need >=1 prior assistant turn to react
-# to. A single-user-message session (a `claude -p` app call whose lone "user
-# message" is a document/transcript payload) cannot be genuine pushback; gating
-# on user_msgs>=2 suppresses false-fires on embedded foreign-language filler
-# ("неправильн"/"хватит"/"не надо" spoken inside a video transcript) without
-# losing real multi-turn corrections (the 2026-06-13 >=1 decision assumed user
-# messages are human chat turns; this encodes the turn-count that assumption
-# implied).
 if pushback_count >= 1 and user_msgs >= 2:
     high_reasons.append(f"pushback:{pushback_count}")
 if harsh_count >= 1 and user_msgs >= 2:
     high_reasons.append(f"harsh:{harsh_count}")
 
-# The /dockwright-fix command = a deliberate human request to retrospect this
-# session. Unlike pushback/harsh (reactions, gated on user_msgs>=2), a single
-# one-shot /dockwright-fix invocation must fire — NO turn-count gate.
 if not fix_predicate_available:
-    # Named on the fire's ledger line so a broken deploy is visible — but
-    # DELIBERATELY NOT in high_reasons, which IS the spawn decision rather than a
-    # label. Appending it there turned the trigger from selective into
-    # spawn-on-every-SessionEnd: measured, a boring low-signal session went
-    # `none` -> `spawn` with the helper absent. Each spawn is a real `claude -p`
-    # serialising on the analyst mutex at up to 25 min against a 2 h queue
-    # budget, so the queue would grow faster than it drains, fleet-wide, with
-    # unbounded spend and nothing rate-limiting it.
     degradations.append("fix-predicate-unavailable")
 if fix_command_flagged:
     high_reasons.append("fix-command")
 
-# Manager sessions: ALWAYS retro — coordination work is itself worth reviewing,
-# and manager turns rarely surface any of the other HIGH signals on their own.
-# Lookup is best-effort: SessionEnd fires BEFORE dockwright session-end, so
-# active/<sid>.json is still present at trigger time for both regular session-
-# close and the manual kill_worker / autoclose / takeover paths.
 agent_val = ""
 home_dir = os.environ.get("HOME", "")
 if home_dir and session_id:
@@ -314,9 +181,6 @@ if home_dir and session_id:
     except Exception:
         pass
 
-# Dedup key: same agent + cwd + first-user-message => same logical work. The
-# bash side uses it to skip a re-spawn within 60 min (retry-storm guard), while
-# still spawning for a legit re-occurrence days later (stale marker).
 dedup_seed = f"{agent_val}|{cwd}|{(first_user_msg or '')[:500]}"
 dedup_key = hashlib.sha256(dedup_seed.encode("utf-8", "ignore")).hexdigest()
 
@@ -327,7 +191,6 @@ elif high_reasons:
 else:
     level = "none"
 
-# Output: 5 lines for bash to read.
 print(level)
 print(session_id)
 print(transcript)
@@ -355,13 +218,6 @@ FINDINGS_DIR="$HOME/.claude/dockwright/selffix/findings"
 DEDUP_DIR="$FINDINGS_DIR/.dedup"
 mkdir -p "$DEDUP_DIR"
 
-# Prune: a finding is deleted ONLY after it has been reviewed (its .reviewed
-# sibling exists) AND the review itself is >14 days old (marker mtime), so the
-# retention clock starts at review time. Unreviewed findings are NEVER
-# age-pruned: they are the Gardener's input corpus and pending proposals
-# reference them by basename — silently destroying unreviewed evidence breaks
-# the never-re-surface-without-decision contract (arch review 2026-06-11 A1).
-# Dedup markers keep the plain 14d prune.
 PRUNED_FINDINGS=0
 while IFS= read -r marker; do
   [ -n "$marker" ] || continue
@@ -372,17 +228,11 @@ PRUNED_DEDUP=$(find "$DEDUP_DIR" -maxdepth 1 -type f -mtime +14 -print 2>/dev/nu
 find "$DEDUP_DIR" -maxdepth 1 -type f -mtime +14 -delete 2>/dev/null || true
 log_debug "prune" "-" "findings=$PRUNED_FINDINGS dedup=$PRUNED_DEDUP"
 
-# If a findings file already exists (even empty = in-flight worker), never
-# re-spawn for this session. -f covers both "worker running" and "worker done".
 if [ -f "$FINDINGS_DIR/${SESSION_ID}.md" ] && [ "$LEVEL" = "high" ]; then
   log_line "skip:findings-exist" "$SESSION_ID" "$REASONS"
   exit 0
 fi
 
-# Dedup guard: skip a re-spawn for the same agent+cwd+first-user-message within
-# the last 60 min. Catches retry storms (near-identical sessions firing in a
-# burst); a legit re-occurrence days later has only a stale marker (>60 min), so
-# it spawns normally.
 if [ "$LEVEL" = "high" ] && [ -n "$DEDUP_KEY" ] && \
    [ -n "$(find "$DEDUP_DIR" -maxdepth 1 -name "$DEDUP_KEY" -mmin -60 2>/dev/null)" ]; then
   log_line "skip:dedup" "$SESSION_ID" "$REASONS key=$DEDUP_KEY"
@@ -391,17 +241,7 @@ fi
 
 case "$LEVEL" in
   high)
-    # Record the dedup marker so a retry storm within 60 min skips re-spawning.
     if [ -n "$DEDUP_KEY" ]; then : > "$DEDUP_DIR/$DEDUP_KEY" 2>/dev/null || true; fi
-    # Limit-brick probe: while the account is rate-limit bricked,
-    # stale_monitor refreshes ~/.claude/dockwright/.manager-limited-* every
-    # scan (~60s) and removes them on clear; the 5-min freshness window is
-    # ~5x that refresh cadence, deliberately tighter than the monitor's
-    # ~10-min dead-loop threshold. A fresh flag means a spawn dies
-    # in seconds leaving a banner stub — enqueue a durable retry instead; the
-    # gardener gate retries once after the brick clears. Fail-open: no fresh
-    # flag, probe error, or enqueue failure -> spawn as always (a doomed run
-    # still self-enqueues via selffix-run.sh).
     if [ -n "$(find "$HOME/.claude/dockwright" -maxdepth 1 -name '.manager-limited-*' -mmin -5 2>/dev/null | head -1)" ] \
        && . "$HOME/.claude/scripts/selffix-retry-lib.sh" 2>/dev/null \
        && selffix_enqueue_retry "$SESSION_ID" "$TRANSCRIPT" "brick"; then

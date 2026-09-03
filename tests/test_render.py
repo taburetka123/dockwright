@@ -1,14 +1,5 @@
-"""render.py — the deploy-time {{vars}} seam for commands and .md presets.
-
-A thin wrapper over compose.compose_text(text, [], vars): no drop-ins, no
-overlay markers. var-free files render byte-identically (keeps today's
-operator command/preset deploys byte-stable); unbound {{...}} stays literal
-(compose warning semantics).
-"""
 from dockwright import render
 
-
-# --- render_file / render_text: identity, substitution, unbound-literal ---
 
 def test_render_identity_without_vars(tmp_path):
     src = tmp_path / "a.md"; src.write_text("plain, {curly} but no var\n")
@@ -33,7 +24,6 @@ def test_render_leaves_unbound_literal(tmp_path):
 
 def test_render_text_returns_str(tmp_path):
     assert render.render_text("hi {{who}}\n", {"who": "there"}) == "hi there\n"
-    # unbound stays literal, var-free is byte-identical
     assert render.render_text("{{unbound}} x\n", {}) == "{{unbound}} x\n"
     assert render.render_text("no vars here\n", {"x": "y"}) == "no vars here\n"
 
@@ -44,8 +34,6 @@ def test_render_file_creates_parent_dirs(tmp_path):
     render.render_file(src, out, {})
     assert out.read_text() == "hi\n"
 
-
-# --- CLI: mirrors compose's var-merging (defaults ⊕ operator) ---
 
 def test_cli_render_single_file(tmp_path):
     core = tmp_path / "core"; core.mkdir()
@@ -69,8 +57,8 @@ def test_cli_render_dir_glob_uses_default_vars(tmp_path):
                       "--glob", "*.md", "--core-dir", str(core)])
     assert rc == 0
     assert (outdir / "a.md").read_text() == "a: DEF\n"
-    assert (outdir / "b.md").read_text() == "b: plain\n"  # byte-identical
-    assert not (outdir / "skip.json").exists()  # glob excludes it
+    assert (outdir / "b.md").read_text() == "b: plain\n"
+    assert not (outdir / "skip.json").exists()
 
 
 def test_cli_render_operator_var_wins_over_default(tmp_path, monkeypatch):
@@ -85,8 +73,6 @@ def test_cli_render_operator_var_wins_over_default(tmp_path, monkeypatch):
     assert rc == 0
     assert out.read_text() == "val: OP\n"
 
-
-# --- <absolute-home> token on the render surface (inherited from compose) ---
 
 def test_render_expands_home_token_in_var_value(tmp_path):
     from pathlib import Path as _P

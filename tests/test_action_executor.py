@@ -1,10 +1,3 @@
-"""Tests for deploy/scripts/action_executor.py (Phase D T10).
-
-Loaded via importlib (deployed scripts are standalone, not a package).
-Every guard here was observed RED before its implementation (TDD;
-drift-guard-tests.md): the adversarial-syntax class especially — without
-it a fake-actuator harness only ever sees well-formed ids.
-"""
 import importlib.util
 import json
 import os
@@ -83,12 +76,12 @@ class TestValidateConfig:
         assert ax.validate_config(make_config()) == []
 
     def test_unpatterned_templated_field_is_a_problem(self):
-        cfg = make_config(patterns={"queue": "^[a-z0-9][a-z0-9-]*$"})  # message_id templated but unpatterned
+        cfg = make_config(patterns={"queue": "^[a-z0-9][a-z0-9-]*$"})
         problems = ax.validate_config(cfg)
         assert any("message_id" in p for p in problems)
 
     def test_bad_regex_is_a_problem(self):
-        cfg = make_config(patterns={"queue": "([", "message_id": "^x$"})  # queue: invalid regex
+        cfg = make_config(patterns={"queue": "([", "message_id": "^x$"})
         assert any("queue" in p for p in ax.validate_config(cfg))
 
     def test_actuator_must_be_list_of_str(self):
@@ -100,7 +93,7 @@ class TestValidateConfig:
         assert any("id_template" in p for p in ax.validate_config(cfg))
 
     def test_ground_in_path_fields_must_be_patterned(self):
-        cfg = make_config(ground_in={"message_id": "/tmp/raw/{topic}.json"})  # topic unpatterned
+        cfg = make_config(ground_in={"message_id": "/tmp/raw/{topic}.json"})
         assert any("topic" in p for p in ax.validate_config(cfg))
 
 
@@ -139,8 +132,6 @@ class TestClassify:
         assert d.kind == "FILTERED" and "already executed" in d.reason
 
     def test_presence_beats_policy(self):
-        # An item missing a templated field is REFUSED even when a policy
-        # predicate would also have filtered it (fail-closed ordering).
         item = make_item(replay="hold")
         del item["message_id"]
         assert classify(item).kind == "REFUSED"
@@ -168,9 +159,6 @@ class TestGrounding:
 
 
 class TestGroundingJsonMembership:
-    """I-3: grounding is exact leaf-value membership, not raw substring. The
-    review proved abc, c-12, and the JSON KEY 'messages' all 'grounded' against
-    {"messages":[{"id":"abc-123"}]} under substring matching."""
 
     def _cfg(self, tmp_path, content='{"messages":[{"id":"abc-123"}]}'):
         raw = tmp_path / "raw" / "orders-dlq.json"
@@ -192,7 +180,6 @@ class TestGroundingJsonMembership:
         assert d.kind == "REFUSED" and "not valid JSON" in d.reason
 
     def test_numeric_leaf_value_matched_as_string(self, tmp_path):
-        # A numeric leaf grounds a string id via str(leaf) - exact, not substring.
         cfg = self._cfg(tmp_path, content='{"ids":[42, 123]}')
         assert classify(make_item(message_id="42"), cfg=cfg).kind == "EXECUTE"
         assert classify(make_item(message_id="4"), cfg=cfg).kind == "REFUSED"
@@ -207,7 +194,6 @@ sys.exit(int(sys.argv[2] == "FAIL") * 3)
 
 
 def setup_env(tmp_path, items, cfg_over=None, proposal_over=None):
-    """Actions dir + verb config + fake recording actuator + proposal file."""
     actions = tmp_path / "actions"
     (actions / "verbs").mkdir(parents=True)
     record = tmp_path / "record.txt"
@@ -268,8 +254,8 @@ class TestCli:
     def test_second_run_is_idempotent(self, tmp_path):
         actions, ppath, record = setup_env(tmp_path, [make_item()])
         assert run_cli(actions, ppath) == 0
-        assert run_cli(actions, ppath) == 0  # retry stays green (I2)
-        assert record.read_text() == "orders-dlq abc-123\n"  # exactly one write
+        assert run_cli(actions, ppath) == 0
+        assert record.read_text() == "orders-dlq abc-123\n"
         types = [e["type"] for e in ledger_events(actions)]
         assert types == ["run", "action_dispatch", "action_executed",
                          "run", "action_filtered"]
@@ -277,18 +263,14 @@ class TestCli:
     def test_intra_proposal_duplicate_filtered(self, tmp_path):
         actions, ppath, record = setup_env(tmp_path, [make_item(), make_item()])
         assert run_cli(actions, ppath) == 0
-        assert record.read_text() == "orders-dlq abc-123\n"  # dispatched once
+        assert record.read_text() == "orders-dlq abc-123\n"
         events = ledger_events(actions)
         assert [e["type"] for e in events] == [
             "run", "action_dispatch", "action_executed", "action_filtered"]
-        # M-b: an intra-run duplicate uses a reason DISTINCT from the ledger
-        # idempotency reason - the first instance may still later fail, so
-        # "already executed (idempotency ledger)" would be a lie here.
         assert events[-1]["reason"] == "duplicate id within proposal"
 
     def test_actuator_failure_exit1_action_failed(self, tmp_path):
         actions, ppath, record = setup_env(tmp_path, [make_item(message_id="x1")])
-        # Swap in a failing actuator: literal FAIL as the recorded first arg.
         fake = tmp_path / "fake_actuator.py"
         cfg = make_config(actuator=[sys.executable, str(fake),
                                     str(tmp_path / "record.txt"), "FAIL", "{message_id}"])
@@ -302,7 +284,6 @@ class TestCli:
         fake = tmp_path / "fake_actuator.py"
         cfg = make_config(actuator=[sys.executable, str(fake), str(record),
                                     "{message_id}", "{queue}"])
-        # First item's message_id "FAIL-1" triggers exit 3; second still runs.
         (actions / "verbs" / "demo-replay.json").write_text(json.dumps(cfg))
         items = [make_item(message_id="FAIL"), make_item(message_id="ok-2")]
         ppath.write_text(json.dumps({"proposal_format": 1, "verb": "demo-replay",
@@ -326,9 +307,6 @@ class TestCli:
 
 class TestCallAnomalies:
     def test_empty_id_key_exit2_nothing_runs(self, tmp_path):
-        # A degenerate operator pattern (^.*$) + single-field id_template can
-        # produce an empty id_key — a record invisible to BOTH the dedup set
-        # and the unresolved-intent check (they filter on id_key truthiness).
         actions, ppath, record = setup_env(
             tmp_path, [make_item(message_id="")],
             cfg_over={"patterns": {"queue": "^[a-z0-9][a-z0-9-]*$",
@@ -338,10 +316,6 @@ class TestCallAnomalies:
         assert not record.exists() and ledger_events(actions) == []
 
     def test_verb_mismatch_exit2(self, tmp_path, capsys):
-        # I-4: bind the mismatch guard. other-verb gets its OWN valid config +
-        # actuator, so exit 2 can come ONLY from the verb-mismatch guard - NOT
-        # from config-missing. Deleting the guard lets the demo-replay proposal
-        # dispatch through the WRONG verb's actuator (exit 0), failing this test.
         actions, ppath, record = setup_env(tmp_path, [make_item()])
         other_record = tmp_path / "other_record.txt"
         other_cfg = make_config(
@@ -352,15 +326,13 @@ class TestCallAnomalies:
         capsys.readouterr()
         assert ax.main(["--verb", "other-verb", "--proposal", str(ppath),
                         "--actions-dir", str(actions)]) == 2
-        assert not record.exists()        # demo-replay actuator never ran
-        assert not other_record.exists()  # other-verb actuator never ran either
+        assert not record.exists()
+        assert not other_record.exists()
         assert ledger_events(actions) == []
         err = capsys.readouterr().err
-        assert "other-verb" in err and "demo-replay" in err  # names the mismatch
+        assert "other-verb" in err and "demo-replay" in err
 
     def test_empty_items_exit2_empty_ledger(self, tmp_path, capsys):
-        # I-2: an empty items list must NOT be a vacuous exit-0 success; a broken
-        # adapter emitting [] must be loud (exit 2), no ledger writes.
         actions, ppath, record = setup_env(tmp_path, [])
         capsys.readouterr()
         assert run_cli(actions, ppath) == 2
@@ -411,56 +383,45 @@ class TestCallAnomalies:
             os.close(fd)
 
     def test_corrupt_ledger_line_exit2_no_double_fire(self, tmp_path, capsys):
-        # I-1: a truncated action_executed line must NOT silently drop from the
-        # dedup set (silent double-fire). A non-blank undecodable line is a
-        # structural anomaly: exit 2 before any dispatch, no second actuator fire.
         actions, ppath, record = setup_env(tmp_path, [make_item()])
         assert run_cli(actions, ppath) == 0
         first = record.read_text()
         ledger = actions / "ledger.jsonl"
         lines = ledger.read_text().splitlines()
-        lines[-1] = '{"type": "action_execu'  # truncated last (action_executed) line
+        lines[-1] = '{"type": "action_execu'
         ledger.write_text("\n".join(lines) + "\n")
         n_lines_before = len(ledger.read_text().splitlines())
         capsys.readouterr()
         assert run_cli(actions, ppath) == 2
-        assert record.read_text() == first  # actuator did NOT fire a second time
-        assert len(ledger.read_text().splitlines()) == n_lines_before  # no new events
+        assert record.read_text() == first
+        assert len(ledger.read_text().splitlines()) == n_lines_before
         err = capsys.readouterr().err
         assert "ledger" in err and "line" in err
 
     def test_unresolved_dispatch_intent_exit2(self, tmp_path, capsys):
-        # M-a: a crash between actuator success and the outcome append leaves a
-        # dispatch intent with no action_executed/action_failed. On rerun that
-        # is UNRESOLVED - the actuator may already have run, so re-firing is
-        # unsafe: exit 2 naming the id_key, no dispatch.
         actions, ppath, record = setup_env(tmp_path, [make_item()])
         ax.ledger_append(actions, "action_dispatch", verb="demo-replay",
                          id_key="orders-dlq/abc-123", argv=["x"])
         capsys.readouterr()
         assert run_cli(actions, ppath) == 2
-        assert not record.exists()  # actuator NOT fired
+        assert not record.exists()
         assert "orders-dlq/abc-123" in capsys.readouterr().err
 
     def test_resolved_dispatch_intent_is_not_an_anomaly(self, tmp_path):
-        # M-a boundary: an intent followed by its outcome is resolved - a normal
-        # rerun stays idempotent (green), not exit 2.
         actions, ppath, record = setup_env(tmp_path, [make_item()])
         assert run_cli(actions, ppath) == 0
-        assert run_cli(actions, ppath) == 0  # dispatch+executed both present
+        assert run_cli(actions, ppath) == 0
 
     def test_dispatch_intent_written_before_outcome(self, tmp_path):
-        # M-a: the WAL intent (action_dispatch) precedes the outcome in the ledger.
         actions, ppath, record = setup_env(tmp_path, [make_item()])
         assert run_cli(actions, ppath) == 0
         types = [e["type"] for e in ledger_events(actions)]
         assert types == ["run", "action_dispatch", "action_executed"]
 
     def test_blank_ledger_lines_still_skipped(self, tmp_path):
-        # I-1 boundary: blank lines are not anomalies.
         actions, ppath, record = setup_env(tmp_path, [make_item()])
         assert run_cli(actions, ppath) == 0
         ledger = actions / "ledger.jsonl"
         with ledger.open("a") as fh:
             fh.write("\n   \n")
-        assert run_cli(actions, ppath) == 0  # rerun idempotent, blank lines ignored
+        assert run_cli(actions, ppath) == 0

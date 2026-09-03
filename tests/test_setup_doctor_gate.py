@@ -1,15 +1,3 @@
-"""setup.sh doctor gate: an accounts:login-only failure warns and continues;
-any other FAIL — or a doctor CRASH with no [FAIL] lines — still aborts.
-
-Login state is a user prerequisite (README prereqs: tmux/Python/claude CLI —
-not "already logged in"), not installer wiring: on a fresh box `claude mcp add`
-creates a marker-less ~/.claude.json BEFORE doctor runs, so the old hard gate
-aborted the documented quickstart. Both pre-existing setup.sh test files run
-under DOCKWRIGHT_SETUP_FILES_ONLY=1, which skips the doctor block entirely —
-this path had NO test, which is why the abort shipped unseen. The
-DOCKWRIGHT_SETUP_RUN_DOCTOR=1 knob exists solely so these tests can drive the
-REAL gate logic with a stub doctor binary; no shipped path sets it.
-"""
 import os
 import subprocess
 from pathlib import Path
@@ -17,7 +5,6 @@ from pathlib import Path
 _REPO = Path(__file__).resolve().parent.parent
 
 _STUB = """#!/usr/bin/env bash
-# Stub dockwright: canned doctor output/rc from env; every other verb no-ops.
 if [ "${1:-}" = "doctor" ]; then
     cat "$STUB_DOCTOR_OUT"
     exit "$STUB_DOCTOR_RC"
@@ -78,7 +65,7 @@ def test_accounts_login_only_failure_warns_and_continues(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     assert "Install complete" in r.stdout
     assert "WARNING: accounts:login failed" in r.stderr
-    assert "fix: claude, then /login" in r.stderr      # exact remediation reaches the human
+    assert "fix: claude, then /login" in r.stderr
     assert "Environment wiring verified." not in r.stdout
 
 
@@ -89,8 +76,6 @@ def test_other_wiring_failure_still_aborts(tmp_path):
 
 
 def test_doctor_crash_without_fail_lines_still_aborts(tmp_path):
-    """rc!=0 with no [FAIL] lines is a doctor CRASH, not a login diagnosis —
-    it must never be swallowed as ignorable (fail-loud, drift-guard-tests.md)."""
     r = _run_setup_with_doctor(tmp_path, _CRASH, 1)
     assert r.returncode == 1
     assert "Install complete" not in r.stdout
@@ -102,21 +87,10 @@ def test_all_pass_verifies_and_completes(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     assert "Environment wiring verified." in r.stdout
     assert "Install complete" in r.stdout
-    # setup.sh prints unrelated provenance warnings (e.g. non-main branch) —
-    # assert only the GATE's warning is absent
     assert "WARNING: accounts:login failed" not in r.stderr
 
 
 def test_real_doctor_fail_line_matches_setup_gate_anchor(tmp_path, monkeypatch, capsys):
-    """The gate above is proven with a STUB doctor — it proves the parser, not
-    that real doctor emits what the parser expects. This test is the other
-    half of the bridge: run the REAL doctor against a fixture whose only
-    plausible accounts failure is accounts:login, extract the ignore-anchor
-    FROM setup.sh's own executed text (no duplicated constant to drift), and
-    assert the real emitted FAIL line matches it — and still carries the exact
-    remediation the warn path forwards to the human. A reformat of doctor's
-    output line (indent, tag, check name) now fails HERE instead of silently
-    flipping the installer between warn-and-continue and abort."""
     import re
     from dockwright import config, doctor
 
@@ -146,14 +120,10 @@ def test_real_doctor_fail_line_matches_setup_gate_anchor(tmp_path, monkeypatch, 
         f"real doctor FAIL line {line!r} no longer matches the setup.sh gate "
         f"anchor {anchor!r} — the installer's warn-vs-abort decision just "
         f"silently changed")
-    assert "fix: claude, then /login" in line  # keeps the stub scenarios representative
+    assert "fix: claude, then /login" in line
 
 
 def test_subname_check_is_not_swallowed_by_prefix_match(tmp_path):
-    """Minor-3 (delta probe E10): the ignore-anchor must match the exact check
-    name `accounts:login`, not any name it prefixes — a hypothetical
-    `accounts:login:sub` FAIL is a DIFFERENT check and must abort, not ride
-    the warn-and-continue path."""
     subname = (
         "  [FAIL] accounts:login:sub: something else broke\n"
         "doctor: 1 check(s) FAILED\n")

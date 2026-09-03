@@ -1,4 +1,3 @@
-"""spend-cost: window session collection + per-model dollar reconstruction."""
 import json
 from datetime import date, datetime, timedelta
 
@@ -27,7 +26,6 @@ SPEND = {"turns": 2, "out_tokens": 100, "in_tokens": 10, "cache_read_tokens": 10
 
 
 def test_collect_sessions_dedupes_by_sid_across_ledger_rows(world):
-    # account-autoswitch shape: 3 ledger rows, 1 sid -> one session.
     for _ in range(3):
         spend_ledger.append_drop_event(
             {"claude_sid": "auto", "agent": "worker", "name": "autoswitch",
@@ -51,7 +49,6 @@ def test_collect_sessions_merges_ledger_closed_active(world):
 
 
 def _write_transcript(world, sid, lines):
-    # find_session_log scans ~/.claude/projects/*/<sid>.jsonl; point HOME at world.
     proj = world / ".claude" / "projects" / "-proj"
     proj.mkdir(parents=True, exist_ok=True)
     (proj / f"{sid}.jsonl").write_text("\n".join(lines) + "\n")
@@ -76,17 +73,14 @@ def test_reconstruct_prices_per_model_from_transcripts(world, monkeypatch):
     spend_ledger.append_drop_event(
         {"claude_sid": "s1", "agent": "worker", "name": "sonnet-job", "spend": SPEND},
         "session_end")
-    # Fable: 1M output ($50) + 1M 1h cache-write ($20) = $70
     _write_transcript(world, "f1", [_aline("a", "claude-fable-5",
                                            output=1_000_000, cache_1h=1_000_000)])
-    # Sonnet: 1M output = $15
     _write_transcript(world, "s1", [_aline("b", "claude-sonnet-4-6", output=1_000_000)])
     report = spend_cost.build_report(since=date.today(), until=date.today())
     assert report["total"] == pytest.approx(85.0)
     by_model = {m["model"]: m for m in report["models"]}
     assert by_model["claude-fable-5"]["cost"] == pytest.approx(70.0)
     assert by_model["claude-sonnet-4-6"]["cost"] == pytest.approx(15.0)
-    # cache share = cache_write+read / total = 20 / 85
     assert report["cache_cost"] == pytest.approx(20.0)
 
 

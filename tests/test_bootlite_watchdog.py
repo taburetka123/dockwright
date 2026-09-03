@@ -1,9 +1,3 @@
-"""Boot-lite watchdog (tick fallback) — manager-less worker detection.
-
-Loads the standalone script the same way test_gardener_gate.py loads the gate;
-notification/nudge side effects are captured via module-attr monkeypatching, pid
-liveness is deterministic via a patched _pid_alive.
-"""
 import importlib.util
 import json
 import time
@@ -59,11 +53,6 @@ def dog(tmp_path, monkeypatch):
 
 
 def test_notify_macos_suppressed_under_pytest(no_live_tmux):
-    """The watchdog is a deployed standalone script (subprocess-runnable, like
-    gardener_gate.py — the 2026-07-03 leak): its _notify_macos must no-op under
-    PYTEST_CURRENT_TEST itself, not rely on per-test monkeypatching. The
-    absorber-presence assert runs first so a regression can't detonate a real
-    notification."""
     mod = _load_watchdog()
     assert no_live_tmux.osascript == []
     mod._notify_macos("boom")
@@ -71,9 +60,6 @@ def test_notify_macos_suppressed_under_pytest(no_live_tmux):
 
 
 def test_notify_macos_invokes_real_osascript_outside_pytest(monkeypatch):
-    """Production-behavior pin: outside pytest the helper really requests a
-    'display notification … "bootlite watchdog"' via osascript (argv recorded
-    by a stub — nothing executes)."""
     import subprocess
     mod = _load_watchdog()
     calls = []
@@ -176,10 +162,8 @@ class TestOrphanDetection:
         assert decision == "ok"
 
     def test_dead_manager_orphans_despite_other_live_manager(self, dog):
-        """Domain #2 (arch review B5): the predicate is per-parent_manager_name —
-        one live manager anywhere must NOT mask another domain's dead manager."""
-        _write_manager(dog, name="grumpy-yak")                      # domain 1, alive
-        _write_manager(dog, name="sly-otter", sid="mgr-2", pid=DEAD_PID)  # domain 2, dead
+        _write_manager(dog, name="grumpy-yak")
+        _write_manager(dog, name="sly-otter", sid="mgr-2", pid=DEAD_PID)
         _write_worker(dog, "w1", "grumpy-yak")
         _write_worker(dog, "w2", "sly-otter", window_id="w-2")
         decision, detail = dog.run_tick(NOW)
@@ -195,9 +179,6 @@ class TestOrphanDetection:
         assert len(dog._test_notifications) == 2
 
     def test_nested_records_excluded_from_both_sides(self, dog):
-        """Nested sub-sessions inherit CLAUDE_PARENT_MANAGER (and a live pid),
-        so without the exclusion a nested ghost would read as an orphaned
-        worker — or, as a manager-agent ghost, as a live manager."""
         _write_worker(dog, "ghost", "grumpy-yak", nested=True)
         decision, _ = dog.run_tick(NOW)
         assert decision == "ok"
@@ -241,13 +222,11 @@ class TestNotifyDedup:
         }))
         _write_worker(dog, "w1", "grumpy-yak")
         dog.run_tick(NOW)
-        # The hook already notified at orphaned_at — no double-notify inside the window.
         assert dog._test_notifications == []
         entry = _state(dog)["grumpy-yak"]
         assert entry["first_seen"] == orphaned_at
         assert entry["last_notified"] == orphaned_at
         assert entry["notify_count"] == 1
-        # Past the window the tick takes over.
         dog.run_tick(orphaned_at + dog.RENOTIFY_SEC + 1)
         assert len(dog._test_notifications) == 1
 
@@ -259,7 +238,7 @@ class TestResolution:
         assert "grumpy-yak" in _state(dog)
         dog.ORPHANS.mkdir(parents=True, exist_ok=True)
         (dog.ORPHANS / "grumpy-yak.json").write_text("{}")
-        _write_manager(dog)                      # manager came back (takeover)
+        _write_manager(dog)
         decision, _ = dog.run_tick(NOW + 60)
         assert decision == "ok"
         assert "grumpy-yak" not in _state(dog)
@@ -267,8 +246,6 @@ class TestResolution:
         assert "orphan_cleared" in [e["event"] for e in _ledger_events(dog)]
 
     def test_stale_flag_without_state_entry_is_unlinked(self, dog):
-        """Important-2: a flag whose stretch resolved before any tick saw it
-        orphaned (takeover race, fast /manager-resume) must not leak."""
         dog.ORPHANS.mkdir(parents=True)
         (dog.ORPHANS / "grumpy-yak.json").write_text(json.dumps({
             "manager_name": "grumpy-yak", "orphaned_at": NOW - 60,
@@ -283,20 +260,17 @@ class TestResolution:
         dog.BOOTLITE_DIR.mkdir(parents=True)
         dog.STATE_PATH.write_text("{corrupt")
         _write_worker(dog, "w1", "grumpy-yak")
-        decision, _ = dog.run_tick(NOW)          # must not raise
+        decision, _ = dog.run_tick(NOW)
         assert decision == "orphans"
         assert "grumpy-yak" in _state(dog)
 
     def test_shape_corrupt_state_entries_dropped_not_fatal(self, dog):
-        """Verifier Important-1: valid JSON, wrong shape ({"yak": 5}) must not
-        wedge the tick — and since nothing else repairs state.json, the loader
-        is the only repair point."""
         dog.BOOTLITE_DIR.mkdir(parents=True)
         dog.STATE_PATH.write_text(json.dumps({"grumpy-yak": 5, "other": "junk"}))
         _write_worker(dog, "w1", "grumpy-yak")
-        decision, _ = dog.run_tick(NOW)          # must not raise
+        decision, _ = dog.run_tick(NOW)
         assert decision == "orphans"
-        entry = _state(dog)["grumpy-yak"]        # rebuilt as a fresh dict entry
+        entry = _state(dog)["grumpy-yak"]
         assert entry["notify_count"] == 1
 
 
@@ -314,7 +288,7 @@ class TestAutonudge:
         dog.run_tick(NOW + 3600)
         assert sorted(w for w, _ in dog._test_nudges) == ["w-1", "w-2"]
         for _, text in dog._test_nudges:
-            assert "worker_done" in text         # checkpoint-and-finish, not "resume your task"
+            assert "worker_done" in text
             assert "resume your task" not in text
 
     def test_autonudge_skips_pending_question_and_missing_window(self, dog, monkeypatch):
@@ -333,7 +307,7 @@ class TestAutonudge:
         monkeypatch.setattr(dog, "AUTONUDGE", True)
         monkeypatch.setattr(dog, "_resolve_get_driver", lambda: None)
         _write_worker(dog, "w1", "grumpy-yak")
-        decision, _ = dog.run_tick(NOW)          # must not raise
+        decision, _ = dog.run_tick(NOW)
         assert decision == "orphans"
         assert len(dog._test_notifications) == 1
         assert dog._test_nudges == []
@@ -343,7 +317,7 @@ class TestAutonudge:
         _write_worker(dog, "w1", "grumpy-yak", window_id="w-1")
         _write_worker(dog, "w2", "grumpy-yak", window_id="w-2")
         dog.run_tick(NOW)
-        (dog.ACTIVE / "w2.json").unlink()        # w2 session ended
+        (dog.ACTIVE / "w2.json").unlink()
         dog.run_tick(NOW + 3600)
         assert set(_state(dog)["grumpy-yak"]["nudged"]) == {"w1"}
 
@@ -389,8 +363,8 @@ class TestAutonudgeTmux:
         _write_worker(dog, "w-1", "grumpy-yak", window_id="w-1")
         _write_worker(dog, "w-2", "grumpy-yak", window_id="w-2")
         decision, _ = dog.run_tick(NOW)
-        assert decision == "orphans"     # detection intact
-        assert dog._test_nudges == []    # no nudge, no crash
+        assert decision == "orphans"
+        assert dog._test_nudges == []
 
 
 class TestHomeFallback:

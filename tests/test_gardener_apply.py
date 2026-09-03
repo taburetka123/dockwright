@@ -1,4 +1,3 @@
-"""Tests for deploy/scripts/gardener_apply.py (T11 actuator)."""
 import importlib.util
 import json
 import os
@@ -22,7 +21,6 @@ def mod(monkeypatch):
 
 @pytest.fixture()
 def postrun_of(mod):
-    # the instance gardener_apply actually bound (spec-review I3)
     return sys.modules["gardener_postrun"]
 
 
@@ -56,19 +54,6 @@ def test_extract_diff_text_missing_fence_is_code2(mod, tmp_path):
 
 
 def test_split_file_diffs_counts_hunk_lines(mod):
-    """A removed line "--- a/foo" immediately followed by an added line
-    "+++ b/foo" (i.e. hunk CONTENT that is itself byte-for-byte a
-    diff file-header pair) must NOT be misread as opening a second file
-    diff — the splitter tracks @@ hunk-line counts, not header lookalikes.
-    A naive pair-scanner (next "--- " line followed by a "+++ " line, with
-    no @@-count tracking) would split this single-file diff into two.
-
-    RED-proof (manually verified, not re-asserted here): with the inner
-    hunk-count `while` loop's condition hardcoded to `False` (so
-    `@@ -1,1 +1,1 @@` consumes zero hunk lines), this exact input splits
-    into 2 FileDiffs instead of 1 — the "--- a/foo"/"+++ b/foo" pair gets
-    read as a second file's header. Restored after confirming the failure.
-    """
     text = "--- a/f\n+++ b/f\n@@ -1,1 +1,1 @@\n--- a/foo\n+++ b/foo\n"
     diffs = mod.split_file_diffs(text)
     assert len(diffs) == 1
@@ -78,9 +63,6 @@ def test_split_file_diffs_counts_hunk_lines(mod):
 
 
 def test_split_file_diffs_keeps_no_newline_markers_verbatim(mod):
-    # marker mid-hunk (after a removed line) and trailing (after the last
-    # added line) — both must survive verbatim and neither is counted
-    # toward the @@ old/new line totals.
     text = (
         "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n"
         "-old1\n\\ No newline at end of file\n-old2\n"
@@ -100,16 +82,6 @@ def test_split_file_diffs_keeps_no_newline_markers_verbatim(mod):
 
 
 def test_split_file_diffs_rejects_dropped_hunk(mod):
-    """C1: a stray line (here a blank line) between two hunks of the SAME
-    file must not silently truncate the patch to just the first hunk.
-
-    RED-PROOF (manually verified, not re-asserted here): before the fix,
-    this exact input — two context hunks against a 12-line file, separated
-    by a blank line — split to a single FileDiff carrying only hunk 1;
-    `apply` would report success having silently dropped hunk 2 (`git apply
-    --check` validates only the already-truncated patch, so it is NOT a
-    net for this). After the fix, `split_file_diffs` raises ApplyError
-    code=2 naming the header/parsed-hunk-count mismatch (2 vs 1)."""
     text = (
         "--- a/f\n+++ b/f\n"
         "@@ -1,3 +1,3 @@\n"
@@ -126,10 +98,6 @@ def test_split_file_diffs_rejects_dropped_hunk(mod):
 
 
 def test_split_file_diffs_clean_two_hunks_same_file_not_tripped(mod):
-    """C1 regression guard: a LEGITIMATE two-hunk single-file diff (no stray
-    line between hunks) must parse to ONE FileDiff carrying BOTH @@ headers
-    and must NOT trip the fail-closed header-count check. Pins that the C1
-    guard fires on truncation only, never on valid multi-hunk diffs."""
     text = (
         "--- a/f\n+++ b/f\n"
         "@@ -1,3 +1,3 @@\n"
@@ -284,9 +252,7 @@ def test_apply_clean_and_revert_roundtrip(wired, postrun_of, git_root, tmp_path)
     evs = events(postrun_of)
     applied = [e for e in evs if e["type"] == "proposal_applied"]
     assert applied and applied[-1]["proposal_id"] == "r1-1"
-    assert "path" not in applied[-1]          # I1: never a top-level path key
-    # apply left x.md uncommitted-dirty; revert now dirty-checks (M2), so the
-    # immediate undo needs --force-dirty (the documented flow commits first).
+    assert "path" not in applied[-1]
     assert wired.main(["revert", "--proposal", str(prop), "--force-dirty"]) == 0
     assert (git_root / "rules" / "x.md").read_text() == "old line\nkeep\n"
     assert git(git_root, "status", "--porcelain").stdout.strip() == ""
@@ -295,10 +261,6 @@ def test_apply_clean_and_revert_roundtrip(wired, postrun_of, git_root, tmp_path)
 
 
 def test_no_path_key_proven_red(wired, postrun_of, git_root, tmp_path):
-    """Drift-guard discipline: prove the no-path assertion actually bites by
-    emitting a doctored event through the same ledger and asserting the
-    checker notices. (The guarded property lives in executed code — the
-    ledger_append call sites — not in prose.)"""
     postrun_of.ledger_append("proposal_applied", proposal_id="x", path="/tmp/leak")
     evs = events(postrun_of)
     assert any("path" in e for e in evs if e["type"] == "proposal_applied")
@@ -316,8 +278,6 @@ def test_apply_context_mismatch_blocks_and_leaves_tree_untouched(
 
 
 def test_ensure_clean_git_status_failure_is_fail_closed(mod, tmp_path):
-    """M2: a nonzero `git status` returncode must fail closed, not pass
-    silently just because stdout happened to be empty."""
     root = tmp_path / "not_a_repo"
     root.mkdir()
     with pytest.raises(mod.ApplyError) as exc:
@@ -340,14 +300,10 @@ def test_apply_dirty_target_force_dirty_succeeds(wired, git_root, tmp_path):
 
 
 def test_revert_dirty_target_refused_and_force_dirty(wired, git_root, tmp_path):
-    """M2: revert dirty-checks symmetric with apply. An unrelated uncommitted
-    edit refuses a plain revert; --force-dirty overrides. (The canon gate stays
-    OFF for revert by design — reverting can legitimately restore a repo to a
-    pre-existing red state.)"""
     prop = make_proposal(tmp_path, [str(git_root / "rules" / "x.md")], DIFF_MOD)
     assert wired.main(["apply", "--proposal", str(prop)]) == 0
     git(git_root, "-c", "user.email=t@t", "-c", "user.name=t",
-        "commit", "-aqm", "applied")            # clean baseline for the revert
+        "commit", "-aqm", "applied")
     (git_root / "rules" / "x.md").write_text("new line\nkeep\nunrelated\n")
     assert wired.main(["revert", "--proposal", str(prop)]) == 1
     assert wired.main(
@@ -356,12 +312,6 @@ def test_revert_dirty_target_refused_and_force_dirty(wired, git_root, tmp_path):
 
 def test_apply_rollback_failure_surfaces_loud_message(
         wired, postrun_of, git_root, tmp_path, monkeypatch, capsys):
-    """When a mid-apply failure triggers the uniform snapshot restore and
-    that restore ITSELF fails, the raised ApplyError must say so loudly
-    ("ROLLBACK OF <path> FAILED — inspect git status") instead of silently
-    claiming the tree was restored. (Task-3 mechanism: the per-root
-    `git apply -R` rollback became a byte-exact snapshot restore; the loud
-    report keys on `_restore` returning a non-empty failed-path list.)"""
     root2 = tmp_path / "claude2"
     (root2 / "rules").mkdir(parents=True)
     (root2 / "rules" / "y.md").write_text("old line\nkeep\n")
@@ -387,13 +337,12 @@ def test_apply_rollback_failure_surfaces_loud_message(
 
     def fake_git_apply(root, patch, check=False, reverse=False):
         if check:
-            return FakeProc(0)                      # both context-checks pass
+            return FakeProc(0)
         if root == real_git_root:
-            return FakeProc(0)                       # first root applies fine
-        return FakeProc(1, "apply boom")              # second root fails
+            return FakeProc(0)
+        return FakeProc(1, "apply boom")
 
     monkeypatch.setattr(wired, "git_apply", fake_git_apply)
-    # the uniform snapshot restore itself fails for every touched file
     monkeypatch.setattr(wired, "_restore", lambda snapshot: list(snapshot))
     rc = wired.main(["apply", "--proposal", str(prop)])
     assert rc == 1
@@ -413,9 +362,9 @@ def test_apply_non_git_root_refused(mod, postrun_of, tmp_path, monkeypatch):
 
 
 def test_apply_new_asset_creates_file_and_parent_dirs(wired, git_root, tmp_path):
-    dest = str(git_root / "flows" / "new.md")   # flows/ does NOT exist yet —
+    dest = str(git_root / "flows" / "new.md")
     diff = f"--- /dev/null\n+++ {dest}\n@@ -0,0 +1,2 @@\n+hello\n+world\n"
-    prop = make_proposal(tmp_path, [dest], diff)  # git apply creates leading dirs
+    prop = make_proposal(tmp_path, [dest], diff)
     assert wired.main(["apply", "--proposal", str(prop)]) == 0
     assert (git_root / "flows" / "new.md").read_text() == "hello\nworld\n"
 
@@ -423,7 +372,7 @@ def test_apply_new_asset_creates_file_and_parent_dirs(wired, git_root, tmp_path)
 def test_base_rev_mismatch_warns_but_applies(wired, git_root, tmp_path, capsys):
     prop = make_proposal(tmp_path, [str(git_root / "rules" / "x.md")], DIFF_MOD)
     assert wired.main(["apply", "--proposal", str(prop)]) == 0
-    assert "WARNING" in capsys.readouterr().out  # base_rev abc1234 != real HEAD
+    assert "WARNING" in capsys.readouterr().out
 
 
 def test_prose_new_asset_distinct_error(wired, git_root, tmp_path, capsys):
@@ -433,8 +382,6 @@ def test_prose_new_asset_distinct_error(wired, git_root, tmp_path, capsys):
     assert wired.main(["apply", "--proposal", str(p)]) == 2
     assert "pre-T11" in capsys.readouterr().err
 
-
-# ---- currency (review-time staleness probe) ------------------------------
 
 def make_currency_proposal(tmp_path, targets, base_rev="abc1234",
                            kind="rule-edit", pid="cur-1", with_diff=True):
@@ -475,10 +422,6 @@ def remote_root(tmp_path):
 
 
 def write_reflog(root, ref, entries):
-    """Lay down a ref's reflog explicitly: [(old_sha, new_sha, epoch), ...],
-    oldest first. Fixtures must not depend on WHICH operations git chose to log
-    — that varies with git version and config, and a fixture whose reflog turned
-    out to hold one entry instead of two reads as a product defect."""
     common = git(root, "rev-parse", "--path-format=absolute",
                  "--git-common-dir").stdout.strip()
     path = os.path.join(common, "logs", ref)
@@ -489,15 +432,11 @@ def write_reflog(root, ref, entries):
 
 
 def reflog_epoch(root, ref):
-    """When the ref last MOVED locally, in epoch seconds."""
     line = git(root, "reflog", "show", "--date=unix", ref).stdout.splitlines()[0]
     return int(line.split("@{")[1].split("}")[0])
 
 
 def fetch_after(mod, root, *proposals):
-    """Model the sitting's own fetch: it runs at review time, after every
-    proposal was drafted. The fixtures build the repo first, so without this
-    the ref reads as fetched-before-drafting."""
     common = git(root, "rev-parse", "--path-format=absolute",
                  "--git-common-dir").stdout.strip()
     latest = max(os.path.getmtime(p) for p in proposals)
@@ -511,8 +450,6 @@ def run_currency(mod, capsys, *proposals):
 
 
 def verdict_of(out, pid):
-    """The verdict token on the proposal's own row — never the totals line,
-    which names every class unconditionally."""
     for line in out.splitlines():
         if line.startswith(pid + "  "):
             return line[len(pid):].strip().split()[0]
@@ -602,11 +539,6 @@ def test_currency_remote_without_branch_is_unknown(mod, postrun_of, remote_root,
 
 def test_currency_base_rev_on_a_side_branch_counts_what_the_drafter_lacked(
         mod, postrun_of, remote_root, tmp_path, monkeypatch, capsys):
-    """`base_rev` comes from the drafter's LOCAL HEAD, which routinely sits on a
-    side branch, so it is often not an ancestor of the comparison ref. The span
-    must still be the set difference `base_rev..ref` — commits reachable from the
-    ref that the drafter did not have. Keying this case on base_rev's commit DATE
-    instead misses every such commit that predates the side commit."""
     monkeypatch.setattr(postrun_of, "ALLOWED_TARGET_ROOTS", [remote_root])
     fork = git(remote_root, "rev-parse", "--short", "HEAD").stdout.strip()
     (remote_root / "rules" / "x.md").write_text("main moved once\nkeep\n")
@@ -632,9 +564,6 @@ def test_currency_base_rev_on_a_side_branch_counts_what_the_drafter_lacked(
 
 def test_currency_non_commit_base_rev_falls_back_to_mtime(wired, git_root, tmp_path,
                                                           capsys):
-    """A `base_rev` that resolves to a blob or tree is not a revision. It must not
-    reach the commit-span path, where a failed date lookup would become an empty
-    `--since` — which git reads as "now" and reports as zero commits."""
     blob = git(git_root, "rev-parse", "HEAD:rules/x.md").stdout.strip()[:7]
     assert git(git_root, "cat-file", "-t", blob).stdout.strip() == "blob"
     prop = make_currency_proposal(tmp_path, [str(git_root / "rules" / "x.md")],
@@ -701,9 +630,6 @@ def test_currency_ref_fetched_before_drafting_is_unknown(mod, postrun_of, remote
 
 def test_currency_quiet_repo_is_fresh_not_ref_stale(mod, postrun_of, remote_root,
                                                     tmp_path, monkeypatch, capsys):
-    """A ref whose newest COMMIT predates drafting is not stale — only a ref
-    last FETCHED before drafting is. Keying the gate on the tip commit date
-    flagged every quiet repository."""
     monkeypatch.setattr(postrun_of, "ALLOWED_TARGET_ROOTS", [remote_root])
     base = git(remote_root, "rev-parse", "--short", "HEAD").stdout.strip()
     prop = make_currency_proposal(tmp_path, [str(remote_root / "rules" / "x.md")],
@@ -782,17 +708,6 @@ def test_currency_unreadable_proposal_does_not_blind_the_batch(wired, git_root,
 
 def test_currency_backdated_commit_arriving_after_drafting_is_stale(
         mod, postrun_of, remote_root, tmp_path, monkeypatch, capsys):
-    """A date filter asks "was this commit AUTHORED after drafting"; the question
-    is "did it ARRIVE on the ref after drafting". A long-lived branch merged in
-    later carries an older committer date, so `--since <drafting>` excludes it and
-    the target reads fresh while its content on the ref has changed. The span is
-    keyed on where the ref POINTED at drafting instead.
-
-    Drafting is pinned a day back, between the reflog horizon and the fetch that
-    brought the merge, so no wall-clock gap decides the outcome. An earlier
-    version also asserted the premise directly (`--since <drafting>` counts 0):
-    that assertion depended on git's date-traversal semantics rather than on this
-    code, was green 30x locally, and went red on CI."""
     monkeypatch.setattr(postrun_of, "ALLOWED_TARGET_ROOTS", [remote_root])
     env = {"GIT_COMMITTER_DATE": "2026-08-05T10:00:00Z",
            "GIT_AUTHOR_DATE": "2026-08-05T10:00:00Z"}
@@ -828,12 +743,6 @@ def test_currency_backdated_commit_arriving_after_drafting_is_stale(
 
 def test_currency_truncated_reflog_degrades_to_the_declared_weak_key(
         mod, postrun_of, remote_root, tmp_path, monkeypatch, capsys):
-    """`<ref>@{<stamp>}` does NOT fail when the stamp predates the reflog's
-    horizon: git exits 0, returns the OLDEST value it still remembers, and warns
-    on stderr. Suppressing that warning made the probe treat a value NEWER than
-    the drafter's as the drafter's, losing every commit in between and reporting
-    fresh. The reconstruction must refuse instead, falling through to the key
-    whose own label declares it is weak."""
     monkeypatch.setattr(postrun_of, "ALLOWED_TARGET_ROOTS", [remote_root])
     (remote_root / "rules" / "x.md").write_text("moved after drafting\nkeep\n")
     commit_all(remote_root, "the change the drafter never saw")

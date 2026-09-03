@@ -1,11 +1,3 @@
-"""PATH-prepend `stat` shims emulating the two platform personalities.
-
-GNU coreutils (verified Ubuntu 25.10): `stat -f %m <file>` prints a multi-line
-filesystem-info block to STDOUT, then exits 1 — inside `$(a || b)` the garbage
-concatenates with the fallback's output and poisons the result (E2E N-1).
-BSD/macOS: `stat -f %m` is the correct file-mtime form; `-c` is an illegal
-option (rc=1, empty stdout).
-"""
 from pathlib import Path
 
 _PY_MTIME = (

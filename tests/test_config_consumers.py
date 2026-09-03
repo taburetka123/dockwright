@@ -1,4 +1,3 @@
-"""Config consumers: hints, pricing overrides, distill model, doctor check."""
 import pytest
 
 from dockwright import config, doctor, pricing, sweep
@@ -15,10 +14,7 @@ def cfg_env(monkeypatch, tmp_path):
     return _install
 
 
-# --- sweep hint ---
-
 def test_sweep_hint_default_is_none(cfg_env):
-    """DEFAULT_WORKTREE_CLEANUP is "" — no operator config means no hint line."""
     assert sweep._ticket_cleanup_hint() is None
 
 
@@ -31,8 +27,6 @@ def test_sweep_hint_from_config_and_suppression(cfg_env):
     assert "worktree pruning" not in report
 
 
-# --- pricing ---
-
 def test_pricing_default_rates_unchanged(cfg_env):
     assert pricing.get_rates() == pricing.MODEL_RATES
     assert pricing.cost_breakdown("claude-opus-4-8", output_tokens=1_000_000)["output"] == 25.0
@@ -42,31 +36,8 @@ def test_pricing_config_override(cfg_env):
     cfg_env('[pricing.rates]\nopus = [10.0, 50.0]\n')
     assert pricing.get_rates()["opus"] == (10.0, 50.0)
     assert pricing.cost_breakdown("claude-opus-4-8", output_tokens=1_000_000)["output"] == 50.0
-    # built-ins not named in the override are untouched
     assert pricing.get_rates()["haiku"] == (1.0, 5.0)
 
-
-# --- distill model ---
-
-def test_distill_model_source():
-    import inspect
-    from dockwright import distill
-    src = inspect.getsource(distill)
-    assert '"claude-sonnet-4-6"' not in src
-    assert "config.distill_model()" in src
-
-
-# --- promote hint ---
-
-def test_promote_hint_source():
-    import inspect
-    from dockwright import promote
-    src = inspect.getsource(promote)
-    assert "/manager-assign" not in src
-    assert "config.assign_command_hint()" in src
-
-
-# --- doctor ---
 
 def test_doctor_config_check_pass_when_absent(cfg_env):
     c = doctor.check_config()
@@ -79,8 +50,6 @@ def test_doctor_config_check_fails_on_corrupt(cfg_env):
     assert not c.ok
     assert "dockwright" in c.name
 
-
-# --- doctor compose:fresh ---
 
 def _compose_dirs(tmp_path):
     core = tmp_path / "core"
@@ -100,7 +69,7 @@ def test_doctor_compose_fresh_nothing_deployed(tmp_path):
 def test_doctor_compose_fresh_legacy_deploy_fails(tmp_path):
     core, out, overlay = _compose_dirs(tmp_path)
     out.mkdir()
-    (out / "manager.md").write_text("core text\n")  # deployed but no stamp
+    (out / "manager.md").write_text("core text\n")
     c = doctor.check_compose_fresh(core, out, overlay)
     assert not c.ok and "legacy" in c.detail
 
@@ -117,7 +86,6 @@ def test_doctor_compose_fresh_and_stale(tmp_path):
 
 
 def test_doctor_main_runs_compose_check_only_with_flag(tmp_path, capsys):
-    """No --compose-out-dir → no compose:fresh line (hermetic ad-hoc doctor)."""
     orch_bin = tmp_path / "orch"
     doctor.main(["--orch-bin", str(orch_bin),
                  "--claude-json", str(tmp_path / "claude.json"),

@@ -1,11 +1,3 @@
-"""`dockwright selffix|gardener enable|disable` — opt-in wiring for the
-self-improvement pipeline (ships OFF on a fresh install).
-
-selffix = the SessionEnd hook that fires selffix-trigger.sh (the per-session
-retro producer). gardener = the launchd loops that digest findings into ranked
-proposals (the consumer). One module because gardener's dependency gate reads
-selffix's settings.json state and its disable shares launchd-label helpers.
-"""
 from __future__ import annotations
 
 import argparse
@@ -31,8 +23,6 @@ _LANE_LOOPS = {
 }
 
 
-# --- path resolution (overridable via CLI flags for tests) -------------------
-
 def _settings_path() -> Path:
     return config.claude_config_home() / "settings.json"
 
@@ -53,8 +43,6 @@ def _gardener_installed(launch_agents_dir: Path, label_prefix: str) -> bool:
     return any((launch_agents_dir / f"{label}.plist").exists()
                for label in _gardener_labels("all", label_prefix))
 
-
-# --- selffix (SessionEnd hook wiring) ----------------------------------------
 
 def selffix_hook_command(scripts_dir: Path) -> str:
     return f"bash {shlex.quote(str(scripts_dir / SELFFIX_TRIGGER))}"
@@ -111,7 +99,7 @@ def disable_selffix(settings_path: Path) -> bool:
                   for b in settings.get("hooks", {}).get("SessionEnd", [])
                   for h in b.get("hooks", []))
     if not present:
-        return False   # strict no-op when not wired (never reformats/backs up)
+        return False
     hooks = settings.get("hooks", {})
     new_blocks = []
     for block in hooks.get("SessionEnd", []):
@@ -156,8 +144,6 @@ def selffix_main(argv=None) -> int:
     return 0
 
 
-# --- gardener (launchd loops) ------------------------------------------------
-
 def _default_run(cmd: list[str]) -> int:
     return subprocess.run(cmd, check=False).returncode
 
@@ -190,7 +176,7 @@ def disable_gardener(lane: str, *, launch_agents_dir: Path, label_prefix: str, r
               file=sys.stderr)
     for label in _gardener_labels(lane, label_prefix):
         if launchctl_available:
-            run(["launchctl", "bootout", f"gui/{uid}/{label}"])   # best-effort
+            run(["launchctl", "bootout", f"gui/{uid}/{label}"])
         (launch_agents_dir / f"{label}.plist").unlink(missing_ok=True)
     return 0
 
@@ -202,7 +188,6 @@ def gardener_main(argv=None) -> int:
     p.add_argument("--settings", type=Path, default=None)
     p.add_argument("--scripts-dir", type=Path, default=None)
     args = p.parse_args(argv)
-    # Conservative per-action defaults: minimal install, full teardown.
     lane = args.lane or ("digest" if args.action == "enable" else "all")
     settings_path = args.settings or _settings_path()
     scripts_dir = args.scripts_dir or _scripts_dir()

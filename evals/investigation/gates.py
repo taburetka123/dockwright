@@ -1,9 +1,3 @@
-"""Deterministic gate — adapted from an earlier deterministic scorer,
-adapted: required_queries -> required_reads (fixture-path suffix match against
-Read/Grep/Glob/Bash tool-call inputs, falling back to content evidence — >=80%
-of the fixture's unique distinctive lines present in the captured corpus —
-when the tool-call input names no file), loops -> num_turns, plus the
-value-grounding gate backed by deploy/scripts/value_grounding.py."""
 from __future__ import annotations
 
 import importlib.util
@@ -63,11 +57,6 @@ def _distinctive_lines(text: str) -> list[str]:
 
 
 def _content_satisfied(fixture_text: str, corpus: str) -> bool:
-    """A read demonstrably happened when >=80% of the fixture's unique
-    distinctive lines appear in the captured evidence corpus — whatever shell
-    form fetched them (a bash glob names no file in its input). Empty fixture
-    or corpus never passes, and neither does a single-line fixture — there's
-    no fractional signal to threshold against a lone line."""
     lines = _distinctive_lines(fixture_text)
     if len(lines) < 2 or not corpus:
         return False

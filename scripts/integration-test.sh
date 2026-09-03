@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# scripts/integration-test.sh — manual e2e smoke test.
-#
-# Run this from a fresh iTerm2 window AFTER `./setup.sh`.
-# It walks you through verifying spawn → ask → answer → status → kill → re-attach.
 
 set -e
 

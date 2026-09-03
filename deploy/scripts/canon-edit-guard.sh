@@ -1,37 +1,11 @@
 #!/usr/bin/env bash
-# canon-edit-guard.sh — PreToolUse hook (Edit|Write|MultiEdit).
-# Warns when a session edits a ~/.claude file that is cp-deployed from the
-# dockwright canon by setup.sh, or COMPOSED into ~/.claude/agents by
-# `dockwright compose` from a core + overlay drop-ins; either way the direct
-# edit is destroyed on the next setup.sh / compose. Also flags a composed
-# agent that has already DRIFTED from the last compose stamp, and folds in
-# asset-validator warnings for the touched file. Emits a permission-NEUTRAL
-# additionalContext note. Fail-open: any parse problem -> exit 0, no output,
-# never blocks.
-#
-# The canon lives at the dockwright checkout's deploy/ dir, resolved from
-# [paths] dockwright_repo in dockwright.toml. That key defaults UNSET and
-# `dockwright compose` itself needs no config, so only the cp-deployed branch —
-# which has no canon path to name without it — may depend on it. Composed/DRIFT
-# detection falls back to the compose stamp (self-sufficient: compose writes it
-# next to the outputs), and the asset warnings never consult the canon at all.
 set -euo pipefail
 
 CLAUDE_DIR="$HOME/.claude"
-# The pre-pass below hands back a path whose directories are resolved, so
-# resolve this side too or the prefix test compares a physical path against a
-# symlinked one — a symlinked ~/.claude (a dotfiles checkout) or a HOME with a
-# trailing slash would silence the hook for the whole install.
 if [ -d "$CLAUDE_DIR" ]; then
     CLAUDE_DIR="$(cd "$CLAUDE_DIR" && pwd -P)"
 fi
 
-# One python3 pass: parse the hook's file_path from stdin, resolve
-# [paths] dockwright_repo + overlay_dir (tomllib when the interpreter has it;
-# a minimal scanner fallback for a py3.9 interpreter with no tomllib), and look
-# the file up in the compose stamp. Emits five lines: file_path, the ~-expanded
-# repo path (blank when unset), the resolved overlay dir, whether the stamp
-# says this file is composed, and the core source the stamp names for it.
 guard_read="$(python3 <(cat <<'PYEOF'
 import json, os, pathlib, sys
 
@@ -198,8 +172,6 @@ STAMP_COMPOSED="$(printf '%s' "$guard_read" | sed -n '4p')"
 STAMP_CORE="$(printf '%s' "$guard_read" | sed -n '5p')"
 
 [ -n "$file_path" ] || exit 0
-# No configured dockwright repo -> no canon path to name in the cp-deployed
-# wording. The composed and asset-warning sections below do not need one.
 CANON_DIR=""
 [ -z "$DOCKWRIGHT_REPO" ] || CANON_DIR="$DOCKWRIGHT_REPO/deploy"
 
@@ -207,28 +179,12 @@ case "$file_path" in "$CLAUDE_DIR"/*) ;; *) exit 0 ;; esac
 
 relpath="${file_path#"$CLAUDE_DIR"/}"
 
-# Resolve the ~/.claude relpath to its canon SOURCE relpath. Most trees deploy at
-# the SAME relpath (commands/ scripts/ skills/ statusline-command.sh). A few
-# deploy RENAMED — setup.sh cp's them to a different ~/.claude path; mirror those
-# lines here (setup.sh:356 loops-registry.md, :362 tmux conf, :364 status_row.py)
-# so renamed files are still guarded. Every branch is existence-gated below, so an
-# ~/.claude path with no canon source (e.g. dockwright/ runtime state) never warns.
-#
-# agents/ is NOT in that world at all: setup.sh cp's nothing there, `dockwright
-# compose` renders it. So every agents/ path skips the cp lookup — the composed
-# arm handles agents/*.md, and the other two arms stay silent rather than tell an
-# operator to edit a canon file setup.sh never copies.
 canon_rel=""
 composed=""
 case "$relpath" in
-    agents/*/*) ;;            # `*` crosses `/` in case patterns; compose emits no nested outputs
+    agents/*/*) ;;
     agents/*.md)
         agent_stem="${relpath#agents/}"; agent_stem="${agent_stem%.md}"
-        # A composed file is NOT cp'd: compose renders ~/.claude/agents/X.md from
-        # deploy/agents/X.core.md (or a plain X.md core) + overlay drop-ins, so a
-        # direct edit here is DESTROYED at the next compose. Prefer the canon when
-        # one is configured (it can name the exact source file); fall back to the
-        # stamp, which is what a stock install has.
         if [ -n "$CANON_DIR" ] && [ -e "$CANON_DIR/agents/$agent_stem.core.md" ]; then
             canon_rel="agents/$agent_stem.core.md"; composed=1
         elif [ -n "$CANON_DIR" ] && [ -e "$CANON_DIR/agents/$agent_stem.md" ]; then
@@ -237,7 +193,7 @@ case "$relpath" in
             composed=1
         fi
         ;;
-    agents/*) ;;              # non-.md under agents/ (vars.defaults.toml): not cp'd either
+    agents/*) ;;
     *)
         if [ -n "$CANON_DIR" ]; then
             if [ -e "$CANON_DIR/$relpath" ]; then
@@ -248,7 +204,6 @@ case "$relpath" in
                     dockwright/status_row.py)           canon_rel="tmux/status_row.py" ;;
                     dockwright/dockwright.tmux.conf)    canon_rel="tmux/dockwright.conf" ;;
                     dockwright/loops-registry.md)       canon_rel="loops-registry.md" ;;
-                    # deprecated, one release: edits through the compat symlink path still map
                     orchestrator/presets/*)             canon_rel="presets/${relpath#orchestrator/presets/}" ;;
                     orchestrator/status_row.py)         canon_rel="tmux/status_row.py" ;;
                     orchestrator/dockwright.tmux.conf)  canon_rel="tmux/dockwright.conf" ;;
@@ -261,17 +216,6 @@ case "$relpath" in
         ;;
 esac
 
-# Asset warnings for the file being touched. Today they are computed at commit
-# time and written to a log nobody opens; here they arrive in-session, attached
-# to the file, at the moment of authorship. Fail-soft in every direction.
-#
-# The whole hook budget is 5s (settings.snippet.json) and the callee-side
-# --max-seconds cap is only advisory — a stale or partially-deployed validator
-# need not honour the flag, and its SIGALRM cannot interrupt a regex that stays
-# in C — so bound the wall clock on THIS side too. `timeout(1)` is absent on
-# stock macOS; the interpreter this hook already requires does the job. The
-# wrapper also absorbs the callee exit status: a command substitution propagates
-# it under `set -e`, and a PreToolUse hook exiting non-zero BLOCKS the tool call.
 warn_text=""
 case "$relpath" in
     rules/*|commands/*|agents/*|flows/*|skills/*)
@@ -287,12 +231,6 @@ except Exception:
         ;;
 esac
 
-# warn_text becomes a single argv element to the final `python3 -c` below. A
-# corrupt or hostile validator that prints more than the exec arg limit would make
-# that exec fail E2BIG (status 126 — a non-blocking error, so the fail-open
-# contract survives, but the composed/DRIFT/canon note would die with it). Cap it
-# well under any ARG_MAX / MAX_ARG_STRLEN; a real per-file warning set is far
-# below the cap, so mark a truncation visibly rather than silently.
 if [ "${#warn_text}" -gt 8192 ]; then
     warn_text="${warn_text:0:8192}
 ... (asset-validator output truncated)"
@@ -300,9 +238,6 @@ fi
 
 [ -n "$canon_rel" ] || [ -n "$composed" ] || [ -n "$warn_text" ] || exit 0
 
-# NOTE: single-quoted python program — no apostrophe may appear anywhere in this
-# body (including inside the message strings) or bash ends the quote early and the
-# hook degrades to silence.
 python3 -c '
 import hashlib, json, os, sys
 canon_dir, canon_rel, composed, stamp_core, overlay_dir, file_path, claude_dir, warn_text = sys.argv[1:9]

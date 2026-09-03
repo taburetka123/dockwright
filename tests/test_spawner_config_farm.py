@@ -14,9 +14,6 @@ def test_account_config_dir_is_sibling_of_config_home(monkeypatch, tmp_path):
 
 
 def test_config_home_and_host_json_default_to_home():
-    # test_paths.py reloads `paths` under a tmp HOME and never restores it, leaking
-    # a stale CONFIG_HOME into later tests. Reload against the real env here so this
-    # assertion is order-independent (and the reload heals the leaked module state).
     import importlib
 
     importlib.reload(paths)
@@ -27,7 +24,6 @@ def test_config_home_and_host_json_default_to_home():
 
 @pytest.fixture
 def farm(monkeypatch, tmp_path):
-    """Canonical ~/.claude populated with shared assets + a host .claude.json."""
     canonical = tmp_path / ".claude"
     canonical.mkdir()
     for d in ("rules", "agents", "commands", "skills", "flows", "scripts",
@@ -196,7 +192,7 @@ def test_host_claude_json_unreadable_is_best_effort(farm):
 def test_host_claude_json_non_dict_is_best_effort(farm):
     tmp, canonical, host = farm
     host.write_text(json.dumps(["not", "a", "dict"]))
-    out = spawner.ensure_account_config_dir("b")  # must not raise
+    out = spawner.ensure_account_config_dir("b")
     assert (out / "rules").is_symlink()
     assert not (out / ".claude.json").exists()
 
@@ -206,7 +202,6 @@ def test_prefix_none_is_empty():
 
 
 def test_prefix_account_a_no_config_dir(monkeypatch):
-    # Account 'a' == the default ~/.claude: NO CLAUDE_CONFIG_DIR, NO farm build.
     def _boom(letter):
         raise AssertionError("account 'a' must NOT build a farm")
     monkeypatch.setattr(spawner, "ensure_account_config_dir", _boom)
@@ -230,15 +225,12 @@ def test_prefix_account_b_exports_config_dir(monkeypatch, tmp_path):
 
 
 def test_prefix_b_unhealthy_farm_falls_back_to_a(monkeypatch, tmp_path):
-    # Partial farm: builder returns a dir whose .claude.json is missing → the worker
-    # must NOT be pinned to it (would have no orchestrator MCP); fall back to the
-    # default login with a TRUTHFUL effective stamp 'a'.
     farm_dir = tmp_path / ".claude-b"
-    farm_dir.mkdir()  # built, but no .claude.json written
+    farm_dir.mkdir()
     monkeypatch.setattr(spawner, "ensure_account_config_dir", lambda letter: farm_dir)
     out = spawner._build_account_prefix("b")
     assert "CLAUDE_CONFIG_DIR" not in out
-    assert out == "CLAUDE_ORCH_ACCOUNT=a "  # effective stamp 'a'
+    assert out == "CLAUDE_ORCH_ACCOUNT=a "
 
 
 def test_prefix_b_unhealthy_farm_non_dict_falls_back_to_a(monkeypatch, tmp_path):
@@ -319,13 +311,12 @@ def test_farm_denies_runtime_and_junk_entries(farm):
     ]:
         assert not (out / name).exists() and not (out / name).is_symlink(), \
             f"{name} must not be symlinked"
-    # functional settings.json still shares
     assert (out / "settings.json").is_symlink()
 
 
 def test_farm_denies_sibling_farm_dirs(farm):
     tmp, canonical, _ = farm
-    (canonical / ".claude-x").mkdir()  # defensive: never a child in reality
+    (canonical / ".claude-x").mkdir()
     out = spawner.ensure_account_config_dir("b")
     assert not (out / ".claude-x").exists() and not (out / ".claude-x").is_symlink()
 
@@ -334,7 +325,7 @@ def test_farm_repairs_dangling_symlink(farm):
     tmp, canonical, _ = farm
     out = tmp / ".claude-b"
     out.mkdir()
-    (out / "rules").symlink_to(tmp / "GONE")  # dangling: target absent
+    (out / "rules").symlink_to(tmp / "GONE")
     assert (out / "rules").is_symlink() and not (out / "rules").exists()
     spawner.ensure_account_config_dir("b")
     assert os.readlink(out / "rules") == str(canonical / "rules")
@@ -359,8 +350,6 @@ def test_farm_real_dir_drift_warns(farm, caplog):
 
 
 def test_ensure_symlink_noop_when_correct_even_if_target_absent(tmp_path):
-    # M4(a): a dangling link already pointing at the desired (absent) target hits
-    # the no-op branch — left as-is, no churn, no error.
     target = tmp_path / "GONE"
     link = tmp_path / "link"
     link.symlink_to(target)
@@ -370,12 +359,11 @@ def test_ensure_symlink_noop_when_correct_even_if_target_absent(tmp_path):
 
 
 def test_farm_real_file_drift_left_intact_and_warns(farm, caplog):
-    # M4(b): a real FILE (not dir) where a symlink belongs is left intact + warned.
     import logging
     tmp, canonical, _ = farm
     out = tmp / ".claude-b"
     out.mkdir()
-    (out / "statusline-command.sh").write_text("local-real")  # canonical has it as a file
+    (out / "statusline-command.sh").write_text("local-real")
     spawner._warned_drift.clear()
     with caplog.at_level(logging.WARNING):
         spawner.ensure_account_config_dir("b")
@@ -385,7 +373,6 @@ def test_farm_real_file_drift_left_intact_and_warns(farm, caplog):
 
 
 def test_farm_drift_warning_deduped_across_spawns(farm, caplog):
-    # M3: a persistent drift warns exactly once across repeated assembly.
     import logging
     tmp, canonical, _ = farm
     out = tmp / ".claude-b"
@@ -403,8 +390,6 @@ def test_farm_drift_warning_deduped_across_spawns(farm, caplog):
 
 
 def test_bp1_to_bp2_upgrade_reassembles_cleanly(farm):
-    # M4(c): a pre-existing BP-1 allowlist-era farm (real .claude.json + old symlink
-    # set + a real claude-runtime dir) re-assembles cleanly with no data loss.
     tmp, canonical, host = farm
     out = tmp / ".claude-b"
     out.mkdir()
@@ -414,21 +399,20 @@ def test_bp1_to_bp2_upgrade_reassembles_cleanly(farm):
         "mcpServers": {"claude-orchestrator": {"command": "orchestrator"}},
         "marker": "bp1-keep",
     }))
-    (out / "sessions").mkdir()  # claude-runtime real dir from a BP-1 worker
+    (out / "sessions").mkdir()
     (out / "sessions" / "s.json").write_text("session-data")
-    (canonical / "selffix-findings").mkdir()  # NEW functional dir BP-1 omitted
+    (canonical / "selffix-findings").mkdir()
     (canonical / "selffix-findings" / "f.md").write_text("finding")
     spawner.ensure_account_config_dir("b")
-    assert (out / "rules").is_symlink()                       # old symlink preserved
-    assert json.loads((out / ".claude.json").read_text())["marker"] == "bp1-keep"  # healthy json kept
-    assert (out / "sessions" / "s.json").read_text() == "session-data"  # runtime dir untouched
+    assert (out / "rules").is_symlink()
+    assert json.loads((out / ".claude.json").read_text())["marker"] == "bp1-keep"
+    assert (out / "sessions" / "s.json").read_text() == "session-data"
     assert not (out / "sessions").is_symlink()
-    assert (out / "selffix-findings").is_symlink()            # new functional dir now shared
+    assert (out / "selffix-findings").is_symlink()
     assert (out / "selffix-findings" / "f.md").read_text() == "finding"
 
 
 def test_farm_never_symlink_credential_pattern_fallback():
-    # I1: fail-closed credential boundary denies future secret-named files.
     for denied in ("auth-token.json", ".SECRET", "foo-oauth-bar", "creds.txt", "my-credential"):
         assert spawner._farm_never_symlink(denied), f"{denied} should be denied (credential pattern)"
     for ok in ("rules", "selffix-findings", "loops-registry.md", "manager-memory",
@@ -437,7 +421,6 @@ def test_farm_never_symlink_credential_pattern_fallback():
 
 
 def test_farm_denies_future_credential_named_file(farm):
-    # I1 end-to-end: a future credential-named canonical entry is not symlinked.
     tmp, canonical, _ = farm
     creds = ("auth-token.json", ".some-cred", "my-oauth-cache", "app-secret.txt")
     for n in creds:
@@ -449,8 +432,6 @@ def test_farm_denies_future_credential_named_file(farm):
 
 
 def test_spawn_worker_tab_pretrusts_host_then_farm(monkeypatch, tmp_path):
-    """L-11 ordering: host BEFORE _build_account_prefix (a first-build farm
-    copies the host file), farm AFTER (and only when healthy)."""
     import asyncio
     import json as _json
     from dockwright import config, paths as dpaths, spawner, trust
@@ -580,9 +561,6 @@ def test_refresh_keeps_legacy_key_while_host_still_has_it(farm):
 
 
 def test_refresh_never_strips_a_legacy_only_farm(farm):
-    # Guard protecting farm health: host has NEITHER key (empty servers) →
-    # the legacy key is the farm's ONLY orchestrator registration; dropping it
-    # would flip the farm unhealthy. Own red→green case per drift-guard rule.
     tmp, canonical, host = farm
     out = spawner.ensure_account_config_dir("b")
     _write_farm_json(out, {
@@ -608,13 +586,10 @@ def test_refresh_vacuous_when_host_mcpservers_missing(farm):
 
 
 def test_refresh_skips_non_dict_farm_mcpservers(farm):
-    # _claude_json_healthy accepts a LIST containing "dockwright" (`in` works on
-    # lists), so a corrupt-but-"healthy" farm reaches the refresh — it must
-    # type-guard and skip, not raise.
     tmp, canonical, host = farm
     out = spawner.ensure_account_config_dir("b")
     _write_farm_json(out, {"mcpServers": ["dockwright"]})
-    spawner.ensure_account_config_dir("b")  # must not raise
+    spawner.ensure_account_config_dir("b")
     assert json.loads((out / ".claude.json").read_text()) == {"mcpServers": ["dockwright"]}
 
 
@@ -624,7 +599,7 @@ def test_refresh_skips_unreadable_host(farm):
     before = {"mcpServers": {"claude-orchestrator": {"command": "orchestrator"}}}
     _write_farm_json(out, before)
     host.write_text("not-json{{{")
-    spawner.ensure_account_config_dir("b")  # must not raise
+    spawner.ensure_account_config_dir("b")
     assert json.loads((out / ".claude.json").read_text()) == before
 
 
@@ -649,7 +624,6 @@ def test_parity_report_clean_farm(farm):
     assert report["exists"] is True
     assert report["config_dir"] == str(tmp / ".claude-b")
     assert report["drift"] == [] and report["missing"] == []
-    # fixture canonical has 12 non-denied entries (9 dirs + 3 files)
     assert report["shared"] == 12
     assert report["claude_json"] == "in-sync"
 
@@ -672,16 +646,13 @@ def test_parity_report_names_real_path_drift(farm):
 
 
 def test_parity_report_is_stateless_despite_warned_drift_dedup(farm):
-    # The report must re-scan; it must NOT consult spawner._warned_drift (the
-    # MCP-resident spawner's once-per-process log dedup) — a prior warn must
-    # not suppress a drift line.
     tmp, canonical, _ = farm
     out = tmp / ".claude-b"
     out.mkdir()
     (out / "rules").mkdir()
     spawner._warned_drift.clear()
-    spawner.ensure_account_config_dir("b")   # logs + dedups the drift
-    spawner.ensure_account_config_dir("b")   # suppressed log — drift persists
+    spawner.ensure_account_config_dir("b")
+    spawner.ensure_account_config_dir("b")
     r1 = spawner.farm_parity_report("b")
     r2 = spawner.farm_parity_report("b")
     assert r1["drift"] == ["rules"] and r2["drift"] == ["rules"]
@@ -751,14 +722,6 @@ def test_ensure_refuses_farm_inside_canonical(farm, monkeypatch):
 
 
 def test_refresh_aborts_when_live_session_writes_midwindow(farm, monkeypatch):
-    # Tier-2 I-1 regression: a live same-account claude rewrites .claude.json
-    # WHOLESALE via atomic replace (measured on-host: inode flips every write)
-    # and takes no lock. If such a write lands between the refresh's read and
-    # its replace, the refresh must ABORT — landing a stale full-file snapshot
-    # reverts oauthAccount/accountUuid and can brick the account's login.
-    # Injection is deterministic: the 2nd parse of the marked farm content is
-    # the refresh's own read (the 1st is _claude_json_healthy), so the
-    # competing write lands exactly inside the read->write window.
     tmp, canonical, host = farm
     out = spawner.ensure_account_config_dir("b")
     _write_farm_json(out, {
@@ -789,7 +752,6 @@ def test_refresh_aborts_when_live_session_writes_midwindow(farm, monkeypatch):
     assert data["mcpServers"] == {"claude-orchestrator": {"command": "orchestrator"}}, \
         "aborted refresh must leave the competing snapshot byte-identical"
     assert not list(out.glob(".claude.json.tmp.*")), "aborted refresh must clean its tmp file"
-    # self-heals on the next (quiet) ensure, preserving the fresh identity:
     spawner.ensure_account_config_dir("b")
     data = real_loads((out / ".claude.json").read_text())
     assert data["oauthAccount"] == {"accountUuid": "fresh-uuid-after-reauth"}

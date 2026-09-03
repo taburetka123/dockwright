@@ -1,4 +1,3 @@
-"""`orchestrator init` writes the documented-defaults dockwright.toml."""
 import tomllib
 
 from dockwright import config, init_config

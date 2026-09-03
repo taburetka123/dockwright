@@ -1,11 +1,3 @@
-"""LLM judge — grade an investigation's textual findings against a hidden rubric.
-
-A no-tool grading call: a single headless ``claude -p`` run with the read-only
-verifier preset and an empty MCP config, from a neutral throwaway cwd. It returns
-an integer 0-100 (the LAST integer the model emits, clamped). A broken judge
-fails CLOSED: any error — nonzero exit, timeout, unparseable output, no integer —
-returns 0, so a scoring failure never masquerades as a passing sample.
-"""
 from __future__ import annotations
 
 import json

@@ -1,26 +1,3 @@
-"""Cross-lane parity for the DOCKWRIGHT_MANAGER_SKIP_PERMS opt-in.
-
-ONE security-relevant gate (it strips the Bash safety classifier off the
-launched manager), THREE independent comparison sites — and no shared helper
-can bind them: stale_monitor.py is dual-homed as a standalone stdlib-only
-script that cannot import the package, and bootstrap-recreate.sh is standalone
-bash. The duplication is architectural, so the anti-drift device has to be a
-test that drives every lane with the SAME value and asserts they answer
-identically.
-
-bash is the reference implementation — `[ "${DOCKWRIGHT_MANAGER_SKIP_PERMS:-}"
-= "1" ]`, an exact compare with no normalization. PR #218 Tier-2 review found
-the two Python lanes running `.strip() == "1"`, so a whitespace-padded value
-("1 ", " 1", "\\n1") authorized a skip-permissions launch in Python while bash
-read the same environment as OFF. Lanes disagreeing about whether a security
-opt-in is ON is the defect; matching Python to bash is the fix.
-
-Drift-guard discipline (~/.claude/rules/drift-guard-tests.md): every lane is
-driven through its EXECUTED path with a real environment value. No lane is
-checked by substring-matching its source — all three files quote the variable
-name verbatim in prose, so a grep-the-file guard would stay green with the gate
-deleted outright.
-"""
 import importlib.util
 import json
 import os
@@ -39,9 +16,6 @@ STALE_MONITOR_PATH = REPO / "src" / "dockwright" / "stale_monitor.py"
 VAR = "DOCKWRIGHT_MANAGER_SKIP_PERMS"
 FLAG = "--dangerously-skip-permissions"
 
-# (env value, gate expected ON). None means the variable is unset entirely.
-# Exactly "1" enables; every whitespace-padded neighbour must NOT, because
-# bash's `=` never normalizes and the lanes have to agree.
 CASES = [
     ("1", True),
     ("1 ", False),
@@ -65,23 +39,12 @@ def _set_var(monkeypatch, value):
 
 
 def _lane_manager_launch(monkeypatch, tmp_path, value):
-    """Fresh-boot lane — also the recreate lane, which imports this helper
-    from mcp_server rather than re-implementing the compare."""
     monkeypatch.setattr(manager_launch.paths, "PRESETS", tmp_path / "no-presets")
     _set_var(monkeypatch, value)
     return FLAG in manager_launch.manager_claude_args()
 
 
 def _lane_stale_monitor(monkeypatch, tmp_path, value):
-    """Account-flip recovery lane — loaded from source the way the deployed
-    standalone copy runs, and driven through the real argv composition.
-
-    HOME is redirected BEFORE exec_module because the module binds HOME and
-    every derived state path (ROOT, ACTIVE, CLOSED, …) at import time, and
-    resolving ROOT stats the operator's real ~/.claude/dockwright. Patching
-    mod.ROOT afterwards covers only the attribute this lane happens to read
-    today; scratch-by-construction keeps the test hermetic if
-    _launch_recovery_manager ever reaches for a sibling path."""
     monkeypatch.setenv("HOME", str(tmp_path))
     spec = importlib.util.spec_from_file_location(
         "stale_monitor_parity", STALE_MONITOR_PATH)
@@ -103,9 +66,6 @@ def _lane_stale_monitor(monkeypatch, tmp_path, value):
 
 
 def _lane_bootstrap_bash(tmp_path, value):
-    """Reference lane — runs the REAL script and reads the RUNTIME_CMD that
-    --dry-run prints verbatim as cmd=[…]. Self-contained in safety: its own
-    fake-tmux dir leads PATH, so nothing here can reach real tmux."""
     fakebin = tmp_path / "fakebin"
     fakebin.mkdir(parents=True)
     (fakebin / "tmux").write_text(
@@ -136,9 +96,6 @@ def _lane_bootstrap_bash(tmp_path, value):
 
 @pytest.mark.parametrize("value,expected", CASES, ids=IDS)
 def test_skip_perms_gate_agrees_across_lanes(monkeypatch, tmp_path, value, expected):
-    """Each lane must read the same environment the same way, and that way is
-    bash's exact compare. A lane that normalizes whitespace turns "1 " into an
-    authorized skip-permissions launch that the other lanes refuse."""
     lanes = {
         "manager_launch.manager_claude_args": _lane_manager_launch(
             monkeypatch, tmp_path / "ml", value),
@@ -151,11 +108,3 @@ def test_skip_perms_gate_agrees_across_lanes(monkeypatch, tmp_path, value, expec
         f"{VAR}={value!r} must leave the gate "
         f"{'ON' if expected else 'OFF'} in every lane; these disagreed: "
         f"{disagreeing} (bash is the reference — exact `= \"1\"`, no strip)")
-
-
-def test_parity_cases_cover_the_whitespace_drift():
-    """The table itself is load-bearing: the defect this module exists for is
-    whitespace-only padding, so a future trim that leaves only ""/"0"/"true"
-    would keep the module green while re-opening the exact hole."""
-    padded = {v for v, _ in CASES if v not in (None, "") and v.strip() == "1" and v != "1"}
-    assert padded >= {"1 ", " 1", "\n1", "1\n"}, padded

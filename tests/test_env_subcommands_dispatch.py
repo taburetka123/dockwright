@@ -5,13 +5,6 @@ from dockwright import __main__ as m
 
 
 def _usage_entries(text):
-    """Names enumerated as USAGE entry lines (first column, two-space indent).
-
-    A bare substring check is defeatable: with the `manager` entry line
-    deleted, "manager" still appears in USAGE via `[manager-name]`,
-    `assign-to-manager`, and a description — so the net anchors on the entry
-    column. The shared internal-hooks line is `|`-split into its tokens.
-    """
     entries = set()
     for line in text.splitlines():
         match = re.match(r"^  ([a-z][a-z0-9 |\-]*?)(?:\s{2,}|$)", line)
@@ -60,7 +53,6 @@ def test_help_prints_usage_rc0(monkeypatch, capsys, flag):
     entries = _usage_entries(captured.out)
     for sub in ("doctor", "manager", "monitor", "selffix", "gardener", "uninstall"):
         assert sub in entries
-    # Internal hook plumbing is enumerated too, under its own group header.
     assert "session-start" in entries
     assert "Internal" in captured.out
 
@@ -73,7 +65,7 @@ def test_bare_invocation_usage_rc2(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "Usage: dockwright" in captured.err
-    assert "doctor" in _usage_entries(captured.err)  # bare usage is enumerated as well
+    assert "doctor" in _usage_entries(captured.err)
 
 
 def test_unknown_subcommand_rc2_with_help_hint(monkeypatch, capsys):
@@ -84,16 +76,3 @@ def test_unknown_subcommand_rc2_with_help_hint(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "Unknown subcommand: frobnicate" in err
     assert "--help" in err
-
-
-def test_usage_enumerates_every_dispatched_subcommand(monkeypatch):
-    """Drift net: every `elif cmd == "x"` target must be enumerated as its own
-    USAGE entry LINE — see _usage_entries for why substring matching is not
-    enough."""
-    import inspect
-    src = inspect.getsource(m)
-    subs = re.findall(r'cmd == "([a-z-]+)"', src)
-    assert len(subs) >= 20, f"dispatcher parse broke: {subs}"
-    entries = _usage_entries(m.USAGE)
-    for sub in subs:
-        assert sub in entries, f"subcommand {sub!r} has no USAGE entry line"

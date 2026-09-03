@@ -197,28 +197,6 @@ max_silence_hours: 72
 last_verified: 2026-06-11
 ```
 
-### corpus-watch
-
-```loop
-name: corpus-watch
-label: {prefix}.corpus-watch
-status: pending-install
-status_why: ships pending-install; opt in by running corpus-watch-install.sh, then flip live via [loops.status_overrides] in dockwright.toml
-trigger: launchd StartInterval 3600
-gate: corpus_watch_gate.py — [modules] gardener=false no-ops SILENTLY (clean off switch, gardener-gate precedent; loops-status reads a module-off install as stale — expected for the whole gardener family) → stop file → state init (first run records HEAD, no retro-scan) → unresolvable last_sha re-init (LOUD check.log line + drift finding naming the unexamined range) → no new commits → 30-min quiet period (batch bursts; on a continuously-committing day latency degrades to the first quiet gap — accepted, non-blocking loop) → run-lock pre-check (skip WITHOUT advancing state) → 6h cooldown on lane=corpus-watch run_start (unconditional — any commits during a cooldown window defer whole, skip WITHOUT advancing state) → mapped-vs-unmapped classification of changed ~/.claude paths via gardener_eval_gate load_map/_coverage (post-rung-3: default map = */deploy/* only; overlay-driven investigation mapping) → spawn; missing run script => spawn-blocked (loud, state un-advanced); unmapped instruction churn (rules/ skills/ commands/ agents/) advances state + accumulates persistent counters, drift-visibility finding at ≥3 files or ≥2048 bytes (no model spend); non-instruction unmapped churn advances state only (no-instruction-churn)
-run_contract: corpus-watch-run.sh detached (argv: examined-sha, range, targets-csv, gardener-dir); acquires the shared analyst run-lock (try; busy => exit, state un-advanced); gardener_eval_gate.py --targets <mapped>; exit 1 => finding + osascript notify (6h throttle); exit 2 => infra-suspect finding + notify (24h throttle, separate marker); exit 4 => anomaly-unmapped run.log line (map race, harmless); any post-run_start failure still writes run_end status=error + a run.log line (state un-advanced); state advances to the EXAMINED sha before lock release in every completed branch. Model spend is the eval harness's own non-interactive claude -p SUT/judge subprocesses — the already-spiked headless contract (eval-trust: six documented headless runs; the sitting flow runs the same gate as background bash); no interactive session exists to observe and outputs land durably in results/latest.json, traces/, the ledger, and findings/ — that is the visible-first why-not (convention item 6). Expected eval spend 0/day on a default install — post-rung-3 (docs/specs/eval-direction.md § Ladder execution record) nothing maps to the investigation suite by default, so the eval branch arms only on installs whose operator overlay (eval-gate-map.json) maps it deliberately; default behavior is drift-visibility findings only. Worst case under the 6h cooldown: 4 eval runs/day.
-permissions_mode: wrappers are LLM-free bash/python; SUT/judge sessions run read-only under deploy/presets/investigation-eval-settings.json + --setting-sources project
-ledger_path: ~/.claude/dockwright/gardener/ledger.jsonl
-kill_switch: ~/.claude/dockwright/corpus-watch-stop
-runtime_program_path: ~/.claude/scripts/corpus_watch_gate.py
-source_path: deploy/scripts/corpus_watch_gate.py
-deploy_mechanism: setup.sh cp + corpus-watch-install.sh (plist)
-log_paths: ~/.claude/dockwright/corpus-watch/check.log, ~/.claude/dockwright/corpus-watch/launchd-out.log, ~/.claude/dockwright/corpus-watch/launchd-err.log
-event_paths: ~/.claude/dockwright/corpus-watch/check.log
-max_silence_hours: 26
-last_verified: 2026-07-28
-```
-
 ### worktree-prune
 
 ```loop

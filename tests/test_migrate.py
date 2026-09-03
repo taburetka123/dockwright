@@ -32,7 +32,7 @@ def test_root_moves_and_symlinks(claude):
     legacy = claude / "orchestrator"
     assert legacy.is_symlink()
     assert os.readlink(legacy) == "dockwright"
-    assert (legacy / "active/s1.json").is_file()  # resolves through link
+    assert (legacy / "active/s1.json").is_file()
 
 
 def test_all_rows_migrate(claude):
@@ -63,7 +63,6 @@ def test_all_rows_migrate(claude):
                    "worktree-prune", "loops-registry.md",
                    ".orchestrator-deploy", "orchestrator-overlay"):
         assert (claude / legacy).is_symlink(), legacy
-    # relative target pinned for a NESTED row, not just row 1
     assert os.readlink(claude / "manager-memory") == "dockwright/manager-memory"
 
 
@@ -78,7 +77,7 @@ def test_idempotent_second_run(claude):
 
 def test_new_preexists_real_dir_merges(claude):
     _mk(claude, "orchestrator/active/s1.json")
-    _mk(claude, "dockwright/manager-memory/keep.md")  # ensure_dirs artifact
+    _mk(claude, "dockwright/manager-memory/keep.md")
     _mk(claude, "manager-memory/old.md")
     migrate.run(claude)
     assert (claude / "dockwright/manager-memory/keep.md").is_file()
@@ -91,7 +90,7 @@ def test_file_collision_aborts_loudly(claude):
     _mk(claude, "dockwright/loops-registry.md", "new")
     with pytest.raises(migrate.MigrationError):
         migrate.run(claude)
-    assert (claude / "loops-registry.md").read_text() == "old"  # untouched
+    assert (claude / "loops-registry.md").read_text() == "old"
 
 
 def test_stop_files_absent_no_symlink(claude):
@@ -118,12 +117,7 @@ def test_dry_run_touches_nothing(claude):
     assert not (claude / "dockwright").exists()
 
 
-# --- hardening beyond the brief -------------------------------------------
-
-
 def test_nested_file_collision_aborts_with_both_intact(claude):
-    """A collision deep inside a dir merge aborts loudly and neither side's
-    file content is touched."""
     _mk(claude, "manager-memory/general/j.md", "old")
     _mk(claude, "dockwright/manager-memory/general/j.md", "new")
     with pytest.raises(migrate.MigrationError):
@@ -133,8 +127,6 @@ def test_nested_file_collision_aborts_with_both_intact(claude):
 
 
 def test_merge_never_writes_through_dst_symlink(claude):
-    """A symlink at the merge destination is a collision, never followed —
-    following it would silently relocate state to wherever it points."""
     elsewhere = claude / "elsewhere"
     elsewhere.mkdir()
     _mk(claude, "manager-memory/sub/old.md", "old")
@@ -147,11 +139,9 @@ def test_merge_never_writes_through_dst_symlink(claude):
 
 
 def test_symlink_child_is_moved_as_link_not_followed(claude):
-    """A child that is itself a symlink is renamed as-is; an intra-tree
-    relative link keeps resolving at the new home."""
     _mk(claude, "gardener/data/ledger.jsonl", "L")
     os.symlink("data", claude / "gardener/link")
-    _mk(claude, "dockwright/gardener/keep.md")  # force the merge path
+    _mk(claude, "dockwright/gardener/keep.md")
     migrate.run(claude)
     moved = claude / "dockwright/gardener/link"
     assert moved.is_symlink()
@@ -160,8 +150,6 @@ def test_symlink_child_is_moved_as_link_not_followed(claude):
 
 
 def test_reborn_legacy_dir_is_merged_and_symlinked(claude, monkeypatch):
-    """A live poller's mkdir re-creating the legacy dir between rename and
-    symlink (EEXIST) gets folded into the new home and the symlink lands."""
     _mk(claude, "orchestrator/active/s1.json")
     real_symlink = os.symlink
     reborn = {"done": False}
@@ -181,8 +169,6 @@ def test_reborn_legacy_dir_is_merged_and_symlinked(claude, monkeypatch):
 
 
 def test_symlink_retry_exhaustion_fails_loudly_with_state_safe(claude, monkeypatch):
-    """If the legacy dir keeps being reborn past the retry bound, migration
-    fails loudly and everything already moved is intact at the new home."""
     _mk(claude, "orchestrator/active/s1.json")
 
     def always_reborn_symlink(target, link, *a, **kw):
@@ -196,7 +182,6 @@ def test_symlink_retry_exhaustion_fails_loudly_with_state_safe(claude, monkeypat
 
 
 def test_legacy_pin_via_absolute_path_aborts(claude, tmp_path, monkeypatch):
-    """The pin assert catches an expanded absolute path, not just the ~ form."""
     abs_legacy = os.path.expanduser("~/.claude/manager-memory")
     cfg = tmp_path / "dockwright.toml"
     cfg.write_text(f'[paths]\nmanager_memory = "{abs_legacy}/"\n')
@@ -214,8 +199,6 @@ def test_wrong_symlink_at_legacy_aborts(claude):
 
 
 def test_dry_run_previews_collision(claude):
-    """Dry-run predicts the loud abort a real run would hit, still touching
-    nothing."""
     _mk(claude, "loops-registry.md", "old")
     _mk(claude, "dockwright/loops-registry.md", "new")
     lines = migrate.run(claude, dry_run=True)
@@ -225,10 +208,6 @@ def test_dry_run_previews_collision(claude):
 
 
 def test_crash_residue_new_only_is_skipped_not_relinked(claude):
-    """Legacy absent + new populated (crash residue, or simply a home that
-    never had legacy state) must NOT manufacture a compat symlink. The
-    retired crash-repair arm did exactly that, resurrecting the legacy links
-    on every deploy after an operator removed them."""
     _mk(claude, "dockwright/manager-memory/j.md")
     lines = migrate.run(claude)
     mm = claude / "manager-memory"
@@ -247,11 +226,6 @@ def test_dry_run_crash_residue_reports_absent(claude):
 
 
 def test_never_migrated_home_grows_no_legacy_symlinks(claude):
-    """A populated new home with NO legacy paths on disk — a fresh machine
-    after its first deploy — must stay legacy-free across repeated runs.
-    Before the crash-repair arm retired, every 2nd+ setup.sh run grew a
-    compat symlink at EVERY legacy name (setup.sh runs migrate-state on each
-    deploy), including on machines that never had anything to migrate."""
     _mk(claude, "dockwright/active/s1.json")
     _mk(claude, "dockwright/manager-memory/j.md")
     _mk(claude, "dockwright/loops-registry.md", "reg")
@@ -266,11 +240,9 @@ def test_never_migrated_home_grows_no_legacy_symlinks(claude):
 
 
 def test_symlink_at_new_path_is_loud_collision(claude):
-    """A symlink squatting at the new path (dangling included) is a loud
-    collision — os.rename would silently replace the link itself."""
     _mk(claude, "loops-registry.md", "old")
     (claude / "dockwright").mkdir()
-    os.symlink("elsewhere", claude / "dockwright/loops-registry.md")  # dangling
+    os.symlink("elsewhere", claude / "dockwright/loops-registry.md")
     with pytest.raises(migrate.MigrationError):
         migrate.run(claude)
     assert (claude / "loops-registry.md").read_text() == "old"
@@ -278,8 +250,6 @@ def test_symlink_at_new_path_is_loud_collision(claude):
 
 
 def test_rename_race_with_ensure_dirs_falls_back_to_merge(claude, monkeypatch):
-    """A concurrent ensure_dirs creating new (non-empty) between the existence
-    check and os.rename must fold into a merge, not escape as a raw OSError."""
     import errno
     _mk(claude, "orchestrator/active/s1.json")
     real_rename = os.rename

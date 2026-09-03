@@ -1,4 +1,3 @@
-import ast
 import inspect
 import os
 import subprocess
@@ -33,8 +32,6 @@ def fresh_orchestrator_dir(tmp_path, monkeypatch):
 
 
 def _install_two_pool(monkeypatch, tmp_path):
-    """The default pool is single-account; tests that stamp/validate account 'b'
-    need it registered, so install the two-account registry explicitly."""
     cfg = tmp_path / "two-pool.toml"
     cfg.write_text('[accounts]\ndefault = "a"\n'
                    '[[accounts.pool]]\nname = "a"\n[[accounts.pool]]\nname = "b"\n')
@@ -71,10 +68,6 @@ def test_register_self_stamps_account_from_env(fresh_orchestrator_dir, monkeypat
     assert record["account"] == "b"
 
 def test_register_self_preserves_hook_stamp_when_env_absent(fresh_orchestrator_dir, monkeypatch):
-    """The SessionStart hook stamps `account` on the active record (hooks.py);
-    become_manager routes /manager boots through register_self_impl minutes
-    later — the rebuilt record must keep the stamp when the MCP server's env
-    doesn't carry CLAUDE_ORCH_ACCOUNT."""
     monkeypatch.delenv("CLAUDE_ORCH_ACCOUNT", raising=False)
     state.write_json_atomic(paths.ACTIVE / "mgr-1.json", {
         "claude_sid": "mgr-1", "agent": "manager", "name": "spry-walrus",
@@ -89,10 +82,6 @@ def test_register_self_preserves_hook_stamp_when_env_absent(fresh_orchestrator_d
     assert record["account"] == "a"
 
 def test_register_self_preserves_started_at_on_reregistration(fresh_orchestrator_dir):
-    """become_manager re-registers an already-active sid minutes after session
-    birth; the rebuilt record must keep the ORIGINAL started_at — the Stop
-    hook's recount uses it as the birth cutoff, and a reset would exclude all
-    pre-promotion usage from the spend recount."""
     state.write_json_atomic(paths.ACTIVE / "mgr-1.json", {
         "claude_sid": "mgr-1", "agent": "manager", "name": "spry-walrus",
         "cwd": "/x", "window_id": "i1", "pid": os.getpid(),
@@ -107,7 +96,6 @@ def test_register_self_account_none_without_env_or_prior_record(fresh_orchestrat
     monkeypatch.delenv("CLAUDE_ORCH_ACCOUNT", raising=False)
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1")
     assert state.read_json(paths.ACTIVE / "w1.json")["account"] is None
-    # An invalid letter is not a stamp either.
     monkeypatch.setenv("CLAUDE_ORCH_ACCOUNT", "z")
     register_self_impl(claude_sid="w2", agent="worker", name="beta", cwd="/y", iterm_sid="i2")
     assert state.read_json(paths.ACTIVE / "w2.json")["account"] is None
@@ -145,7 +133,6 @@ def test_answer_unblocks_ask(fresh_orchestrator_dir):
 def test_list_pending_returns_oldest_first(fresh_orchestrator_dir):
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1")
     register_self_impl(claude_sid="w2", agent="worker", name="beta", cwd="/y", iterm_sid="i2")
-    # Write two questions directly via the helper (not blocking)
     from dockwright.mcp_server import _write_question
     _write_question(worker_sid="w1", worker_name="alpha", question="q1")
     time.sleep(0.05)
@@ -242,15 +229,12 @@ def test_drop_questions_for_worker_removes_scoped_questions(fresh_orchestrator_d
     assert (paths.QUESTIONS / "manager-b" / "q2.json").exists()
 
 
-# Append to tests/test_mcp_tools.py
 from dockwright.mcp_server import (
     send_manager_to_worker_impl, kill_worker_impl, attach_existing_impl,
 )
 from dockwright import paths as paths_module
 
 def test_send_manager_to_worker_types_content(fresh_orchestrator_dir, monkeypatch):
-    """Happy path: type the message CONTENT directly into the worker's window
-    (direct delivery — tmux buffers it if the worker is mid-turn)."""
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="42")
     typed = []
     monkeypatch.setattr(
@@ -262,8 +246,6 @@ def test_send_manager_to_worker_types_content(fresh_orchestrator_dir, monkeypatc
     assert typed == [("42", "[MANAGER] also check Y")]
 
 def test_send_manager_to_worker_marker_prepends_once_multiline(fresh_orchestrator_dir, monkeypatch):
-    """The marker rides INSIDE the paste body: prefix on the first line only,
-    later lines untouched (bracketed-paste + single-Enter mechanics unchanged)."""
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="42")
     typed = []
     monkeypatch.setattr(
@@ -279,8 +261,6 @@ def test_send_manager_to_worker_unknown_worker(fresh_orchestrator_dir):
         send_manager_to_worker_impl(worker="ghost", text="hi")
 
 def test_send_manager_to_worker_resolves_via_terminal_ls_when_id_empty(fresh_orchestrator_dir, monkeypatch):
-    """A3: persisted window_id empty → match a live window by cwd+runtime,
-    stamp it back, deliver."""
     import dockwright.mcp_server as srv
     state.write_json_atomic(paths.ACTIVE / "w1.json", {
         "claude_sid": "w1", "agent": "worker", "name": "alpha",
@@ -294,11 +274,9 @@ def test_send_manager_to_worker_resolves_via_terminal_ls_when_id_empty(fresh_orc
     monkeypatch.setattr(srv, "_WINDOW_RESOLVE_RETRY_SLEEP", 0)
     result = srv.send_manager_to_worker_impl("alpha", "hi")
     assert result["status"] == "delivered" and sent["wid"] == "555"
-    assert state.read_json(paths.ACTIVE / "w1.json")["window_id"] == "555"  # stamped back
+    assert state.read_json(paths.ACTIVE / "w1.json")["window_id"] == "555"
 
 def test_send_manager_to_worker_persisted_id_confirmed_live(fresh_orchestrator_dir, monkeypatch):
-    """A3: persisted window_id appears live in `tmux list-panes` → use it as-is (early
-    return), never enter the cwd-match path — even when its cwd differs."""
     import dockwright.mcp_server as srv
     state.write_json_atomic(paths.ACTIVE / "w1.json", {
         "claude_sid": "w1", "agent": "worker", "name": "alpha",
@@ -312,18 +290,16 @@ def test_send_manager_to_worker_persisted_id_confirmed_live(fresh_orchestrator_d
     assert result["status"] == "delivered" and sent["wid"] == "555"
 
 def test_send_manager_to_worker_no_live_window_raises_loud(fresh_orchestrator_dir, monkeypatch):
-    """A3: genuinely no live window (retries exhausted) → raise, never a file."""
     import dockwright.mcp_server as srv
     state.write_json_atomic(paths.ACTIVE / "w1.json", {
         "claude_sid": "w1", "agent": "worker", "name": "alpha",
         "cwd": "/tmp/wt", "window_id": "", "runtime": "claude"})
-    monkeypatch.setattr(srv, "_terminal_ls", lambda: [])   # no windows
+    monkeypatch.setattr(srv, "_terminal_ls", lambda: [])
     monkeypatch.setattr(srv, "_WINDOW_RESOLVE_RETRY_SLEEP", 0)
     with pytest.raises(ValueError, match="no live window"):
         srv.send_manager_to_worker_impl("alpha", "hi")
 
 def test_send_manager_to_worker_ambiguous_cwd_match_raises(fresh_orchestrator_dir, monkeypatch):
-    """A3: >1 cwd match → unresolvable, never guess → raise."""
     import dockwright.mcp_server as srv
     state.write_json_atomic(paths.ACTIVE / "w1.json", {
         "claude_sid": "w1", "agent": "worker", "name": "alpha",
@@ -343,13 +319,11 @@ def test_send_manager_to_worker_swallows_terminal_failure(fresh_orchestrator_dir
         raise FileNotFoundError("tmux not installed")
 
     monkeypatch.setattr("dockwright.mcp_server.subprocess.run", boom)
-    # Must not raise — direct typing is best-effort.
     result = send_manager_to_worker_impl(worker="alpha", text="hi")
     assert result["status"] == "delivered"
 
 def test_kill_worker_marks_terminating(fresh_orchestrator_dir):
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1", pid=12345)
-    # Use dry_run so we don't actually SIGTERM pid 12345
     result = kill_worker_impl(worker="alpha", dry_run=True)
     assert result["would_kill"] == 12345
     assert result["iterm_sid"] == "i1"
@@ -369,7 +343,7 @@ from dockwright.mcp_server import become_manager_impl
 def test_become_manager_rolls_funny_name_and_default_domain(fresh_orchestrator_dir):
     result = become_manager_impl(claude_sid="mgr-1", iterm_sid="i9")
     assert result["ok"] is True
-    assert "-" in result["name"]  # funny: <adj>-<animal>
+    assert "-" in result["name"]
     assert result["domain"] == "general"
     assert result["runtime"] == "claude"
     record = state.read_json(paths.ACTIVE / "mgr-1.json")
@@ -380,7 +354,6 @@ def test_become_manager_rolls_funny_name_and_default_domain(fresh_orchestrator_d
 
 
 def test_become_manager_records_claude_runtime_and_list_managers_exposes_it(fresh_orchestrator_dir):
-    # Managers are Claude-only; the record/list always reports runtime="claude".
     result = become_manager_impl(claude_sid="mgr-1", iterm_sid="i9")
     assert result["runtime"] == "claude"
     record = state.read_json(paths.ACTIVE / "mgr-1.json")
@@ -413,23 +386,7 @@ def test_become_manager_paint_preflight_failures_do_not_fail_registration(monkey
     result = mcp_server.become_manager_impl("sid-bm-2", iterm_sid="%5")
     assert result["ok"] is True
 
-# --- PID-test reaper ordering ----------------------------------------------
-# register_self_impl / become_manager_impl run two prunes in order:
-#   1. _prune_stale_active_records() — the dead-PID reaper. ANY record whose pid
-#      is an int that _pid_alive() reports as dead is dropped. Synthetic test pids
-#      (e.g. 99999999) are dead, so they get reaped HERE, before step 2.
-#   2. _prune_same_pid_ghosts() — drops live-pid records under a different sid.
-# Consequence for tests: to exercise the SAME-PID ghost logic, the pid must look
-# alive — either patch `_pid_alive` -> True (so the synthetic pid survives step 1)
-# or use a real live pid (os.getpid()). A bare synthetic pid never reaches step 2;
-# it's already gone. Tests below that need step 2 patch _pid_alive accordingly.
-# _prune_stale_active_records now lives in registry.py with its own _pid_alive
-# binding — patch BOTH "dockwright.mcp_server._pid_alive" AND
-# "dockwright.registry._pid_alive" (see the tests below).
 def test_prune_stale_active_records_keeps_non_positive_pid(fresh_orchestrator_dir):
-    """A pid of 0 / negative can't prove the session dead (_pid_alive returns
-    False for non-positive pids without ever signalling) — such records must be
-    kept, not reaped. Mirrors preflight_cleanup._prune_active's guard."""
     from dockwright.mcp_server import _prune_stale_active_records
     state.write_json_atomic(paths.ACTIVE / "sid-zero.json", {
         "claude_sid": "sid-zero", "agent": "manager", "name": "odd-hydra", "pid": 0,
@@ -445,9 +402,6 @@ def test_prune_stale_active_records_keeps_non_positive_pid(fresh_orchestrator_di
 
 
 def test_prune_stale_active_records_keeps_pid_beyond_os_range(fresh_orchestrator_dir):
-    """os.kill raises OverflowError (not OSError) above the C int range — a poisoned
-    record must not traceback the reaper (it runs on become_manager / spawn_worker /
-    register_self paths fleet-wide) and must be kept, not reaped."""
     from dockwright.mcp_server import _prune_stale_active_records
     state.write_json_atomic(paths.ACTIVE / "sid-huge.json", {
         "claude_sid": "sid-huge", "agent": "manager", "name": "huge-golem", "pid": 2**31,
@@ -459,7 +413,6 @@ def test_prune_stale_active_records_keeps_pid_beyond_os_range(fresh_orchestrator
 
 
 def test_prune_stale_active_records_ledgers_spend(fresh_orchestrator_dir, monkeypatch):
-    """Dead-pid prune appends the record's spend to the ledger before unlinking."""
     import json
     from dockwright.mcp_server import _prune_stale_active_records
     monkeypatch.setattr(paths, "SPEND_LEDGER", fresh_orchestrator_dir / "spend-ledger.jsonl")
@@ -480,14 +433,6 @@ def test_prune_stale_active_records_ledgers_spend(fresh_orchestrator_dir, monkey
 
 
 def test_become_manager_allows_multiple_managers(fresh_orchestrator_dir, monkeypatch):
-    """Multi-manager: a second manager session is permitted (different name + domain).
-
-    In production each manager runs in its own tmux window = its own Claude Code
-    process = its own pid, so the same-pid ghost prune never touches the other.
-    The test process shares one pid, so we patch os.getppid to two distinct
-    values to model two windows (otherwise the prune would wrongly drop mgr-1).
-    _pid_alive is patched True so the distinct fake pids aren't reaped as stale.
-    """
     monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: True)
     monkeypatch.setattr("dockwright.registry._pid_alive", lambda pid: True)
     pids = iter([1001, 1002])
@@ -499,21 +444,11 @@ def test_become_manager_allows_multiple_managers(fresh_orchestrator_dir, monkeyp
     assert r1["name"] != r2["name"]
     assert r1["domain"] == "general"
     assert r2["domain"] == "dlq"
-    # Both records survive — distinct pids, no false-positive prune.
     assert state.read_json(paths.ACTIVE / "mgr-1.json") is not None
     assert state.read_json(paths.ACTIVE / "mgr-2.json") is not None
 
 
 def test_become_manager_prunes_same_pid_ghost(fresh_orchestrator_dir, monkeypatch):
-    """Ghost-record bug: /manager calls become_manager with a placeholder sid before
-    the real sid is in context. The SessionStart placeholder has name="manager";
-    the real become_manager call must prune that same-window placeholder, leaving
-    only the real one.
-
-    _pid_alive is patched True so the ghost is NOT reaped as a dead-pid stale
-    record — that forces the new same-pid prune (not stale-pruning) to be what
-    removes it, matching production where the pid is the very live session.
-    """
     monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: True)
     monkeypatch.setattr("dockwright.registry._pid_alive", lambda pid: True)
     monkeypatch.setattr("dockwright.mcp_server.os.getppid", lambda: 4242)
@@ -526,7 +461,6 @@ def test_become_manager_prunes_same_pid_ghost(fresh_orchestrator_dir, monkeypatc
     })
     real = become_manager_impl(claude_sid="mgr-real", iterm_sid="i9", domain="general")
     assert real["ok"] is True
-    # Only the real record survives; the placeholder ghost is gone.
     assert state.read_json(paths.ACTIVE / "manager-session.json") is None
     assert state.read_json(paths.ACTIVE / "mgr-real.json") is not None
     managers = [r for r in state.list_json_in(paths.ACTIVE) if r.get("agent") == "manager"]
@@ -535,24 +469,18 @@ def test_become_manager_prunes_same_pid_ghost(fresh_orchestrator_dir, monkeypatc
 
 
 def test_become_manager_prunes_funny_named_bootstrap_ghost(fresh_orchestrator_dir, monkeypatch):
-    """Regression for the funny-name SessionStart change: the bootstrap placeholder is
-    now registered under a funny <adjective>-<animal> name, not the literal "manager".
-    The same-window/same-pid placeholder under a different sid must still be pruned so
-    no stale duplicate manager survives to make resolve_manager() window/pid-ambiguous.
-    """
     monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: True)
     monkeypatch.setattr("dockwright.registry._pid_alive", lambda pid: True)
     monkeypatch.setattr("dockwright.mcp_server.os.getppid", lambda: 4242)
     state.write_json_atomic(paths.ACTIVE / "manager-session.json", {
         "claude_sid": "manager-session",
         "agent": "manager",
-        "name": "snug-ibex",  # funny name, as SessionStart now writes
+        "name": "snug-ibex",
         "window_id": "i9",
         "pid": 4242,
     })
     real = become_manager_impl(claude_sid="mgr-real", iterm_sid="i9", domain="general")
     assert real["ok"] is True
-    # The funny-named placeholder ghost is gone; only the real record survives.
     assert state.read_json(paths.ACTIVE / "manager-session.json") is None
     assert state.read_json(paths.ACTIVE / "mgr-real.json") is not None
     managers = [r for r in state.list_json_in(paths.ACTIVE) if r.get("agent") == "manager"]
@@ -568,11 +496,6 @@ def test_become_manager_tool_exposes_optional_name():
 
 
 def test_become_manager_tool_forwards_name_for_in_place_reboot(fresh_orchestrator_dir, monkeypatch):
-    """/manager-reboot re-registers post-/clear under the SAME name via the MCP
-    tool wrapper (the impl always took `name`; the wrapper didn't forward it —
-    that gap re-rolled a fresh name and broke event-bucket routing). The
-    pre-clear record shares this process's pid, so the same-pid prune must
-    drop it and the kept name must come back un-suffixed."""
     from dockwright.mcp_server import become_manager
 
     monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: True)
@@ -589,7 +512,7 @@ def test_become_manager_tool_forwards_name_for_in_place_reboot(fresh_orchestrato
     result = become_manager(claude_sid="mgr-post-clear", iterm_sid="i9",
                             domain="general", name="kept-fox")
     assert result["ok"] is True
-    assert result["name"] == "kept-fox"  # preserved, NOT auto-suffixed
+    assert result["name"] == "kept-fox"
     assert state.read_json(paths.ACTIVE / "mgr-pre-clear.json") is None
     record = state.read_json(paths.ACTIVE / "mgr-post-clear.json")
     assert record["name"] == "kept-fox"
@@ -598,7 +521,6 @@ def test_become_manager_tool_forwards_name_for_in_place_reboot(fresh_orchestrato
 
 
 def test_become_manager_tool_without_name_still_rolls_funny_name(fresh_orchestrator_dir, monkeypatch):
-    """None default = auto-roll, exactly as before the param existed."""
     from dockwright.mcp_server import become_manager
 
     monkeypatch.setattr("dockwright.mcp_server.os.getppid", lambda: 4242)
@@ -608,9 +530,6 @@ def test_become_manager_tool_without_name_still_rolls_funny_name(fresh_orchestra
 
 
 def test_become_manager_tool_suffixes_name_taken_by_different_live_session(fresh_orchestrator_dir, monkeypatch):
-    """The docstring's auto-suffix claim: a passed name held by a DIFFERENT live
-    session (different pid — not the same-tab ghost the prune drops) must come
-    back suffixed instead of clobbering the peer."""
     from dockwright.mcp_server import become_manager
 
     monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: True)
@@ -629,21 +548,11 @@ def test_become_manager_tool_suffixes_name_taken_by_different_live_session(fresh
     assert result["ok"] is True
     assert result["name"] != "kept-fox"
     assert result["name"].startswith("kept-fox")
-    assert state.read_json(paths.ACTIVE / "peer-mgr.json") is not None  # peer untouched
+    assert state.read_json(paths.ACTIVE / "peer-mgr.json") is not None
 
 
 def test_prune_same_pid_ghosts_drops_same_window_placeholder_regardless_of_name(fresh_orchestrator_dir):
-    """Helper contract: prune this tab's own stale manager identity structurally.
-
-    The discriminator is the tmux window, NOT the name: a same-pid + same-window
-    record under a different sid can only be a prior identity of the very session
-    re-registering (SessionStart placeholder / two-phase become_manager first call),
-    so it is pruned whether named "manager", "manager-2", or a funny name. A live
-    peer manager lives in its own window, so the same-window guard spares it.
-    """
     from dockwright.mcp_server import _prune_same_pid_ghosts
-    # Write records directly so register_self_impl's dead-pid stale-pruning doesn't
-    # reap the fake pids first — we want to exercise the helper in isolation.
     paths.ensure_dirs()
     state.write_json_atomic(paths.ACTIVE / "bootstrap.json", {
         "claude_sid": "bootstrap",
@@ -659,9 +568,6 @@ def test_prune_same_pid_ghosts_drops_same_window_placeholder_regardless_of_name(
         "window_id": "current-window",
         "pid": 7777,
     })
-    # Funny-named same-window placeholder — the case the funny-name SessionStart
-    # change produces. The old literal-"manager" check missed this; the structural
-    # check prunes it.
     state.write_json_atomic(paths.ACTIVE / "funny-same-window.json", {
         "claude_sid": "funny-same-window",
         "agent": "manager",
@@ -684,18 +590,17 @@ def test_prune_same_pid_ghosts_drops_same_window_placeholder_regardless_of_name(
         "pid": 7777,
     })
     state.write_json_atomic(paths.ACTIVE / "other.json", {"claude_sid": "other", "name": "gamma", "pid": 8888})
-    # Legacy record with no pid (None) — must survive.
     state.write_json_atomic(paths.ACTIVE / "legacy.json", {"claude_sid": "legacy", "name": "delta", "pid": None})
 
     _prune_same_pid_ghosts(7777, keep_sid="keep", keep_window_id="current-window")
 
-    assert state.read_json(paths.ACTIVE / "bootstrap.json") is None          # literal "manager" → pruned
-    assert state.read_json(paths.ACTIVE / "bootstrap-suffixed.json") is None  # "manager-2" → pruned
-    assert state.read_json(paths.ACTIVE / "funny-same-window.json") is None   # funny name, same window → pruned
-    assert state.read_json(paths.ACTIVE / "live-peer.json") is not None       # different window → kept
-    assert state.read_json(paths.ACTIVE / "keep.json") is not None            # caller's own sid → kept
-    assert state.read_json(paths.ACTIVE / "other.json") is not None           # different pid → kept
-    assert state.read_json(paths.ACTIVE / "legacy.json") is not None          # non-int pid → kept
+    assert state.read_json(paths.ACTIVE / "bootstrap.json") is None
+    assert state.read_json(paths.ACTIVE / "bootstrap-suffixed.json") is None
+    assert state.read_json(paths.ACTIVE / "funny-same-window.json") is None
+    assert state.read_json(paths.ACTIVE / "live-peer.json") is not None
+    assert state.read_json(paths.ACTIVE / "keep.json") is not None
+    assert state.read_json(paths.ACTIVE / "other.json") is not None
+    assert state.read_json(paths.ACTIVE / "legacy.json") is not None
 
 def test_kill_worker_drops_pending_questions(fresh_orchestrator_dir):
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1", pid=12345)
@@ -704,10 +609,7 @@ def test_kill_worker_drops_pending_questions(fresh_orchestrator_dir):
     _write_question(worker_sid="w1", worker_name="alpha", question="q2")
     assert len(list(paths.QUESTIONS.iterdir())) == 2
     result = kill_worker_impl(worker="alpha", dry_run=True)
-    # dry_run does not drop
     assert len(list(paths.QUESTIONS.iterdir())) == 2
-    # Non-dry-run would drop, but we can't actually SIGTERM pid 12345 in test;
-    # call the helper directly to verify cleanup logic
     from dockwright.mcp_server import _drop_questions_for_worker
     dropped = _drop_questions_for_worker("w1")
     assert dropped == 2
@@ -803,13 +705,10 @@ def test_resolve_unique_name_finds_next_free_suffix(fresh_orchestrator_dir):
 
 def test_resolve_unique_name_excluding_sid_treats_own_record_as_free(fresh_orchestrator_dir):
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1")
-    # If we're re-resolving for the same session, our own name should be free
     assert _resolve_unique_name("alpha", excluding_sid="w1") == "alpha"
 
 def test_ask_manager_recovers_from_corrupt_answer_file(fresh_orchestrator_dir):
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1")
-    # Corrupt answer appears first; ask_manager must remove it and keep polling
-    # until a valid answer arrives.
 
     async def run():
         task = _asyncio.create_task(ask_manager_impl(claude_sid="w1", question="?", poll_interval=0.02))
@@ -824,23 +723,11 @@ def test_ask_manager_recovers_from_corrupt_answer_file(fresh_orchestrator_dir):
     assert _asyncio.run(run()) == "real answer"
 
 def test_ask_manager_is_async(fresh_orchestrator_dir):
-    """Pins the fix for the event-loop-starvation wedge: a sync ask_manager
-    blocks the worker's single-threaded MCP event loop; FastMCP's @tool()
-    returns the function unchanged, so the module-level names must both be
-    coroutine functions."""
     from dockwright import mcp_server
     assert inspect.iscoroutinefunction(mcp_server.ask_manager_impl)
     assert inspect.iscoroutinefunction(mcp_server.ask_manager)
 
 def test_ask_manager_does_not_starve_event_loop(fresh_orchestrator_dir):
-    """The incident: a pending ask_manager starved the worker's single-threaded
-    MCP loop, so a later worker_done hung forever. The new impl must yield
-    between polls so other tool calls are serviced while it waits."""
-    # Guard FIRST: against a fully sync impl the async body below would HANG the
-    # suite rather than fail — create_task(sync_call(...)) evaluates the blocking
-    # call eagerly and a monopolized loop never runs wait_for's timer. This assert
-    # turns that hang into an instant red. (It does not catch an async def that
-    # blocks internally — only the sync-regression case.)
     assert inspect.iscoroutinefunction(ask_manager_impl)
 
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1")
@@ -849,8 +736,6 @@ def test_ask_manager_does_not_starve_event_loop(fresh_orchestrator_dir):
 
     async def run():
         ask = _asyncio.create_task(ask_manager_impl(claude_sid="w1", question="blocked?", poll_interval=0.02))
-        # In a single-threaded loop, this sleep returning at all while the ask
-        # task is alive proves the poll loop yields control.
         await _asyncio.sleep(0.1)
         assert not ask.done()
         done = worker_done_impl("w2", "victim tool completes while ask_manager waits")
@@ -868,8 +753,6 @@ def test_ask_manager_timeout_returns_reask_sentinel(fresh_orchestrator_dir):
     result = _asyncio.run(ask_manager_impl(
         claude_sid="w1", question="anyone there?", poll_interval=0.01, timeout_sec=0.05))
     assert result.startswith("NO_ANSWER_YET:")
-    # The question survives the timeout — the manager still sees ONE stable
-    # pending question (stale_monitor nudge-skip/autoclose key off it too).
     pending = list_pending_questions_impl()
     assert len(pending) == 1
     assert pending[0]["question_id"] in result
@@ -887,7 +770,7 @@ def test_ask_manager_resume_reattaches_without_duplicate_question(fresh_orchestr
             claude_sid="w1", question="q?", poll_interval=0.02, resume_question_id=qid))
         await _asyncio.sleep(0.1)
         assert not task.done()
-        assert len(list_pending_questions_impl()) == 1  # no duplicate question
+        assert len(list_pending_questions_impl()) == 1
         answer_question_impl(question_id=qid, text="finally")
         return await _asyncio.wait_for(task, timeout=2.0)
 
@@ -922,7 +805,7 @@ def test_ask_manager_resume_foreign_question_raises(fresh_orchestrator_dir):
     with pytest.raises(ValueError, match="another worker"):
         _asyncio.run(ask_manager_impl(
             claude_sid="w1", question="q?", poll_interval=0.01, resume_question_id=qid))
-    assert len(list_pending_questions_impl()) == 1  # question untouched
+    assert len(list_pending_questions_impl()) == 1
 
 
 def test_ask_manager_resume_unregistered_sid_raises(fresh_orchestrator_dir):
@@ -941,8 +824,6 @@ def test_answer_question_stamps_worker_sid(fresh_orchestrator_dir):
 
 
 def test_answer_question_unreadable_question_record_writes_unstamped(fresh_orchestrator_dir):
-    """Corrupt question record → the answer is still written, just without the
-    worker_sid stamp (never block an answer on stamping)."""
     qid = "q-corrupt"
     paths.QUESTIONS.mkdir(parents=True, exist_ok=True)
     (paths.QUESTIONS / f"{qid}.json").write_text("{not json")
@@ -963,13 +844,10 @@ def test_ask_manager_resume_foreign_stamped_answer_raises_and_preserves(fresh_or
     with pytest.raises(ValueError, match="another worker"):
         _asyncio.run(ask_manager_impl(
             claude_sid="w1", question="q?", poll_interval=0.01, resume_question_id=qid))
-    # The foreign answer must NOT be consumed — it belongs to the other worker.
     assert (paths.ANSWERS / f"{qid}.json").exists()
 
 
 def test_ask_manager_resume_accepts_legacy_unstamped_answer(fresh_orchestrator_dir):
-    """Manager and worker run separate server processes with independent restart
-    times — an old manager server writes unstamped answers. Tolerate absence."""
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1")
     qid = "q-legacy"
     state.write_json_atomic(paths.ANSWERS / f"{qid}.json", {
@@ -981,9 +859,6 @@ def test_ask_manager_resume_accepts_legacy_unstamped_answer(fresh_orchestrator_d
 
 
 def test_ask_manager_resume_toctou_recheck_finds_answer(fresh_orchestrator_dir, monkeypatch):
-    """The resume path's final answer re-check: if the manager's answer lands
-    between resume's first answer check and the question-file check, resume
-    must return it — not raise the fail-fast ValueError."""
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1")
     from dockwright import mcp_server
     from dockwright.mcp_server import _write_question
@@ -994,9 +869,6 @@ def test_ask_manager_resume_toctou_recheck_finds_answer(fresh_orchestrator_dir, 
     def racy(q, sid):
         calls["n"] += 1
         if calls["n"] == 1:
-            # Simulate the TOCTOU window: the first answer check sees nothing;
-            # the manager answers (write answer THEN unlink question) before
-            # the question-file check runs.
             answer_question_impl(question_id=qid, text="landed mid-window")
             return None
         return real(q, sid)
@@ -1008,7 +880,6 @@ def test_ask_manager_resume_toctou_recheck_finds_answer(fresh_orchestrator_dir, 
 
 
 def test_register_self_name_collision_with_dead_pid_succeeds(fresh_orchestrator_dir):
-    """A stale record (dead pid) holding the same name must be pruned, not block re-registration."""
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1", pid=99999999)
     result = register_self_impl(claude_sid="w2", agent="worker", name="alpha", cwd="/y", iterm_sid="i2", pid=os.getpid())
     assert result["ok"] is True
@@ -1016,7 +887,6 @@ def test_register_self_name_collision_with_dead_pid_succeeds(fresh_orchestrator_
     assert (paths.ACTIVE / "w2.json").exists()
 
 def test_become_manager_stale_record_with_dead_pid_succeeds(fresh_orchestrator_dir):
-    """Closing a manager tab (SIGHUP) leaves a stale active/<sid>.json. The next /manager must succeed."""
     register_self_impl(claude_sid="old-mgr", agent="manager", name="manager", cwd="/x", iterm_sid="i0", pid=99999999)
     result = become_manager_impl(claude_sid="new-mgr", iterm_sid="i1")
     assert result["ok"] is True
@@ -1028,9 +898,6 @@ def test_resolve_unique_name_skips_dead_records(fresh_orchestrator_dir):
     assert _resolve_unique_name("alpha") == "alpha"
 
 def test_resolve_unique_name_avoids_funny_name_collision(fresh_orchestrator_dir):
-    """A caller-passed name colliding with an active record's funny_name would
-    give two live sessions the same display handle — suffix it like a routing
-    name collision."""
     state.write_json_atomic(paths.ACTIVE / "w1.json", {
         "claude_sid": "w1", "agent": "worker", "name": "task-x",
         "funny_name": "alpha", "window_id": "i1", "pid": os.getpid(),
@@ -1140,10 +1007,8 @@ def test_get_worker_tail_returns_last_n_lines(fresh_orchestrator_dir, tmp_path, 
     assert result["name"] == "alpha"
     assert result["lines_returned"] == 10
     assert len(result["entries"]) == 10
-    # last entry is index 99 (role=user, content=msg-99)
     assert result["entries"][-1]["role"] == "user"
     assert "msg-99" in result["entries"][-1]["content_preview"]
-    # first returned entry is index 90
     assert "msg-90" in result["entries"][0]["content_preview"]
 
 def test_get_worker_tail_reads_codex_payload_content(fresh_orchestrator_dir, tmp_path, monkeypatch):
@@ -1219,19 +1084,15 @@ def test_worker_done_writes_event_file(fresh_orchestrator_dir):
     assert record["summary"] == "rebase landed; tests green"
     assert record["event_id"] == result["event_id"]
     assert isinstance(record["completed_at"], (int, float))
-    # filename encodes both sid and event id
     assert done_files[0].name == f"w1-{result['event_id']}.json"
-    # null-parent worker → written to the shared _unscoped bucket
     assert done_files[0].parent.name == paths.UNSCOPED_BUCKET
 
 def test_worker_done_unknown_sid_rejected(fresh_orchestrator_dir):
     with pytest.raises(ValueError, match="session ghost-sid not registered"):
         worker_done_impl(claude_sid="ghost-sid", summary="done")
-    # No file should have been written
     assert list(paths.DONE.rglob("*.json")) == []
 
 def test_worker_done_multiple_events_for_same_worker(fresh_orchestrator_dir):
-    """A worker may signal done more than once across multiple tasks in one session."""
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1", pid=os.getpid())
     r1 = worker_done_impl(claude_sid="w1", summary="task A done")
     r2 = worker_done_impl(claude_sid="w1", summary="task B done")
@@ -1239,14 +1100,12 @@ def test_worker_done_multiple_events_for_same_worker(fresh_orchestrator_dir):
     assert len(list(paths.DONE.rglob("*.json"))) == 2
 
 def test_worker_done_scoped_to_parent_manager_subdir(fresh_orchestrator_dir):
-    """A worker with a parent manager writes its done event into done/<manager>/."""
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x",
                        iterm_sid="i1", pid=os.getpid(), parent_manager_name="manager-a")
     worker_done_impl(claude_sid="w1", summary="scoped done")
     scoped = list((paths.DONE / "manager-a").glob("*.json"))
     assert len(scoped) == 1
     assert state.read_json(scoped[0])["summary"] == "scoped done"
-    # nothing leaked into the unscoped bucket
     assert list((paths.DONE / paths.UNSCOPED_BUCKET).glob("*.json")) == []
 
 
@@ -1273,12 +1132,12 @@ def test_worker_done_stamps_ticket_and_artifacts_published(fresh_orchestrator_di
     paths.ASSIGNMENTS.mkdir(parents=True, exist_ok=True)
     state.write_json_atomic(paths.ASSIGNMENTS / "w1.json", {"claude_sid": "w1", "ticket": "TKT-SANDBOX-1"})
     artifact_put_impl("TKT-SANDBOX-1", "spec", "repo", "body", "complete", "w1")
-    artifact_put_impl("TKT-SANDBOX-1", "plan", "repo", "body", "complete", "other-sid")  # foreign writer
+    artifact_put_impl("TKT-SANDBOX-1", "plan", "repo", "body", "complete", "other-sid")
     worker_done_impl(claude_sid="w1", summary="done")
     (event_path,) = list(paths.done_dir_for(None).glob("w1-*.json"))
     event = state.read_json(event_path)
     assert event["ticket"] == "TKT-SANDBOX-1"
-    assert event["artifacts_published"] == 1            # own writes only
+    assert event["artifacts_published"] == 1
 
 
 def test_worker_done_stamps_zero_when_keyed_but_unpublished(fresh_orchestrator_dir):
@@ -1303,18 +1162,14 @@ def test_worker_done_never_raises_from_stamp(fresh_orchestrator_dir, monkeypatch
     import dockwright.mcp_server as _mcp
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1")
     paths.ASSIGNMENTS.mkdir(parents=True, exist_ok=True)
-    # The ticket seed is what forces _published_count to reach artifact_list_impl —
-    # without it the except branch would never be exercised.
     state.write_json_atomic(paths.ASSIGNMENTS / "w1.json", {"claude_sid": "w1", "ticket": "TKT-SANDBOX-1"})
     monkeypatch.setattr(_mcp, "artifact_list_impl",
                         lambda t: (_ for _ in ()).throw(RuntimeError("store down")))
     result = worker_done_impl(claude_sid="w1", summary="done")
-    assert result["ok"] is True                          # done event survives a broken store
+    assert result["ok"] is True
 
 
 def test_worker_done_self_heals_from_claimed_assignment(fresh_orchestrator_dir):
-    # M-2 ghost lane: the active record was reaped seconds after registration,
-    # but the claimed assignment survives — the completion signal must land.
     state.write_json_atomic(paths.assignment_path("w9"), {
         "assignment_id": "a-1", "claude_sid": "w9", "name": "fix-thing",
         "parent_manager_name": "boss", "claimed_at": 1000.0,
@@ -1338,8 +1193,6 @@ def test_worker_done_no_record_no_assignment_still_rejects(fresh_orchestrator_di
 
 
 def test_worker_done_rejects_assignment_with_foreign_sid_stamp(fresh_orchestrator_dir):
-    # A hand-edited/corrupt assignment whose claude_sid stamp disagrees with
-    # its filename must not reconstruct a done event for the wrong worker.
     state.write_json_atomic(paths.assignment_path("w9"),
                             {"claude_sid": "other", "name": "fix-thing"})
     with pytest.raises(ValueError, match="not registered"):
@@ -1375,7 +1228,6 @@ from dockwright.mcp_server import (
 )
 
 def test_prepare_handoff_writes_file_and_snapshots(fresh_orchestrator_dir):
-    # Register a manager and one worker; queue one pending question.
     mgr_result = become_manager_impl(claude_sid="mgr-old", iterm_sid="i0")
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x",
                        iterm_sid="i1", pid=os.getpid(),
@@ -1413,7 +1265,6 @@ def test_prepare_handoff_rejects_unknown_sid(fresh_orchestrator_dir):
 
 
 def test_become_manager_with_takeover_releases_and_acquires(fresh_orchestrator_dir, monkeypatch):
-    # Register old manager + prepare handoff.
     old_result = become_manager_impl(claude_sid="mgr-old", iterm_sid="i0")
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
 
@@ -1430,16 +1281,12 @@ def test_become_manager_with_takeover_releases_and_acquires(fresh_orchestrator_d
         handoff_id=handoff["handoff_id"], iterm_sid="i1",
     )
     assert result["ok"] is True
-    # New manager record exists and inherited the predecessor's name + domain.
     new_record = state.read_json(paths.ACTIVE / "mgr-new.json")
     assert new_record["agent"] == "manager"
     assert new_record["name"] == old_result["name"]
     assert new_record["domain"] == "general"
     assert new_record["runtime"] == "claude"
-    # Old manager's tmux window was closed gracefully (no SIGTERM — SessionEnd
-    # needs to fire for the outgoing session's retro + memory distill).
     assert closed == ["i0"]
-    # Handoff is marked consumed.
     handoff_after = state.read_json(paths.HANDOFFS / f"{handoff['handoff_id']}.json")
     assert handoff_after["consumed_at"] is not None
     assert handoff_after["to_sid"] == "mgr-new"
@@ -1452,14 +1299,11 @@ def test_become_manager_with_takeover_reports_pane_closed_and_reuses_preflight(f
     monkeypatch.setattr("dockwright.mcp_server._close_window", lambda w: None)
     monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: True)
     monkeypatch.setattr("dockwright.registry._pid_alive", lambda pid: True)
-    # Overrides the conftest autouse "" stub: proves the takeover reuses the inner
-    # become_manager_impl's preflight line rather than re-running the cleanup.
     monkeypatch.setattr(mcp_server, "_run_preflight_cleanup", lambda: "pruned 1 husk")
 
     result = mcp_server.become_manager_with_takeover_impl(
         claude_sid="mgr-new", takeover_from="mgr-old",
         handoff_id=handoff["handoff_id"], iterm_sid="i1")
-    # Absorbed tmux → predecessor pane absent from list-panes → reported closed.
     assert result["predecessor_pane_closed"] is True
     assert result["preflight"] == "pruned 1 husk"
 
@@ -1477,7 +1321,7 @@ def test_become_manager_with_takeover_flags_predecessor_pane_still_open(fresh_or
         def current_pane_id(self):
             return "i1"
         async def pane_exists(self, pane):
-            return True  # predecessor pane still live -> takeover reports not-closed
+            return True
 
     monkeypatch.setattr(mcp_server, "get_driver", lambda: _StillOpenDriver())
 
@@ -1489,19 +1333,6 @@ def test_become_manager_with_takeover_flags_predecessor_pane_still_open(fresh_or
 
 
 def test_become_manager_with_takeover_verifies_pane_from_inside_running_loop(fresh_orchestrator_dir, monkeypatch):
-    """Regression (CRITICAL): the MCP SDK runs sync tools INLINE in the event-loop
-    thread, so the takeover impl runs with a loop already running. A bare
-    asyncio.run() in the pane-close verification raised "cannot be called from a
-    running event loop", the surrounding except swallowed it, and
-    predecessor_pane_closed came back False for EVERY real resume/recovery boot —
-    routing them all down the manual-approval tmux path. The thread-bridge fix must
-    report True when the (mocked) driver says the predecessor pane is gone, even when
-    the impl is invoked from within a running loop.
-
-    The prior in-loop-agnostic tests missed this because they call the sync impl
-    directly (no running loop); here we call it from inside asyncio.run() exactly as
-    func_metadata does.
-    """
     import asyncio
     from dockwright import mcp_server
     become_manager_impl(claude_sid="mgr-old", iterm_sid="i0")
@@ -1515,14 +1346,11 @@ def test_become_manager_with_takeover_verifies_pane_from_inside_running_loop(fre
         def current_pane_id(self):
             return "i1"
         async def pane_exists(self, pane):
-            return False  # predecessor pane absent -> takeover must report closed
+            return False
 
     monkeypatch.setattr(mcp_server, "get_driver", lambda: _PaneGoneDriver())
 
     async def _call_from_loop():
-        # Invoke the SYNC impl with a loop already running, exactly as the MCP SDK
-        # does (func_metadata runs sync tools inline in the loop thread). A bare
-        # asyncio.run() inside the impl raises here; the thread-bridge survives it.
         assert asyncio.get_running_loop() is not None
         return mcp_server.become_manager_with_takeover_impl(
             claude_sid="mgr-new", takeover_from="mgr-old",
@@ -1534,9 +1362,6 @@ def test_become_manager_with_takeover_verifies_pane_from_inside_running_loop(fre
 
 
 def test_become_manager_with_takeover_stamps_account_from_env(fresh_orchestrator_dir, monkeypatch):
-    """A recovery tab spawns with CLAUDE_ORCH_ACCOUNT in its env; the takeover's
-    re-registration must stamp the new manager's record with that letter so the
-    flip lane attributes a later brick to the real account."""
     become_manager_impl(claude_sid="mgr-old", iterm_sid="i0")
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
     monkeypatch.setattr("dockwright.mcp_server._close_window", lambda window_id: None)
@@ -1565,7 +1390,6 @@ def test_become_manager_with_takeover_registers_claude_runtime(fresh_orchestrato
         handoff_id=handoff["handoff_id"],
         iterm_sid="i1",
     )
-    # Managers are Claude-only — the resumed manager always registers as claude.
     assert result["runtime"] == "claude"
     new_record = state.read_json(paths.ACTIVE / "mgr-new.json")
     assert new_record["runtime"] == "claude"
@@ -1599,10 +1423,6 @@ def test_become_manager_with_takeover_appends_trigger_log(fresh_orchestrator_dir
 
 
 def test_become_manager_with_takeover_swallows_terminal_failure(fresh_orchestrator_dir, monkeypatch, tmp_path):
-    """A terminal close-window subprocess failure must NOT abort the takeover —
-    `_close_window` swallows internally; the new manager registers and
-    consumes the handoff regardless.
-    """
     become_manager_impl(claude_sid="mgr-old", iterm_sid="i0")
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
 
@@ -1631,17 +1451,11 @@ def test_become_manager_with_takeover_rejects_mismatched_handoff(fresh_orchestra
             claude_sid="mgr-new", takeover_from="someone-else",
             handoff_id=handoff["handoff_id"], iterm_sid="i1",
         )
-    # The old manager's active record must not have been touched.
     assert state.read_json(paths.ACTIVE / "mgr-old.json") is not None
     assert not (paths.ACTIVE / "mgr-new.json").exists()
 
 
 def test_bootstrap_recreate_handoff_key_parity(fresh_orchestrator_dir, tmp_path):
-    """T2: the handoff record prepare_handoff_impl writes and the payload the
-    REAL bootstrap-recreate.sh (the third blessed writer) prints under
-    --dry-run must carry the exact same key set — a drift here means the
-    script's handoff silently omits (or adds) a field the takeover consumer
-    depends on."""
     become_manager_impl(claude_sid="mgr-old", iterm_sid="i0")
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
     mcp_keys = set(state.read_json(paths.HANDOFFS / f"{handoff['handoff_id']}.json").keys())
@@ -1667,18 +1481,6 @@ def test_bootstrap_recreate_handoff_key_parity(fresh_orchestrator_dir, tmp_path)
 
 @pytest.mark.parametrize("missing_mode", ["deleted", "empty"])
 def test_takeover_fails_loud_when_handoff_lacks_manager_name(fresh_orchestrator_dir, missing_mode):
-    """T7: predecessor's active record is gone (normal — this function unlinks
-    it on first consumption) AND the handoff itself omits manager_name (the
-    bootstrap-recreate.sh bug this change fixes, or any other legacy/hand-
-    authored handoff) — as a deleted key OR as an empty string, both of which
-    must trip `if not v` (guards against an `is None`-only regression). Must
-    refuse rather than roll a fresh identity — and must mutate NOTHING:
-    handoff unconsumed, and a pending question addressed to the predecessor
-    must survive (drop happens below the raise). (No _close_window spy here —
-    the predecessor's record is unlinked so old_pid is None and that branch is
-    structurally unreachable; the on-disk-record shape that DOES exercise it
-    is pinned separately by
-    test_takeover_pre_mutation_when_predecessor_record_on_disk_but_nameless.)"""
     become_manager_impl(claude_sid="mgr-old", iterm_sid="i0", domain="personal")
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
     (paths.ACTIVE / "mgr-old.json").unlink()
@@ -1701,9 +1503,6 @@ def test_takeover_fails_loud_when_handoff_lacks_manager_name(fresh_orchestrator_
         )
     message = str(exc_info.value)
     assert handoff["handoff_id"] in message, message
-    # Bind to the rendered "omits ..." clause, not just substring presence —
-    # a message naming the WRONG missing field would otherwise still pass
-    # (the invariant tail always mentions "manager_name" regardless).
     omitted = message.split("omits ", 1)[1].split(".", 1)[0]
     assert omitted == "manager_name", message
 
@@ -1720,13 +1519,6 @@ def test_takeover_fails_loud_when_handoff_lacks_manager_name(fresh_orchestrator_
 
 @pytest.mark.parametrize("missing_mode", ["deleted", "empty"])
 def test_takeover_fails_loud_when_handoff_lacks_domain_never_defaults_general(fresh_orchestrator_dir, missing_mode):
-    """T8: same shape as T7 but the handoff omits domain instead (deleted key
-    or empty string) — the latent half of the bug, where a dead manager's
-    successor would silently boot into "general" (wrong memory pool, wrong
-    distill directory) with no signal anywhere. Must refuse instead, and must
-    mutate NOTHING: handoff unconsumed, no successor record (so in particular
-    none with domain "general"), and a pending question addressed to the
-    predecessor must survive."""
     become_manager_impl(claude_sid="mgr-old", iterm_sid="i0", domain="personal")
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
     (paths.ACTIVE / "mgr-old.json").unlink()
@@ -1764,14 +1556,6 @@ def test_takeover_fails_loud_when_handoff_lacks_domain_never_defaults_general(fr
 
 
 def test_takeover_pre_mutation_when_predecessor_record_on_disk_but_nameless(fresh_orchestrator_dir, monkeypatch):
-    """M-3: pins the pre-mutation ordering in a shape T7/T8 structurally cannot
-    reach — both tests unlink the predecessor's record themselves, so their
-    "nothing mutated" assertions can never observe whether the unlink itself
-    ran. Here the predecessor's record stays ON DISK (pid + window_id intact)
-    but loses its name, and the handoff loses manager_name too — the raise
-    must fire before _close_window, before the record unlink, and before the
-    question drop. Red-proven separately by moving the raise below those three
-    mutations."""
     become_manager_impl(claude_sid="mgr-old", iterm_sid="i0", domain="personal")
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
 
@@ -1815,10 +1599,6 @@ def test_takeover_pre_mutation_when_predecessor_record_on_disk_but_nameless(fres
 
 
 def test_takeover_record_gone_complete_handoff_succeeds(fresh_orchestrator_dir, monkeypatch):
-    """T9 (control): the legitimate lane the fail-loud change must not break —
-    predecessor's active record is gone (normal post-first-consumption state)
-    but the handoff carries both fields (as every MCP writer always does).
-    Takeover succeeds, inheriting name + domain from the handoff itself."""
     old_result = become_manager_impl(claude_sid="mgr-old", iterm_sid="i0", domain="personal")
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
     (paths.ACTIVE / "mgr-old.json").unlink()
@@ -1837,21 +1617,10 @@ def test_takeover_record_gone_complete_handoff_succeeds(fresh_orchestrator_dir, 
     new_record = state.read_json(paths.ACTIVE / "mgr-new.json")
     assert new_record["name"] == old_result["name"]
     assert new_record["domain"] == "personal"
-    # I-2(iii): the returned name must be the PERSISTED name, not merely the
-    # requested one — the two diverge exactly when become_manager_impl
-    # auto-suffixes a collision (covered below).
     assert result["name"] == new_record["name"]
 
 
 def test_takeover_prunes_dead_corpse_holding_inherited_name(fresh_orchestrator_dir, monkeypatch):
-    """D-3: _prune_stale_active_records() inside the collision check is
-    load-bearing, not decorative — without it, a dead corpse record still
-    holding the inherited name would permanently false-refuse every future
-    takeover of this name (nothing else on this path ever reaps it). The
-    corpse's pid is dead and it carries no window_id, so the pane-liveness
-    gate never engages ("windowless records keep the pid-only bar" —
-    registry._prune_stale_active_records docstring) and the prune reaps it
-    outright, letting the takeover succeed normally."""
     old_result = become_manager_impl(claude_sid="mgr-old", iterm_sid="i0", domain="personal")
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
     (paths.ACTIVE / "mgr-old.json").unlink()
@@ -1882,36 +1651,12 @@ def test_takeover_prunes_dead_corpse_holding_inherited_name(fresh_orchestrator_d
 def test_takeover_fails_loud_when_inherited_name_collides_with_live_session(
     fresh_orchestrator_dir, monkeypatch, collision_field
 ):
-    """I-2(a): a live session already holds the inherited name — the recovery
-    double-launch race prepare_recovery_handoff_impl's own docstring documents
-    (two successors can consume two different handoffs for the same
-    predecessor). Registering would silently auto-suffix
-    (become_manager_impl -> _resolve_unique_name) and strand every in-flight
-    worker whose parent_manager_name still points at the un-suffixed name —
-    the exact incident this PR exists to fix, re-entering through a different
-    door. Must refuse before any mutation. Covers both scan arms: the
-    collision can sit in the holder's `name` or its `funny_name` (R-2).
-
-    The predecessor's active record stays ON DISK holding its name (NOT
-    unlinked) so the close-window / record-unlink / question-drop path is
-    actually reachable — otherwise neutering the collision check is
-    invisible: become_manager_impl auto-suffixes the same collision anyway,
-    so the BACKSTOP raises instead, and a test that only checks "some
-    ValueError, handoff unconsumed, no mgr-new record" cannot distinguish the
-    two refusal paths even though their consequences differ materially (the
-    backstop path closes the predecessor's window, deletes its record, and
-    drops its questions before it discovers the race — R-1)."""
     old_result = become_manager_impl(claude_sid="mgr-old", iterm_sid="i0", domain="personal")
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
 
     from dockwright.mcp_server import _write_question
     _write_question(worker_sid="mgr-old", worker_name="manager", question="dangling?")
 
-    # A second consumer of a duplicate handoff already registered under the
-    # predecessor's name before this takeover call runs. register_self_impl
-    # would itself reject the duplicate name (mgr-old's own record is still
-    # live), so write the usurper's record directly — shaped like a real
-    # manager record.
     usurper_record = {
         "claude_sid": "usurper", "agent": "manager", "cwd": "/x",
         "window_id": "i9", "pid": os.getpid(), "domain": "personal", "runtime": "claude",
@@ -1933,11 +1678,6 @@ def test_takeover_fails_loud_when_inherited_name_collides_with_live_session(
             claude_sid="mgr-new", takeover_from="mgr-old",
             handoff_id=handoff["handoff_id"], iterm_sid="i1",
         )
-    # Survival assertions come FIRST and are the load-bearing check (R-1):
-    # neutering the collision check still raises (the backstop below catches
-    # the same collision), so a message-content-only assertion would pass on
-    # either refusal path. These distinguish them — only the collision-check
-    # path leaves the predecessor completely untouched.
     assert closed == [], "the predecessor's window must not be closed before the refusal"
     assert (paths.ACTIVE / "mgr-old.json").exists(), \
         "the predecessor's record must not be unlinked before the refusal"
@@ -1961,20 +1701,6 @@ def test_takeover_fails_loud_when_inherited_name_collides_with_live_session(
 def test_takeover_raises_and_unregisters_when_registration_races_and_returns_suffixed_name(
     fresh_orchestrator_dir, monkeypatch
 ):
-    """I-2(b) backstop: the pre-mutation collision check above closes the
-    common race, but a NEW collision can still land in the gap between that
-    check and become_manager_impl's own registration. If become_manager_impl
-    silently auto-suffixes anyway, the takeover must not report success under
-    the un-suffixed name — unregister the wrongly-named successor and refuse,
-    with the handoff left unconsumed so a retry can still consume it.
-
-    D-2: become_manager_impl's real _backfill_legacy_workers call would have
-    just stamped every null-parent worker with the dead suffixed name before
-    the backstop unwinds the registration — unlinking the successor alone
-    leaves those workers pointing at a name nothing will ever register again
-    (worse than None: unadoptable by the next single-manager boot). The fake
-    below stamps a pre-seeded legacy worker exactly the way the real backfill
-    would, to prove the backstop reverts it."""
     from dockwright import mcp_server
 
     old_result = become_manager_impl(claude_sid="mgr-old", iterm_sid="i0", domain="personal")
@@ -1998,9 +1724,6 @@ def test_takeover_raises_and_unregisters_when_registration_races_and_returns_suf
             "cwd": "/x", "window_id": iterm_sid, "pid": os.getpid(),
             "domain": domain, "runtime": "claude",
         })
-        # Simulate the real become_manager_impl's _backfill_legacy_workers call:
-        # this attempt is (momentarily) the only manager, so it adopts the
-        # null-parent legacy worker under the freshly suffixed name.
         legacy = state.read_json(paths.ACTIVE / "legacy-worker.json")
         legacy["parent_manager_name"] = raced_name
         state.write_json_atomic(paths.ACTIVE / "legacy-worker.json", legacy)
@@ -2031,10 +1754,6 @@ def test_takeover_raises_and_unregisters_when_registration_races_and_returns_suf
 
 
 def test_bootstrap_recreate_seam_end_to_end(tmp_path, fresh_orchestrator_dir, monkeypatch):
-    """ATTACK-4 seam: the PR's own test files never cross writer -> consumer —
-    bootstrap-recreate.sh (Task A) writes a real handoff, and this test feeds
-    it to the real become_manager_with_takeover_impl (Task B), proving the two
-    halves actually agree end to end, not just independently."""
     import shutil
     script = Path(__file__).resolve().parent.parent / "deploy" / "scripts" / "bootstrap-recreate.sh"
     script_home = tmp_path / "script-home"
@@ -2072,9 +1791,6 @@ def test_bootstrap_recreate_seam_end_to_end(tmp_path, fresh_orchestrator_dir, mo
     assert len(written) == 1, written
     handoff_id = written[0].stem
 
-    # Point the MCP layer's paths at the SAME home the script wrote into —
-    # fresh_orchestrator_dir's tmp_path is unrelated to script_home, so
-    # re-target every path attribute the fixture patches, same idiom.
     dw = script_home / ".claude" / "dockwright"
     monkeypatch.setattr(paths, "ROOT", dw)
     monkeypatch.setattr(paths, "ACTIVE", dw / "active")
@@ -2108,11 +1824,7 @@ def test_bootstrap_recreate_seam_end_to_end(tmp_path, fresh_orchestrator_dir, mo
     assert new_record["domain"] == "personal"
 
 
-# --- prepare_recovery_handoff ---
-
 def _brick_manager_record(sid, age_sec=300):
-    """Model the monitor's precondition for a legit recovery target: state
-    'processing' and record file silent for >= MANAGER_LIMIT_CHECK_FLOOR_SEC."""
     p = paths.ACTIVE / f"{sid}.json"
     record = state.read_json(p)
     record["state"] = "processing"
@@ -2122,28 +1834,22 @@ def _brick_manager_record(sid, age_sec=300):
 
 
 def test_prepare_recovery_handoff_refuses_live_idle_manager(fresh_orchestrator_dir):
-    """A healthy idle manager (live pid, state idle) must never be handed out
-    as a recovery-takeover target — 2026-07-29 16:23 live-manager-kill class."""
     become_manager_impl(claude_sid="mgr-live", iterm_sid="i0")
     with pytest.raises(ValueError, match="not an active manager"):
         prepare_recovery_handoff_impl("mgr-live")
 
 
 def test_prepare_recovery_handoff_refuses_live_processing_fresh(fresh_orchestrator_dir):
-    """Live pid + state processing + record written <120s ago = a manager
-    mid-work, not a brick."""
     become_manager_impl(claude_sid="mgr-live", iterm_sid="i0")
     p = paths.ACTIVE / "mgr-live.json"
     record = state.read_json(p)
     record["state"] = "processing"
-    state.write_json_atomic(p, record)  # fresh mtime
+    state.write_json_atomic(p, record)
     with pytest.raises(ValueError, match="not an active manager"):
         prepare_recovery_handoff_impl("mgr-live")
 
 
 def test_prepare_recovery_handoff_refuses_live_idle_stale_record(fresh_orchestrator_dir):
-    """Delete-one-line coverage for the `state != "processing"` clause: a healthy manager
-    idle >120s between turns is the common posture — the mtime clause alone lets it through."""
     become_manager_impl(claude_sid="mgr-idle-old", iterm_sid="i0")
     p = paths.ACTIVE / "mgr-idle-old.json"
     old = time.time() - 3600
@@ -2153,7 +1859,6 @@ def test_prepare_recovery_handoff_refuses_live_idle_stale_record(fresh_orchestra
 
 
 def test_prepare_recovery_handoff_allows_bricked_target(fresh_orchestrator_dir):
-    """The designed lane: live pid + processing + >=120s silent record."""
     become_manager_impl(claude_sid="mgr-bricked", iterm_sid="i0")
     _brick_manager_record("mgr-bricked")
     out = prepare_recovery_handoff_impl("mgr-bricked")
@@ -2161,17 +1866,13 @@ def test_prepare_recovery_handoff_allows_bricked_target(fresh_orchestrator_dir):
 
 
 def test_prepare_recovery_handoff_allows_dead_pid(fresh_orchestrator_dir, monkeypatch):
-    """Dead process = dead manager: proceed regardless of state/mtime."""
-    become_manager_impl(claude_sid="mgr-dead", iterm_sid="i0")  # state idle, fresh mtime
+    become_manager_impl(claude_sid="mgr-dead", iterm_sid="i0")
     monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: False)
     out = prepare_recovery_handoff_impl("mgr-dead")
     assert "handoff_id" in out
 
 
 def test_prepare_recovery_handoff_allows_pidless_record(fresh_orchestrator_dir):
-    """No pid = no liveness evidence (legacy/hand-made record): fail open —
-    refusing would deadlock legit recovery; the monitor's own detection remains
-    the gate."""
     state.write_json_atomic(paths.ACTIVE / "mgr-legacy.json", {
         "claude_sid": "mgr-legacy", "agent": "manager", "name": "old-timer",
         "cwd": "/x", "window_id": "i0", "pid": None, "started_at": 1.0,
@@ -2183,10 +1884,6 @@ def test_prepare_recovery_handoff_allows_pidless_record(fresh_orchestrator_dir):
 
 
 def test_prepare_recovery_handoff_refuses_live_manager_mid_long_turn(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """THE 2026-07-29 kill class (Tier-2 Critical repro): a healthy manager 40 min
-    into a single turn — state processing, record mtime frozen at turn start,
-    transcript appended seconds ago. The record clock alone calls it dead; the
-    transcript leg must refuse."""
     become_manager_impl(claude_sid="mgr-live", iterm_sid="i0")
     p = paths.ACTIVE / "mgr-live.json"
     record = state.read_json(p)
@@ -2203,9 +1900,6 @@ def test_prepare_recovery_handoff_refuses_live_manager_mid_long_turn(fresh_orche
 
 
 def test_prepare_recovery_handoff_allows_bricked_target_with_stale_transcript(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """The other direction (a liveness check that never allows is as bad as one
-    that wrongly allows): genuinely bricked — processing, record AND transcript
-    both silent 40 min — must still be detected as recoverable."""
     become_manager_impl(claude_sid="mgr-bricked", iterm_sid="i0")
     _brick_manager_record("mgr-bricked", age_sec=2400)
     log = tmp_path / "mgr-bricked.jsonl"
@@ -2235,11 +1929,6 @@ _SYNTHETIC_LIMIT = {"type": "assistant", "isApiErrorMessage": True,
 
 
 def test_prepare_recovery_handoff_refuses_manager_blocked_on_tool(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """Tier-2 round-3 Critical repro (autonomous chain): a manager asks its human
-    about a rate limit, calls AskUserQuestion, and goes silent on both files —
-    the monitor's banner check false-positives on the prose and launches a
-    recovery. The guard must recognise the trailing unfinished tool_use as
-    ALIVE and refuse; killing a manager mid-question is the round-1 outcome."""
     become_manager_impl(claude_sid="mgr-modal", iterm_sid="i0")
     _brick_manager_record("mgr-modal", age_sec=2400)
     log = tmp_path / "mgr-modal.jsonl"
@@ -2256,11 +1945,6 @@ def test_prepare_recovery_handoff_refuses_manager_blocked_on_tool(fresh_orchestr
 
 
 def test_prepare_recovery_handoff_allows_real_latched_brick_shapes(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """A genuinely latched brick always ENDS in a synthetic assistant TEXT event
-    (validated on the 2026-07-29 incident transcripts: model="<synthetic>",
-    isApiErrorMessage=True). Both banner classes, each preceded by an earlier
-    real tool_use turn — the discriminator must key on the LAST assistant
-    event, not on any tool_use anywhere in the file."""
     for i, latch in enumerate((_SYNTHETIC_401, _SYNTHETIC_LIMIT)):
         sid = f"mgr-latched-{i}"
         become_manager_impl(claude_sid=sid, iterm_sid=f"i{i}")
@@ -2280,42 +1964,13 @@ def test_prepare_recovery_handoff_allows_real_latched_brick_shapes(fresh_orchest
         assert "handoff_id" in out, sid
 
 
-def test_liveness_refusal_matches_procedure_routing_phrase(fresh_orchestrator_dir):
-    """Prose-code contract, both sides anchored: the raised message must contain
-    the exact phrase manager-takeover-recovery.md step 3 routes on."""
-    import re
-    doc = (Path(__file__).resolve().parents[1]
-           / "deploy" / "commands" / "manager-takeover-recovery.md").read_text()
-    m = re.search(r'errors with "([^"]+)"', doc)
-    assert m, "step-3 routing phrase not found in procedure doc"
-    become_manager_impl(claude_sid="mgr-live", iterm_sid="i0")
-    with pytest.raises(ValueError) as ei:
-        prepare_recovery_handoff_impl("mgr-live")
-    assert m.group(1) in str(ei.value)
-
-
 def test_recovery_silence_floor_matches_stale_monitor():
-    """Drift guard between the guard's clock and the monitor's detection floor —
-    if the floor ever moves, the guard must move with it or legit recoveries
-    get refused at the successor's first call."""
     from dockwright import mcp_server, stale_monitor
     assert (mcp_server.RECOVERY_TAKEOVER_MIN_SILENCE_SEC
             == stale_monitor.MANAGER_LIMIT_CHECK_FLOOR_SEC)
 
 
 def test_liveness_clock_is_the_monitors_quantity(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """Round-1's Critical was prose-only parity: the constant was pinned
-    (120 == 120) while the QUANTITY diverged. Pin the quantity: on identical
-    on-disk state, the guard's verdict must agree with the monitor's own
-    _last_activity computation — the expectation is DERIVED from
-    _last_activity, so any source it gains later (e.g. subagent mtimes via
-    _latest_subagent_mtime — the planted agent-1.jsonl below is exactly that
-    signal, invisible to both clocks today) reds this test until the guard
-    follows. Both clocks run their own real resolvers over one tmp tree;
-    stale_monitor binds its projects root at import (repo-documented caveat),
-    so that side's root is aligned via the same attr the test_stale_monitor
-    fixture uses. The mtime→max→floor computation on both sides is
-    untouched."""
     from dockwright import stale_monitor
     from dockwright.mcp_server import (_recovery_target_liveness,
                                        RECOVERY_TAKEOVER_MIN_SILENCE_SEC)
@@ -2349,16 +2004,13 @@ def test_liveness_clock_is_the_monitors_quantity(fresh_orchestrator_dir, tmp_pat
 
 
 def test_takeover_refuses_revived_recovery_target(fresh_orchestrator_dir, monkeypatch):
-    """Guard point B: a recovery-marked handoff whose target shows liveness at
-    CONSUME time must refuse BEFORE any destructive act — window untouched,
-    predecessor record kept, handoff unconsumed."""
     become_manager_impl(claude_sid="old-sid", iterm_sid="i0")
     _brick_manager_record("old-sid")
     out = prepare_recovery_handoff_impl("old-sid")
     p = paths.ACTIVE / "old-sid.json"
     record = state.read_json(p)
     record["state"] = "idle"
-    state.write_json_atomic(p, record)  # revival: fresh mtime + idle
+    state.write_json_atomic(p, record)
     closed = []
     monkeypatch.setattr("dockwright.mcp_server._close_window", lambda w: closed.append(w))
     with pytest.raises(ValueError, match="liveness|live"):
@@ -2372,8 +2024,6 @@ def test_takeover_refuses_revived_recovery_target(fresh_orchestrator_dir, monkey
 
 
 def test_takeover_refuses_revived_target_gone_idle_and_quiet(fresh_orchestrator_dir, monkeypatch):
-    """Guard-B twin: the predecessor revived, finished its turn (state idle) and has been
-    quiet >120s — only the state clause refuses."""
     become_manager_impl(claude_sid="old-sid", iterm_sid="i0")
     p = paths.ACTIVE / "old-sid.json"
     r = state.read_json(p); r["state"] = "processing"; state.write_json_atomic(p, r)
@@ -2390,23 +2040,12 @@ def test_takeover_refuses_revived_target_gone_idle_and_quiet(fresh_orchestrator_
 
 
 def test_become_manager_pops_pending_takeover_env(fresh_orchestrator_dir, monkeypatch):
-    """The recovery tab's whole process tree (claude CLI + its MCP server)
-    inherits DOCKWRIGHT_PENDING_TAKEOVER=1. Registration IS the identity
-    acquisition, so become_manager_impl must pop the var from the MCP server's
-    env — otherwise a later TmuxDriver.spawn from this process could birth a
-    tmux server with the var in its global env, silently suppressing
-    SessionStart registration for every future manager tab (add-one sweep on
-    the guard's blast radius)."""
     monkeypatch.setenv("DOCKWRIGHT_PENDING_TAKEOVER", "1")
     become_manager_impl(claude_sid="mgr-pop", iterm_sid="i0")
     assert "DOCKWRIGHT_PENDING_TAKEOVER" not in os.environ
 
 
 def test_takeover_nonrecovery_handoff_live_predecessor_still_works(fresh_orchestrator_dir, monkeypatch):
-    """Guard-B scoping (the recreate-lane protection): a NON-recovery handoff
-    consumed against a live, fresh, idle predecessor is the designed
-    /recreate-manager flow and must not regress. Handoff hand-written in
-    bootstrap-recreate.sh's shape + manager_name/domain."""
     result = become_manager_impl(claude_sid="old-sid", iterm_sid="i0")
     state.write_json_atomic(paths.HANDOFFS / "h-recreate.json", {
         "handoff_id": "h-recreate", "from_sid": "old-sid", "to_sid": None,
@@ -2445,9 +2084,6 @@ def test_prepare_recovery_handoff_shape(fresh_orchestrator_dir):
     assert handoff["recovery"] is True
     assert handoff["trigger_reason"] == "account-flip-recovery"
     assert "[auto-recovery]" in handoff["narrative_summary"]
-    # Exact key-parity with prepare_handoff (same schema consumers) — fires in
-    # both directions: a key added to prepare_handoff_impl but not mirrored here,
-    # or a stray key added only to the recovery record.
     PARITY_KEYS = {"handoff_id", "from_sid", "to_sid", "prepared_at", "consumed_at",
                    "trigger_reason", "narrative_summary", "manager_name", "domain",
                    "workers_snapshot", "questions_snapshot"}
@@ -2455,7 +2091,6 @@ def test_prepare_recovery_handoff_shape(fresh_orchestrator_dir):
         "unexpected keys — was prepare_handoff_impl extended? Mirror in the recovery record"
     assert handoff["to_sid"] is None
     assert handoff["consumed_at"] is None
-    # snapshots are populated
     assert len(handoff["workers_snapshot"]) == 1
     assert handoff["workers_snapshot"][0]["name"] == "alpha"
     assert len(handoff["questions_snapshot"]) == 1
@@ -2463,11 +2098,9 @@ def test_prepare_recovery_handoff_shape(fresh_orchestrator_dir):
 
 
 def test_prepare_recovery_handoff_rejects_non_manager(fresh_orchestrator_dir):
-    # No record at all → ValueError
     with pytest.raises(ValueError, match="not an active manager"):
         prepare_recovery_handoff_impl("ghost-sid")
 
-    # A worker record → ValueError
     register_self_impl(
         claude_sid="w1", agent="worker", name="beta", cwd="/x", iterm_sid="i1",
         pid=os.getpid(),
@@ -2501,12 +2134,10 @@ def test_recovery_handoff_accepted_by_takeover(fresh_orchestrator_dir, monkeypat
     assert result["name"] == old_result["name"]
     assert result["domain"] == "general"
 
-    # Handoff is consumed and bound to new-sid
     handoff_after = state.read_json(paths.HANDOFFS / f"{out['handoff_id']}.json")
     assert handoff_after["consumed_at"] is not None
     assert handoff_after["to_sid"] == "new-sid"
 
-    # New manager record exists
     new_record = state.read_json(paths.ACTIVE / "new-sid.json")
     assert new_record["agent"] == "manager"
     assert new_record["name"] == old_result["name"]
@@ -2521,10 +2152,8 @@ def test_become_manager_with_takeover_rejects_unknown_handoff(fresh_orchestrator
 
 
 def test_become_manager_with_takeover_drops_old_manager_questions(fresh_orchestrator_dir, monkeypatch):
-    """Takeover must not orphan questions addressed to the old sid."""
     become_manager_impl(claude_sid="mgr-old", iterm_sid="i0")
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
-    # Manager rarely receives questions but the consistency invariant matters.
     from dockwright.mcp_server import _write_question
     _write_question(worker_sid="mgr-old", worker_name="manager", question="dangling?")
 
@@ -2536,7 +2165,6 @@ def test_become_manager_with_takeover_drops_old_manager_questions(fresh_orchestr
         claude_sid="mgr-new", takeover_from="mgr-old",
         handoff_id=handoff["handoff_id"], iterm_sid="i1",
     )
-    # All old-sid questions are gone
     remaining = [
         state.read_json(q) for q in paths.QUESTIONS.iterdir() if q.suffix == ".json"
     ]
@@ -2553,7 +2181,6 @@ def test_become_manager_with_takeover_rejects_already_consumed(fresh_orchestrato
         claude_sid="mgr-new", takeover_from="mgr-old",
         handoff_id=handoff["handoff_id"], iterm_sid="i1",
     )
-    # Second takeover with the same handoff must fail.
     with pytest.raises(ValueError, match="already consumed"):
         become_manager_with_takeover_impl(
             claude_sid="mgr-newest", takeover_from="mgr-old",
@@ -2562,9 +2189,6 @@ def test_become_manager_with_takeover_rejects_already_consumed(fresh_orchestrato
 
 
 def test_become_manager_auto_suffixes_explicit_name_collision(fresh_orchestrator_dir):
-    """When an explicit name collides with a live active record, auto-suffix it
-    (e.g. /manager-resume preserving the predecessor name during a brief overlap).
-    """
     state.write_json_atomic(paths.ACTIVE / "stale-sid.json", {
         "claude_sid": "stale-sid",
         "agent": "manager",
@@ -2577,7 +2201,6 @@ def test_become_manager_auto_suffixes_explicit_name_collision(fresh_orchestrator
     })
     result = become_manager_impl(claude_sid="mgr-new", iterm_sid="i-new", name="grumpy-yak")
     assert result["ok"] is True
-    # Either inherited the suffix flow OR the rerolled name; never collides.
     assert result["name"] != "grumpy-yak" or state.read_json(paths.ACTIVE / "stale-sid.json") is None
 
 
@@ -2602,10 +2225,6 @@ def _patch_exec(monkeypatch):
         return _FakeProc()
 
     monkeypatch.setattr(spawner.asyncio, "create_subprocess_exec", fake_exec)
-    # Always isolate the account-active pointer so legacy tests (which never call
-    # _enable_pool) stay pool-off even if ~/.claude/dockwright/account-active
-    # exists on the machine running the tests. Pool tests call _enable_pool AFTER
-    # this, whose setattr overwrites the sentinel.
     monkeypatch.setattr(paths, "ACCOUNT_ACTIVE", Path("/nonexistent/__no_account_active__"))
     return captured
 
@@ -2620,9 +2239,7 @@ def test_spawn_worker_forwards_extra_args(monkeypatch):
     ))
     inner_cmd = captured["args"][-1]
     assert "--dangerously-skip-permissions" in inner_cmd
-    # extra_args must appear before the prompt
     assert inner_cmd.index("--dangerously-skip-permissions") < inner_cmd.index("hello")
-    # And after `claude `
     claude_pos = inner_cmd.rindex("claude ")
     assert claude_pos < inner_cmd.index("--dangerously-skip-permissions")
 
@@ -2637,7 +2254,6 @@ def test_spawn_worker_forwards_env(monkeypatch):
     ))
     inner_cmd = captured["args"][-1]
     assert "MY_VAR=1" in inner_cmd
-    # Orchestrator-controlled keys still present and not overridden
     assert "CLAUDE_AGENT=worker" in inner_cmd
     assert "CLAUDE_WORKER_NAME=alpha" in inner_cmd
     assert "CLAUDE_WORKER_RUNTIME=claude" in inner_cmd
@@ -2672,7 +2288,6 @@ def test_spawn_worker_defaults_unchanged_when_new_params_omitted(monkeypatch):
         name="alpha",
     ))
     inner_cmd = captured["args"][-1]
-    # No model passed → orchestrator appends its claude-opus-5[1m] default before the prompt
     assert inner_cmd.rstrip().endswith("claude --model 'claude-opus-5[1m]' hi")
 
 
@@ -2695,7 +2310,6 @@ def test_spawn_worker_codex_runtime_builds_codex_command(monkeypatch):
 
 
 def test_spawn_manager_builds_claude_command_without_runtime_env(monkeypatch):
-    # Managers are Claude-only — a manager spawn carries no runtime marker env.
     captured = _patch_exec(monkeypatch)
     _asyncio.run(spawner.spawn_worker_tab(
         cwd="/tmp/x",
@@ -2770,8 +2384,6 @@ def test_spawn_worker_target_window_match_adds_match_flag(monkeypatch):
     ))
     argv = list(captured["args"])
     assert "new-window" in argv
-    # Forwarded verbatim as the new-window target so the worker lands in the
-    # named window/session, not a fresh detached one.
     assert "-t" in argv and argv[argv.index("-t") + 1] == "window_id:42"
 
 
@@ -2785,7 +2397,6 @@ def test_spawn_worker_no_match_flag_when_target_window_match_unset(monkeypatch):
     ))
     argv = list(captured["args"])
     assert "new-window" in argv
-    # Default mode: no -t target (a fresh detached window).
     assert "-t" not in argv
 
 
@@ -2793,7 +2404,7 @@ def test_spawn_worker_route_to_workers_window_ignores_target_window_match(monkey
     terminal._DRIVER = None
     captured = _patch_exec(monkeypatch)
 
-    async def fake_find(self):   # now a method → takes self
+    async def fake_find(self):
         return "%99"
 
     monkeypatch.setattr(terminal.TmuxDriver, "find_group_pane", fake_find)
@@ -2805,22 +2416,15 @@ def test_spawn_worker_route_to_workers_window_ignores_target_window_match(monkey
         target_window_match="window_id:42",
     ))
     argv = list(captured["args"])
-    # An existing workers window/session means new-window into the workers group,
-    # NOT the caller-supplied target_window_match.
     assert "new-window" in argv
     assert argv[argv.index("-t") + 1] == terminal.WORKERS_OS_WINDOW_CLASS
     assert "window_id:42" not in argv
 
 
 def test_spawn_worker_tab_manager_routes_to_mgr_session(monkeypatch):
-    """agent="manager" must call get_driver().spawn with route_to_manager_session=True;
-    agent="worker" (default) must call it with route_to_manager_session=False."""
     import asyncio as _asyncio2
     from dockwright import spawner as _spawner
 
-    # Isolate account selection: point ACCOUNT_ACTIVE at a nonexistent file so
-    # the pool is off and _active_account() also returns None (same guard as
-    # _patch_exec uses).
     monkeypatch.setattr(paths, "ACCOUNT_ACTIVE", Path("/nonexistent/__no_account_active__"))
 
     captured_spawn_kwargs: dict = {}
@@ -2832,7 +2436,6 @@ def test_spawn_worker_tab_manager_routes_to_mgr_session(monkeypatch):
 
     monkeypatch.setattr(_spawner, "get_driver", lambda: FakeDrv())
 
-    # manager spawn → route_to_manager_session=True
     _asyncio2.run(_spawner.spawn_worker_tab(
         cwd="/tmp/x",
         initial_prompt="/manager-resume x",
@@ -2843,7 +2446,6 @@ def test_spawn_worker_tab_manager_routes_to_mgr_session(monkeypatch):
         f"expected route_to_manager_session=True for agent='manager', got: {captured_spawn_kwargs}"
     )
 
-    # worker spawn → route_to_manager_session=False
     captured_spawn_kwargs.clear()
     _asyncio2.run(_spawner.spawn_worker_tab(
         cwd="/tmp/x",
@@ -2856,25 +2458,13 @@ def test_spawn_worker_tab_manager_routes_to_mgr_session(monkeypatch):
     )
 
 
-# --- account pool login model (per-CLAUDE_CONFIG_DIR keychain login) ---
-
 def _enable_pool(monkeypatch, tmp_path, letter="a"):
-    """Fake pointer + isolated counter/state. The login-model picker NEVER calls
-    `security`; this guard fails the test if it ever does.
-
-    Patches SPAWN_COUNTER and ACCOUNT_STATE to tmp_path so _pick_account() never
-    touches ~/.claude/dockwright/ state during tests. Counter starts at 0
-    (a-slot by default weights 1:1), which is why letter='a' is the default.
-    """
     pointer = tmp_path / "account-active"
     pointer.write_text(f"{letter}\n")
     monkeypatch.setattr(paths, "ACCOUNT_ACTIVE", pointer)
     monkeypatch.setattr(paths, "SPAWN_COUNTER", tmp_path / "spawn-counter.json")
     monkeypatch.setattr(paths, "ACCOUNT_STATE", tmp_path / "account-state.json")
     monkeypatch.setattr(paths, "ACCOUNT_USAGE", tmp_path / "usage")
-    # Keep spawn tests hermetic: never build a real ~/.claude-<letter> farm in HOME.
-    # Return a deterministic tmp-based dir so worker-prefix assertions still see
-    # CLAUDE_CONFIG_DIR without touching the real filesystem.
     def _fake_farm(letter):
         d = tmp_path / f".claude-{letter}"
         d.mkdir(parents=True, exist_ok=True)
@@ -2883,9 +2473,6 @@ def _enable_pool(monkeypatch, tmp_path, letter="a"):
         )
         return d
     monkeypatch.setattr(spawner, "ensure_account_config_dir", _fake_farm)
-    # L-11 farm pre-trust reads paths.account_config_dir(letter)/.claude.json;
-    # on an unpatched CONFIG_HOME that resolves to the developer's real
-    # ~/.claude-<letter>. Redirect it to the tmp farm _fake_farm already builds.
     monkeypatch.setattr(paths, "account_config_dir", lambda letter: tmp_path / f".claude-{letter}")
 
     def fake_run(args, **kwargs):
@@ -2898,10 +2485,7 @@ def _enable_pool(monkeypatch, tmp_path, letter="a"):
 
 
 def test_spawn_worker_account_a_default(monkeypatch, tmp_path):
-    """Worker on account 'a' (the default ~/.claude): no token, no CLAUDE_CONFIG_DIR,
-    stamp 'a'. counter=0 with 1:1 weights → 'a'."""
     captured = _patch_exec(monkeypatch)
-    # _enable_pool must come AFTER _patch_exec so its setattr wins.
     _enable_pool(monkeypatch, tmp_path, letter="a")
     _asyncio.run(spawner.spawn_worker_tab(
         cwd="/tmp/x",
@@ -2915,8 +2499,6 @@ def test_spawn_worker_account_a_default(monkeypatch, tmp_path):
 
 
 def test_spawn_worker_account_b_config_dir(monkeypatch, tmp_path):
-    """Worker on account 'b': CLAUDE_CONFIG_DIR=.../.claude-b, no token, stamp 'b'.
-    Force the picker to 'b' directly (W_A=0 would still clamp to 'a')."""
     captured = _patch_exec(monkeypatch)
     _enable_pool(monkeypatch, tmp_path, letter="b")
     monkeypatch.setattr(spawner, "_pick_account", lambda force=False: "b")
@@ -2929,13 +2511,10 @@ def test_spawn_worker_account_b_config_dir(monkeypatch, tmp_path):
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in inner_cmd
     assert f"CLAUDE_CONFIG_DIR={tmp_path}/.claude-b" in inner_cmd
     assert "CLAUDE_ORCH_ACCOUNT=b" in inner_cmd
-    # The login authenticates the session — no keychain reads in the cmdline.
     assert "$(security" not in inner_cmd
 
 
 def test_spawn_manager_rides_pointer_a(monkeypatch, tmp_path):
-    """Manager rides the pointer: pointer=a → default ~/.claude, no token, no
-    CLAUDE_CONFIG_DIR, stamp 'a'."""
     captured = _patch_exec(monkeypatch)
     _enable_pool(monkeypatch, tmp_path, letter="a")
     _asyncio.run(spawner.spawn_worker_tab(
@@ -2951,12 +2530,8 @@ def test_spawn_manager_rides_pointer_a(monkeypatch, tmp_path):
 
 
 def test_spawn_manager_rides_pointer_b(monkeypatch, tmp_path):
-    """Manager rides the pointer: pointer=b → CLAUDE_CONFIG_DIR=.../.claude-b,
-    no token, stamp 'b'."""
     captured = _patch_exec(monkeypatch)
     _enable_pool(monkeypatch, tmp_path, letter="b")
-    # 'b' is only a valid pointer when the registry holds it; the default pool
-    # is now single-account, so install the two-account registry explicitly.
     _install_two_pool(monkeypatch, tmp_path)
     _asyncio.run(spawner.spawn_worker_tab(
         cwd="/tmp/x",
@@ -2972,7 +2547,6 @@ def test_spawn_manager_rides_pointer_b(monkeypatch, tmp_path):
 
 def test_spawn_omits_prefix_without_pointer(monkeypatch):
     captured = _patch_exec(monkeypatch)
-    # _patch_exec already points ACCOUNT_ACTIVE at a nonexistent path; no _enable_pool
     _asyncio.run(spawner.spawn_worker_tab(
         cwd="/tmp/x",
         initial_prompt="hi",
@@ -2984,7 +2558,6 @@ def test_spawn_omits_prefix_without_pointer(monkeypatch):
 
 
 def test_spawn_omits_prefix_on_invalid_pointer(monkeypatch, tmp_path):
-    # letter 'z' is not valid (not a|b) → pool off, no stamp.
     captured = _patch_exec(monkeypatch)
     _enable_pool(monkeypatch, tmp_path, letter="z")
     _asyncio.run(spawner.spawn_worker_tab(cwd="/tmp/x", initial_prompt="hi", name="alpha"))
@@ -2994,13 +2567,6 @@ def test_spawn_omits_prefix_on_invalid_pointer(monkeypatch, tmp_path):
 
 
 def test_caller_token_disables_pool_injection(monkeypatch, tmp_path):
-    """A caller-supplied CLAUDE_CODE_OAUTH_TOKEN disables pool routing for this
-    spawn: no CLAUDE_CONFIG_DIR farm and no CLAUDE_ORCH_ACCOUNT stamp. Note the
-    default ~/.claude keychain login now OUTRANKS the caller token, so the token
-    no longer reliably forces a token identity — it's kept as a defensive escape
-    hatch and the session record staying unstamped is truthful. The caller's raw
-    token rides the worker cmdline (visible in ps — their informed choice). A
-    forged CLAUDE_ORCH_ACCOUNT is still dropped."""
     captured = _patch_exec(monkeypatch)
     _enable_pool(monkeypatch, tmp_path, letter="a")
     _asyncio.run(spawner.spawn_worker_tab(
@@ -3008,24 +2574,17 @@ def test_caller_token_disables_pool_injection(monkeypatch, tmp_path):
         initial_prompt="hi",
         name="alpha",
         env={
-            "CLAUDE_ORCH_ACCOUNT": "b",          # caller tries to forge account
-            "CLAUDE_CODE_OAUTH_TOKEN": "caller-token",  # caller owns auth
+            "CLAUDE_ORCH_ACCOUNT": "b",
+            "CLAUDE_CODE_OAUTH_TOKEN": "caller-token",
         },
     ))
     inner_cmd = captured["args"][-1]
-    # Caller token rides through as plain caller env…
     assert "CLAUDE_CODE_OAUTH_TOKEN=caller-token" in inner_cmd
-    # …and the pool prefix is fully absent: no substitution, no stamp at all.
     assert "$(security" not in inner_cmd
     assert "CLAUDE_ORCH_ACCOUNT" not in inner_cmd
 
 
 def test_caller_config_dir_dropped_picker_wins(monkeypatch, tmp_path):
-    """CLAUDE_CONFIG_DIR is the sole billing lever, so a caller-passed value must
-    NOT override the picker's account-derived farm — otherwise a caller could
-    mis-bill by pinning the spawn to another account's config dir. The forged
-    value is dropped from the caller-env section and the picker's
-    CLAUDE_CONFIG_DIR (=.../.claude-b) is the only one in the inner cmd."""
     captured = _patch_exec(monkeypatch)
     _enable_pool(monkeypatch, tmp_path, letter="b")
     monkeypatch.setattr(spawner, "_pick_account", lambda force=False: "b")
@@ -3033,16 +2592,13 @@ def test_caller_config_dir_dropped_picker_wins(monkeypatch, tmp_path):
         cwd="/tmp/x",
         initial_prompt="hi",
         name="alpha",
-        env={"CLAUDE_CONFIG_DIR": "/tmp/evil"},   # caller tries to override billing
+        env={"CLAUDE_CONFIG_DIR": "/tmp/evil"},
     ))
     inner_cmd = captured["args"][-1]
     assert "/tmp/evil" not in inner_cmd, "caller CLAUDE_CONFIG_DIR must be dropped"
     assert f"CLAUDE_CONFIG_DIR={tmp_path}/.claude-b" in inner_cmd, "picker's farm wins"
     assert inner_cmd.count("CLAUDE_CONFIG_DIR=") == 1, "only the picker's assignment survives"
     assert "CLAUDE_ORCH_ACCOUNT=b" in inner_cmd
-
-
-# --- window_id_exists parsing ---
 
 
 def _patch_terminal_ls(monkeypatch, stdout: bytes, returncode: int = 0):
@@ -3060,7 +2616,6 @@ def _patch_terminal_ls(monkeypatch, stdout: bytes, returncode: int = 0):
 
 
 def _panes_stdout(pane_ids):
-    # tmux list-panes -F "#{pane_id}" emits one pane id per line.
     return ("\n".join(str(p) for p in pane_ids) + "\n").encode()
 
 
@@ -3086,34 +2641,25 @@ def test_window_id_exists_false_on_nonzero_returncode(monkeypatch):
 
 
 def test_window_id_exists_matches_exact_pane_id(monkeypatch):
-    # the window_id arg arrives as a str; pane_exists compares it against the
-    # list-panes output verbatim.
     terminal._DRIVER = None
     _patch_terminal_ls(monkeypatch, _panes_stdout(["42"]))
     assert _asyncio.run(spawner.window_id_exists("42")) is True
 
-
-# --- Preset support on spawn_worker ---
 
 from dockwright.mcp_server import spawn_worker_impl
 from dockwright.mcp_server import _repo_sync_footer
 
 
 def _patch_spawn_worker_tab(monkeypatch):
-    """Replace spawner.spawn_worker_tab with a recorder. Returns the captured dict."""
     captured: dict = {}
 
     async def fake_spawn(**kwargs):
         captured.update(kwargs)
         return ("999", kwargs.get("name", ""))
 
-    # spawn_worker_impl does a lazy `from .spawner import spawn_worker_tab`, so we
-    # patch the source module's attribute, which is what the lazy import resolves to.
     monkeypatch.setattr(spawner, "spawn_worker_tab", fake_spawn)
     return captured
 
-
-# --- spawn registration detection net ---
 
 from dockwright.mcp_server import _confirm_spawn_registration as _confirm_reg
 
@@ -3132,7 +2678,7 @@ def test_confirm_spawn_registration_times_out_when_absent(fresh_orchestrator_dir
 
 def test_spawn_worker_impl_reports_registered(fresh_orchestrator_dir, monkeypatch):
     monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
-    _patch_spawn_registers_active(monkeypatch)  # writes active/spawned-<name>.json, agent=worker
+    _patch_spawn_registers_active(monkeypatch)
     result = _asyncio.run(spawn_worker_impl(
         initial_prompt="task", name="reg-worker", cwd="/tmp/x",
         _registration_timeout_sec=2.0, _poll_interval=0.01))
@@ -3143,7 +2689,7 @@ def test_spawn_worker_impl_reports_registered(fresh_orchestrator_dir, monkeypatc
 
 def test_spawn_worker_impl_reports_no_register(fresh_orchestrator_dir, monkeypatch):
     monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
-    _patch_spawn_worker_tab(monkeypatch)  # never registers
+    _patch_spawn_worker_tab(monkeypatch)
     result = _asyncio.run(spawn_worker_impl(
         initial_prompt="task", name="lost-worker", cwd="/tmp/x",
         _registration_timeout_sec=0.2, _poll_interval=0.01))
@@ -3153,8 +2699,6 @@ def test_spawn_worker_impl_reports_no_register(fresh_orchestrator_dir, monkeypat
     assert "did not register" in result["reason"]
     assert paths.pending_assignment_path(result["assignment_id"]).exists()
 
-
-# --- spawn_replacement_manager OS-window targeting ---
 
 from dockwright.mcp_server import spawn_replacement_manager_impl
 
@@ -3172,17 +2716,12 @@ def test_spawn_replacement_manager_targets_old_manager_window(fresh_orchestrator
     captured = _patch_spawn_worker_tab(monkeypatch)
     _patch_window_id_exists(monkeypatch, True)
     result = _asyncio.run(spawn_replacement_manager_impl(handoff["handoff_id"]))
-    # window_id: (not id:) so the old manager's window id can't collide with an
-    # unrelated tab id and recreate the manager in the wrong OS-window.
     assert captured["target_window_match"] == "window_id:42"
     assert captured["runtime"] == "claude"
     assert result["runtime"] == "claude"
 
 
 def test_spawn_replacement_manager_pins_opus_model(fresh_orchestrator_dir, monkeypatch):
-    # The recreate lane must pin the manager model explicitly: without
-    # extra_args it rides the spawner's WORKER default, so a future worker
-    # default change would silently move the manager lane too.
     become_manager_impl(claude_sid="mgr-old", iterm_sid="42")
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
     captured = _patch_spawn_worker_tab(monkeypatch)
@@ -3192,10 +2731,6 @@ def test_spawn_replacement_manager_pins_opus_model(fresh_orchestrator_dir, monke
 
 
 def test_spawn_replacement_manager_carries_settings_and_rc(fresh_orchestrator_dir, monkeypatch, tmp_path):
-    """Recreate lane composes the same tail as `dockwright manager`
-    (manager_claude_args): deployed allowlist settings + default-ON
-    remote-control (the reliable enrollment flag — the global
-    remoteControlAtStartup key is unreliable for spawned sessions)."""
     presets = tmp_path / "presets"; presets.mkdir(exist_ok=True)
     settings = presets / "manager-settings.json"
     settings.write_text("{}")
@@ -3207,18 +2742,12 @@ def test_spawn_replacement_manager_carries_settings_and_rc(fresh_orchestrator_di
     _asyncio.run(spawn_replacement_manager_impl(handoff["handoff_id"]))
     assert captured["extra_args"] == [
         "--remote-control", "--settings", str(settings), "--model", "claude-opus-5[1m]"]
-    # Parse-shape invariant: the token after --remote-control (the prompt is
-    # appended by spawner._runtime_command right after extra_args) must be a
-    # dash-option, or --remote-control [name] swallows the /manager-resume prompt.
     _rc = captured["extra_args"].index("--remote-control")
     assert _rc + 1 < len(captured["extra_args"]) and \
         captured["extra_args"][_rc + 1].startswith("-"), captured["extra_args"]
 
 
 def test_spawn_replacement_manager_carries_skip_perms_opt_in(fresh_orchestrator_dir, monkeypatch):
-    """The recreate lane inherits the opt-in via manager_claude_args — no
-    lane-local wiring to drift. Default-off is pinned by the existing
-    exact-argv asserts in the neighboring tests."""
     monkeypatch.setenv("DOCKWRIGHT_MANAGER_SKIP_PERMS", "1")
     become_manager_impl(claude_sid="mgr-old", iterm_sid="42")
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
@@ -3231,10 +2760,6 @@ def test_spawn_replacement_manager_carries_skip_perms_opt_in(fresh_orchestrator_
 
 
 def test_spawn_replacement_manager_inherits_predecessor_funny_name(fresh_orchestrator_dir, monkeypatch):
-    """The incoming tab inherits the predecessor's funny name via CLAUDE_WORKER_NAME,
-    so its SessionStart placeholder IS the eventual name (become_manager_with_takeover
-    does the authoritative rename). Passing "manager" here would defeat the funny-name
-    identity hardening."""
     become_manager_impl(claude_sid="mgr-old", iterm_sid="42")
     mgr_name = state.read_json(paths.ACTIVE / "mgr-old.json")["name"]
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
@@ -3247,8 +2772,6 @@ def test_spawn_replacement_manager_inherits_predecessor_funny_name(fresh_orchest
 
 
 def test_spawn_replacement_manager_passes_empty_name_when_none_recorded(fresh_orchestrator_dir, monkeypatch):
-    """Legacy handoff with no recorded manager_name → CLAUDE_WORKER_NAME="" so the
-    SessionStart hook rolls a fresh funny name instead of the literal "manager"."""
     become_manager_impl(claude_sid="mgr-old", iterm_sid="42")
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
     handoff_path = paths.HANDOFFS / f"{handoff['handoff_id']}.json"
@@ -3275,7 +2798,7 @@ def test_spawn_replacement_manager_falls_back_when_active_record_missing(fresh_o
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
     (paths.ACTIVE / "mgr-old.json").unlink()
     captured = _patch_spawn_worker_tab(monkeypatch)
-    _patch_window_id_exists(monkeypatch, True)  # should not even be consulted
+    _patch_window_id_exists(monkeypatch, True)
     _asyncio.run(spawn_replacement_manager_impl(handoff["handoff_id"]))
     assert captured["target_window_match"] is None
 
@@ -3284,14 +2807,9 @@ from dockwright.mcp_server import _resolve_old_manager_window_match
 
 
 def test_resolve_old_manager_window_match_falls_back_when_iterm_sid_empty(fresh_orchestrator_dir):
-    # Legacy active record predating managers storing iterm_sid: a falsy ""
-    # must fall back to bare --type=tab (resolver returns None) without ever
-    # consulting tmux list-panes.
     become_manager_impl(claude_sid="mgr-old", iterm_sid="42")
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
     record = state.read_json(paths.ACTIVE / "mgr-old.json")
-    # Simulate a legacy active record with no window id: clear both the new
-    # and legacy keys. The helper falls back to "" when neither is set.
     record.pop("window_id", None)
     record["iterm_sid"] = ""
     state.write_json_atomic(paths.ACTIVE / "mgr-old.json", record)
@@ -3329,8 +2847,6 @@ def test_spawn_worker_preset_missing_raises(fresh_orchestrator_dir, monkeypatch)
 
 
 def test_spawn_worker_preset_none_unchanged(fresh_orchestrator_dir, monkeypatch):
-    """Calling without preset must pass initial_prompt through unmodified
-    (modulo the universal repo-sync footer every non-blank prompt gets)."""
     captured = _patch_spawn_worker_tab(monkeypatch)
     _asyncio.run(spawn_worker_impl(
         initial_prompt="real task",
@@ -3340,14 +2856,11 @@ def test_spawn_worker_preset_none_unchanged(fresh_orchestrator_dir, monkeypatch)
     assert captured["initial_prompt"] == "real task" + _repo_sync_footer()
 
 
-# --- Remote Control disabled on workers ---
-
 REMOTE_OFF_FLAGS = ["--settings", '{"enableAllProjectMcpServers": true, "remoteControlAtStartup": false, "disableRemoteControl": true}']
 RC_ON_FLAGS = ["--settings", '{"enableAllProjectMcpServers": true}', "--remote-control"]
 
 
 def test_spawn_worker_disables_remote_control(fresh_orchestrator_dir, monkeypatch):
-    """Workers must auto-prepend --settings flags that disable Claude Code Remote."""
     monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
     captured = _patch_spawn_worker_tab(monkeypatch)
     result = _asyncio.run(spawn_worker_impl(
@@ -3362,7 +2875,6 @@ def test_spawn_worker_disables_remote_control(fresh_orchestrator_dir, monkeypatc
 
 
 def test_spawn_worker_disables_remote_appends_caller_extra_args(fresh_orchestrator_dir, monkeypatch):
-    """Caller-supplied extra_args must be APPENDED after the remote-off flags, not replaced."""
     monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
     captured = _patch_spawn_worker_tab(monkeypatch)
     _asyncio.run(spawn_worker_impl(
@@ -3389,20 +2901,10 @@ def test_spawn_worker_impl_codex_runtime_skips_claude_remote_flags(fresh_orchest
     assert "--settings" not in captured["extra_args"]
 
 
-# --- Remote Control opt-in (CLAUDE_ORCH_WORKER_RC=1) ---
-
 from dockwright.mcp_server import _claude_worker_settings_args
 
 
 def test_claude_rc_args_default_keeps_remote_off(monkeypatch):
-    """Flag unset → the legacy RC-off --settings, no --remote-control.
-
-    Preset injection forced off (D1 changed the no-arg default to the
-    deployed preset path when [spawn] worker_headless_preset=true, which
-    this machine's real ~/.claude/dockwright/presets may satisfy) so this
-    test stays scoped to what it actually covers: RC-flag parsing on the
-    inline-fallback path.
-    """
     monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
     monkeypatch.setattr(_config, "worker_headless_preset", lambda: False)
     assert _claude_worker_settings_args() == REMOTE_OFF_FLAGS
@@ -3411,7 +2913,6 @@ def test_claude_rc_args_default_keeps_remote_off(monkeypatch):
 
 @pytest.mark.parametrize("val", ["0", "", "true", "yes", " ", "2", "01", "1x"])
 def test_claude_rc_args_non_one_values_keep_remote_off(monkeypatch, val):
-    """Any value other than "1" preserves the byte-identical RC-off default."""
     monkeypatch.setenv("CLAUDE_ORCH_WORKER_RC", val)
     monkeypatch.setattr(_config, "worker_headless_preset", lambda: False)
     assert _claude_worker_settings_args() == REMOTE_OFF_FLAGS
@@ -3419,7 +2920,6 @@ def test_claude_rc_args_non_one_values_keep_remote_off(monkeypatch, val):
 
 @pytest.mark.parametrize("val", ["1", " 1 "])
 def test_claude_rc_args_enables_remote_when_opted_in(monkeypatch, val):
-    """CLAUDE_ORCH_WORKER_RC=1 → --remote-control, and NOT the RC-off --settings."""
     monkeypatch.setenv("CLAUDE_ORCH_WORKER_RC", val)
     monkeypatch.setattr(_config, "worker_headless_preset", lambda: False)
     assert _claude_worker_settings_args() == RC_ON_FLAGS
@@ -3428,7 +2928,6 @@ def test_claude_rc_args_enables_remote_when_opted_in(monkeypatch, val):
 
 
 def test_spawn_worker_opt_in_enables_remote_control(fresh_orchestrator_dir, monkeypatch):
-    """flag=1 → worker extra_args contain --remote-control and NOT the RC-off settings."""
     monkeypatch.setenv("CLAUDE_ORCH_WORKER_RC", "1")
     captured = _patch_spawn_worker_tab(monkeypatch)
     result = _asyncio.run(spawn_worker_impl(
@@ -3443,7 +2942,6 @@ def test_spawn_worker_opt_in_enables_remote_control(fresh_orchestrator_dir, monk
 
 
 def test_spawn_worker_opt_in_appends_caller_extra_args(fresh_orchestrator_dir, monkeypatch):
-    """flag=1 → --remote-control prepended, caller extra_args still appended after."""
     monkeypatch.setenv("CLAUDE_ORCH_WORKER_RC", "1")
     captured = _patch_spawn_worker_tab(monkeypatch)
     _asyncio.run(spawn_worker_impl(
@@ -3454,8 +2952,6 @@ def test_spawn_worker_opt_in_appends_caller_extra_args(fresh_orchestrator_dir, m
     ))
     assert captured["extra_args"] == RC_ON_FLAGS + ["--dangerously-skip-permissions"]
 
-
-# --- Headless preset becomes the claude-spawn default (spec D1) ---
 
 from dockwright import mcp_server
 
@@ -3549,15 +3045,6 @@ def test_settings_args_caller_settings_keeps_rc_flag(tmp_path, monkeypatch):
     assert mcp_server._claude_worker_settings_args(["--settings", "/x.json"]) == ["--remote-control"]
 
 
-# --- Resume replays the spawn's settings (verifier Finding 1) ---
-#
-# The no-arg headless default must NOT silently apply to EVERY resume: a worker
-# spawned read-only (--settings verifier-settings.json) that resumes onto the
-# auto headless preset is a permission WIDENING. So the composed spawn
-# args are persisted on the assignment record and replayed verbatim on resume;
-# a legacy record with no persisted args resumes NARROW (manual inline), never
-# fails open to the headless preset.
-
 from dockwright.mcp_server import _legacy_inline_settings_args
 
 
@@ -3632,12 +3119,9 @@ def test_resume_replays_headless_preset_spawn_args(fresh_orchestrator_dir, monke
 
 
 def test_resume_legacy_record_falls_back_to_manual_inline(fresh_orchestrator_dir, monkeypatch):
-    # A pre-spawn_extra_args record: original settings unknowable → resume must
-    # fail NARROW (manual inline, no permissions key), NEVER open to the headless preset.
     monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
     state.write_json_atomic(paths.CLOSED / "lsid.json", {
         "claude_sid": "lsid", "name": "legacy", "cwd": "/x", "runtime": "claude", "closed_at": 1.0})
-    # No assignment record for this sid — simulates the legacy / crash-orphan case.
     captured = {}
 
     async def fake_spawn(**kwargs):
@@ -3656,8 +3140,6 @@ def test_resume_legacy_record_falls_back_to_manual_inline(fresh_orchestrator_dir
 
 
 def test_legacy_inline_settings_args_matches_old_main_fallback(monkeypatch):
-    # The legacy resume fallback is byte-identical to the inline no-preset branch
-    # so the two can never drift.
     monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
     monkeypatch.setattr(mcp_server.config, "worker_headless_preset", lambda: False)
     assert _legacy_inline_settings_args() == mcp_server._claude_worker_settings_args()
@@ -3665,7 +3147,6 @@ def test_legacy_inline_settings_args_matches_old_main_fallback(monkeypatch):
 
 
 def test_resume_codex_stays_no_extra_args(fresh_orchestrator_dir, monkeypatch):
-    # Codex resume rides the runtime's fixed defaults — never a --settings replay.
     monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
     state.write_json_atomic(paths.CLOSED / "cxsid.json", {
         "claude_sid": "cxsid", "name": "cx", "cwd": "/x", "runtime": "codex", "closed_at": 1.0})
@@ -3687,10 +3168,6 @@ def test_resume_codex_stays_no_extra_args(fresh_orchestrator_dir, monkeypatch):
 
 @pytest.mark.parametrize("flag", [None, "1"])
 def test_manager_spawn_unaffected_by_worker_rc_flag(fresh_orchestrator_dir, monkeypatch, flag):
-    """The worker RC opt-in must never leak into the manager spawn path: the
-    manager's own --remote-control (manager_claude_args, default-ON, governed
-    solely by DOCKWRIGHT_MANAGER_RC) makes the composed extra_args IDENTICAL
-    whether or not CLAUDE_ORCH_WORKER_RC is set."""
     if flag is None:
         monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
     else:
@@ -3721,8 +3198,7 @@ def test_spawn_worker_impl_pauses_when_both_hot(fresh_orchestrator_dir, monkeypa
     _write_usage_mcp(tmp_path, "b", 97.0)
     result = _asyncio.run(spawn_worker_impl("hi", name="paused-one"))
     assert result["status"] == "paused"
-    assert captured == {}  # spawn_worker_tab never called (recorder stays empty)
-    # gate returns before _write_pending_assignment → no pending leaked (dir is isolated)
+    assert captured == {}
     assert not list(paths.ASSIGNMENTS_PENDING.glob("*.json"))
 
 
@@ -3733,7 +3209,7 @@ def test_spawn_worker_impl_force_bypasses_pause(fresh_orchestrator_dir, monkeypa
     _write_usage_mcp(tmp_path, "b", 97.0)
     result = _asyncio.run(spawn_worker_impl("hi", name="forced-one", force=True))
     assert result.get("status") != "paused"
-    assert captured.get("force") is True  # force forwarded to spawn_worker_tab
+    assert captured.get("force") is True
 
 
 def test_spawn_worker_impl_default_spawns_without_usage(fresh_orchestrator_dir, monkeypatch, tmp_path):
@@ -3748,8 +3224,6 @@ def test_spawn_worker_impl_default_spawns_without_usage(fresh_orchestrator_dir, 
 def test_spawn_worker_writes_window_sidecar(fresh_orchestrator_dir, monkeypatch):
     async def fake_spawn_tab(**kw):
         return ("777", None)
-    # spawn_worker_impl lazy-imports spawn_worker_tab from .spawner, so patch the
-    # source module's attribute (what the lazy import resolves to).
     monkeypatch.setattr(spawner, "spawn_worker_tab", fake_spawn_tab)
     _asyncio.run(spawn_worker_impl(name="w1", initial_prompt="do x", cwd="/tmp/wt"))
     sidecars = list(paths_module.ASSIGNMENTS_PENDING.glob("*.window"))
@@ -3770,20 +3244,18 @@ def test_spawn_worker_default_cwd_creates_worker_home_when_absent(fresh_orchestr
     monkeypatch.setenv("CLAUDE_ORCH_WORKER_HOME", str(absent))
     monkeypatch.chdir(tmp_path)
     _asyncio.run(spawn_worker_impl(initial_prompt="poke", name="wh-absent"))
-    assert captured["cwd"] == str(absent)   # created, NOT os.getcwd()
+    assert captured["cwd"] == str(absent)
     assert absent.is_dir()
 
 
 def test_spawn_worker_default_cwd_falls_back_to_getcwd_when_mkdir_fails(fresh_orchestrator_dir, monkeypatch, tmp_path):
     captured = _patch_spawn_worker_tab(monkeypatch)
-    # Parent is a regular file → ensure_worker_home()'s mkdir raises OSError
-    # (fail-open), home is not a dir, so cwd falls back to os.getcwd().
     blocker = tmp_path / "blocker"
     blocker.write_text("x")
     monkeypatch.setenv("CLAUDE_ORCH_WORKER_HOME", str(blocker / "worker"))
     monkeypatch.chdir(tmp_path)
     _asyncio.run(spawn_worker_impl(initial_prompt="poke", name="wh-mkdir-fail"))
-    assert captured["cwd"] == str(tmp_path)   # os.getcwd() fallback preserved
+    assert captured["cwd"] == str(tmp_path)
 
 
 def test_spawn_worker_explicit_cwd_unaffected_by_worker_home(fresh_orchestrator_dir, monkeypatch, tmp_path):
@@ -3804,15 +3276,12 @@ def test_spawn_worker_mcp_signature_has_default_runtime():
 
 
 def test_manager_mcp_signatures_have_no_runtime_param():
-    # Managers are Claude-only — neither tool exposes a runtime selector.
     import inspect
     from dockwright.mcp_server import become_manager, spawn_replacement_manager
 
     assert "runtime" not in inspect.signature(become_manager).parameters
     assert "runtime" not in inspect.signature(spawn_replacement_manager).parameters
 
-
-# --- wait_for_worker ---
 
 from dockwright.mcp_server import wait_for_worker_impl
 
@@ -3891,17 +3360,12 @@ def test_wait_for_worker_raises_on_unknown(fresh_orchestrator_dir):
 
 
 def test_wait_for_worker_manager_holder_fails_fast_naming_the_holder(fresh_orchestrator_dir):
-    """Resolving a MANAGER record would pin the wait on a sid that never writes a
-    done event — fail fast. And not with the generic "no worker named": the name
-    IS taken, just by the wrong kind of session — say so."""
     register_self_impl(claude_sid="mgr-1", agent="manager", name="happy-yak", cwd="/x", iterm_sid="i1", pid=os.getpid())
     with pytest.raises(ValueError, match="held by an active manager"):
         _asyncio.run(wait_for_worker_impl("happy-yak", timeout_sec=1, _poll_interval=0.01))
 
 
 def test_wait_for_worker_done_event_beats_manager_holder_error(fresh_orchestrator_dir):
-    """A done event for the name must keep winning over the holder fail-fast —
-    the precedence is statement order, so pin it against reorders."""
     register_self_impl(claude_sid="mgr-1", agent="manager", name="happy-yak", cwd="/x", iterm_sid="i1", pid=os.getpid())
     paths.DONE.mkdir(parents=True, exist_ok=True)
     state.write_json_atomic(paths.DONE / "w-gone-1.json", {
@@ -3914,8 +3378,6 @@ def test_wait_for_worker_done_event_beats_manager_holder_error(fresh_orchestrato
 
 
 def test_wait_for_worker_closed_record_beats_manager_holder_error(fresh_orchestrator_dir):
-    """A closed worker shadowed by a same-named active manager still resolves to
-    the worker's record — 'exited', not the holder error."""
     register_self_impl(claude_sid="mgr-1", agent="manager", name="happy-yak", cwd="/x", iterm_sid="i1", pid=os.getpid())
     paths.CLOSED.mkdir(parents=True, exist_ok=True)
     state.write_json_atomic(paths.CLOSED / "w-closed.json", {
@@ -3933,7 +3395,6 @@ def test_wait_for_worker_raises_on_timeout(fresh_orchestrator_dir):
 
 
 def test_wait_for_worker_resolves_sid_via_closed_record(fresh_orchestrator_dir):
-    """Worker already in closed/ with a done event → return done immediately."""
     paths.CLOSED.mkdir(parents=True, exist_ok=True)
     state.write_json_atomic(paths.CLOSED / "w1.json", {
         "claude_sid": "w1",
@@ -3948,7 +3409,6 @@ def test_wait_for_worker_resolves_sid_via_closed_record(fresh_orchestrator_dir):
 
 
 def test_wait_for_worker_closed_without_done_returns_exited(fresh_orchestrator_dir):
-    """Worker only in closed/ with no done event → exited immediately, no waiting."""
     paths.CLOSED.mkdir(parents=True, exist_ok=True)
     state.write_json_atomic(paths.CLOSED / "w1.json", {
         "claude_sid": "w1",
@@ -3968,8 +3428,6 @@ def _rewrite_active(sid: str, **fields):
 
 
 def test_wait_for_worker_ignores_done_older_than_tasked_at(fresh_orchestrator_dir):
-    # Audit repro (finding 2): worker finished task 1 30 min ago, manager
-    # re-tasked it, wait must NOT return task 1's summary instantly.
     register_self_impl(claude_sid="w1", agent="worker", name="foo", cwd="/x", iterm_sid="i1", pid=os.getpid())
     _write_done_event(sid="w1", worker_name="foo", summary="TASK 1 done", completed_at=time.time() - 1800)
     _rewrite_active("w1", state="processing", tasked_at=time.time() - 60)
@@ -3994,7 +3452,6 @@ def test_wait_for_worker_retasked_blocks_then_returns_fresh_done(fresh_orchestra
 
 
 def test_wait_for_worker_returns_done_newer_than_tasked_at_instantly(fresh_orchestrator_dir):
-    # Flow B: worker finished AFTER the last tasking; wait returns immediately.
     register_self_impl(claude_sid="w1", agent="worker", name="foo", cwd="/x", iterm_sid="i1", pid=os.getpid())
     _rewrite_active("w1", state="idle", tasked_at=time.time() - 60)
     _write_done_event(sid="w1", worker_name="foo", summary="fresh done")
@@ -4003,8 +3460,6 @@ def test_wait_for_worker_returns_done_newer_than_tasked_at_instantly(fresh_orche
 
 
 def test_wait_for_worker_legacy_record_without_stamps_keeps_old_behavior(fresh_orchestrator_dir):
-    # Records written before the upgrade have neither tasked_at nor
-    # processing_since: bound is 0 -> old (stale-returning) behavior preserved.
     register_self_impl(claude_sid="w1", agent="worker", name="foo", cwd="/x", iterm_sid="i1", pid=os.getpid())
     _write_done_event(sid="w1", worker_name="foo", summary="old done", completed_at=time.time() - 1800)
     result = _asyncio.run(wait_for_worker_impl("foo", timeout_sec=60, _poll_interval=0.05))
@@ -4012,8 +3467,6 @@ def test_wait_for_worker_legacy_record_without_stamps_keeps_old_behavior(fresh_o
 
 
 def test_wait_for_worker_grace_window_admits_done_crossing_the_retask(fresh_orchestrator_dir):
-    # A legit done landing within the 2s grace before the re-task must be
-    # returned (otherwise a done/nudge crossing hangs the wait until timeout).
     register_self_impl(claude_sid="w1", agent="worker", name="foo", cwd="/x", iterm_sid="i1", pid=os.getpid())
     now = time.time()
     _write_done_event(sid="w1", worker_name="foo", summary="crossed done", completed_at=now - 1.0)
@@ -4023,8 +3476,6 @@ def test_wait_for_worker_grace_window_admits_done_crossing_the_retask(fresh_orch
 
 
 def test_wait_for_worker_processing_since_gates_without_tasked_at(fresh_orchestrator_dir):
-    # Human-typed re-task path: no manager send, but user_prompt_submit stamped
-    # processing_since; a done event older than the running episode is stale.
     register_self_impl(claude_sid="w1", agent="worker", name="foo", cwd="/x", iterm_sid="i1", pid=os.getpid())
     _write_done_event(sid="w1", worker_name="foo", summary="TASK 1 done", completed_at=time.time() - 1800)
     _rewrite_active("w1", state="processing", processing_since=time.time() - 60)
@@ -4033,8 +3484,6 @@ def test_wait_for_worker_processing_since_gates_without_tasked_at(fresh_orchestr
 
 
 def test_wait_for_worker_processing_since_ignored_when_idle(fresh_orchestrator_dir):
-    # processing_since outlives the episode (stop_hook flips state to idle but
-    # keeps the field); it must only gate while state == processing.
     register_self_impl(claude_sid="w1", agent="worker", name="foo", cwd="/x", iterm_sid="i1", pid=os.getpid())
     _write_done_event(sid="w1", worker_name="foo", summary="done before idle", completed_at=time.time() - 1800)
     _rewrite_active("w1", state="idle", processing_since=time.time() - 60)
@@ -4043,9 +3492,6 @@ def test_wait_for_worker_processing_since_ignored_when_idle(fresh_orchestrator_d
 
 
 def test_wait_for_worker_unrelated_record_stamps_never_gate_closed_worker(fresh_orchestrator_dir):
-    # Guard for the record loop-variable leak: sid resolves via closed/, and a
-    # DIFFERENT worker's active record (with fresh stamps) is the last one the
-    # resolution loop iterated. Its tasked_at must not gate foo's done event.
     register_self_impl(claude_sid="other", agent="worker", name="bar", cwd="/y", iterm_sid="i2", pid=os.getpid())
     _rewrite_active("other", state="processing", tasked_at=time.time())
     state.write_json_atomic(paths.CLOSED / "w1.json", {
@@ -4066,9 +3512,6 @@ def test_send_manager_to_worker_stamps_tasked_at(fresh_orchestrator_dir, monkeyp
     assert record["tasked_at"] >= before
 
 
-# --- prepare_handoff manager-memory distill ---
-
-
 class _FakeCompleted:
     def __init__(self, stdout: bytes = b"", stderr: bytes = b"", returncode: int = 0):
         self.stdout = stdout
@@ -4077,7 +3520,6 @@ class _FakeCompleted:
 
 
 def test_prepare_handoff_writes_distill_file(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    # Manager session needs a transcript so find_session_log resolves to something real.
     log = _write_fake_transcript(tmp_path, monkeypatch, "mgr-old", [
         {"type": "user", "message": {"content": "do X"}},
         {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
@@ -4098,26 +3540,19 @@ def test_prepare_handoff_writes_distill_file(fresh_orchestrator_dir, tmp_path, m
     assert result["distill_path"] is not None
     memory_file = Path(result["distill_path"])
     assert memory_file.exists()
-    # Multi-manager: memory lives in manager-memory/<domain>/<date>-<sid>.md
     assert memory_file.parent == paths.MANAGER_MEMORY / "general"
     assert memory_file.name.endswith("-mgr-old.md")
     assert "shipped X" in memory_file.read_text()
-    # Distill is pure transcript summarization — pinned to sonnet to cut cost rather
-    # than inheriting the user's (opus) default.
     argv = captured["args"][0]
     assert argv[argv.index("--model") + 1] == "claude-sonnet-4-6"
-    # Effort pinned to high (deterministic) instead of inheriting the CLI's undocumented default.
     assert argv[argv.index("--effort") + 1] == "high"
-    # Slimmed bytes piped to claude -p (raw transcripts can be MBs and overflow
-    # the prompt), fenced as untrusted data (2026-07-29 distill-injection kill).
     assert captured["input"] == (
         b"<<<TRANSCRIPT_DATA_BEGIN>>>\n"
         b"USER: do X\n\nASSISTANT: ok"
         b"\n<<<TRANSCRIPT_DATA_END>>>"
     )
-    # Timeout cap applied so a hung subprocess can't block the handoff indefinitely.
     assert captured["timeout"] == 180
-    assert log.exists()  # transcript stays on disk through the test
+    assert log.exists()
 
 
 def test_slim_transcript_strips_tool_use_and_tool_result_bulk():
@@ -4150,10 +3585,6 @@ def test_slim_transcript_strips_tool_use_and_tool_result_bulk():
 
 
 def test_slim_transcript_truncates_head_plus_tail_when_over_max_bytes():
-    """Distill prompt asks for Decisions + Direction + Shipped + Open threads.
-    Three of four are time-uniform across the session, so dropping the head
-    loses the user's original direction and early decisions. Keep both ends.
-    """
     from dockwright.mcp_server import _slim_transcript
     raw_lines = [
         json.dumps({"type": "user", "message": {"content": f"msg-{i:03d}"}})
@@ -4163,19 +3594,12 @@ def test_slim_transcript_truncates_head_plus_tail_when_over_max_bytes():
     slim = _slim_transcript(raw, max_bytes=500)
     decoded = slim.decode("utf-8")
     assert "[transcript middle truncated]" in decoded
-    # Head: earliest messages survive.
     assert "msg-000" in decoded
-    # Tail: latest messages survive.
     assert "msg-199" in decoded
-    # Middle dropped.
     assert "msg-100" not in decoded
 
 
 def test_slim_transcript_keeps_inner_text_of_list_tool_result():
-    """Worker_done summaries arrive as `[{type:'text', text:'shipped abc'}]`
-    inside tool_result.content. Don't elide them — they're tiny and feed the
-    distill prompt's `Shipped` section.
-    """
     from dockwright.mcp_server import _slim_transcript
     raw = json.dumps({
         "type": "user",
@@ -4191,7 +3615,6 @@ def test_slim_transcript_keeps_inner_text_of_list_tool_result():
 
 
 def test_slim_transcript_falls_back_to_elision_for_string_tool_result():
-    """Bulk string-shaped tool_results (the common case) stay elided."""
     from dockwright.mcp_server import _slim_transcript
     raw = json.dumps({
         "type": "user",
@@ -4205,7 +3628,6 @@ def test_slim_transcript_falls_back_to_elision_for_string_tool_result():
 
 
 def test_distill_logs_stdout_on_nonzero_exit(fresh_orchestrator_dir, tmp_path, monkeypatch, capsys):
-    """`claude -p` writes 'Prompt is too long' to STDOUT (not stderr) — log it."""
     _write_fake_transcript(tmp_path, monkeypatch, "mgr-old", [
         {"type": "user", "message": {"content": "hi"}},
         {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},
@@ -4236,15 +3658,12 @@ def test_prepare_handoff_distill_failure_does_not_raise(fresh_orchestrator_dir, 
     monkeypatch.setattr("dockwright.mcp_server.subprocess.run", boom)
 
     result = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
-    # Handoff record is the source of truth — it MUST still exist.
     assert (paths.HANDOFFS / f"{result['handoff_id']}.json").exists()
     assert result["distill_path"] is None
-    # No file should have been written into manager-memory.
     assert list(paths.MANAGER_MEMORY.iterdir()) == []
 
 
 def test_prepare_handoff_distill_missing_transcript_skips(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    # HOME points at tmp_path but we do NOT write a transcript — find_session_log returns None.
     monkeypatch.setenv("HOME", str(tmp_path))
     (tmp_path / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
     become_manager_impl(claude_sid="mgr-old", iterm_sid="i0")
@@ -4258,15 +3677,11 @@ def test_prepare_handoff_distill_missing_transcript_skips(fresh_orchestrator_dir
     monkeypatch.setattr("dockwright.mcp_server.subprocess.run", fake_run)
 
     result = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
-    # Handoff still written even though distill was skipped.
     assert (paths.HANDOFFS / f"{result['handoff_id']}.json").exists()
     assert result["distill_path"] is None
-    # claude -p must NOT have been spawned with no transcript to feed it.
     assert called == []
     assert list(paths.MANAGER_MEMORY.iterdir()) == []
 
-
-# --- Multi-manager: routing filters ---
 
 from dockwright.mcp_server import (
     _matches_manager, list_workers_impl as _lw, list_pending_questions_impl as _lpq,
@@ -4275,8 +3690,6 @@ from dockwright.mcp_server import (
 
 
 def test_routing_filter_isolates_workers_by_parent_manager_name(fresh_orchestrator_dir):
-    """Manager A's list_workers must not see manager B's workers."""
-    # Two managers, two workers — each scoped.
     register_self_impl(claude_sid="w-a", agent="worker", name="worker-a", cwd="/x",
                        iterm_sid="i1", pid=os.getpid(), parent_manager_name="manager-a")
     register_self_impl(claude_sid="w-b", agent="worker", name="worker-b", cwd="/y",
@@ -4288,13 +3701,8 @@ def test_routing_filter_isolates_workers_by_parent_manager_name(fresh_orchestrat
 
 
 def test_routing_filter_excludes_null_parent_under_strict_scope(fresh_orchestrator_dir):
-    """A legacy record (no parent_manager_name) is INVISIBLE to per-manager calls.
-
-    Strict semantics — see ~/.claude/rules (orchestrator-routing-cleanup spec).
-    Recovery path: _backfill_legacy_workers on a single-manager become_manager.
-    """
     register_self_impl(claude_sid="legacy", agent="worker", name="oldie", cwd="/x",
-                       iterm_sid="i1", pid=os.getpid())  # no parent_manager_name
+                       iterm_sid="i1", pid=os.getpid())
     register_self_impl(claude_sid="w-a", agent="worker", name="worker-a", cwd="/x",
                        iterm_sid="i2", pid=os.getpid(), parent_manager_name="manager-a")
     a_view = _lw(manager_name="manager-a")
@@ -4303,7 +3711,6 @@ def test_routing_filter_excludes_null_parent_under_strict_scope(fresh_orchestrat
     assert "worker-a" in [w["name"] for w in a_view]
     assert "oldie" not in [w["name"] for w in b_view]
     assert "worker-a" not in [w["name"] for w in b_view]
-    # Wildcard (None) still sees both — back-compat for legacy callers.
     all_view = _lw(manager_name=None)
     assert {"oldie", "worker-a"} <= {w["name"] for w in all_view}
 
@@ -4326,7 +3733,6 @@ def test_routing_filter_done_events_by_manager(fresh_orchestrator_dir):
                        iterm_sid="i2", pid=os.getpid(), parent_manager_name="manager-b")
     _wd(claude_sid="w-a", summary="A done")
     _wd(claude_sid="w-b", summary="B done")
-    # wait_for_worker by name resolved through manager scoping should find only the right one.
     result_a = _asyncio.run(wait_for_worker_impl("worker-a", timeout_sec=60,
                                                  _poll_interval=0.05,
                                                  manager_name="manager-a"))
@@ -4339,19 +3745,15 @@ def test_routing_filter_done_events_by_manager(fresh_orchestrator_dir):
 
 
 def test_unscoped_done_event_not_visible_to_per_manager_wait(fresh_orchestrator_dir):
-    """A null-parent (legacy) worker still writes to _unscoped (event-side
-    contract preserved), but per-manager wait_for_worker calls do NOT resolve
-    it — they raise ValueError. Recovery: backfill or wildcard call."""
     register_self_impl(claude_sid="w-legacy", agent="worker", name="legacy", cwd="/x",
-                       iterm_sid="i1", pid=os.getpid())  # no parent_manager_name
+                       iterm_sid="i1", pid=os.getpid())
     _wd(claude_sid="w-legacy", summary="legacy done")
     unscoped = list((paths.DONE / paths.UNSCOPED_BUCKET).glob("w-legacy-*.json"))
-    assert len(unscoped) == 1  # write-side contract unchanged
+    assert len(unscoped) == 1
     for mgr in ("manager-a", "manager-b"):
         with pytest.raises(ValueError, match="no worker named 'legacy'"):
             _asyncio.run(wait_for_worker_impl("legacy", timeout_sec=60,
                                               _poll_interval=0.05, manager_name=mgr))
-    # Wildcard still resolves (back-compat).
     result = _asyncio.run(wait_for_worker_impl("legacy", timeout_sec=60,
                                                 _poll_interval=0.05, manager_name=None))
     assert result["found"] == "done"
@@ -4359,28 +3761,20 @@ def test_unscoped_done_event_not_visible_to_per_manager_wait(fresh_orchestrator_
 
 
 def test_backfill_adopts_orphans_on_single_manager_boot(fresh_orchestrator_dir, monkeypatch):
-    """When exactly one manager boots, _backfill_legacy_workers attributes any
-    null-parent worker records to it — restoring per-manager visibility."""
-    # Two null-parent workers (legacy / pre-multi-manager).
     register_self_impl(claude_sid="w1", agent="worker", name="orphan-1", cwd="/x",
-                       iterm_sid="i1", pid=os.getpid())  # null parent
+                       iterm_sid="i1", pid=os.getpid())
     register_self_impl(claude_sid="w2", agent="worker", name="orphan-2", cwd="/y",
-                       iterm_sid="i2", pid=os.getpid())  # null parent
-    # No manager yet — both are invisible under strict scope.
+                       iterm_sid="i2", pid=os.getpid())
     assert _lw(manager_name="solo") == []
-    # Manager registers; backfill should fire inside become_manager_impl.
     from dockwright.mcp_server import become_manager_impl
     monkeypatch.setattr("dockwright.mcp_server.names.roll_manager_name",
                         lambda is_taken=None: "solo")
     become_manager_impl(claude_sid="mgr-1", domain="general")
-    # Now both orphans should belong to "solo" — per-manager lookup finds them.
     visible = sorted(w["name"] for w in _lw(manager_name="solo"))
     assert visible == ["orphan-1", "orphan-2"]
 
 
 def test_become_manager_roll_taken_set_includes_worker_funny_names(fresh_orchestrator_dir, monkeypatch):
-    """The auto-roll must not reuse a live worker's funny_name (legacy records
-    may hold old-pool names that overlap the manager pool)."""
     state.write_json_atomic(paths.ACTIVE / "w-1.json", {
         "claude_sid": "w-1", "agent": "worker", "name": "task-x",
         "funny_name": "happy-dragon", "pid": os.getpid(), "window_id": "i-w1",
@@ -4400,7 +3794,6 @@ def test_become_manager_roll_taken_set_includes_worker_funny_names(fresh_orchest
 
 
 def test_backfill_skips_when_zero_managers_active(fresh_orchestrator_dir, capsys):
-    """0 managers → backfill skips with a warning; orphans stay null-parent."""
     from dockwright.mcp_server import _backfill_legacy_workers
     register_self_impl(claude_sid="w1", agent="worker", name="orphan-1", cwd="/x",
                        iterm_sid="i1", pid=os.getpid())
@@ -4413,12 +3806,6 @@ def test_backfill_skips_when_zero_managers_active(fresh_orchestrator_dir, capsys
 
 
 def test_backfill_skips_when_two_managers_active(fresh_orchestrator_dir, capsys):
-    """2+ managers → backfill skips with a warning; orphans stay null-parent.
-
-    Writes manager records directly (not via become_manager_impl) because the
-    test process can host only one same-pid manager — the second register call
-    prunes the first via `_prune_same_pid_ghosts`.
-    """
     from dockwright.mcp_server import _backfill_legacy_workers
     for sid, name in [("m1", "mgr-a"), ("m2", "mgr-b")]:
         state.write_json_atomic(paths.ACTIVE / f"{sid}.json", {
@@ -4436,15 +3823,10 @@ def test_backfill_skips_when_two_managers_active(fresh_orchestrator_dir, capsys)
 
 
 def test_questions_with_null_parent_invisible_under_strict_scope(fresh_orchestrator_dir):
-    """Documented regression: a question written by a null-parent worker is
-    NOT visible to any per-manager list_pending_questions call. The scoped
-    questions monitor also ignores legacy flat files; recovery is backfill or
-    list_pending_questions(manager_name=None)."""
     _write_question(worker_sid="w-orphan", worker_name="orphan",
                     question="anybody?", parent_manager_name=None)
     assert _lpq(manager_name="manager-a") == []
     assert _lpq(manager_name="manager-b") == []
-    # Wildcard sees it (back-compat).
     wildcard = _lpq(manager_name=None)
     assert [q["question"] for q in wildcard] == ["anybody?"]
 
@@ -4525,8 +3907,6 @@ def test_list_closed_workers_mcp_signature_has_optional_limit():
     assert params["limit"].default is None
 
 
-# --- Multi-manager: /manager-close ---
-
 from dockwright.mcp_server import close_manager_self_impl
 
 
@@ -4538,7 +3918,6 @@ def test_close_manager_self_runs_distill_and_clears_active(fresh_orchestrator_di
     become_manager_impl(claude_sid="mgr-old", iterm_sid="i9", domain="general")
 
     def fake_run(*args, **kwargs):
-        # Differentiate distill (subprocess.run with `input=`) from tmux calls (no input kw).
         if kwargs.get("input") is not None:
             return _FakeCompleted(stdout=b"## Decisions\nshipped\n")
         return _FakeCompleted(stdout=b"")
@@ -4548,14 +3927,11 @@ def test_close_manager_self_runs_distill_and_clears_active(fresh_orchestrator_di
     assert result["ok"] is True
     assert result["distill_path"] is not None
     assert "general" in result["distill_path"]
-    # Active record removed (manager closed).
     assert not (paths.ACTIVE / "mgr-old.json").exists()
-    # Memory file written.
     assert Path(result["distill_path"]).exists()
 
 
 def test_close_manager_self_swallows_distill_failure(fresh_orchestrator_dir, monkeypatch):
-    """Distill failure must not prevent the active-record cleanup or tab close."""
     become_manager_impl(claude_sid="mgr-old", iterm_sid="i9", domain="general")
 
     def boom(*args, **kwargs):
@@ -4574,8 +3950,6 @@ def test_close_manager_self_rejects_non_manager(fresh_orchestrator_dir):
         close_manager_self_impl("w1")
 
 
-# --- Multi-manager: memory layout migration ---
-
 from dockwright.mcp_server import _migrate_flat_manager_memory
 
 
@@ -4587,27 +3961,22 @@ def test_migrate_flat_manager_memory_moves_legacy_files(fresh_orchestrator_dir):
     flat_b.write_text("# old session B")
     moved = _migrate_flat_manager_memory()
     assert moved == 2
-    # Moved into general/ subdir.
     general = paths.MANAGER_MEMORY / "general"
     assert (general / "2026-05-01-mgr-old.md").exists()
     assert (general / "2026-05-02-mgr-older.md").exists()
-    # Originals gone.
     assert not flat_a.exists()
     assert not flat_b.exists()
 
 
 def test_migrate_flat_manager_memory_is_idempotent(fresh_orchestrator_dir):
-    """Calling twice produces 0 moves on the second pass."""
     paths.MANAGER_MEMORY.mkdir(parents=True, exist_ok=True)
     (paths.MANAGER_MEMORY / "2026-05-01-x.md").write_text("x")
     assert _migrate_flat_manager_memory() == 1
     assert _migrate_flat_manager_memory() == 0
-    # Subdir structure preserved.
     assert (paths.MANAGER_MEMORY / "general" / "2026-05-01-x.md").exists()
 
 
 def test_migrate_flat_manager_memory_ignores_existing_subdirs(fresh_orchestrator_dir):
-    """A pre-existing subdir (e.g. general/, dlq/) shouldn't be touched."""
     (paths.MANAGER_MEMORY / "general").mkdir(parents=True)
     (paths.MANAGER_MEMORY / "general" / "x.md").write_text("kept")
     (paths.MANAGER_MEMORY / "dlq").mkdir()
@@ -4618,13 +3987,10 @@ def test_migrate_flat_manager_memory_ignores_existing_subdirs(fresh_orchestrator
     assert (paths.MANAGER_MEMORY / "dlq" / "y.md").read_text() == "kept too"
 
 
-# --- Multi-manager: SessionEnd distill fallback ---
-
 from dockwright.hooks import session_end as _session_end
 
 
 def test_session_end_distill_skips_when_memory_already_exists(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """If /manager-close already wrote today's memory file, SessionEnd must not redo distill."""
     _write_fake_transcript(tmp_path, monkeypatch, "mgr-x", [
         {"type": "user", "message": {"content": "go"}},
     ])
@@ -4633,7 +3999,6 @@ def test_session_end_distill_skips_when_memory_already_exists(fresh_orchestrator
         "cwd": "/x", "iterm_sid": "i1", "pid": 1, "started_at": 0,
         "domain": "general",
     })
-    # Pre-create today's memory file.
     from datetime import datetime as _dt
     today = _dt.now().strftime("%Y-%m-%d")
     general = paths.manager_memory_domain_dir("general")
@@ -4649,16 +4014,11 @@ def test_session_end_distill_skips_when_memory_already_exists(fresh_orchestrator
     monkeypatch.setenv("CLAUDE_AGENT", "manager")
     monkeypatch.setattr("sys.stdin", _io.StringIO(json.dumps({"session_id": "mgr-x"})))
     _session_end()
-    # claude -p must NOT have been invoked since the file existed.
     assert not any(args and "claude" in args[0][0] for _label, args, _kw in calls if isinstance(args, tuple) and len(args) > 0 and isinstance(args[0], list))
-    # Pre-existing content untouched.
     assert existing.read_text() == "pre-existing from /manager-close"
 
 
 def test_session_end_distill_runs_when_no_memory_exists(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """cmd+w with no /manager-close must spawn a DETACHED fallback distill —
-    never run it in-process, since the SessionEnd hook's 5s budget is far
-    shorter than the distill's typical 10-30s `claude -p` round-trip."""
     state.write_json_atomic(paths.ACTIVE / "mgr-x.json", {
         "claude_sid": "mgr-x", "agent": "manager", "name": "grumpy-yak",
         "cwd": "/x", "iterm_sid": "i1", "pid": 1, "started_at": 0,
@@ -4679,22 +4039,12 @@ def test_session_end_distill_runs_when_no_memory_exists(fresh_orchestrator_dir, 
     (cmd,), kw = popens[0]
     assert cmd[-4:] == ["distill", "mgr-x", "--domain", "general"]
     assert kw["start_new_session"] is True
-    # Stdio contract: DEVNULL keeps the detached child off the dead hook's tty;
-    # the log redirection is the only diagnosability the unobserved child has.
     assert kw["stdin"] is subprocess.DEVNULL
     assert kw["stdout"].name.endswith("distill-fallback.log")
     assert kw["stderr"] is kw["stdout"]
 
 
-# --- Distill child env sanitization (infinite-fan-out regression) ---
-
-
 def test_distill_subprocess_env_strips_orchestrator_keys(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """The headless `claude -p` distill child must NOT inherit the orchestrator
-    session env: an inherited CLAUDE_AGENT=manager makes the child's SessionStart
-    hook register a phantom manager record, and its SessionEnd hook re-distill —
-    spawning another `claude -p` with the same env, fanning out indefinitely.
-    """
     from dockwright.mcp_server import _distill_manager_session
     _write_fake_transcript(tmp_path, monkeypatch, "mgr-x", [
         {"type": "user", "message": {"content": "go"}},
@@ -4719,19 +4069,12 @@ def test_distill_subprocess_env_strips_orchestrator_keys(fresh_orchestrator_dir,
     assert env is not None, "distill subprocess must pass an explicit sanitized env"
     for key in paths.ORCHESTRATOR_ENV_KEYS:
         assert key not in env, f"orchestrator key {key} leaked into the distill child env"
-    # Sentinel marks the child so the hooks skip it even if a future spawn
-    # path forgets to strip the env.
     assert env[paths.DISTILL_ENV_SENTINEL] == "1"
-    # Spend-class tag opts the child into SessionEnd headless spend capture.
     assert env["CLAUDE_SPEND_CLASS"] == "distill"
-    # Non-orchestrator env is still inherited (claude needs HOME, PATH, etc).
     assert env.get("HOME") == str(tmp_path)
 
 
 def test_session_end_distill_child_never_redistills(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """SessionEnd for a distill child (sentinel set) must be a no-op — no
-    `claude -p` spawned, no memory file written — even when CLAUDE_AGENT=manager
-    leaked through and an active record exists for the sid."""
     _write_fake_transcript(tmp_path, monkeypatch, "distill-1", [
         {"type": "user", "message": {"content": "go"}},
     ])
@@ -4754,11 +4097,7 @@ def test_session_end_distill_child_never_redistills(fresh_orchestrator_dir, tmp_
     assert list(paths.MANAGER_MEMORY.iterdir()) == []
 
 
-# --- spawn_worker stamps CLAUDE_PARENT_MANAGER ---
-
-
 def test_spawn_worker_stamps_parent_manager_env(fresh_orchestrator_dir, monkeypatch):
-    """spawn_worker_impl with manager_sid must inject CLAUDE_PARENT_MANAGER into the worker env."""
     become_manager_impl(claude_sid="mgr-a", iterm_sid="i0", domain="general")
     mgr_name = state.read_json(paths.ACTIVE / "mgr-a.json")["name"]
     captured = _patch_spawn_worker_tab(monkeypatch)
@@ -4773,7 +4112,6 @@ def test_spawn_worker_stamps_parent_manager_env(fresh_orchestrator_dir, monkeypa
 
 
 def test_spawn_worker_no_manager_sid_omits_parent_env(fresh_orchestrator_dir, monkeypatch):
-    """Without manager_sid (back-compat), CLAUDE_PARENT_MANAGER must not be added."""
     captured = _patch_spawn_worker_tab(monkeypatch)
     _asyncio.run(spawn_worker_impl(
         initial_prompt="do X",
@@ -4784,19 +4122,11 @@ def test_spawn_worker_no_manager_sid_omits_parent_env(fresh_orchestrator_dir, mo
     assert "CLAUDE_PARENT_MANAGER" not in env
 
 
-# --- Full-cycle: parent_manager_name preserved across session_end → resume_worker ---
-
 from dockwright.hooks import session_end as _session_end_h
 from dockwright.mcp_server import resume_worker_impl as _resume_worker_mcp
 
 
 def test_parent_manager_preserved_across_close_and_resume(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """Spawning a worker with a parent, then closing + resuming it, must re-stamp
-    CLAUDE_PARENT_MANAGER on the resumed worker's env. Otherwise auto-closed
-    (stale_monitor) or cmd+w-closed workers come back wildcard-visible to every
-    manager, defeating multi-manager routing."""
-    # Step 1: spawn worker with a parent manager via spawn_worker_impl. Use the
-    # full path so the CLAUDE_PARENT_MANAGER env is computed from manager_sid.
     become_manager_impl(claude_sid="mgr-a", iterm_sid="i0", domain="general")
     mgr_name = state.read_json(paths.ACTIVE / "mgr-a.json")["name"]
     captured_spawn = _patch_spawn_worker_tab(monkeypatch)
@@ -4808,18 +4138,12 @@ def test_parent_manager_preserved_across_close_and_resume(fresh_orchestrator_dir
     ))
     assert (captured_spawn.get("env") or {}).get("CLAUDE_PARENT_MANAGER") == mgr_name
 
-    # Step 2: simulate the worker's SessionStart hook writing its active record.
-    # (In production the hook reads CLAUDE_PARENT_MANAGER and stamps the record;
-    # we write the record directly to keep the test scoped to the
-    # session_end → resume hop.)
     state.write_json_atomic(paths.ACTIVE / "wfc-sid.json", {
         "claude_sid": "wfc-sid", "agent": "worker", "name": "worker-fc",
         "cwd": "/tmp/fc", "iterm_sid": "iw", "pid": os.getpid(), "started_at": 0,
         "parent_manager_name": mgr_name,
     })
 
-    # Step 3: trigger session_end on the worker — it must archive the parent into closed/.
-    # A live transcript is required so resume_worker's transcript check (Bug 3) accepts it.
     _make_transcript(tmp_path, monkeypatch, "wfc-sid")
     import io as _io
     monkeypatch.setenv("CLAUDE_AGENT", "worker")
@@ -4832,7 +4156,6 @@ def test_parent_manager_preserved_across_close_and_resume(fresh_orchestrator_dir
         "resume_worker can re-stamp it. This is the regression Important #1 fixes."
     )
 
-    # Step 4: resume_worker — assert spawn_worker_tab gets env={CLAUDE_PARENT_MANAGER: mgr_name}.
     captured_resume = _patch_spawn_registers_active(monkeypatch)
     _asyncio.run(_resume_worker_mcp(name="worker-fc", _registration_timeout_sec=2.0, _poll_interval=0.01))
     resumed_env = captured_resume.get("env") or {}
@@ -4842,16 +4165,11 @@ def test_parent_manager_preserved_across_close_and_resume(fresh_orchestrator_dir
     )
 
 
-# --- Backfill: legacy parent-null workers attributed to the lone manager on boot ---
-
-
 def test_become_manager_backfills_legacy_workers_when_sole_manager(fresh_orchestrator_dir, capsys):
-    """3 parent-null workers + 1 manager booting → all 3 get attributed to that manager."""
     for i in range(3):
         state.write_json_atomic(paths.ACTIVE / f"legacy-{i}.json", {
             "claude_sid": f"legacy-{i}", "agent": "worker", "name": f"old-{i}",
             "cwd": "/x", "iterm_sid": f"i{i}", "pid": os.getpid(), "started_at": 0,
-            # parent_manager_name intentionally missing (pre-multi-manager)
         })
     result = become_manager_impl(claude_sid="mgr-fresh", iterm_sid="i9", domain="general")
     mgr_name = result["name"]
@@ -4864,7 +4182,6 @@ def test_become_manager_backfills_legacy_workers_when_sole_manager(fresh_orchest
 
 
 def test_become_manager_skips_backfill_when_two_managers_active(fresh_orchestrator_dir, capsys):
-    """Ambiguous: 3 null-parent workers + 2 managers → leave null + warn on stderr."""
     state.write_json_atomic(paths.ACTIVE / "mgr-a.json", {
         "claude_sid": "mgr-a", "agent": "manager", "name": "manager-a",
         "cwd": "/x", "iterm_sid": "i0", "pid": os.getpid(), "started_at": 0,
@@ -4888,8 +4205,6 @@ def test_become_manager_skips_backfill_when_two_managers_active(fresh_orchestrat
 
 
 def test_become_manager_backfill_idempotent_on_second_boot(fresh_orchestrator_dir):
-    """After first manager boot stamps the workers, a SECOND manager booting must
-    not re-backfill (no null parents remain) and the existing stamps must stick."""
     state.write_json_atomic(paths.ACTIVE / "legacy-1.json", {
         "claude_sid": "legacy-1", "agent": "worker", "name": "old-1",
         "cwd": "/x", "iterm_sid": "i1", "pid": os.getpid(), "started_at": 0,
@@ -4898,14 +4213,10 @@ def test_become_manager_backfill_idempotent_on_second_boot(fresh_orchestrator_di
     stamped_name = state.read_json(paths.ACTIVE / "legacy-1.json")["parent_manager_name"]
     assert stamped_name == first["name"]
     become_manager_impl(claude_sid="mgr-2nd", iterm_sid="i10", domain="dlq")
-    # Stamped name must still point to the FIRST manager — second manager's boot
-    # is a no-op because the workers no longer have null parents.
     assert state.read_json(paths.ACTIVE / "legacy-1.json")["parent_manager_name"] == first["name"]
 
 
 def test_resume_reclaims_autoclosed_spend_to_ledger(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """An autoclosed record (closed_reason like 'idle>7200s') has spend only in closed/.
-    Resume must ledger it before deleting, so the period is not lost."""
     import json as _json
     monkeypatch.setattr(paths, "SPEND_LEDGER", fresh_orchestrator_dir / "spend-ledger.jsonl")
     _make_transcript(tmp_path, monkeypatch, "idle-sid")
@@ -4918,9 +4229,7 @@ def test_resume_reclaims_autoclosed_spend_to_ledger(fresh_orchestrator_dir, tmp_
     _patch_spawn_registers_active(monkeypatch)
     result = _asyncio.run(_resume_worker_mcp(name="idle-worker", _registration_timeout_sec=2.0, _poll_interval=0.01))
     assert result["ok"] is True
-    # closed record was deleted
     assert not (paths.CLOSED / "idle-sid.json").exists()
-    # ledger has exactly one entry for this sid
     ledger_path = fresh_orchestrator_dir / "spend-ledger.jsonl"
     assert ledger_path.exists(), "ledger file must be created"
     entries = [_json.loads(line) for line in ledger_path.read_text().splitlines() if line.strip()]
@@ -4930,8 +4239,6 @@ def test_resume_reclaims_autoclosed_spend_to_ledger(fresh_orchestrator_dir, tmp_
 
 
 def test_resume_does_not_reledger_session_end_closures(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """session_end-reason closed records were already ledgered at close (Task 3).
-    Resume must NOT append them again — doing so would double-count the period."""
     import json as _json
     monkeypatch.setattr(paths, "SPEND_LEDGER", fresh_orchestrator_dir / "spend-ledger.jsonl")
     _make_transcript(tmp_path, monkeypatch, "ended-sid")
@@ -4944,9 +4251,7 @@ def test_resume_does_not_reledger_session_end_closures(fresh_orchestrator_dir, t
     _patch_spawn_registers_active(monkeypatch)
     result = _asyncio.run(_resume_worker_mcp(name="ended-worker", _registration_timeout_sec=2.0, _poll_interval=0.01))
     assert result["ok"] is True
-    # closed record was deleted
     assert not (paths.CLOSED / "ended-sid.json").exists()
-    # ledger must remain empty — no double-count
     ledger_path = fresh_orchestrator_dir / "spend-ledger.jsonl"
     if ledger_path.exists():
         entries = [line for line in ledger_path.read_text().splitlines() if line.strip()]
@@ -4954,25 +4259,18 @@ def test_resume_does_not_reledger_session_end_closures(fresh_orchestrator_dir, t
 
 
 def test_resume_worker_with_null_parent_omits_env(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """A legacy closed record with no parent must resume without injecting an env."""
     _make_transcript(tmp_path, monkeypatch, "legacy-sid")
     state.write_json_atomic(paths.CLOSED / "legacy-sid.json", {
         "claude_sid": "legacy-sid", "name": "legacy-worker", "cwd": "/tmp/l",
         "iterm_sid": "il", "closed_at": 1.0,
-        # parent_manager_name intentionally omitted (legacy record)
     })
     captured = _patch_spawn_registers_active(monkeypatch)
     _asyncio.run(_resume_worker_mcp(name="legacy-worker", _registration_timeout_sec=2.0, _poll_interval=0.01))
     env = captured.get("env")
-    # Either env is None (back-compat) or the key is absent — both are acceptable.
     assert env is None or "CLAUDE_PARENT_MANAGER" not in env
 
 
-# --- resume_worker bug fixes: newest-record selection, verify-before-delete, transcript ---
-
 def _make_transcript(tmp_path, monkeypatch, sid, nonempty=True):
-    """Create a ~/.claude/projects/*/<sid>.jsonl under a tmp HOME (so find_session_log
-    locates it). Pass nonempty=False to create an empty file (resume would fail)."""
     monkeypatch.setenv("HOME", str(tmp_path))
     projects = tmp_path / ".claude" / "projects" / "-Users-x"
     projects.mkdir(parents=True, exist_ok=True)
@@ -4982,7 +4280,6 @@ def _make_transcript(tmp_path, monkeypatch, sid, nonempty=True):
 
 
 def _make_codex_transcript(tmp_path, monkeypatch, sid, nonempty=True):
-    """Create a ~/.codex/sessions/**/rollout-*-<sid>.jsonl for Codex resume."""
     monkeypatch.setenv("HOME", str(tmp_path))
     sessions = tmp_path / ".codex" / "sessions" / "2026" / "05" / "26"
     sessions.mkdir(parents=True, exist_ok=True)
@@ -4992,10 +4289,6 @@ def _make_codex_transcript(tmp_path, monkeypatch, sid, nonempty=True):
 
 
 def _patch_spawn_registers_active(monkeypatch):
-    """spawn_worker_tab mock that ALSO simulates the SessionStart hook registering
-    the resumed worker into active/ — so resume_worker's poll-before-delete confirms it.
-    Registers under the resume_sid it was given: `--resume <sid>` reuses the session
-    id, so that's the sid the real hook writes."""
     captured: dict = {}
 
     async def fake_spawn(**kwargs):
@@ -5017,8 +4310,6 @@ from dockwright.mcp_server import _find_closed_record_by_name as _find_closed
 
 
 def test_find_closed_record_by_name_returns_newest_among_duplicates(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """Bug 1: duplicate closed records under one name → return the newest (max closed_at),
-    not the filesystem-arbitrary first iterdir match."""
     _make_transcript(tmp_path, monkeypatch, "old-sid")
     _make_transcript(tmp_path, monkeypatch, "new-sid")
     state.write_json_atomic(paths.CLOSED / "old-sid.json", {
@@ -5050,11 +4341,7 @@ def test_resume_worker_uses_runtime_from_closed_record(fresh_orchestrator_dir, t
 
 
 def test_find_closed_record_prefers_live_transcript_over_newer_junk(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """Bugs 1+3 (the tkt-8773 scenario): the NEWER record's transcript is gone (junk
-    session); the older record has a live transcript (the healthy session). Must pick
-    the healthy one despite it being older."""
-    _make_transcript(tmp_path, monkeypatch, "healthy-sid")  # older, live
-    # junk-sid: newer closed_at but NO transcript file written
+    _make_transcript(tmp_path, monkeypatch, "healthy-sid")
     state.write_json_atomic(paths.CLOSED / "junk-sid.json", {
         "claude_sid": "junk-sid", "name": "tkt-8773", "cwd": "/x", "closed_at": 999.0})
     state.write_json_atomic(paths.CLOSED / "healthy-sid.json", {
@@ -5064,9 +4351,7 @@ def test_find_closed_record_prefers_live_transcript_over_newer_junk(fresh_orches
 
 
 def test_find_closed_record_raises_when_no_live_transcript(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """Bug 3: every name-match points at a vanished transcript → raise a clear error
-    naming the sids tried, rather than handing back a record that resume can't restore."""
-    monkeypatch.setenv("HOME", str(tmp_path))  # empty projects tree → no transcripts
+    monkeypatch.setenv("HOME", str(tmp_path))
     state.write_json_atomic(paths.CLOSED / "dead-a.json", {
         "claude_sid": "dead-a", "name": "gone", "cwd": "/x", "closed_at": 1.0})
     state.write_json_atomic(paths.CLOSED / "dead-b.json", {
@@ -5078,12 +4363,10 @@ def test_find_closed_record_raises_when_no_live_transcript(fresh_orchestrator_di
 
 
 def test_resume_worker_keeps_closed_record_when_registration_times_out(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """Bug 2: spawn returns a window id but the resumed session never registers into
-    active/ → the closed record MUST survive (recoverable) and resume returns ok:False."""
     _make_transcript(tmp_path, monkeypatch, "stuck-sid")
     state.write_json_atomic(paths.CLOSED / "stuck-sid.json", {
         "claude_sid": "stuck-sid", "name": "stuck", "cwd": "/tmp/s", "closed_at": 1.0})
-    _patch_spawn_worker_tab(monkeypatch)  # records kwargs but does NOT register active/
+    _patch_spawn_worker_tab(monkeypatch)
     result = _asyncio.run(_resume_worker_mcp(
         name="stuck", _registration_timeout_sec=0.05, _poll_interval=0.01))
     assert result["ok"] is False
@@ -5092,8 +4375,6 @@ def test_resume_worker_keeps_closed_record_when_registration_times_out(fresh_orc
 
 
 def test_resume_worker_unlinks_closed_record_after_registration_confirmed(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """Bug 2 happy path: once the resumed worker appears in active/, the closed record
-    is deleted and resume returns ok:True."""
     _make_transcript(tmp_path, monkeypatch, "good-sid")
     state.write_json_atomic(paths.CLOSED / "good-sid.json", {
         "claude_sid": "good-sid", "name": "good", "cwd": "/tmp/g", "closed_at": 1.0})
@@ -5106,7 +4387,6 @@ def test_resume_worker_unlinks_closed_record_after_registration_confirmed(fresh_
 
 
 def test_resume_worker_claude_applies_remote_off_settings(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """A resumed claude worker must carry the SAME RC-off --settings as a fresh spawn."""
     monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
     _make_transcript(tmp_path, monkeypatch, "rc-sid")
     state.write_json_atomic(paths.CLOSED / "rc-sid.json", {
@@ -5120,7 +4400,6 @@ def test_resume_worker_claude_applies_remote_off_settings(fresh_orchestrator_dir
 
 
 def test_resume_worker_claude_honors_remote_control_opt_in(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """CLAUDE_ORCH_WORKER_RC=1 → resumed worker gets --remote-control, not the RC-off settings."""
     monkeypatch.setenv("CLAUDE_ORCH_WORKER_RC", "1")
     _make_transcript(tmp_path, monkeypatch, "rc-on-sid")
     state.write_json_atomic(paths.CLOSED / "rc-on-sid.json", {
@@ -5134,7 +4413,6 @@ def test_resume_worker_claude_honors_remote_control_opt_in(fresh_orchestrator_di
 
 
 def test_resume_worker_codex_skips_claude_remote_flags(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """Codex resume must NOT receive --settings (codex rejects it); extra_args stays falsy."""
     monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
     _make_codex_transcript(tmp_path, monkeypatch, "cx-sid")
     state.write_json_atomic(paths.CLOSED / "cx-sid.json", {
@@ -5149,12 +4427,6 @@ def test_resume_worker_codex_skips_claude_remote_flags(fresh_orchestrator_dir, t
 
 
 def test_resume_worker_rejects_name_already_active(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """A live session already holds the closed worker's name (e.g. a fresh worker was
-    spawned under the same task name after the old one closed) → resume must refuse
-    BEFORE spawning. Without the guard, the name-keyed registration poll matches the
-    OTHER live session instantly: the closed record is deleted and the result claims
-    name=X, while the resumed session actually re-registers as X-2 — so follow-up
-    send_manager_to_worker(X) routes to the wrong worker."""
     _make_transcript(tmp_path, monkeypatch, "old-sid")
     state.write_json_atomic(paths.CLOSED / "old-sid.json", {
         "claude_sid": "old-sid", "name": "tkt-1234", "cwd": "/x", "closed_at": 1.0})
@@ -5171,10 +4443,6 @@ def test_resume_worker_rejects_name_already_active(fresh_orchestrator_dir, tmp_p
 
 
 def test_resume_worker_rejected_for_manager_holder_names_the_manager(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """Managers roll names from the same funny-name pool, so a live manager can hold a
-    closed worker's name. The refusal must say a MANAGER holds it — not suggest
-    send_manager_to_worker/kill_worker, which are worker-only and would just raise
-    "no worker named" for this name."""
     _make_transcript(tmp_path, monkeypatch, "old-sid")
     state.write_json_atomic(paths.CLOSED / "old-sid.json", {
         "claude_sid": "old-sid", "name": "happy-yak", "cwd": "/x", "closed_at": 1.0})
@@ -5190,11 +4458,6 @@ def test_resume_worker_rejected_for_manager_holder_names_the_manager(fresh_orche
 
 
 def test_resume_worker_ignores_foreign_name_claim_mid_window(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """TOCTOU inside the registration window: the pre-flight guard passed (name free),
-    but a FOREIGN session registers the name before the resumed session does (e.g. a
-    concurrent spawn_worker under the same task name). The poll must NOT confirm on
-    the foreign record: confirming would delete the closed record (the only resume
-    pointer) and hand back a name that routes to the foreign session."""
     _make_transcript(tmp_path, monkeypatch, "old-sid")
     state.write_json_atomic(paths.CLOSED / "old-sid.json", {
         "claude_sid": "old-sid", "name": "tkt-1234", "cwd": "/x", "closed_at": 1.0})
@@ -5218,10 +4481,6 @@ def test_resume_worker_ignores_foreign_name_claim_mid_window(fresh_orchestrator_
 
 
 def test_resume_worker_confirms_via_resumed_sid_and_returns_registered_name(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """`claude --resume <sid>` reuses the session id, so the resumed session
-    re-registers as active/<sid>.json. Confirmation is keyed on that sid; if the name
-    was stolen mid-window and the hook suffixed it, the result must surface the
-    ACTUAL registered handle so follow-up send_manager_to_worker routes correctly."""
     _make_transcript(tmp_path, monkeypatch, "old-sid")
     state.write_json_atomic(paths.CLOSED / "old-sid.json", {
         "claude_sid": "old-sid", "name": "tkt-1234", "cwd": "/x", "closed_at": 1.0})
@@ -5245,9 +4504,6 @@ def test_resume_worker_confirms_via_resumed_sid_and_returns_registered_name(fres
 
 
 def test_resume_worker_codex_accepts_new_sid_registration_under_name(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """Codex-lane fallback: if a codex build rolls a fresh thread id on resume, the
-    old sid never re-registers. Accept a record that claimed the name and did NOT
-    exist pre-spawn, and return the NEW sid (the old one points at nothing live)."""
     _make_codex_transcript(tmp_path, monkeypatch, "codex-old")
     state.write_json_atomic(paths.CLOSED / "codex-old.json", {
         "claude_sid": "codex-old", "name": "codex-worker", "cwd": "/x",
@@ -5272,10 +4528,6 @@ def test_resume_worker_codex_accepts_new_sid_registration_under_name(fresh_orche
 
 
 def test_resume_worker_codex_fallback_ignores_non_worker_name_claim(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """The codex-lane name fallback must only accept WORKER registrations: a manager
-    appearing mid-window under the claimed name (shared funny-name pool) is not the
-    resumed session — confirming on it deletes the closed record and points the
-    result at a manager."""
     _make_codex_transcript(tmp_path, monkeypatch, "codex-old")
     state.write_json_atomic(paths.CLOSED / "codex-old.json", {
         "claude_sid": "codex-old", "name": "happy-yak", "cwd": "/x",
@@ -5297,18 +4549,15 @@ def test_resume_worker_codex_fallback_ignores_non_worker_name_claim(fresh_orches
 
 
 def test_resume_worker_concurrent_second_call_refused(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """Two concurrent resume_worker(name) calls would both pass the pre-flight guard
-    (nothing registered yet) and spawn TWO tabs resuming the same sid — transcript
-    corruption. The second call must refuse while the first is in flight."""
     _make_transcript(tmp_path, monkeypatch, "dup-sid")
     state.write_json_atomic(paths.CLOSED / "dup-sid.json", {
         "claude_sid": "dup-sid", "name": "dup-task", "cwd": "/x", "closed_at": 1.0})
-    _patch_spawn_worker_tab(monkeypatch)  # records kwargs; never registers active/
+    _patch_spawn_worker_tab(monkeypatch)
 
     async def scenario():
         first = _asyncio.create_task(_resume_worker_mcp(
             name="dup-task", _registration_timeout_sec=0.5, _poll_interval=0.01))
-        await _asyncio.sleep(0.05)  # first call is now inside its registration poll
+        await _asyncio.sleep(0.05)
         with pytest.raises(ValueError, match="already in progress"):
             await _resume_worker_mcp(
                 name="dup-task", _registration_timeout_sec=0.5, _poll_interval=0.01)
@@ -5320,10 +4569,6 @@ def test_resume_worker_concurrent_second_call_refused(fresh_orchestrator_dir, tm
 
 
 def test_resume_worker_refuses_when_resume_sid_already_active(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """A live active record under the closed record's OWN sid (but a different name,
-    so the name guard passes) means the session is already running — spawning
-    `--resume <sid>` again would attach a second process to the same transcript, and
-    a sid-keyed poll would instantly false-confirm on the pre-existing record."""
     _make_transcript(tmp_path, monkeypatch, "old-sid")
     state.write_json_atomic(paths.CLOSED / "old-sid.json", {
         "claude_sid": "old-sid", "name": "tkt-1234", "cwd": "/x", "closed_at": 1.0})
@@ -5336,16 +4581,7 @@ def test_resume_worker_refuses_when_resume_sid_already_active(fresh_orchestrator
     assert (paths.CLOSED / "old-sid.json").exists()
 
 
-# --- kill_worker graceful-close path --------------------------------------
-# kill_worker_impl closes the worker's tmux window so Claude Code's SessionEnd
-# hook fires (which in turn fires selffix-trigger.sh + orchestrator session-
-# end's closed/<sid>.json archive). No SIGTERM, no manual selffix trigger.
-
 def test_kill_worker_closes_window_instead_of_sigterm(fresh_orchestrator_dir, monkeypatch):
-    """kill_worker_impl must close the worker's tmux window/pane — that hands the
-    SIGHUP→grace→SIGKILL sequence to Claude Code, giving its SessionEnd hooks
-    time to run. No `os.kill(SIGTERM)`, no `_trigger_selffix_for_outgoing_session`.
-    """
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1", pid=12345)
 
     closed = []
@@ -5369,9 +4605,6 @@ def test_kill_worker_closes_window_instead_of_sigterm(fresh_orchestrator_dir, mo
 
 
 def test_kill_worker_skips_close_when_pid_already_dead(fresh_orchestrator_dir, monkeypatch):
-    """If the worker process is already gone, there's nothing to close — return
-    `already_dead=True` and skip the close call entirely.
-    """
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1", pid=12345)
 
     closed = []
@@ -5388,10 +4621,6 @@ def test_kill_worker_skips_close_when_pid_already_dead(fresh_orchestrator_dir, m
 
 
 def test_kill_worker_swallows_terminal_failure(fresh_orchestrator_dir, monkeypatch):
-    """A terminal close-window subprocess failure must NOT propagate — the helper
-    `_close_window` swallows internally, and `kill_worker_impl` must use
-    it (not re-raise).
-    """
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1", pid=12345)
 
     def boom(*a, **k):
@@ -5399,12 +4628,9 @@ def test_kill_worker_swallows_terminal_failure(fresh_orchestrator_dir, monkeypat
     monkeypatch.setattr("dockwright.mcp_server.subprocess.run", boom)
     monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: True)
 
-    # No exception should escape.
     result = kill_worker_impl(worker="alpha", dry_run=False)
     assert "killed_pid" in result
 
-
-# === Part A: manager records the pane id via env-inherit (with param override) ===
 
 def test_become_manager_inherits_pane_id_from_env(fresh_orchestrator_dir, monkeypatch):
     terminal._DRIVER = None
@@ -5428,8 +4654,6 @@ def test_become_manager_empty_iterm_sid_and_no_env_stays_empty(fresh_orchestrato
     record = state.read_json(paths.ACTIVE / "mgr-none.json")
     assert record["window_id"] == ""
 
-
-# === Part B: _input_is_idle parser ===
 
 from dockwright.mcp_server import _input_is_idle
 
@@ -5459,7 +4683,6 @@ def test_input_is_idle_empty_or_none_is_busy():
 
 
 def test_input_is_idle_dim_placeholder_is_idle():
-    # Claude Code empty-box ghost-text: faint (\x1b[2m) placeholder after the caret.
     screen = ("output above\n"
               "\x1b[39m❯ \x1b[2mSpawn a worker to investigate the codebase\x1b[0m\n"
               "  ? for shortcuts")
@@ -5467,27 +4690,20 @@ def test_input_is_idle_dim_placeholder_is_idle():
 
 
 def test_input_is_idle_ansi_typed_input_is_busy():
-    # Real typed input is normal-intensity (no faint span) after the caret.
     assert _input_is_idle("\x1b[39m❯ \x1b[39mdo the migration first\x1b[0m") is False
 
 
 def test_input_is_idle_ansi_empty_box_is_idle():
-    # ANSI-captured but genuinely empty box (no placeholder, no typed text).
     assert _input_is_idle("\x1b[39m❯ \x1b[0m") is True
 
 
 def test_input_is_idle_bare_reset_terminates_dim_span():
-    # Faint span closed by the bare reset \x1b[m (no params) still reads as empty.
     assert _input_is_idle("\x1b[39m❯ \x1b[2msuggestion text\x1b[m") is True
 
 
 def test_input_is_idle_bare_reset_ends_faint_so_later_text_is_busy():
-    # The bare reset \x1b[m must END the faint span: normal-intensity text typed
-    # AFTER it survives the dim-strip → busy. (Strict check of the empty-param branch.)
     assert _input_is_idle("\x1b[39m❯ \x1b[2mghost\x1b[mREAL") is False
 
-
-# === Part C: _capture_text uses ANSI capture ===
 
 def test_capture_text_uses_ansi_capture(monkeypatch):
     import dockwright.mcp_server as srv
@@ -5502,12 +4718,6 @@ def test_capture_text_uses_ansi_capture(monkeypatch):
     monkeypatch.setattr(srv, "get_driver", lambda: _FakeDriver())
     assert srv._capture_text("%9") == "ansi:%9"
 
-
-# === Part D: send_manager_to_manager (manager <-> manager) ===
-#
-# DIRECT + idle guard, loud on failure. When the peer's input box is idle, type the
-# message CONTENT directly (delivered_live). When a human is mid-typing, do NOT type
-# and return peer_busy (no clobber, no inbox). No live window → RAISE.
 
 from dockwright.mcp_server import send_manager_to_manager_impl
 
@@ -5545,7 +4755,7 @@ def test_send_manager_to_manager_unreadable_window_raises(fresh_orchestrator_dir
     import dockwright.mcp_server as srv
     state.write_json_atomic(paths.ACTIVE / "m2.json", {
         "claude_sid": "m2", "agent": "manager", "name": "peer", "window_id": "9"})
-    monkeypatch.setattr(srv, "_capture_text", lambda wid: None)  # unreadable
+    monkeypatch.setattr(srv, "_capture_text", lambda wid: None)
     with pytest.raises(ValueError, match="unreadable"):
         srv.send_manager_to_manager_impl("peer", "hi")
 
@@ -5560,7 +4770,7 @@ def test_send_manager_to_manager_resolves_and_stamps_back(fresh_orchestrator_dir
     monkeypatch.setattr(srv, "_send_text", lambda wid, txt: sent.update(wid=wid))
     r = srv.send_manager_to_manager_impl("peer", "hi")
     assert r["status"] == "delivered_live" and sent["wid"] == "77"
-    assert state.read_json(paths.ACTIVE / "m2.json")["window_id"] == "77"  # stamped back
+    assert state.read_json(paths.ACTIVE / "m2.json")["window_id"] == "77"
 
 
 def test_send_manager_to_manager_unknown_name_raises(fresh_orchestrator_dir):
@@ -5578,13 +4788,13 @@ def test_send_manager_to_manager_dim_placeholder_delivers(fresh_orchestrator_dir
     import dockwright.mcp_server as srv
     state.write_json_atomic(paths.ACTIVE / "m2.json", {
         "claude_sid": "m2", "agent": "manager", "name": "peer", "window_id": "9"})
-    # Empty box showing a faint rotating placeholder — must NOT read as busy.
     monkeypatch.setattr(srv, "_capture_text",
                         lambda wid: "\x1b[39m❯ \x1b[2mSpawn a worker to investigate\x1b[0m")
+    monkeypatch.setattr(srv, "_resolve_sender_manager", lambda: None)
     typed = []
     monkeypatch.setattr(srv, "_send_text", lambda wid, txt: typed.append(txt))
     r = srv.send_manager_to_manager_impl("peer", "hi")
-    assert r["status"] == "delivered_live" and typed == ["hi"]
+    assert r["status"] == "delivered_live" and typed == ["[MANAGER] hi"]
 
 
 def test_send_manager_to_manager_ansi_typed_input_is_busy(fresh_orchestrator_dir, monkeypatch):
@@ -5599,12 +4809,115 @@ def test_send_manager_to_manager_ansi_typed_input_is_busy(fresh_orchestrator_dir
     assert r["status"] == "peer_busy" and r["delivered"] is False and typed == []
 
 
+def _peer_and_sender(monkeypatch, sender):
+    import dockwright.mcp_server as srv
+    state.write_json_atomic(paths.ACTIVE / "m2.json", {
+        "claude_sid": "m2", "agent": "manager", "name": "peer", "window_id": "9"})
+    monkeypatch.setattr(srv, "_capture_text", lambda wid: "❯ ")
+    monkeypatch.setattr(srv, "_resolve_sender_manager", lambda: sender)
+    typed = []
+    monkeypatch.setattr(srv, "_send_text", lambda wid, txt: typed.append(txt))
+    return srv, typed
+
+
+def test_send_manager_to_manager_stamps_sender_name_and_domain(fresh_orchestrator_dir, monkeypatch):
+    srv, typed = _peer_and_sender(monkeypatch, {"name": "sender-mgr", "domain": "infra"})
+    r = srv.send_manager_to_manager_impl("peer", "hi")
+    assert typed == ["[MANAGER sender-mgr · infra] hi"]
+    assert r["sender"] == "sender-mgr"
+
+
+def test_send_manager_to_manager_stamp_prepends_once_multiline(fresh_orchestrator_dir, monkeypatch):
+    srv, typed = _peer_and_sender(monkeypatch, {"name": "sender-mgr", "domain": "infra"})
+    srv.send_manager_to_manager_impl("peer", "line one\nline two")
+    assert typed == ["[MANAGER sender-mgr · infra] line one\nline two"]
+    assert typed[0].count("[MANAGER ") == 1
+
+
+def test_send_manager_to_manager_stamp_defaults_domain_when_record_has_none(fresh_orchestrator_dir, monkeypatch):
+    srv, typed = _peer_and_sender(monkeypatch, {"name": "sender-mgr"})
+    srv.send_manager_to_manager_impl("peer", "hi")
+    assert typed == [f"[MANAGER sender-mgr · {srv.DEFAULT_DOMAIN}] hi"]
+
+
+def test_send_manager_to_manager_unresolved_sender_still_marks_as_manager(fresh_orchestrator_dir, monkeypatch):
+    srv, typed = _peer_and_sender(monkeypatch, None)
+    r = srv.send_manager_to_manager_impl("peer", "hi")
+    assert typed == ["[MANAGER] hi"]
+    assert r["sender"] is None
+
+
+def test_send_manager_to_manager_nameless_sender_record_still_marks_as_manager(fresh_orchestrator_dir, monkeypatch):
+    srv, typed = _peer_and_sender(monkeypatch, {"name": "", "domain": "infra"})
+    r = srv.send_manager_to_manager_impl("peer", "hi")
+    assert typed == ["[MANAGER] hi"]
+    assert r["sender"] is None
+
+
+def test_send_manager_to_manager_leading_slash_arrives_as_plain_text(fresh_orchestrator_dir, monkeypatch):
+    srv, typed = _peer_and_sender(monkeypatch, {"name": "sender-mgr", "domain": "infra"})
+    srv.send_manager_to_manager_impl("peer", "/manager-close now")
+    assert typed == ["[MANAGER sender-mgr · infra] /manager-close now"]
+    assert not typed[0].startswith("/")
+
+
+def test_send_manager_to_manager_peer_busy_stamps_nothing(fresh_orchestrator_dir, monkeypatch):
+    import dockwright.mcp_server as srv
+    state.write_json_atomic(paths.ACTIVE / "m2.json", {
+        "claude_sid": "m2", "agent": "manager", "name": "peer", "window_id": "9"})
+    monkeypatch.setattr(srv, "_capture_text", lambda wid: "❯ half a thought")
+    monkeypatch.setattr(srv, "_resolve_sender_manager",
+                        lambda: {"name": "sender-mgr", "domain": "infra"})
+    typed = []
+    monkeypatch.setattr(srv, "_send_text", lambda wid, txt: typed.append(txt))
+    r = srv.send_manager_to_manager_impl("peer", "hi")
+    assert r["status"] == "peer_busy" and typed == []
+    assert "sender" not in r
+
+
+def test_send_manager_to_manager_stamps_from_active_record_without_patching_the_resolver(
+        fresh_orchestrator_dir, monkeypatch):
+    import dockwright.mcp_server as srv
+    state.write_json_atomic(paths.ACTIVE / "m1.json", {
+        "claude_sid": "m1", "agent": "manager", "name": "sender-mgr",
+        "domain": "infra", "window_id": "%7"})
+    state.write_json_atomic(paths.ACTIVE / "m2.json", {
+        "claude_sid": "m2", "agent": "manager", "name": "peer", "window_id": "9"})
+    monkeypatch.setenv("TMUX_PANE", "%7")
+    monkeypatch.setattr(srv, "_capture_text", lambda wid: "❯ ")
+    typed = []
+    monkeypatch.setattr(srv, "_send_text", lambda wid, txt: typed.append(txt))
+    r = srv.send_manager_to_manager_impl("peer", "hi")
+    assert typed == ["[MANAGER sender-mgr · infra] hi"]
+    assert r["sender"] == "sender-mgr"
+
+
+def test_send_manager_to_manager_delivers_when_sender_resolution_raises(fresh_orchestrator_dir, monkeypatch):
+    import dockwright.mcp_server as srv
+    from dockwright import identity
+
+    def boom():
+        raise ValueError("corrupt active record")
+
+    state.write_json_atomic(paths.ACTIVE / "m2.json", {
+        "claude_sid": "m2", "agent": "manager", "name": "peer", "window_id": "9"})
+    monkeypatch.setattr(identity, "resolve_manager_record", boom)
+    monkeypatch.setattr(srv, "_capture_text", lambda wid: "❯ ")
+    typed = []
+    monkeypatch.setattr(srv, "_send_text", lambda wid, txt: typed.append(txt))
+    r = srv.send_manager_to_manager_impl("peer", "hi")
+    assert r["status"] == "delivered_live" and typed == ["[MANAGER] hi"]
+
+
+def test_resolve_sender_manager_reads_the_identity_resolver(monkeypatch):
+    import dockwright.mcp_server as srv
+    from dockwright import identity
+    monkeypatch.setattr(identity, "resolve_manager_record",
+                        lambda: {"name": "who", "domain": "dom"})
+    assert srv._resolve_sender_manager() == {"name": "who", "domain": "dom"}
+
+
 def test_kill_worker_does_not_match_manager(fresh_orchestrator_dir):
-    """kill_worker targets workers only. Managers share the funny-name pool with
-    worker display names, so an unfiltered name match would close a peer manager's
-    (or the caller's own) tmux window. The refusal must NAME the manager holder —
-    a bare "no worker named X" reads as a typo when X visibly exists in
-    list_managers."""
     register_self_impl(claude_sid="m1", agent="manager", name="happy-yak", cwd="/x", iterm_sid="i1", pid=12345)
     with pytest.raises(ValueError, match="active manager") as exc:
         kill_worker_impl(worker="happy-yak", dry_run=True)
@@ -5612,9 +4925,6 @@ def test_kill_worker_does_not_match_manager(fresh_orchestrator_dir):
 
 
 def test_send_manager_to_worker_does_not_match_manager(fresh_orchestrator_dir, monkeypatch):
-    """send_manager_to_worker must not resolve a manager: it types directly with NO
-    idle guard, while manager panes are guarded (a human may be mid-typing there) —
-    that's what send_manager_to_manager exists for. The error must point there."""
     register_self_impl(claude_sid="m1", agent="manager", name="happy-yak", cwd="/x", iterm_sid="42")
     typed = []
     monkeypatch.setattr(
@@ -5628,9 +4938,6 @@ def test_send_manager_to_worker_does_not_match_manager(fresh_orchestrator_dir, m
 
 
 def test_worker_finder_names_manager_holder_by_sid_too(fresh_orchestrator_dir):
-    """The finder matches by name OR sid; targeting a manager's SID must get the
-    same holder-naming refusal, and a genuinely unknown id keeps the plain
-    "no worker named" message."""
     register_self_impl(claude_sid="mgr-sid-1", agent="manager", name="happy-yak", cwd="/x", iterm_sid="i1", pid=12345)
     with pytest.raises(ValueError, match="active manager"):
         kill_worker_impl(worker="mgr-sid-1", dry_run=True)
@@ -5638,13 +4945,10 @@ def test_worker_finder_names_manager_holder_by_sid_too(fresh_orchestrator_dir):
         kill_worker_impl(worker="ghost", dry_run=True)
 
 
-# === Part D2: _send_text direct-typing helper (bracketed paste) ===
-
 from dockwright.mcp_server import _send_text
 
 
 def test_send_text_uses_bracketed_paste_then_single_enter(fresh_orchestrator_dir, monkeypatch):
-    """Content is loaded into a buffer and pasted bracketed (-p), then exactly ONE Enter."""
     terminal._DRIVER = None
     calls = []
     monkeypatch.setattr(
@@ -5652,26 +4956,19 @@ def test_send_text_uses_bracketed_paste_then_single_enter(fresh_orchestrator_dir
         lambda args, **kw: calls.append((list(args), kw)),
     )
     _send_text("42", "do the migration first")
-    # set-option pin + load-buffer + paste-buffer + send-keys Enter
     assert len(calls) == 4
     load = next(a for a, _ in calls if "load-buffer" in a)
     paste = next(a for a, _ in calls if "paste-buffer" in a)
     enters = [a for a, _ in calls if "send-keys" in a and a[-1] == "Enter"]
-    # Content goes through stdin as a single buffer payload — never a positional arg.
     load_kw = next(kw for a, kw in calls if "load-buffer" in a)
     assert load_kw["input"] == b"do the migration first"
     assert "do the migration first" not in load
-    # Bracketed paste (-p) scoped to the target pane.
     assert "-p" in paste and "-t" in paste and paste[paste.index("-t") + 1] == "42"
-    # Exactly one Enter, scoped to the pane.
     assert len(enters) == 1
     assert enters[0][enters[0].index("-t") + 1] == "42"
 
 
 def test_send_text_multiline_arrives_whole(fresh_orchestrator_dir, monkeypatch):
-    """A multi-line message must reach the window as ONE bracketed-paste payload with
-    every newline preserved, and trigger exactly ONE Enter — so the embedded newlines
-    insert as text instead of submitting and fragmenting the message."""
     terminal._DRIVER = None
     calls = []
     monkeypatch.setattr(
@@ -5680,16 +4977,13 @@ def test_send_text_multiline_arrives_whole(fresh_orchestrator_dir, monkeypatch):
     )
     multiline = "line one\nline two\n\nline four with trailing"
     _send_text("7", multiline)
-    # The entire multi-line message is delivered as a single buffer payload, whole,
-    # pasted bracketed (-p) so newlines arrive as text, never as submit.
     load_kw = next(kw for a, kw in calls if "load-buffer" in a)
     assert load_kw["input"] == multiline.encode("utf-8")
     paste = next(a for a, _ in calls if "paste-buffer" in a)
     assert "-p" in paste
-    # Exactly one Enter overall, and no extra shell-outs — no per-line submit.
     enter_calls = [a for a, _ in calls if "send-keys" in a and a[-1] == "Enter"]
     assert len(enter_calls) == 1
-    assert len(calls) == 4  # set-option pin + load-buffer + paste-buffer + send-keys
+    assert len(calls) == 4
 
 
 def test_send_text_swallows_failure(fresh_orchestrator_dir, monkeypatch):
@@ -5697,14 +4991,10 @@ def test_send_text_swallows_failure(fresh_orchestrator_dir, monkeypatch):
         raise FileNotFoundError("tmux not installed")
 
     monkeypatch.setattr("dockwright.mcp_server.subprocess.run", boom)
-    _send_text("42", "hi")  # must not raise
+    _send_text("42", "hi")
 
-
-# === Part E: close-on-takeover (present id, ls-fallback, no-resolution) ===
 
 def test_become_manager_with_takeover_skips_close_when_no_window_resolves(fresh_orchestrator_dir, monkeypatch):
-    """Legacy predecessor (empty iterm_sid) AND the terminal ls resolves nothing →
-    skip the close silently (no close-window subprocess call)."""
     monkeypatch.delenv("TMUX_PANE", raising=False)
     become_manager_impl(claude_sid="mgr-old", iterm_sid="")
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
@@ -5723,9 +5013,6 @@ def test_become_manager_with_takeover_skips_close_when_no_window_resolves(fresh_
 
 
 def test_become_manager_with_takeover_resolves_window_via_ls_when_no_iterm_sid(fresh_orchestrator_dir, monkeypatch):
-    """Legacy predecessor (empty iterm_sid): resolve its window via the terminal
-    ls by the manager name in the title and close THAT window (not the incoming
-    manager's)."""
     terminal._DRIVER = None
     monkeypatch.delenv("TMUX_PANE", raising=False)
     old = become_manager_impl(claude_sid="mgr-old", iterm_sid="")
@@ -5733,8 +5020,6 @@ def test_become_manager_with_takeover_resolves_window_via_ls_when_no_iterm_sid(f
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
     monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: True)
     monkeypatch.setattr("dockwright.registry._pid_alive", lambda pid: True)
-    # tmux list-panes tree: the predecessor's window (title carries its name) + the incoming
-    # manager's own window (must be excluded).
     monkeypatch.setattr("dockwright.mcp_server._terminal_ls", lambda: [
         {"tabs": [
             {"title": f"{old_name} · general", "windows": [
@@ -5752,7 +5037,7 @@ def test_become_manager_with_takeover_resolves_window_via_ls_when_no_iterm_sid(f
         handoff_id=handoff["handoff_id"], iterm_sid="9",
     )
     assert result["ok"] is True
-    assert closed == ["7"]  # predecessor's window resolved by name, incoming (9) excluded
+    assert closed == ["7"]
 
 
 def test_resolve_manager_window_matches_session_id_env(fresh_orchestrator_dir, monkeypatch):
@@ -5768,11 +5053,6 @@ def test_resolve_manager_window_matches_session_id_env(fresh_orchestrator_dir, m
 
 
 def test_resolve_manager_window_name_match_runs_unconditionally(fresh_orchestrator_dir, monkeypatch):
-    """Pass-2 title match runs whether or not exclude_id is present.  The
-    no-exclude_id caller is send_manager_to_manager (a SEND, not a close) so
-    matching the peer's own titled window is the correct intent; active manager
-    names are unique enough that a cross-manager prefix collision is not a risk.
-    Both exclude_id='' and exclude_id=other-window should resolve."""
     from dockwright.mcp_server import _resolve_manager_window
     tree = [
         {"tabs": [
@@ -5782,39 +5062,33 @@ def test_resolve_manager_window_name_match_runs_unconditionally(fresh_orchestrat
         ]},
     ]
     monkeypatch.setattr("dockwright.mcp_server._terminal_ls", lambda: tree)
-    # No exclude_id → name pass still fires → resolves.
     assert _resolve_manager_window("some-sid", "grumpy-yak", exclude_id="") == "5"
-    # With an exclude_id that isn't this window → name pass runs → resolves.
     assert _resolve_manager_window("some-sid", "grumpy-yak", exclude_id="9") == "5"
 
 
 def test_kill_worker_resolves_window_id_records(fresh_orchestrator_dir, monkeypatch):
-    """A worker record written by the NEW code (only window_id) resolves
-    via state.window_id_of — proves the helper is on the read path."""
     state.write_json_atomic(paths.ACTIVE / "new-sid.json", {
         "claude_sid": "new-sid",
         "agent": "worker",
         "name": "new-worker",
         "cwd": "/x",
-        "window_id": "new-win-1",  # new key only
+        "window_id": "new-win-1",
         "pid": os.getpid(),
         "started_at": 0,
         "state": "idle",
         "parent_manager_name": None,
     })
     result = kill_worker_impl(worker="new-worker", dry_run=True)
-    assert result["iterm_sid"] == "new-win-1"  # external return key stays iterm_sid; helper resolved it
+    assert result["iterm_sid"] == "new-win-1"
 
 
 def test_kill_worker_resolves_legacy_iterm_sid_records(fresh_orchestrator_dir, monkeypatch):
-    """A pre-rename worker record (only legacy iterm_sid key) still resolves
-    via the helper's fallback. Regression guard — locks in dual-key reads."""
     state.write_json_atomic(paths.ACTIVE / "legacy-sid.json", {
         "claude_sid": "legacy-sid",
         "agent": "worker",
         "name": "legacy-worker",
         "cwd": "/x",
-        "iterm_sid": "leg-win-1",  # legacy key only
+        "iterm_sid": "leg-win-1",
         "pid": os.getpid(),
         "started_at": 0,
         "state": "idle",
@@ -5825,10 +5099,6 @@ def test_kill_worker_resolves_legacy_iterm_sid_records(fresh_orchestrator_dir, m
 
 
 def test_list_managers_returns_iterm_sid_from_window_id_records(fresh_orchestrator_dir):
-    """become_manager writes the persistent JSON with the new `window_id` key, but
-    list_managers' external return shape MUST keep `iterm_sid` (caller stability per
-    spec). Regression guard: list_managers reads via state.window_id_of so the
-    returned `iterm_sid` value carries the manager's actual window id, not None."""
     from dockwright.mcp_server import list_managers
     become_manager_impl(claude_sid="mgr-1", iterm_sid="win-9", domain="general")
     out = list_managers()
@@ -5837,32 +5107,23 @@ def test_list_managers_returns_iterm_sid_from_window_id_records(fresh_orchestrat
     assert out[0]["iterm_sid"] == "win-9"
 
 
-# --- spawn_worker manager_sid resolution: reject-or-scope (linux E2E F-β1) ---
-
 def test_spawn_worker_rejects_unresolvable_manager_sid(fresh_orchestrator_dir, monkeypatch):
-    """A non-empty manager_sid with no ACTIVE record (funny name / typo'd or
-    mangled UUID) must REJECT pre-spawn: parent_manager_name is stamped at
-    registration and never rewritten, so a warned-but-spawned worker stays
-    misrouted for its whole life (linux E2E C12). No tab, no pending file."""
     captured = _patch_spawn_worker_tab(monkeypatch)
     with pytest.raises(ValueError) as exc:
         _asyncio.run(spawn_worker_impl(
             initial_prompt="hi",
             name="worker-rejected",
-            manager_sid="snug-ibex",  # funny name, not a registered sid
+            manager_sid="snug-ibex",
         ))
     msg = str(exc.value)
     assert "snug-ibex" in msg
     assert "list_managers" in msg
     assert "manager_sid=None" in msg
-    assert captured == {}   # spawner never invoked
+    assert captured == {}
     assert list(paths.ASSIGNMENTS_PENDING.glob("*.json")) == []
 
 
 def test_spawn_worker_rejects_worker_sid_as_manager_sid(fresh_orchestrator_dir, monkeypatch):
-    """C12's mangled sid was cross-contaminated from a WORKER's sid. Today that
-    lane is fully SILENT (the sid resolves to the worker's name, no warning) —
-    the guard must name the actual agent kind and reject."""
     register_self_impl(claude_sid="w-sid-1", agent="worker", name="some-worker",
                        cwd="/x", iterm_sid="i1")
     captured = _patch_spawn_worker_tab(monkeypatch)
@@ -5877,10 +5138,6 @@ def test_spawn_worker_rejects_worker_sid_as_manager_sid(fresh_orchestrator_dir, 
 
 
 def test_spawn_worker_rejects_nested_manager_record(fresh_orchestrator_dir, monkeypatch):
-    """A nested manager-agent ghost (agent="manager", nested=True — the
-    nested-<sid8> shape hooks.py registers for a manager's nested child) passes
-    a naive agent check, but no monitor watches its buckets; the guard mirrors
-    _find_manager_record's `not nested` predicate."""
     state.write_json_atomic(paths.ACTIVE / "n-sid-1.json", {
         "claude_sid": "n-sid-1", "agent": "manager", "name": "nested-abc12345",
         "nested": True, "cwd": "/x", "window_id": "i2",
@@ -5897,12 +5154,6 @@ def test_spawn_worker_rejects_nested_manager_record(fresh_orchestrator_dir, monk
 
 
 def test_spawn_worker_rejects_manager_record_with_falsy_name(fresh_orchestrator_dir, monkeypatch):
-    """Same bug-class as F-β1: a resolvable manager record whose `name` is
-    falsy used to return that falsy name — spawn_worker_impl then skipped the
-    env stamp and spawned SILENTLY unscoped, bypassing the record-is-None
-    reject arm. A live manager always has a name (become_manager /
-    register_self_impl write it synchronously), so a nameless record is a
-    corrupt registration: reject it like the other bad-sid shapes."""
     state.write_json_atomic(paths.ACTIVE / "noname-1.json", {
         "claude_sid": "noname-1", "agent": "manager", "name": "",
         "cwd": "/x", "window_id": "i3",
@@ -5919,7 +5170,6 @@ def test_spawn_worker_rejects_manager_record_with_falsy_name(fresh_orchestrator_
 
 
 def test_spawn_worker_no_warning_on_none_manager_sid(fresh_orchestrator_dir, monkeypatch):
-    """manager_sid=None is the intentional legacy single-manager wildcard — no warning."""
     _patch_spawn_worker_tab(monkeypatch)
     result = _asyncio.run(spawn_worker_impl(
         initial_prompt="hi",
@@ -5931,7 +5181,6 @@ def test_spawn_worker_no_warning_on_none_manager_sid(fresh_orchestrator_dir, mon
 
 
 def test_spawn_worker_no_warning_on_resolvable_manager_sid(fresh_orchestrator_dir, monkeypatch):
-    """A resolvable manager_sid keeps the existing behavior: scoped, no warning."""
     become_manager_impl(claude_sid="mgr-a", iterm_sid="i0", domain="general")
     mgr_name = state.read_json(paths.ACTIVE / "mgr-a.json")["name"]
     _patch_spawn_worker_tab(monkeypatch)
@@ -5948,27 +5197,21 @@ def test_resolve_parent_manager_branches(fresh_orchestrator_dir):
     from dockwright.mcp_server import _resolve_parent_manager
     become_manager_impl(claude_sid="mgr-a", iterm_sid="i0", domain="general")
     mgr_name = state.read_json(paths.ACTIVE / "mgr-a.json")["name"]
-    # falsy manager_sid → intentional legacy/unscoped wildcard, allowed
     assert _resolve_parent_manager(None) is None
     assert _resolve_parent_manager("") is None
-    # resolvable top-level manager sid → name (happy path unchanged)
     assert _resolve_parent_manager("mgr-a") == mgr_name
-    # truthy but unresolvable → reject
     with pytest.raises(ValueError, match="snug-ibex"):
         _resolve_parent_manager("snug-ibex")
-    # a WORKER's sid → reject, naming the kind
     register_self_impl(claude_sid="w-1", agent="worker", name="wrk",
                        cwd="/x", iterm_sid="i9")
     with pytest.raises(ValueError, match="active worker record"):
         _resolve_parent_manager("w-1")
-    # nested manager-agent ghost → reject (mirrors _find_manager_record)
     state.write_json_atomic(paths.ACTIVE / "n-1.json", {
         "claude_sid": "n-1", "agent": "manager",
         "name": "nested-deadbeef", "nested": True,
     })
     with pytest.raises(ValueError, match="active nested manager-agent record"):
         _resolve_parent_manager("n-1")
-    # manager record with a MISSING name key → falsy-name arm, same reject
     state.write_json_atomic(paths.ACTIVE / "noname-2.json", {
         "claude_sid": "noname-2", "agent": "manager",
     })
@@ -5977,23 +5220,16 @@ def test_resolve_parent_manager_branches(fresh_orchestrator_dir):
 
 
 def test_resolve_manager_name_for_filter_warns_to_stderr_on_unresolvable_sid(fresh_orchestrator_dir, capsys):
-    """The READ/filter helper degrades to wildcard when a manager_sid can't resolve;
-    it must WARN to stderr so the silent "returns every manager's records" degradation
-    is visible. Resolvable + falsy sids stay silent."""
     from dockwright.mcp_server import _resolve_manager_name_for_filter
     become_manager_impl(claude_sid="mgr-a", iterm_sid="i0", domain="general")
     mgr_name = state.read_json(paths.ACTIVE / "mgr-a.json")["name"]
 
-    # Resolvable sid → returns name, no warning.
     assert _resolve_manager_name_for_filter("mgr-a", "list_workers") == mgr_name
     assert capsys.readouterr().err == ""
 
-    # Falsy sid → intentional wildcard, no warning.
     assert _resolve_manager_name_for_filter(None, "list_workers") is None
     assert capsys.readouterr().err == ""
 
-    # Truthy but unresolvable (funny name passed instead of UUID) → None + stderr warning
-    # that names the tool, the bad sid, and the wildcard degradation.
     assert _resolve_manager_name_for_filter("snug-ibex", "list_workers") is None
     err = capsys.readouterr().err
     assert "list_workers" in err
@@ -6002,8 +5238,6 @@ def test_resolve_manager_name_for_filter_warns_to_stderr_on_unresolvable_sid(fre
 
 
 def test_takeover_inherits_funny_name_and_preserves_worker_routing(fresh_orchestrator_dir, monkeypatch):
-    """Recreate/takeover keeps the predecessor's funny name so a worker parented to
-    that name still resolves to the recreated manager (parent_manager_name stays valid)."""
     monkeypatch.setattr("dockwright.mcp_server._close_window", lambda *a, **k: None)
     monkeypatch.setattr(
         "dockwright.mcp_server.names.roll_manager_name", lambda is_taken: "happy-otter"
@@ -6017,7 +5251,6 @@ def test_takeover_inherits_funny_name_and_preserves_worker_routing(fresh_orchest
     handoff = prepare_handoff_impl(
         claude_sid="mgr-old", narrative_summary="s", trigger_reason="recreate"
     )
-    # Make the old manager look dead so the takeover's _pid_alive guard short-circuits.
     old = state.read_json(paths.ACTIVE / "mgr-old.json")
     old["pid"] = 2
     state.write_json_atomic(paths.ACTIVE / "mgr-old.json", old)
@@ -6025,14 +5258,10 @@ def test_takeover_inherits_funny_name_and_preserves_worker_routing(fresh_orchest
         claude_sid="mgr-new", takeover_from="mgr-old",
         handoff_id=handoff["handoff_id"], iterm_sid="i-new",
     )
-    # The recreated manager keeps the inherited funny name (never "manager").
     assert state.read_json(paths.ACTIVE / "mgr-new.json")["name"] == "happy-otter"
-    # The worker parented to the old name still resolves to the recreated manager.
     workers = list_workers_impl(manager_name="happy-otter")
     assert [w["name"] for w in workers] == ["task-1"]
 
-
-# --- Artifact store: document plane (docs/orchestrator-artifact-store-spec-v2.md Part I) ---
 
 from dockwright.mcp_server import (
     artifact_put_impl, artifact_get_impl, artifact_list_impl,
@@ -6048,8 +5277,6 @@ def test_artifact_put_get_round_trips(fresh_orchestrator_dir):
     assert got["read_set"] == [] and got["contract_hash"] is None
 
 
-# --- F1: task_key canonical param + ticket deprecated alias on the 6 tools ---
-
 from dockwright.mcp_server import (
     artifact_put as _tool_artifact_put, artifact_get as _tool_artifact_get,
     artifact_list as _tool_artifact_list, artifact_view as _tool_artifact_view,
@@ -6058,19 +5285,15 @@ from dockwright.mcp_server import (
 
 
 def test_artifact_put_accepts_task_key_and_ticket_alias(fresh_orchestrator_dir):
-    # task_key (canonical) writes under the key
     _tool_artifact_put(task_key="K-1", phase="spec", name="srs", content="a",
                        status="complete", writer_sid="s1")
     assert artifact_get_impl("K-1", "spec", "srs")["content"] == "a"
-    # ticket (deprecated alias) still works for one release
     _tool_artifact_put(ticket="K-2", phase="spec", name="srs", content="b",
                        status="complete", writer_sid="s1")
     assert artifact_get_impl("K-2", "spec", "srs")["content"] == "b"
-    # both given -> task_key wins
     _tool_artifact_put(task_key="K-3", ticket="K-2", phase="spec", name="srs",
                        content="c", status="complete", writer_sid="s1")
     assert artifact_get_impl("K-3", "spec", "srs")["content"] == "c"
-    # neither given -> fail fast (mirrors the old required-param behavior)
     with pytest.raises(ValueError):
         _tool_artifact_put(phase="spec", name="srs", content="d",
                            status="complete", writer_sid="s1")
@@ -6104,9 +5327,6 @@ def test_pipeline_event_accepts_task_key_and_ticket_alias(fresh_orchestrator_dir
 from dockwright.mcp_server import _read_events, _write_artifact_atomic, _put_clobber_verdict
 
 
-# --- No-clobber guard on artifact_put (single-writer invariant, enforced) ---
-
-
 def test_artifact_put_refuses_clobber_of_hand_authored_file(fresh_orchestrator_dir):
     path = paths.artifact_path("TKT-SANDBOX-9", "review", "report")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -6134,7 +5354,6 @@ def test_artifact_put_refuses_foreign_writer_record(fresh_orchestrator_dir):
 
 
 def test_artifact_put_same_writer_update_flows(fresh_orchestrator_dir):
-    # The designed partial -> complete flip must stay frictionless.
     artifact_put_impl("TKT-SANDBOX-9", "spec", "repo", "draft", "partial", "w1")
     artifact_put_impl("TKT-SANDBOX-9", "spec", "repo", "final", "complete", "w1")
     got = artifact_get_impl("TKT-SANDBOX-9", "spec", "repo")
@@ -6143,7 +5362,6 @@ def test_artifact_put_same_writer_update_flows(fresh_orchestrator_dir):
 
 
 def test_artifact_put_overwrite_flag_replaces(fresh_orchestrator_dir):
-    # Canonical legitimate use: a successor finishing a dead worker's phase.
     artifact_put_impl("TKT-SANDBOX-9", "spec", "repo", "body A", "complete", "writer-a")
     artifact_put_impl("TKT-SANDBOX-9", "spec", "repo", "successor body", "complete",
                       "writer-b", overwrite=True)
@@ -6156,8 +5374,6 @@ def test_artifact_put_overwrite_flag_replaces(fresh_orchestrator_dir):
 
 
 def test_artifact_put_stamps_identical_hand_content(fresh_orchestrator_dir):
-    # A hand-written full report whose text equals the put's content byte-exact
-    # is stamped in place — nothing can be lost.
     path = paths.artifact_path("TKT-SANDBOX-9", "review", "report")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("full verdict text")
@@ -6174,12 +5390,10 @@ def test_write_artifact_atomic_exclusive_raises_on_existing(tmp_path):
     with pytest.raises(FileExistsError):
         _write_artifact_atomic(p, "new", exclusive=True)
     assert p.read_text() == "occupant"
-    assert list(tmp_path.glob(".*.tmp")) == []     # tmp cleaned up on failure
+    assert list(tmp_path.glob(".*.tmp")) == []
 
 
 def test_artifact_put_eexist_race_reruns_guard_refuse(fresh_orchestrator_dir, monkeypatch):
-    # TOCTOU closure: guard saw no file, a FOREIGN record lands before our
-    # exclusive create -> the put must re-guard and refuse, never replace blind.
     import dockwright.mcp_server as m
     real = m._write_artifact_atomic
     injected = {"done": False}
@@ -6203,8 +5417,6 @@ def test_artifact_put_eexist_race_reruns_guard_refuse(fresh_orchestrator_dir, mo
 
 
 def test_artifact_put_eexist_race_allows_same_writer(fresh_orchestrator_dir, monkeypatch):
-    # Same race, but the record that landed is OUR OWN (e.g. a retried put):
-    # re-guard says allowed -> last-wins replace, the pre-existing semantics.
     import dockwright.mcp_server as m
     real = m._write_artifact_atomic
     injected = {"done": False}
@@ -6223,9 +5435,6 @@ def test_artifact_put_eexist_race_allows_same_writer(fresh_orchestrator_dir, mon
     res = artifact_put_impl("TKT-SANDBOX-9", "spec", "repo", "mine", "complete", "w1")
     got = artifact_get_impl("TKT-SANDBOX-9", "spec", "repo")
     assert got["content"] == "mine"
-    # The re-guard's "allowed" arm (site C) must archive the interloper's
-    # record the same as the other two allowed-branch sites — deleting site
-    # C's `_archive_replaced` call leaves the module 481-green otherwise.
     prev = paths.artifact_path("TKT-SANDBOX-9", "spec", "repo").with_name("spec.repo.md.prev")
     _, prev_body = state.parse_artifact(prev.read_text())
     assert prev_body == "earlier attempt"
@@ -6234,9 +5443,6 @@ def test_artifact_put_eexist_race_allows_same_writer(fresh_orchestrator_dir, mon
 
 
 def test_artifact_put_second_eexist_propagates(fresh_orchestrator_dir, monkeypatch):
-    # Guard said absent, exclusive create keeps losing the race (file appears,
-    # vanishes before the re-guard, reappears): the second EEXIST must
-    # propagate loudly — no retry loop.
     import dockwright.mcp_server as m
 
     def always_eexist(p, text, exclusive=False):
@@ -6250,10 +5456,6 @@ def test_artifact_put_second_eexist_propagates(fresh_orchestrator_dir, monkeypat
 
 
 def test_artifact_put_eexist_reguard_refuses_own_complete_record(fresh_orchestrator_dir, monkeypatch):
-    # Same race shape as test_artifact_put_eexist_race_reruns_guard_refuse, but
-    # what lands is OUR OWN finalized record with different content: the
-    # re-guard's default-deny arm must classify own_complete_record and
-    # refuse, never blind-replace it.
     import dockwright.mcp_server as m
     real = m._write_artifact_atomic
     injected = {"done": False}
@@ -6278,11 +5480,6 @@ def test_artifact_put_eexist_reguard_refuses_own_complete_record(fresh_orchestra
 
 
 def test_artifact_put_eexist_reguard_refuses_unknown_verdict(fresh_orchestrator_dir, monkeypatch):
-    # Side-effecting verdict fake: the FIRST call (initial guard) returns
-    # "absent" so the put reaches the EEXIST branch at all; the SECOND call
-    # (the re-guard) returns an unrecognized verdict. A constant fake would
-    # short-circuit at dispatch site 1 and never exercise the re-guard's own
-    # default-deny arm.
     import dockwright.mcp_server as m
     calls = {"n": 0}
 
@@ -6369,20 +5566,11 @@ def test_artifact_put_emits_event(fresh_orchestrator_dir):
     assert ev["actor_sid"] == "sid-w1" and ev["status"] == "complete"
 
 
-# --- Own-final guard + default-deny dispatch (spec 2026-07-31, builds on #234) ---
-
-
 def _last_event(task_key):
     return _read_events(paths.artifact_events_path(task_key))[-1]
 
 
 def _seed_raw_record(task_key, phase, name, body, stamp_overrides=None):
-    """Write a record file directly (bypassing the put) so tests can seed
-    stamps the put itself can no longer produce (null status, falsy sid).
-    NOTE: serialize_artifact emits EVERY _FM_KEYS key — an override of None
-    yields `status: null`, never a missing line; where a genuinely missing
-    key is needed, the occupant is seeded from raw frontmatter text instead
-    (see test_put_clobber_verdict_fail_closed_axes's p4 leg)."""
     stamp = {"phase": phase, "name": name, "status": "complete",
              "writer_sid": "sid-w1", "contract_hash": None,
              "written_at": 0.0, "read_set": []}
@@ -6462,16 +5650,12 @@ def test_artifact_put_rejects_falsy_writer_sid(fresh_orchestrator_dir):
 
 
 def test_put_clobber_verdict_fail_closed_axes(fresh_orchestrator_dir):
-    # Direct unit calls: stamp axes that artifact_put_impl can no longer
-    # produce must still classify fail-closed if found on disk.
     p1 = _seed_raw_record("TKT-SANDBOX-1", "spec", "a", "body", {"writer_sid": ""})
     assert _put_clobber_verdict(p1, "spec", "a", "other", "complete", "") == "foreign_record"
     p2 = _seed_raw_record("TKT-SANDBOX-1", "spec", "b", "body", {"status": None})
     assert _put_clobber_verdict(p2, "spec", "b", "other", "complete", "sid-w1") == "own_complete_record"
     p3 = _seed_raw_record("TKT-SANDBOX-1", "spec", "c", "body", {"phase": None})
     assert _put_clobber_verdict(p3, "spec", "c", "other", "complete", "sid-w1") == "colliding_record"
-    # Genuinely MISSING status key (reachable on disk: parse_artifact skips a
-    # non-JSON value line, dropping the key) — must classify final too.
     p4 = paths.artifact_path("TKT-SANDBOX-1", "spec", "d")
     p4.write_text('---\nphase: "spec"\nname: "d"\nstatus: notjson\n'
                   'writer_sid: "sid-w1"\n---\nbody')
@@ -6490,12 +5674,7 @@ def test_artifact_put_unknown_verdict_fails_closed(fresh_orchestrator_dir, monke
     assert _last_event("TKT-SANDBOX-1")["reason"] == "some_future_verdict"
 
 
-# --- Replaced-content sidecar (spec 2026-07-31, builds on #234, own-final guard) ---
-
-
 def test_artifact_put_partial_replacement_archives_previous(fresh_orchestrator_dir):
-    # The manager-named red-proof: a partial full report replaced by a summary
-    # must leave the report recoverable byte-exact in the sidecar.
     artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "FULL 514-line report", "partial", "sid-w1")
     p = paths.artifact_path("TKT-SANDBOX-1", "review", "verdict")
     original = p.read_text()
@@ -6537,8 +5716,6 @@ def test_artifact_put_sidecar_latest_only(fresh_orchestrator_dir):
 
 
 def test_artifact_put_archive_failure_fails_closed(fresh_orchestrator_dir, monkeypatch):
-    # Pin, not red-first: exists to stop a later swallow-and-proceed wrap
-    # around the archive (spec §3a fail-closed bullet).
     artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "FULL REPORT", "partial", "sid-w1")
     p = paths.artifact_path("TKT-SANDBOX-1", "review", "verdict")
     before = p.read_text()
@@ -6555,17 +5732,13 @@ def test_artifact_put_archive_failure_fails_closed(fresh_orchestrator_dir, monke
 
 
 def test_artifact_put_real_archive_failure_fails_closed(fresh_orchestrator_dir):
-    # Behavioural sibling to the pin above: a REAL failure inside
-    # _archive_replaced itself (no monkeypatch of the helper), so a
-    # swallow-and-proceed wrap written INSIDE the helper's body — which the
-    # monkeypatch pin above cannot see — is caught here too.
     artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "FULL REPORT", "partial", "sid-w1")
     p = paths.artifact_path("TKT-SANDBOX-1", "review", "verdict")
     before = p.read_text()
     events_before = paths.artifact_events_path("TKT-SANDBOX-1").read_text()
     prev = p.with_name(p.name + ".prev")
     prev.mkdir()
-    (prev / "blocker").write_text("occupied")  # non-empty: os.replace cannot succeed
+    (prev / "blocker").write_text("occupied")
     with pytest.raises(OSError):
         artifact_put_impl("TKT-SANDBOX-1", "review", "verdict", "summary", "complete", "sid-w1")
     assert p.read_text() == before
@@ -6578,12 +5751,6 @@ def test_sidecar_invisible_to_readers(fresh_orchestrator_dir):
     assert [a["name"] for a in artifact_list_impl("TKT-SANDBOX-1")] == ["verdict"]
     assert not list(paths.artifact_ticket_dir("TKT-SANDBOX-1").glob("*.tmp"))
 
-
-# --- Guard matrix: hand-enumerated from spec 2026-07-31 §3 — NEVER derive these
-# expectations from the code under test. Each value: refusal reason, or
-# ("write", sidecar_expected). ADD-ONE contract: a new occupant class, status
-# value, kwarg, or write path must add cells here (and the == meta-assertion
-# below forces the count to be deliberate).
 
 _INCOMING = "incoming content"
 _OTHER_BODY = "previous different body"
@@ -6632,24 +5799,7 @@ _MATRIX_EXPECT = {
 }
 
 
-def test_guard_matrix_is_total():
-    # Meta-assertion (drift-guard: pin every axis with ==, never >= — a
-    # displaced cell must go red, not just a shrunk total): 10 occupants x 2
-    # statuses x 2 overwrite = 40 cells, every one enumerated by hand.
-    assert {k[0] for k in _MATRIX_EXPECT} == {
-        "absent", "own_partial", "own_final_same_body", "own_final_diff_body",
-        "own_status_null", "own_status_missing_key", "colliding_record",
-        "foreign_record", "hand_file_equal", "hand_file_diff"}
-    assert {k[1] for k in _MATRIX_EXPECT} == {"partial", "complete"}
-    assert {k[2] for k in _MATRIX_EXPECT} == {False, True}
-    assert len(_MATRIX_EXPECT) == 40
-
-
 def _seed_occupant(kind, task_key):
-    """Returns the canonical path targeted by the matrix put
-    (phase='review', name='tar_get'), with `kind` occupying it. The target
-    name is deliberately underscore-shaped so a REAL prior put under the
-    dotted sibling 'tar.get' sanitize-collides onto the same file."""
     phase, name = "review", "tar_get"
     p = paths.artifact_path(task_key, phase, name)
     if kind == "absent":
@@ -6663,15 +5813,10 @@ def _seed_occupant(kind, task_key):
     elif kind == "own_status_null":
         _seed_raw_record(task_key, phase, name, _OTHER_BODY, {"status": None})
     elif kind == "own_status_missing_key":
-        # parse_artifact drops a non-JSON value line entirely — the on-disk
-        # shape a hand-edit/truncation produces: the status KEY is absent.
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text('---\nphase: "review"\nname: "tar_get"\nstatus: notjson\n'
                      'writer_sid: "sid-w1"\n---\n' + _OTHER_BODY)
     elif kind == "colliding_record":
-        # A REAL put under the dotted sibling name: same writer, status
-        # partial — proving the collision check precedes the owner/status
-        # allow rows. Lands at this exact path via sanitization.
         artifact_put_impl(task_key, phase, "tar.get", _OTHER_BODY, "partial", "sid-w1")
         assert paths.artifact_path(task_key, phase, "tar.get") == p
     elif kind == "foreign_record":
@@ -6719,10 +5864,6 @@ def test_artifact_put_guard_matrix(fresh_orchestrator_dir, occupant,
 
 
 def test_artifact_put_signature_pin():
-    # ADD-ONE tripwire: a NEW parameter on the put path must consciously
-    # visit the guard table (spec 2026-07-31 §3) and _MATRIX_EXPECT above —
-    # update both, then this pin. (_tool_artifact_put is the tool's existing
-    # import at the top of this file; @mcp.tool() returns the plain function.)
     assert list(inspect.signature(artifact_put_impl).parameters) == [
         "task_key", "phase", "name", "content", "status", "writer_sid",
         "contract_hash", "read_set", "overwrite"]
@@ -6731,157 +5872,14 @@ def test_artifact_put_signature_pin():
         "contract_hash", "read_set", "overwrite", "ticket"]
 
 
-def test_store_write_helpers_called_only_from_artifact_put_impl():
-    # ADD-ONE tripwire: a future write path USING EITHER HELPER from outside
-    # the guarded put surfaces as a new caller; _archive_replaced's caller
-    # set pins that archiving happens only on the guarded path. Honest limit
-    # (spec §7): a writer that uses NEITHER helper — raw open/replace here or
-    # elsewhere — is outside this tripwire's sight; _archive_replaced's own
-    # inlined tmp+replace is exactly such a write, guarded instead by its
-    # caller pin.
-    tree = ast.parse(inspect.getsource(mcp_server))
-    callers = {"_write_artifact_atomic": set(), "_archive_replaced": set()}
-    stack = []
-
-    class V(ast.NodeVisitor):
-        def visit_FunctionDef(self, node):
-            stack.append(node.name)
-            self.generic_visit(node)
-            stack.pop()
-        visit_AsyncFunctionDef = visit_FunctionDef
-
-        def visit_Call(self, node):
-            f = node.func
-            n = getattr(f, "id", None) or getattr(f, "attr", None)
-            if n in callers:
-                callers[n].add(stack[-1] if stack else "<module>")
-            self.generic_visit(node)
-
-    V().visit(tree)
-    assert callers == {"_write_artifact_atomic": {"artifact_put_impl"},
-                       "_archive_replaced": {"artifact_put_impl"}}
-
-
-def test_non_exclusive_writes_paired_with_archive():
-    # ADDENDUM (controller, routed from the Task 2 review — Important 2): the
-    # caller-SET tripwire above cannot see the sidecar contract — a fourth
-    # non-exclusive _write_artifact_atomic call added inside
-    # artifact_put_impl with no archive prefix, or a dropped archive prefix on
-    # an existing one, leaves the caller set unchanged (still {artifact_put_impl})
-    # and so is invisible to it. This pairs each non-exclusive write with its
-    # immediately preceding sibling statement, which must be an assignment
-    # whose value is a call to _archive_replaced. ADD-ONE contract: a 4th
-    # non-exclusive write site must consciously visit spec §3a's archive
-    # contract and update the pinned (guarded, unguarded) count below.
-    #
-    # Honest limits (Task 3 review Minors 1+2; Minor 4 closed by a sibling
-    # tripwire below): this walk matches _write_artifact_atomic BY NAME at the
-    # call site, so it only classifies a write shaped as a bare `ast.Expr`
-    # statement calling that name directly — an aliased call
-    # (`w = _write_artifact_atomic; w(path, text)`) is invisible to `total`
-    # itself, not merely to the guarded/unguarded buckets, since neither
-    # `_write_artifact_atomic` nor `_archive_replaced` appears as that call's
-    # func. test_write_helpers_never_aliased (below) closes that gap
-    # independently by pinning that every BARE-NAME reference to either helper
-    # is itself a direct call. A reference reachable only as a string or an
-    # attribute at runtime (`getattr(mod, "_write...")`, `globals()[...]`) is
-    # outside ANY name-based check — the floor of static analysis, not an
-    # unclosed gap — and is covered behaviourally instead: a dynamic-lookup
-    # write that actually RUNS reddens the matrix WHEN THE OCCUPANT CLASS IS
-    # ONE THE MATRIX ENUMERATES. That qualifier is load-bearing: the matrix's
-    # occupant set is a hand-maintained list of 10, so a put path reachable
-    # only via a NEW occupant class (a new stamp field + a new verdict) is
-    # unguarded by construction — the hand-list case
-    # `~/.claude/rules/drift-guard-tests.md` rule 4 names. Likewise a new
-    # accepted STATUS value is unpinned but harmless: only the literal
-    # "partial" keeps a record replaceable, so any unknown status is treated
-    # as final on the destructive axis. Separately, the pairing check only pins that the
-    # preceding sibling CALLS _archive_replaced, not that its result is BOUND
-    # to `archived` — `_unused = _archive_replaced(...)` reads as guarded
-    # here. The `guarded+unguarded+exclusive == total` count below turns an
-    # unrecognised (non-aliased) statement shape (assignment/return) red
-    # instead of silently uncounted; the wrong-binding gap has no such
-    # structural guard and is instead caught behaviourally by the 40-cell
-    # matrix above (14 cells go red on a missing `archived_previous`).
-    tree = ast.parse(inspect.getsource(mcp_server))
-    target = next(n for n in ast.walk(tree)
-                 if isinstance(n, ast.FunctionDef) and n.name == "artifact_put_impl")
-
-    def _call_name(node):
-        if not isinstance(node, ast.Call):
-            return None
-        f = node.func
-        return getattr(f, "id", None) or getattr(f, "attr", None)
-
-    def _is_exclusive_true(call):
-        return any(kw.arg == "exclusive" and isinstance(kw.value, ast.Constant)
-                   and kw.value.value is True for kw in call.keywords)
-
-    total = sum(1 for n in ast.walk(target)
-               if isinstance(n, ast.Call) and _call_name(n) == "_write_artifact_atomic")
-
-    guarded = unguarded = exclusive = 0
-    for node in ast.walk(target):
-        for field in ("body", "orelse", "finalbody"):
-            stmts = getattr(node, field, None)
-            if not isinstance(stmts, list) or not all(
-                    isinstance(s, ast.stmt) for s in stmts):
-                continue
-            for i, stmt in enumerate(stmts):
-                if not (isinstance(stmt, ast.Expr)
-                       and _call_name(stmt.value) == "_write_artifact_atomic"):
-                    continue
-                if _is_exclusive_true(stmt.value):
-                    exclusive += 1
-                    continue
-                prev = stmts[i - 1] if i > 0 else None
-                if isinstance(prev, ast.Assign) and _call_name(prev.value) == "_archive_replaced":
-                    guarded += 1
-                else:
-                    unguarded += 1
-    # Coverage tripwire: every _write_artifact_atomic call inside
-    # artifact_put_impl must land in one of the three buckets above — a call
-    # in a statement shape the walk doesn't recognise (assignment, return,
-    # ...) would inflate `total` without moving any bucket, going red here
-    # instead of passing uncounted.
-    assert guarded + unguarded + exclusive == total
-    assert (guarded, unguarded) == (3, 0)
-
-
-def test_write_helpers_never_aliased():
-    # Minor 4 (round-2 review): both the caller-set tripwire and the pairing
-    # tripwire above match on the callee's NAME at the call site, so
-    # rebinding a helper to a local name (`w = _write_artifact_atomic` then
-    # `w(path, text)`) is unguarded, unarchived, and invisible to all three —
-    # the caller-set pin, the pairing walk, and its total-balance check
-    # alike, since none of them ever see `_write_artifact_atomic` or
-    # `_archive_replaced` as the aliased call's func. This pins that every
-    # BARE-NAME reference to either helper anywhere in the module is itself
-    # the direct func of a Call node — an alias would leave a bare `ast.Name`
-    # reference that is never called by that name. It does NOT see a name
-    # that exists only as a string or an attribute at runtime
-    # (`getattr(mod, "_write...")`, `globals()[...]`, `mod._write...`): no
-    # name-based check can, and a reachable one is caught by the matrix.
-    tree = ast.parse(inspect.getsource(mcp_server))
-    called = {id(n.func) for n in ast.walk(tree)
-             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-    assert [n.id for n in ast.walk(tree) if isinstance(n, ast.Name)
-           and n.id in {"_write_artifact_atomic", "_archive_replaced"}
-           and id(n) not in called] == []
-
-
-# --- Artifact store: folds (spec §6) ---
-
 from dockwright.mcp_server import (
     _join_worker_liveness, pipeline_status_impl, artifact_view_impl, pipeline_event_impl,
 )
 
 
 def test_pipeline_status_joins_liveness(fresh_orchestrator_dir):
-    # active writer
     register_self_impl(claude_sid="sid-live", agent="worker", name="w-live", cwd="/x", iterm_sid="i1")
     artifact_put_impl("TKT-SANDBOX-1", "spec", "a", "x", "complete", "sid-live")
-    # done writer — event in a PER-MANAGER bucket (regression for v1's done_dir_for(None) bug)
     done_dir = paths.done_dir_for("mgr-name")
     done_dir.mkdir(parents=True, exist_ok=True)
     state.write_json_atomic(done_dir / "sid-done-ev1.json",
@@ -6892,7 +5890,6 @@ def test_pipeline_status_joins_liveness(fresh_orchestrator_dir):
 
 
 def test_join_liveness_runtime_from_closed_record(fresh_orchestrator_dir):
-    # codex worker: done event AND closed record — runtime must come from closed/, not default
     done_dir = paths.done_dir_for("mgr-name")
     done_dir.mkdir(parents=True, exist_ok=True)
     state.write_json_atomic(done_dir / "sid-cx-ev1.json",
@@ -6912,11 +5909,6 @@ def test_artifact_view_renders_all(fresh_orchestrator_dir):
 
 
 def test_artifact_view_survives_corrupt_frontmatter_stamp(fresh_orchestrator_dir):
-    # parse_artifact deliberately SKIPS corrupt frontmatter lines (state.py),
-    # so a stamp can lose phase/name; the view's recovery branch rebuilds them
-    # from the <phase>.<name>.md filename. Pre-fix that branch raised
-    # NameError (Path never imported in mcp_server) and aborted the whole fold
-    # (orch-audit finding 3).
     artifact_put_impl("TKT-SANDBOX-1", "spec", "good", "GOOD-body", "complete", "s1")
     artifact_put_impl("TKT-SANDBOX-1", "review", "bad", "BAD-body", "complete", "s2")
     bad_path = paths.artifact_path("TKT-SANDBOX-1", "review", "bad")
@@ -6924,7 +5916,7 @@ def test_artifact_view_survives_corrupt_frontmatter_stamp(fresh_orchestrator_dir
     text = text.replace('phase: "review"', "phase: {corrupt")
     text = text.replace('name: "bad"', "name: {corrupt")
     bad_path.write_text(text)
-    out = artifact_view_impl("TKT-SANDBOX-1")          # must not raise
+    out = artifact_view_impl("TKT-SANDBOX-1")
     assert "spec.good" in out and "GOOD-body" in out
     assert "review.bad" in out and "BAD-body" in out
 
@@ -6932,8 +5924,8 @@ def test_artifact_view_survives_corrupt_frontmatter_stamp(fresh_orchestrator_dir
 def test_events_reader_skips_malformed_trailing_line(fresh_orchestrator_dir):
     artifact_put_impl("TKT-SANDBOX-1", "spec", "a", "x", "complete", "s1")
     with open(paths.artifact_events_path("TKT-SANDBOX-1"), "a") as f:
-        f.write('{"type":"note","trunc')          # simulated crash mid-append
-    out = pipeline_status_impl("TKT-SANDBOX-1")            # must not raise
+        f.write('{"type":"note","trunc')
+    out = pipeline_status_impl("TKT-SANDBOX-1")
     assert "artifact_put" in out
 
 
@@ -6943,8 +5935,6 @@ def test_pipeline_event_appends(fresh_orchestrator_dir):
     out = pipeline_status_impl("TKT-SANDBOX-1")
     assert "dispatch" in out and "fan-out" in out
 
-
-# --- Artifact store: retention (spec §9) ---
 
 from dockwright.mcp_server import _prune_stale_artifacts
 
@@ -6972,22 +5962,16 @@ def test_prune_sweeps_orphan_tmp(fresh_orchestrator_dir):
     fresh_tmp = d / ".spec.a.999.cafebabe.tmp"
     stale_tmp.write_text("x")
     fresh_tmp.write_text("x")
-    _age(stale_tmp, 1)                      # > 1h
+    _age(stale_tmp, 1)
     _prune_stale_artifacts()
     assert not stale_tmp.exists() and fresh_tmp.exists()
 
-
-# --- Ownership plane: spawn-path pending assignment (spec §11, §12) ---
 
 from dockwright.mcp_server import _unkeyed_key_hint, _current_branch
 
 
 @pytest.fixture
 def configured_key_regex(monkeypatch, tmp_path):
-    """Point config discovery at a temp dockwright.toml carrying an operator's
-    Jira-style key regex, so the unkeyed-spawn hint sees a configured pattern
-    exactly as an operator's deployment would — independent of the ambient
-    ~/.claude config (DOCKWRIGHT_CONFIG is authoritative)."""
     p = tmp_path / "dockwright.toml"
     p.write_text("[task_keys]\nkey_regex = '[A-Za-z]{2,}-\\d+'\n")
     monkeypatch.setenv(_config.ENV_CONFIG_PATH, str(p))
@@ -6996,9 +5980,6 @@ def configured_key_regex(monkeypatch, tmp_path):
 
 @pytest.fixture
 def no_orch_config(monkeypatch, tmp_path):
-    """Authoritative 'no config': DOCKWRIGHT_CONFIG points at a nonexistent file,
-    so config falls to generic defaults (no key derivation, no [spawn.env]) even
-    on a machine whose ~/.claude/dockwright.toml is populated."""
     monkeypatch.setenv(_config.ENV_CONFIG_PATH, str(tmp_path / "nope.toml"))
 
 
@@ -7023,8 +6004,6 @@ def test_spawn_worker_writes_pending_assignment(fresh_orchestrator_dir, monkeypa
 
 def test_spawn_worker_no_derivation_no_footer_without_config(fresh_orchestrator_dir, monkeypatch,
                                                              no_orch_config):
-    # Generic default: no [task_keys] key_regex -> a Jira-shaped reference in the
-    # prompt is NOT auto-derived, and a keyless spawn gets no artifact footer.
     captured = _patch_spawn_worker_tab(monkeypatch)
     result = _asyncio.run(spawn_worker_impl(
         initial_prompt="/ticket-start TKT-8353 extra", name="w1", cwd="/tmp"))
@@ -7035,8 +6014,6 @@ def test_spawn_worker_no_derivation_no_footer_without_config(fresh_orchestrator_
 
 
 def test_spawn_env_injected_from_config(fresh_orchestrator_dir, monkeypatch, tmp_path):
-    # [spawn.env] entries land in the spawned claude worker's env; a caller-supplied
-    # value for the same key still wins.
     cfg = tmp_path / "dockwright.toml"
     cfg.write_text('[spawn.env]\nFOO = "bar"\nSHARED = "from-config"\n')
     monkeypatch.setenv(_config.ENV_CONFIG_PATH, str(cfg))
@@ -7044,20 +6021,17 @@ def test_spawn_env_injected_from_config(fresh_orchestrator_dir, monkeypatch, tmp
     _asyncio.run(spawn_worker_impl(
         initial_prompt="task", name="w1", cwd="/tmp", env={"SHARED": "from-caller"}))
     assert captured["env"]["FOO"] == "bar"
-    assert captured["env"]["SHARED"] == "from-caller"   # caller env wins over config
+    assert captured["env"]["SHARED"] == "from-caller"
 
 
 def test_spawn_env_absent_by_default(fresh_orchestrator_dir, monkeypatch, no_orch_config):
-    # No [spawn.env] -> nothing extra is injected; in particular the former
-    # hardcoded SUPERPOWERS_AUTONOMOUS is gone from the generic default.
     captured = _patch_spawn_worker_tab(monkeypatch)
     _asyncio.run(spawn_worker_impl(initial_prompt="task", name="w1", cwd="/tmp"))
-    assert "SUPERPOWERS_AUTONOMOUS" not in captured["env"]
+    assert "WORKER_AUTONOMOUS" not in captured["env"]
 
 
 def test_spawn_env_absent_by_default_codex_unaffected(fresh_orchestrator_dir, monkeypatch,
                                                       tmp_path):
-    # [spawn.env] is claude-only; codex has its own protocol and is excluded.
     cfg = tmp_path / "dockwright.toml"
     cfg.write_text('[spawn.env]\nFOO = "bar"\n')
     monkeypatch.setenv(_config.ENV_CONFIG_PATH, str(cfg))
@@ -7073,9 +6047,9 @@ def test_spawn_worker_pending_prompt_is_pre_preset(fresh_orchestrator_dir, monke
     _asyncio.run(spawn_worker_impl(initial_prompt="the ask", name="w1", cwd="/tmp", preset="boiler"))
     (pending,) = list(paths.ASSIGNMENTS_PENDING.glob("*.json"))
     record = state.read_json(pending)
-    assert record["initial_prompt"] == "the ask"        # NOT the expanded prompt
+    assert record["initial_prompt"] == "the ask"
     assert record["preset"] == "boiler"
-    assert "BOILERPLATE" in captured["initial_prompt"]  # expansion still reaches the tab
+    assert "BOILERPLATE" in captured["initial_prompt"]
 
 
 def test_spawn_failure_unlinks_pending(fresh_orchestrator_dir, monkeypatch):
@@ -7088,16 +6062,12 @@ def test_spawn_failure_unlinks_pending(fresh_orchestrator_dir, monkeypatch):
 
 
 def test_unkeyed_hint_fires_on_prompt_or_name_mention(configured_key_regex):
-    # The token is quoted VERBATIM (the deleted derivation uppercased; an
-    # advisory must quote what the text actually contains).
     assert "TKT-4242" in _unkeyed_key_hint("scout", "background: TKT-4242 was affected")
     assert "tkt-4242" in _unkeyed_key_hint("tkt-4242-fix", "free text")
     assert _unkeyed_key_hint("scout", "no key here") is None
 
 
 def test_unkeyed_hint_is_conditional_never_a_recommendation(configured_key_regex):
-    # The hint fires on exactly the misfiling incident's shape (a prose
-    # mention), so its wording must stay conditional — never directive.
     hint = _unkeyed_key_hint("scout", "see TKT-4242 for background")
     assert "mention is not an assignment" in hint
     assert "UNKEYED" in hint
@@ -7108,7 +6078,6 @@ def test_unkeyed_hint_none_without_config(no_orch_config):
 
 
 def test_unkeyed_hint_invalid_regex_falls_to_none(monkeypatch, tmp_path):
-    # A malformed operator regex must fail-open to no hint, never crash a spawn.
     p = tmp_path / "dockwright.toml"
     p.write_text("[task_keys]\nkey_regex = '[A-Za-z'\n")
     monkeypatch.setenv(_config.ENV_CONFIG_PATH, str(p))
@@ -7116,14 +6085,11 @@ def test_unkeyed_hint_invalid_regex_falls_to_none(monkeypatch, tmp_path):
 
 
 def test_current_branch_best_effort(tmp_path):
-    assert _current_branch(str(tmp_path)) is None       # not a git repo
+    assert _current_branch(str(tmp_path)) is None
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "my-branch"], cwd=repo, check=True)
     assert _current_branch(str(repo)) == "my-branch"
-
-
-# --- Auto-publish: artifact discipline footer on keyed spawns ---
 
 
 def test_spawn_footer_injected_with_explicit_task_key(fresh_orchestrator_dir, monkeypatch):
@@ -7134,7 +6100,7 @@ def test_spawn_footer_injected_with_explicit_task_key(fresh_orchestrator_dir, mo
     text = captured["initial_prompt"]
     assert "[orchestrator] Artifact discipline — task_key: `yt-bot-public`" in text
     assert 'artifact_put(task_key="yt-bot-public"' in text
-    assert text.startswith("build the scraper")     # the ask still leads; footer trails
+    assert text.startswith("build the scraper")
 
 
 def test_spawn_footer_absent_on_prompt_mention_without_explicit_key(
@@ -7152,8 +6118,6 @@ def test_spawn_footer_absent_when_no_key_resolves(fresh_orchestrator_dir, monkey
 
 
 def test_spawn_footer_absent_on_blank_prompt_even_with_key(fresh_orchestrator_dir, monkeypatch):
-    # An empty prompt is a documented bare-runtime-session lane; injecting a footer
-    # would fabricate a first turn out of nothing.
     captured = _patch_spawn_worker_tab(monkeypatch)
     _asyncio.run(spawn_worker_impl(initial_prompt="", name="bare", cwd="/tmp", task_key="TKT-SANDBOX-1"))
     assert captured["initial_prompt"] == ""
@@ -7177,13 +6141,11 @@ def test_spawn_footer_not_in_assignment_record(fresh_orchestrator_dir, monkeypat
     _asyncio.run(spawn_worker_impl(initial_prompt="do X", name="w1", cwd="/tmp", task_key="TKT-SANDBOX-2"))
     (pending,) = list(paths.ASSIGNMENTS_PENDING.glob("*.json"))
     record = state.read_json(pending)
-    assert record["initial_prompt"] == "do X"       # raw pre-footer ask
-    assert record["ticket"] == "TKT-SANDBOX-2"              # resolution-refactor regression pin
+    assert record["initial_prompt"] == "do X"
+    assert record["ticket"] == "TKT-SANDBOX-2"
 
 
 def test_spawn_footer_present_for_codex_runtime(fresh_orchestrator_dir, monkeypatch):
-    # The footer is appended runtime-agnostically, before the spawner — pin that
-    # the codex lane gets it too.
     captured = _patch_spawn_worker_tab(monkeypatch)
     _asyncio.run(spawn_worker_impl(
         initial_prompt="port the bot", name="cx-bot", cwd="/tmp",
@@ -7191,23 +6153,16 @@ def test_spawn_footer_present_for_codex_runtime(fresh_orchestrator_dir, monkeypa
     assert "[orchestrator] Artifact discipline" in captured["initial_prompt"]
 
 
-# --- Repo freshness: sync-once footer on every non-blank spawn ---
-
-
 def test_repo_sync_footer_injected_without_task_key(fresh_orchestrator_dir, monkeypatch):
-    # Unkeyed scouts are the at-risk population — unlike the artifact footer,
-    # this one must NOT be task_key-gated.
     captured = _patch_spawn_worker_tab(monkeypatch)
     _asyncio.run(spawn_worker_impl(
         initial_prompt="just poke around", name="scout", cwd="/tmp"))
     text = captured["initial_prompt"]
     assert "[orchestrator] Repo freshness" in text
-    assert text.startswith("just poke around")      # the ask still leads
+    assert text.startswith("just poke around")
 
 
 def test_repo_sync_footer_absent_on_blank_prompt(fresh_orchestrator_dir, monkeypatch):
-    # Blank prompt = documented bare-runtime-session lane (same guard as the
-    # artifact footer): no fabricated first turn.
     captured = _patch_spawn_worker_tab(monkeypatch)
     _asyncio.run(spawn_worker_impl(initial_prompt="", name="bare", cwd="/tmp"))
     assert captured["initial_prompt"] == ""
@@ -7238,8 +6193,6 @@ def test_repo_sync_footer_lands_after_artifact_footer(fresh_orchestrator_dir, mo
 
 
 def test_repo_sync_footer_names_the_git_recipe():
-    # Content pin: a paraphrase must not drop the sync recipe, the conflicted-
-    # rebase escape hatch, or the stale-tree fallback.
     text = _repo_sync_footer()
     assert "fetch origin main" in text
     assert "merge --ff-only origin/main" in text
@@ -7254,8 +6207,6 @@ def test_repo_sync_footer_is_headless_approvable():
     assert "&&" not in footer
     assert "cd <repo>" in footer
 
-
-# --- Ownership plane: brief surfacing + pipeline_status join (spec §13) ---
 
 from dockwright.mcp_server import list_closed_workers_impl as _lcw_impl
 
@@ -7272,7 +6223,7 @@ def test_list_workers_surfaces_brief(fresh_orchestrator_dir):
     _seed_assignment("w1", "fix the DLQ handler in the billing service")
     (a, b) = sorted(list_workers_impl(), key=lambda w: w["name"])
     assert a["brief"] == "fix the DLQ handler in the billing service"
-    assert b["brief"] is None                              # no assignment → None
+    assert b["brief"] is None
 
 
 def test_list_workers_brief_truncated_to_200(fresh_orchestrator_dir):
@@ -7293,7 +6244,7 @@ def test_list_closed_workers_surfaces_brief(fresh_orchestrator_dir):
 def test_list_closed_workers_tolerates_missing_sid(fresh_orchestrator_dir):
     state.write_json_atomic(paths.CLOSED / "junk.json", {"name": "legacy", "closed_at": 1.0})
     (r,) = _lcw_impl()
-    assert r["brief"] is None                              # no crash on sid-less record
+    assert r["brief"] is None
 
 
 def test_pipeline_status_lists_assignment_with_no_artifacts(fresh_orchestrator_dir):
@@ -7308,23 +6259,19 @@ def test_pipeline_status_lists_assignment_with_no_artifacts(fresh_orchestrator_d
     })
     out = pipeline_status_impl("TKT-SANDBOX-1")
     assert "tkt-sandbox-1-impl" in out and "implement the thing" in out
-    assert "unrelated" not in out                  # other ticket filtered out
+    assert "unrelated" not in out
 
-
-# --- Ownership plane: resume interplay (spec §12) ---
 
 from dockwright.mcp_server import _spawn_and_confirm_resume
 
 
 def test_codex_lane_confirm_migrates_assignment(fresh_orchestrator_dir):
-    # closed codex worker with an assignment under the OLD sid
     state.write_json_atomic(paths.CLOSED / "old-sid.json", {
         "claude_sid": "old-sid", "name": "cx", "cwd": "/x", "runtime": "codex", "closed_at": 1.0})
     _seed_assignment("old-sid", "codex task")
     closed_path = paths.CLOSED / "old-sid.json"
 
     async def fake_spawn(**kwargs):
-        # codex rolled a fresh thread id: register under a NEW sid claiming the name
         register_self_impl(claude_sid="new-sid", agent="worker", name="cx", cwd="/x", iterm_sid="i7")
         return ("win-7", "cx")
 
@@ -7354,8 +6301,6 @@ def test_resume_spawn_passes_no_assignment_env(fresh_orchestrator_dir):
     assert "CLAUDE_ASSIGNMENT_ID" not in (captured.get("env") or {})
 
 
-# --- Ownership plane: retention (spec §14) ---
-
 from dockwright.mcp_server import _prune_stale_assignments
 
 
@@ -7364,13 +6309,13 @@ def test_prune_assignments_keeps_active_sid(fresh_orchestrator_dir):
     _seed_assignment("w1")
     _age(paths.ASSIGNMENTS / "w1.json", 31)
     _prune_stale_assignments()
-    assert (paths.ASSIGNMENTS / "w1.json").exists()        # active = absolute keep
+    assert (paths.ASSIGNMENTS / "w1.json").exists()
 
 
 def test_prune_assignments_keeps_crash_orphan_within_retention(fresh_orchestrator_dir):
-    _seed_assignment("w-crashed")                          # no active, no closed — the SIGHUP case
+    _seed_assignment("w-crashed")
     _prune_stale_assignments()
-    assert (paths.ASSIGNMENTS / "w-crashed.json").exists()  # fresh mtime → kept
+    assert (paths.ASSIGNMENTS / "w-crashed.json").exists()
 
 
 def test_prune_assignments_removes_stale(fresh_orchestrator_dir):
@@ -7386,7 +6331,7 @@ def test_prune_pending_sweeps_orphans(fresh_orchestrator_dir):
     fresh_p = paths.ASSIGNMENTS_PENDING / "aid-new.json"
     stale.write_text("{}")
     fresh_p.write_text("{}")
-    _age(stale, 2)                                         # > 24h
+    _age(stale, 2)
     _prune_stale_assignments()
     assert not stale.exists() and fresh_p.exists()
 
@@ -7397,16 +6342,12 @@ def test_prune_pending_sweeps_window_sidecar_orphans(fresh_orchestrator_dir):
     fresh_p = paths.pending_window_path("aid-new")
     stale.write_text("777")
     fresh_p.write_text("888")
-    _age(stale, 2)                                         # > 24h
+    _age(stale, 2)
     _prune_stale_assignments()
     assert not stale.exists() and fresh_p.exists()
 
 
 def test_spawn_path_sweeps_expired_pending_litter(fresh_orchestrator_dir, monkeypatch):
-    # Failed spawns leave .pending pairs for late registration; the 24h TTL
-    # reap used to run only on rare cold paths (list_closed_workers /
-    # pipeline_status), so on a spawn-only fleet the litter never cleared
-    # (VM E2E L-9). The spawn path is the pendings' write site — it sweeps.
     monkeypatch.delenv("CLAUDE_ORCH_WORKER_RC", raising=False)
     _patch_spawn_worker_tab(monkeypatch)
     paths.ASSIGNMENTS_PENDING.mkdir(parents=True, exist_ok=True)
@@ -7420,18 +6361,15 @@ def test_spawn_path_sweeps_expired_pending_litter(fresh_orchestrator_dir, monkey
         initial_prompt="task", name="sweeper", cwd="/tmp/x",
         _registration_timeout_sec=0.2, _poll_interval=0.01))
     assert not stale_json.exists() and not stale_window.exists()
-    # The spawn's OWN fresh pending pair must survive its no_register outcome.
     assert paths.pending_assignment_path(result["assignment_id"]).exists()
 
-
-# --- Review-fix regressions (code-review round 1) ---
 
 def test_folds_tolerate_corrupted_stamp_lines(fresh_orchestrator_dir):
     artifact_put_impl("TKT-SANDBOX-1", "spec", "srs", "the body", "complete", "sid-1")
     p = paths.artifact_path("TKT-SANDBOX-1", "spec", "srs")
     corrupted = p.read_text().replace('status: "complete"', "status: {broken")
     p.write_text(corrupted)
-    status_out = pipeline_status_impl("TKT-SANDBOX-1")     # must not raise (Important #2)
+    status_out = pipeline_status_impl("TKT-SANDBOX-1")
     assert "spec.srs" in status_out
     view_out = artifact_view_impl("TKT-SANDBOX-1")
     assert "the body" in view_out
@@ -7439,10 +6377,9 @@ def test_folds_tolerate_corrupted_stamp_lines(fresh_orchestrator_dir):
 
 def test_prune_artifacts_tolerates_vanishing_entries(fresh_orchestrator_dir):
     artifact_put_impl("TKT-SANDBOX-1", "spec", "srs", "x", "complete", "s1")
-    # dangling symlink: rglob yields it, .stat() raises FileNotFoundError (Important #3)
     (paths.artifact_ticket_dir("TKT-SANDBOX-1") / "dangling").symlink_to(
         fresh_orchestrator_dir / "nope-does-not-exist")
-    _prune_stale_artifacts()                        # must not raise
+    _prune_stale_artifacts()
     assert paths.artifact_ticket_dir("TKT-SANDBOX-1").exists()
 
 
@@ -7452,10 +6389,8 @@ def test_spawn_value_error_unlinks_pending(fresh_orchestrator_dir, monkeypatch):
     monkeypatch.setattr(spawner, "spawn_worker_tab", raise_value_error)
     with pytest.raises(ValueError):
         _asyncio.run(spawn_worker_impl(initial_prompt="x", name="w1", cwd="/tmp"))
-    assert list(paths.ASSIGNMENTS_PENDING.glob("*.json")) == []   # Minor #1
+    assert list(paths.ASSIGNMENTS_PENDING.glob("*.json")) == []
 
-
-# --- Personal task keys (no Jira ticket) ---
 
 def test_spawn_worker_explicit_task_key_wins_over_derivation(fresh_orchestrator_dir, monkeypatch,
                                                              configured_key_regex):
@@ -7465,14 +6400,11 @@ def test_spawn_worker_explicit_task_key_wins_over_derivation(fresh_orchestrator_
         name="yt-bot-scraper", cwd="/tmp", task_key="yt-bot-public"))
     (pending,) = list(paths.ASSIGNMENTS_PENDING.glob("*.json"))
     record = state.read_json(pending)
-    assert record["ticket"] == "yt-bot-public"      # explicit task_key is the ONLY keying path
+    assert record["ticket"] == "yt-bot-public"
 
 
 def test_spawn_never_derives_key_from_prompt_prose(fresh_orchestrator_dir, monkeypatch,
                                                    configured_key_regex):
-    # The misfiling incident: no explicit task_key, an unrelated key mentioned
-    # once in a background anecdote. The spawn must stay UNKEYED — no stamped
-    # ticket, no artifact-discipline footer — and surface only an advisory hint.
     captured = _patch_spawn_worker_tab(monkeypatch)
     result = _asyncio.run(spawn_worker_impl(
         initial_prompt="investigate the filing bug; background: TKT-4242 was hit",
@@ -7491,7 +6423,7 @@ def test_spawn_never_derives_key_from_name(fresh_orchestrator_dir, monkeypatch,
     (pending,) = list(paths.ASSIGNMENTS_PENDING.glob("*.json"))
     assert state.read_json(pending)["ticket"] is None
     assert "[orchestrator] Artifact discipline" not in captured["initial_prompt"]
-    assert "tkt-4242" in result["task_key_hint"]     # verbatim, not uppercased
+    assert "tkt-4242" in result["task_key_hint"]
 
 
 def test_spawn_hint_absent_with_explicit_task_key(fresh_orchestrator_dir, monkeypatch,
@@ -7515,10 +6447,6 @@ def test_spawn_hint_absent_without_any_mention(fresh_orchestrator_dir, monkeypat
 
 def test_spawn_hint_uses_raw_caller_name_not_resolved(fresh_orchestrator_dir, monkeypatch,
                                                       configured_key_regex):
-    # _resolve_unique_name suffixes a colliding name with -<ordinal>, which can
-    # make a non-key-shaped caller name match the regex. The hint must judge the
-    # caller's RAW name. Auto-generated worker-<epoch> names (name=None) must
-    # never fire the hint either.
     _patch_spawn_worker_tab(monkeypatch)
     state.write_json_atomic(paths.ACTIVE / "sid-taken.json",
                             {"claude_sid": "sid-taken", "agent": "worker", "name": "scout"})
@@ -7540,7 +6468,6 @@ def test_spawn_worker_without_task_key_stays_unkeyed(fresh_orchestrator_dir, mon
 
 
 def test_slug_key_round_trips_store_and_joins_assignments(fresh_orchestrator_dir):
-    # arbitrary personal slug end-to-end: put -> list -> pipeline_status with assignments joined
     artifact_put_impl("yt-bot-public", "spec", "scraper", "# bot spec", "complete", "sid-bot")
     (entry,) = artifact_list_impl("yt-bot-public")
     assert entry["phase"] == "spec" and entry["name"] == "scraper"
@@ -7554,15 +6481,13 @@ def test_slug_key_round_trips_store_and_joins_assignments(fresh_orchestrator_dir
     assert "yt-bot-scraper" in out and "build the scraper half" in out
 
 
-# --- task_key fail-fast validation (verifier hardenings on #54) ---
-
 def test_spawn_worker_blank_task_key_rejected(fresh_orchestrator_dir, monkeypatch):
     _patch_spawn_worker_tab(monkeypatch)
     for blank in ("", "   "):
         with pytest.raises(ValueError, match="blank"):
             _asyncio.run(spawn_worker_impl(initial_prompt="x", name="w1", cwd="/tmp",
                                            task_key=blank))
-    assert list(paths.ASSIGNMENTS_PENDING.glob("*.json")) == []   # fail-fast: nothing written
+    assert list(paths.ASSIGNMENTS_PENDING.glob("*.json")) == []
 
 
 def test_spawn_worker_path_hostile_task_key_rejected(fresh_orchestrator_dir, monkeypatch):
@@ -7572,8 +6497,6 @@ def test_spawn_worker_path_hostile_task_key_rejected(fresh_orchestrator_dir, mon
                                        task_key="yt bot"))
     assert list(paths.ASSIGNMENTS_PENDING.glob("*.json")) == []
 
-
-# --- spend telemetry surfacing ----------------------------------------------
 
 def test_list_workers_renders_compact_spend(fresh_orchestrator_dir):
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1", pid=os.getpid())
@@ -7588,8 +6511,6 @@ def test_list_workers_renders_compact_spend(fresh_orchestrator_dir):
                            "cache_creation_1h_tokens": 0}}}
     state.write_json_atomic(paths.ACTIVE / "w1.json", record)
     workers = list_workers_impl()
-    # Money leads, priced at display time from the per-model buckets:
-    # out 340k*$25/M + in 900*$5/M + cache-rd 5.1M*$5*0.1/M = $11.05.
     assert workers[0]["spend"] == "$11.05 / 340k out / 5.1M cache-rd"
 
 
@@ -7605,10 +6526,6 @@ def test_list_workers_compact_spend_small_and_large_counts(fresh_orchestrator_di
     record["spend"] = {"turns": 1, "out_tokens": 512, "in_tokens": 0,
                        "cache_read_tokens": 0, "last_turn_out": 512, "last_msg_id": "m"}
     state.write_json_atomic(paths.ACTIVE / "w1.json", record)
-    # Pre-by_model record (no per-model buckets): tokens only, no $ figure —
-    # and no turn/episode count at all. The ledger's Stop-derived `turns` and
-    # the session report's prompt-derived episodes are DIFFERENT measures
-    # (Tier-2 round 2 measured 3/41 real divergences); neither renders here.
     spend_line = list_workers_impl()[0]["spend"]
     assert spend_line == "512 out"
     assert "turn" not in spend_line and "episode" not in spend_line
@@ -7621,7 +6538,6 @@ def test_list_workers_compact_spend_small_and_large_counts(fresh_orchestrator_di
                            "cache_creation_5m_tokens": 0,
                            "cache_creation_1h_tokens": 0}}}
     state.write_json_atomic(paths.ACTIVE / "w1.json", record)
-    # Unpriced model: the $ figure is a LOWER BOUND, marked as such.
     assert list_workers_impl()[0]["spend"] == "≥$0.00 / 2.4M out"
 
 
@@ -7635,7 +6551,6 @@ def test_worker_done_stamps_spend_totals(fresh_orchestrator_dir):
     worker_done_impl(claude_sid="w1", summary="done")
     done_files = list(paths.DONE.rglob("*.json"))
     event = state.read_json(done_files[0])
-    # Totals only — the tail cursor and per-turn value are record internals.
     assert event["spend"] == {"turns": 12, "out_tokens": 340_000,
                               "in_tokens": 900, "cache_read_tokens": 5_100_000,
                               "cache_creation_tokens": 75_000}
@@ -7647,10 +6562,6 @@ def test_worker_done_spend_none_when_never_metered(fresh_orchestrator_dir):
     event = state.read_json(list(paths.DONE.rglob("*.json"))[0])
     assert event["spend"] is None
 
-# ---- nested sub-session guards --------------------------------------------
-# Nested records (claude -p children of a registered session, flagged
-# nested:true by the SessionStart hook) stay visible for debugging but must
-# never generate manager notifications or be managed like real workers.
 
 def _write_nested_record(sid="nested-1", name="nested-abcd1234", agent="worker",
                          parent_manager_name="mgr", **overrides):
@@ -7684,13 +6595,12 @@ def test_ask_manager_nested_raises_without_question_file(fresh_orchestrator_dir)
 
 
 def test_ask_manager_resume_nested_raises(fresh_orchestrator_dir):
-    """Resume must run the same record/nested validation as a fresh ask."""
     from dockwright.mcp_server import _write_question
     qid = _write_question(worker_sid="nested-1", worker_name="nested", question="q?")
     _write_nested_record()
     with pytest.raises(ValueError, match="nested"):
         _asyncio.run(ask_manager_impl("nested-1", "q?", poll_interval=0.01, resume_question_id=qid))
-    assert len(list(paths.QUESTIONS.rglob("*.json"))) == 1  # question untouched
+    assert len(list(paths.QUESTIONS.rglob("*.json"))) == 1
 
 
 def test_kill_worker_nested_refuses(fresh_orchestrator_dir):
@@ -7726,8 +6636,6 @@ def test_list_managers_excludes_nested_manager_records(fresh_orchestrator_dir):
 
 
 def test_backfill_ignores_nested_records(fresh_orchestrator_dir, capsys):
-    """A nested manager-agent ghost must not break single-manager attribution,
-    and null-parent nested workers must not get stamped."""
     from dockwright.mcp_server import _backfill_legacy_workers
     register_self_impl(claude_sid="mgr-1", agent="manager", name="real-mgr",
                        cwd="/x", iterm_sid="9", pid=os.getpid())
@@ -7750,16 +6658,11 @@ def test_spawn_worker_default_title_is_plain_name(monkeypatch):
     _asyncio.run(spawner.spawn_worker_tab(
         cwd="/tmp/x", initial_prompt="hi", name="alpha"))
     argv = list(captured["args"])
-    # tmux passes the window name via -n; default worker title is <name> (no emoji).
     assert "-n" in argv and argv[argv.index("-n") + 1] == "alpha"
     assert not any("[w]" in str(a) for a in argv)
 
 
 def test_resolve_manager_window_title_match_without_exclude_id(monkeypatch):
-    """tmux ls omits env so Pass-1 (session-id) never fires; Pass-2 title match
-    must run even when exclude_id is empty (send_manager_to_manager caller has no
-    exclude_id — it's a send, not a close, so matching the peer's own titled window
-    is the intent)."""
     import dockwright.mcp_server as m
     data = [{"wm_class": "mgr", "tabs": [{"title": "alpha · general",
              "windows": [{"id": "%3", "cwd": "/c", "title": "alpha · general", "pid": "1"}]}]}]
@@ -7768,9 +6671,6 @@ def test_resolve_manager_window_title_match_without_exclude_id(monkeypatch):
 
 
 def test_match_worker_by_cwd_uniqueness_on_tmux():
-    """tmux ls populates {id,cwd,title,pid} only — no foreground_processes key.
-    The function must fall back to cwd-uniqueness and return the single matching
-    window id instead of silently returning ''."""
     import dockwright.mcp_server as m
     data = [{"wm_class": "claude-workers", "tabs": [{"title": "w",
              "windows": [{"id": "%6", "cwd": "/work/x", "title": "t", "pid": "2"}]}]}]
@@ -7779,10 +6679,6 @@ def test_match_worker_by_cwd_uniqueness_on_tmux():
 
 
 def test_mcp_send_and_close_emit_tmux_argv(fresh_orchestrator_dir, monkeypatch):
-    """Regression guard: with tmux backend, _send_text and _close_window
-    route through TmuxDriver and emit tmux argv (send-keys + kill-pane), not kitty argv.
-    Uses the internal helpers directly so we avoid the full window-resolve scaffolding
-    needed by send_manager_to_worker_impl while still covering the routing path."""
     import subprocess as _sp
     from dockwright import terminal
     import dockwright.mcp_server as srv
@@ -7799,35 +6695,29 @@ def test_mcp_send_and_close_emit_tmux_argv(fresh_orchestrator_dir, monkeypatch):
 
     monkeypatch.setattr(_sp, "run", _fake_run)
 
-    # Exercise send path
     srv._send_text("%5", "hello worker")
-    # Exercise close path
     srv._close_window("%5")
 
-    # send_text should have emitted at least one "send-keys ... Enter"
     assert any(
         "send-keys" in c and c[-1] == "Enter" and "%5" in c
         for c in calls
     ), f"No tmux send-keys Enter found in: {calls}"
 
-    # close should have emitted kill-pane targeting %5
     assert any(
         c[0] == "tmux" and "kill-pane" in c and "%5" in c
         for c in calls
     ), f"No tmux kill-pane %5 found in: {calls}"
 
-    # Confirm it's tmux, not kitty
     assert not any("kitty" in c[0] for c in calls), f"kitty appeared in calls: {calls}"
 
 
 def test_await_input_ready_returns_when_idle(fresh_orchestrator_dir, monkeypatch):
-    """Claude lane: polls _input_is_idle and returns as soon as the box is ready."""
     import dockwright.mcp_server as srv
     calls = {"n": 0}
 
     def fake_idle(screen):
         calls["n"] += 1
-        return calls["n"] >= 3          # ready on the 3rd poll
+        return calls["n"] >= 3
 
     monkeypatch.setattr(srv, "_capture_text", lambda wid: "screen")
     monkeypatch.setattr(srv, "_input_is_idle", fake_idle)
@@ -7836,17 +6726,13 @@ def test_await_input_ready_returns_when_idle(fresh_orchestrator_dir, monkeypatch
     assert calls["n"] == 3
 
 def test_await_input_ready_times_out_without_raising(fresh_orchestrator_dir, monkeypatch):
-    """Claude lane: never-idle pane (or _capture_text=None) → returns after the
-    bounded timeout, no exception — typing into a booting pane is best-effort."""
     import dockwright.mcp_server as srv
-    monkeypatch.setattr(srv, "_capture_text", lambda wid: None)   # unreadable forever
+    monkeypatch.setattr(srv, "_capture_text", lambda wid: None)
     monkeypatch.setattr(srv, "_INPUT_READY_POLL_SEC", 0.0)
     monkeypatch.setattr(srv, "_INPUT_READY_TIMEOUT_SEC", 0.05)
-    _asyncio.run(srv._await_input_ready("555", "claude"))          # must not raise
+    _asyncio.run(srv._await_input_ready("555", "claude"))
 
 def test_await_input_ready_codex_short_circuits(fresh_orchestrator_dir, monkeypatch):
-    """Codex lane: _input_is_idle is Claude-caret-specific and can NEVER pass on a
-    codex pane — the helper must take the fixed sleep and never call it."""
     import dockwright.mcp_server as srv
 
     def boom(screen):
@@ -7857,14 +6743,12 @@ def test_await_input_ready_codex_short_circuits(fresh_orchestrator_dir, monkeypa
     _asyncio.run(srv._await_input_ready("555", "codex"))
 
 def test_await_input_ready_no_window_id_returns_immediately(fresh_orchestrator_dir, monkeypatch):
-    """No window id to poll → nothing to wait on (delivery's own resolve retries cover it)."""
     import dockwright.mcp_server as srv
     monkeypatch.setattr(srv, "_capture_text",
                         lambda wid: (_ for _ in ()).throw(AssertionError("no poll expected")))
     _asyncio.run(srv._await_input_ready("", "claude"))
 
 
-# --- send_manager_to_worker auto_resume lane ---
 from dockwright.mcp_server import send_manager_to_worker_auto_impl as _auto_send
 
 
@@ -7876,7 +6760,6 @@ def _write_closed(name, sid, cwd="/tmp/wt", runtime="claude", closed_at=1.0):
 
 
 def test_auto_send_live_worker_delivers_without_resume(fresh_orchestrator_dir, monkeypatch):
-    """Target alive → normal delivery; no resume, no `resumed` key in the result."""
     import dockwright.mcp_server as srv
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="42")
     typed = []
@@ -7892,20 +6775,17 @@ def test_auto_send_live_worker_delivers_without_resume(fresh_orchestrator_dir, m
 
 
 def test_auto_send_resumes_closed_worker_and_delivers(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """Closed + resumable → resume (all real guards), readiness wait, deliver to the
-    registered handle; marker appears EXACTLY once; tasked_at stamped; result carries
-    resumed/sid."""
     import dockwright.mcp_server as srv
     _make_transcript(tmp_path, monkeypatch, "gone-sid")
     _write_closed("alpha", "gone-sid")
-    _patch_spawn_registers_active(monkeypatch)   # fake spawn registers active/ + window "999"
+    _patch_spawn_registers_active(monkeypatch)
     typed = []
     monkeypatch.setattr(srv, "_send_text", lambda wid, text: typed.append((wid, text)))
     monkeypatch.setattr(srv, "_terminal_ls", lambda: [
         {"tabs": [{"windows": [
             {"id": "999", "cwd": "/tmp/wt",
              "foreground_processes": [{"cmdline": ["claude", "--resume"]}]}]}]}])
-    monkeypatch.setattr(srv, "_INPUT_READY_TIMEOUT_SEC", 0.0)   # skip the poll in tests
+    monkeypatch.setattr(srv, "_INPUT_READY_TIMEOUT_SEC", 0.0)
     result = _asyncio.run(_auto_send(
         "alpha", "continue", _registration_timeout_sec=2.0, _poll_interval=0.01))
     assert result["status"] == "delivered"
@@ -7919,25 +6799,21 @@ def test_auto_send_resumes_closed_worker_and_delivers(fresh_orchestrator_dir, tm
 
 
 def test_auto_send_nothing_resumable_raises_combined(fresh_orchestrator_dir):
-    """Never-existed worker → combined raise naming both the send failure and the
-    probe failure. No silent inbox."""
     with pytest.raises(ValueError, match=r"no worker named 'ghost'.*auto_resume.*no closed worker"):
         _asyncio.run(_auto_send("ghost", "hi"))
 
 
 def test_auto_send_closed_without_transcript_raises_combined(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """Closed record exists but its transcript is gone → probe error surfaced."""
-    monkeypatch.setenv("HOME", str(tmp_path))   # empty projects tree → no transcripts
+    monkeypatch.setenv("HOME", str(tmp_path))
     _write_closed("alpha", "dead-sid")
     with pytest.raises(ValueError, match=r"auto_resume.*none have a live transcript"):
         _asyncio.run(_auto_send("alpha", "hi"))
 
 
 def test_auto_send_registration_timeout_raises_and_keeps_record(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """resume returns ok:False → raise 'message NOT delivered'; closed record intact."""
     _make_transcript(tmp_path, monkeypatch, "stuck-sid")
     _write_closed("alpha", "stuck-sid")
-    _patch_spawn_worker_tab(monkeypatch)   # spawns but never registers active/
+    _patch_spawn_worker_tab(monkeypatch)
     with pytest.raises(ValueError, match="message NOT delivered"):
         _asyncio.run(_auto_send("alpha", "hi",
                                 _registration_timeout_sec=0.05, _poll_interval=0.01))
@@ -7945,8 +6821,6 @@ def test_auto_send_registration_timeout_raises_and_keeps_record(fresh_orchestrat
 
 
 def test_auto_send_manager_holder_refused(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """Name held by an active MANAGER + a same-name closed worker record → the
-    resume holder-guard refusal propagates (no delivery, no resume)."""
     _make_transcript(tmp_path, monkeypatch, "old-worker-sid")
     state.write_json_atomic(paths.ACTIVE / "mgr1.json", {
         "claude_sid": "mgr1", "agent": "manager", "name": "happy-yak",
@@ -7957,8 +6831,6 @@ def test_auto_send_manager_holder_refused(fresh_orchestrator_dir, tmp_path, monk
 
 
 def test_auto_send_nested_target_raises(fresh_orchestrator_dir):
-    """Nested target: live path refuses; no closed record → combined raise carries
-    the nested refusal."""
     state.write_json_atomic(paths.ACTIVE / "nested-abcd.json", {
         "claude_sid": "nested-abcd", "agent": "worker", "name": "nested-abcd1234",
         "cwd": "/x", "pid": os.getpid(), "started_at": 0,
@@ -7968,12 +6840,10 @@ def test_auto_send_nested_target_raises(fresh_orchestrator_dir):
 
 
 def test_auto_send_codex_lane(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """Codex closed record → resume via the codex lane; readiness wait takes the
-    fixed codex sleep (never polls _input_is_idle); delivery proceeds."""
     import dockwright.mcp_server as srv
     _make_codex_transcript(tmp_path, monkeypatch, "cx-sid")
     _write_closed("cx", "cx-sid", cwd="/tmp/cx", runtime="codex")
-    _patch_spawn_registers_active(monkeypatch)   # registers under resume_sid, runtime codex
+    _patch_spawn_registers_active(monkeypatch)
     typed = []
     monkeypatch.setattr(srv, "_send_text", lambda wid, text: typed.append(text))
     monkeypatch.setattr(srv, "_terminal_ls", lambda: [
@@ -7991,8 +6861,6 @@ def test_auto_send_codex_lane(fresh_orchestrator_dir, tmp_path, monkeypatch):
 
 
 def test_auto_send_concurrent_resume_in_flight_raises(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """A resume of the same name already in flight → the dedup guard raises; the
-    loser retries later and lands on the live path once registration completes."""
     import dockwright.mcp_server as srv
     _make_transcript(tmp_path, monkeypatch, "rr-sid")
     _write_closed("alpha", "rr-sid")
@@ -8005,7 +6873,6 @@ def test_auto_send_concurrent_resume_in_flight_raises(fresh_orchestrator_dir, tm
 
 
 def test_auto_send_spawn_failure_propagates_and_keeps_record(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """Tab spawn fails (RuntimeError from resume) → propagates; closed record intact."""
     _make_transcript(tmp_path, monkeypatch, "sp-sid")
     _write_closed("alpha", "sp-sid")
 
@@ -8019,16 +6886,11 @@ def test_auto_send_spawn_failure_propagates_and_keeps_record(fresh_orchestrator_
 
 
 def test_auto_send_post_resume_delivery_failure_names_resumed_sid(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """Resume succeeds but the delivery send fails (no window resolvable) → the raise
-    must carry the corrected guidance (worker WAS resumed; retry a plain send), not
-    the live-path 'resume_worker or re-spawn' text."""
     import dockwright.mcp_server as srv
     _make_transcript(tmp_path, monkeypatch, "pr-sid")
     _write_closed("alpha", "pr-sid")
 
     async def fake_spawn(**kwargs):
-        # Register active/ (confirms resume) but with NO window id and a cwd that
-        # never matches the (empty) terminal listing → post-resume send raises.
         sid = kwargs.get("resume_sid")
         state.write_json_atomic(paths.ACTIVE / f"{sid}.json", {
             "claude_sid": sid, "agent": "worker", "name": kwargs.get("name"),
@@ -8046,8 +6908,6 @@ def test_auto_send_post_resume_delivery_failure_names_resumed_sid(fresh_orchestr
 
 
 def test_send_tool_default_auto_resume_false_unchanged(fresh_orchestrator_dir, tmp_path, monkeypatch):
-    """The async tool wrapper with auto_resume omitted behaves exactly like today:
-    closed worker → the live-path raise, resume never attempted."""
     import dockwright.mcp_server as srv
     _make_transcript(tmp_path, monkeypatch, "cl-sid")
     _write_closed("alpha", "cl-sid")
@@ -8072,9 +6932,6 @@ def _write_manager_record(sid, name, **overrides):
 
 
 def test_list_managers_flags_never_took_a_turn(fresh_orchestrator_dir):
-    """The %405 ghost class: registered long ago, zero completed turns. Keyed on
-    BOTH last_turn_at (conditional stamp) and last_turn_at_uptime (unconditional
-    per Stop) so a live manager with broken transcript resolution never flags."""
     from dockwright.mcp_server import list_managers
     now = time.time()
     _write_manager_record("ghost", "noisy-wizard-2", started_at=now - 700)
@@ -8086,9 +6943,9 @@ def test_list_managers_flags_never_took_a_turn(fresh_orchestrator_dir):
     _write_manager_record("no-birth", "ancient-one", started_at=None)
     flags = {m["name"]: m["never_took_a_turn"] for m in list_managers()}
     assert flags == {
-        "noisy-wizard-2": True,     # never turned, past grace
-        "fresh-boot": False,        # never turned, inside grace
-        "old-faithful": False,      # turned
-        "quiet-scribe": False,      # Stop fired (uptime stamp), transcript never resolved
-        "ancient-one": True,        # identity-less ancient record IS the anomaly
+        "noisy-wizard-2": True,
+        "fresh-boot": False,
+        "old-faithful": False,
+        "quiet-scribe": False,
+        "ancient-one": True,
     }

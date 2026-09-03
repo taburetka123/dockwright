@@ -1,15 +1,3 @@
-"""`dockwright spend-cost`: per-model USD spend reconstructed from full
-transcripts.
-
-Fixes the three meter defects of the prior ledger-based meter: tail truncation (reads the WHOLE
-transcript), flat-Sonnet pricing (prices per model via pricing.py), and
-cache-creation omission (includes cache writes with their TTL multiplier).
-
-Reconstructs from transcripts rather than the token ledger because the ledger
-is tail-truncated and modelless for the historical window; the transcripts are
-the source of truth. One session = one sid = one transcript (account-autoswitch's
-multiple ledger rows collapse to one session).
-"""
 import argparse
 import json
 import sys
@@ -30,9 +18,6 @@ def _date_of(ts) -> date:
 
 
 def collect_sessions() -> list:
-    """One {sid, date, name, runtime} per unique session across the ledger,
-    closed/, and active/ — keyed on sid (a session is one transcript), keeping
-    the latest end date when a sid appears more than once."""
     seen: dict = {}
 
     def _add(sid, when, name, runtime):
@@ -58,9 +43,7 @@ def collect_sessions() -> list:
 
 
 def build_report(*, since: date, until: date) -> dict:
-    """Reconstruct per-model USD spend for sessions whose end date is in
-    [since, until]."""
-    models: dict = {}        # canonical token+cost accumulation, keyed by raw model id
+    models: dict = {}
     anatomy = {"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0}
     total = 0.0
     sessions_counted = 0

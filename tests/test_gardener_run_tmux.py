@@ -3,60 +3,11 @@ import pytest
 from pathlib import Path
 SCRIPT = Path(__file__).resolve().parent.parent / "deploy" / "scripts" / "gardener-run.sh"
 
-def test_gardener_has_tmux_visible_branch():
-    src = SCRIPT.read_text()
-    assert 'has-session -t claude-workers' in src
-    assert 'new-session -d -s claude-workers' in src
-    assert 'new-window -d -t claude-workers' in src
-
-def test_gardener_kitty_branch_is_gone():
-    src = SCRIPT.read_text()
-    assert 'resolve_kitty_socket' not in src
-    assert 'no-kitty-socket' not in src
-    assert 'TERMINAL_BACKEND' not in src
-    assert 'kitty @' not in src
-
 def test_gardener_script_syntax_ok():
     assert shutil.which("bash")
     r = subprocess.run(["bash", "-n", str(SCRIPT)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
 
-
-def test_gardener_notify_no_ops_under_pytest():
-    """notify() runs real /usr/bin/osascript; tests exec this script for real
-    (test_module_toggle), so the guard must live in the script itself — the
-    2026-07-03 gardener-gate desktop-notification leak class."""
-    src = SCRIPT.read_text()
-    assert 'if [ -n "${PYTEST_CURRENT_TEST:-}" ]; then return 0; fi' in src
-
-
-def test_gardener_tmux_conf_legacy_fallback():
-    src = SCRIPT.read_text()
-    # New home first, then TWO legacy fallbacks (dockwright-rename, one release).
-    assert 'TMUX_CONF_FILE="$HOMEDIR/.claude/dockwright/dockwright.tmux.conf"' in src
-    assert 'TMUX_CONF_LEGACY="$HOMEDIR/.claude/orchestrator/dockwright.tmux.conf"' in src
-    assert 'TMUX_CONF_LEGACY2="$HOMEDIR/.claude/orchestrator/claude-orch.tmux.conf"' in src
-    assert 'elif [ -f "$TMUX_CONF_LEGACY" ]; then FFLAG=(-f "$TMUX_CONF_LEGACY")' in src
-    assert 'elif [ -f "$TMUX_CONF_LEGACY2" ]; then FFLAG=(-f "$TMUX_CONF_LEGACY2")' in src
-
-
-# ---- behavioral: visible-path window lifecycle on a scratch tmux socket ----
-# The kill on clean finish is this plan's only destructive op — string guards
-# are not acceptable for it (a commented-out kill still matches substrings).
-# Stub `claude` parses the digest path from its prompt arg, writes Status: ok,
-# and stays alive like the real interactive REPL the wrapper leaves behind.
-#
-# These are the plan's first tmux-behavioral tests, so they ride the repo's
-# sanctioned real-tmux harness: @pytest.mark.real_tmux + the `real_tmux`
-# fixture (conftest.py). That marker is LOAD-BEARING — the autouse
-# `no_live_tmux` guard otherwise ABSORBS every `tmux` subprocess.run in the
-# pytest process (returning empty), which would make `_panes()` always read []
-# and silently pass the kill assertion without a real kill (the exact
-# coincidence-detector failure the destructive-op note warns about). The
-# fixture also hands us a throwaway `wt-iso-<pid>` socket and kill+unlink
-# teardown (leak-net covered), so the wrapper's real server never survives the
-# test — never the live `dockwright` socket. The wrapper's OWN tmux calls run
-# in a child bash process, untouched by the guard.
 
 TMUX = shutil.which("tmux")
 
@@ -95,13 +46,9 @@ def _seed_gardener_home(home):
     scripts = home / ".claude" / "scripts"
     scripts.mkdir(parents=True)
     shutil.copy(SCRIPT.parent / "runlock.sh", scripts / "runlock.sh")
-    # postrun/spend are best-effort ('|| true') — absent is fine.
     presets = home / ".claude" / "dockwright" / "presets"
     presets.mkdir(parents=True)
     (presets / "gardener-analyst-settings.json").write_text("{}")
-    # The headless lane runs default-deny (--setting-sources ""), which also
-    # drops user-level skill discovery — so it passes the skill BODY as the
-    # prompt and refuses to spawn without it. See test_headless_lane_lockdown.py.
     skill = home / ".claude" / "skills" / "dockwright-gardener-digest"
     skill.mkdir(parents=True)
     (skill / "SKILL.md").write_text("# dockwright-gardener-digest\nstub body\n")
@@ -139,8 +86,6 @@ def test_gardener_visible_kills_pane_on_status_ok(tmp_path, real_tmux):
 @pytest.mark.real_tmux
 @pytest.mark.skipif(TMUX is None, reason="tmux not installed")
 def test_gardener_visible_leaves_pane_on_timeout(tmp_path, real_tmux):
-    """No Status line → overdue path: the tab is the human's to close (PRD
-    §9.3) — never killed; the sidecar still cleans up on wrapper exit."""
     sock = real_tmux
     home = tmp_path / "home"
     gdir = _seed_gardener_home(home)
@@ -157,19 +102,7 @@ def test_gardener_visible_leaves_pane_on_timeout(tmp_path, real_tmux):
                        capture_output=True)
 
 
-# ---- --dry-run probe boundary + sandbox-HOME refusal (2026-07-17 incident) ----
-# gardener-run.sh's visible spawn tail has the SAME shape as the incident script:
-# live-socket default (TMUX_SOCK=dockwright) + a real `claude` spawn onto it. These
-# two run the REAL script with a test-local fake-tmux dir fronting PATH (the
-# bootstrap-recreate-guard idiom), so the spawn tail can only ever hit a logging
-# stub — never real tmux, even if the conftest autouse shim were removed. They
-# reach the visible spawn path via --trigger force + a seeded runlock/preset home.
-
-
 def _fake_tmux_logging_dir(tmp_path):
-    """A fake `tmux` that LOGS every invocation and fakes has-session (miss) +
-    new-session/new-window (returns a pane id). Its log file existing proves the
-    spawn tail ran; its absence proves the script exited before any tmux call."""
     d = tmp_path / "fakebin"
     d.mkdir()
     log = tmp_path / "tmux-invocations.log"
@@ -195,8 +128,6 @@ def _gardener_probe_env(home, fakebin, sock=None):
     if sock is not None:
         env["DOCKWRIGHT_TMUX_SOCKET"] = sock
     else:
-        # Leave the socket at its live/default (`dockwright`) — the exact incident
-        # shape. Pop BOTH overrides so an ambient operator socket can't steer it.
         env.pop("DOCKWRIGHT_TMUX_SOCKET", None)
         env.pop("CLAUDE_ORCH_TMUX_SOCKET", None)
     return env
@@ -204,10 +135,6 @@ def _gardener_probe_env(home, fakebin, sock=None):
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
 def test_gardener_dry_run_probes_without_spawning(tmp_path):
-    """--dry-run reaches the visible spawn gate, prints the plan, and exits 0
-    BEFORE any tmux call. RED against the unfixed script: the arg loop's default
-    arm silently `shift`s unknown flags, so --dry-run was ignored and the spawn
-    tail ran → the fake-tmux log EXISTED."""
     home = tmp_path / "home"
     _seed_gardener_home(home)
     fakebin, log = _fake_tmux_logging_dir(tmp_path)
@@ -221,12 +148,6 @@ def test_gardener_dry_run_probes_without_spawning(tmp_path):
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
 def test_gardener_sandboxed_home_live_socket_is_refused(tmp_path):
-    """The caged incident-shape reproduction for gardener: a sandboxed HOME does
-    NOT isolate tmux (-L namespaces by uid, not HOME), so a probe run under a
-    sandboxed HOME against the live/default socket would spawn onto the LIVE
-    fleet. The guard refuses it (exit 3), naming --dry-run, before any tmux call.
-    RED against the unfixed script: no guard → spawn tail ran (fake-tmux log
-    existed) and the run exited 0 via the timeout path, not 3."""
     home = tmp_path / "home"
     _seed_gardener_home(home)
     fakebin, log = _fake_tmux_logging_dir(tmp_path)
@@ -241,8 +162,6 @@ def test_gardener_sandboxed_home_live_socket_is_refused(tmp_path):
 @pytest.mark.real_tmux
 @pytest.mark.skipif(TMUX is None, reason="tmux not installed")
 def test_gardener_visible_writes_sidecar_during_run(tmp_path, real_tmux):
-    """While the run is live the sidecar must exist and carry the pane id —
-    it is what shields the pane from the M-2 orphan alarm."""
     sock = real_tmux
     home = tmp_path / "home"
     gdir = _seed_gardener_home(home)

@@ -109,8 +109,6 @@ class TestIntervalAndMarker:
         assert decision == "frontier"
 
     def test_marker_just_past_boundary_fires(self, gate):
-        # 0.01d above the boundary, not exactly 7.0 — utime/float round-trip
-        # noise at the exact boundary would make that assertion flaky.
         _arm_marker(gate, age_days=7.01)
         assert gate.decide(NOW, force=False)[0] == "frontier"
 
@@ -118,8 +116,6 @@ class TestIntervalAndMarker:
         assert gate.INTERVAL_DAYS == 7.0
 
     def test_interval_env_override(self, gate, monkeypatch, tmp_path):
-        # Override must differ from the 7d default to discriminate: an 8d-old
-        # marker fires under the default but not under a 28d override.
         monkeypatch.setenv("GARDENER_FRONTIER_INTERVAL_DAYS", "28")
         mod = _load_gate()
         monkeypatch.setattr(mod, "GARDENER_DIR", gate.GARDENER_DIR)
@@ -147,7 +143,7 @@ class TestRetryGap:
     def test_digest_lane_runs_do_not_cool_frontier(self, gate):
         _arm_marker(gate, age_days=40)
         _ledger_run_start(gate, age_sec=3600, lane="digest")
-        _ledger_run_start(gate, age_sec=7200, lane=None)  # legacy = digest
+        _ledger_run_start(gate, age_sec=7200, lane=None)
         assert gate.decide(NOW, force=False)[0] == "frontier"
 
     def test_legacy_event_envelope_tolerated(self, gate):
@@ -162,7 +158,6 @@ class TestRetryGap:
 
 class TestHostileInputs:
     def test_future_dated_marker_is_not_due(self, gate):
-        # negative age (clock skew / restored backup) must read as benign
         gate.MARKER_PATH.write_text("frontier marker\n")
         future = NOW + 3 * 86400
         os.utime(gate.MARKER_PATH, (future, future))

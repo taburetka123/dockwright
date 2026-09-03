@@ -1,31 +1,4 @@
 #!/usr/bin/env bash
-# loop-label-prefix.sh — resolve this operator's launchd label-prefix for
-# background loops ([loops].label_prefix in dockwright.toml; default
-# "com.dockwright" — src/dockwright/config.py DEFAULT_LOOP_LABEL_PREFIX).
-#
-# Sourced by deploy/scripts/*-install.sh. setup.sh cp's this file into
-# ~/.claude/scripts/ alongside the install scripts (same flat directory as
-# the repo checkout's deploy/scripts/), so the relative lookup below resolves
-# whether an install script runs from the repo checkout or from its deployed
-# copy.
-#
-# Two tiers:
-#   1. Import the real config.py (repo checkout + its venv, found two levels
-#      up from this file) — the authoritative resolution, including every
-#      discovery-order / tilde-expansion edge case config.py itself handles.
-#   2. Self-contained fallback: re-read the SAME operator config file
-#      directly (env DOCKWRIGHT_CONFIG -> XDG_CONFIG_HOME/dockwright ->
-#      ~/.claude/dockwright.toml), needing no package import at all. This is
-#      what makes a deployed-copy (re)install — no adjacent repo checkout —
-#      still honour an operator override (e.g. this operator's
-#      ~/.claude/dockwright.toml [loops].label_prefix = "com.dockwright").
-# Both tiers default to "com.dockwright" on any failure (fail-open, the same
-# contract config.py itself guarantees).
-#
-# CAVEAT: changing label_prefix between installs of the SAME loop makes the
-# NEXT (re)install create a plist under the NEW label — the old one is not
-# removed automatically. Bootout + rm the old plist by hand (see each
-# install script's own "Uninstall" comment) when switching prefixes.
 
 dockwright_loop_label_prefix() {
   local script_dir repo_root prefix py
@@ -82,18 +55,6 @@ PYEOF
   echo "${prefix:-com.dockwright}"
 }
 
-# _dockwright_toml_get <section> <key> <kind> — echo the dockwright.toml value
-# at [section] key, resolved through the SAME discovery order config.py uses
-# (env DOCKWRIGHT_CONFIG -> XDG_CONFIG_HOME/dockwright -> ~/.claude/...).
-# <kind> shapes the output: bool -> "true"/"false"; path -> the ~-expanded
-# string; list -> one item per line; str (default) -> the raw string. Prints
-# NOTHING when the key is unset/absent so every caller applies its own default.
-#
-# tomllib is used when the interpreter has it (py3.11+); a minimal scanner is
-# the fallback for the py3.9 /usr/bin/python3 some launchd / SessionEnd-hook
-# contexts resolve `python3` to (no tomllib there). The scanner covers only the
-# simple scalar / inline-list shapes dockwright.toml uses — it is NOT a general
-# TOML parser. Fail-open: any error prints nothing.
 _dockwright_toml_get() {
   DOCKWRIGHT_Q_SECTION="$1" DOCKWRIGHT_Q_KEY="$2" DOCKWRIGHT_Q_KIND="${3:-str}" \
   python3 - <<'PYEOF' 2>/dev/null
@@ -193,9 +154,6 @@ else:
 PYEOF
 }
 
-# dockwright_module_enabled <module> — exit 0 (enabled) / 1 (disabled). Reads
-# [modules].<module>; ONLY an explicit `<module> = false` disables. Default +
-# fail-open (missing key / no config / parse error): ENABLED.
 dockwright_module_enabled() {
   local name="${1:?module name required}" value
   value="$(_dockwright_toml_get modules "$name" bool)" || value=""
@@ -203,14 +161,10 @@ dockwright_module_enabled() {
   return 0
 }
 
-# dockwright_repo_path — echo the ~-expanded [paths].dockwright_repo, or
-# nothing when unset (self-referential tooling home; e.g. the Gardener cwd).
 dockwright_repo_path() {
   _dockwright_toml_get paths dockwright_repo path
 }
 
-# dockwright_high_skills — echo [gardener].high_skills, one skill name per
-# line (empty when unset). The selffix trigger's task-triage HIGH gate.
 dockwright_high_skills() {
   _dockwright_toml_get gardener high_skills list
 }

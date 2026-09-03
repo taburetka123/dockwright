@@ -10,8 +10,6 @@ from dockwright import terminal
 
 
 def _reset_driver(monkeypatch):
-    # Reset the process-wide cache so each _terminal_ls test gets a fresh
-    # TmuxDriver (the only backend).
     terminal._DRIVER = None
 
 
@@ -166,8 +164,6 @@ def test_protected_window_ids_includes_fresh_gardener_sidecar(fresh_orchestrator
 
 
 def test_protected_window_ids_ignores_stale_gardener_sidecar(fresh_orchestrator_dir):
-    """A crashed wrapper's leaked sidecar must not hide a leaked window from
-    `dockwright sweep` past the TTL."""
     live = fresh_orchestrator_dir / "gardener" / "live-windows"
     live.mkdir(parents=True)
     sidecar = live / "r1.window"
@@ -183,9 +179,6 @@ def test_non_workers_os_window_ignored(fresh_orchestrator_dir):
 
 
 def test_orphan_scan_tolerates_non_dict_elements(fresh_orchestrator_dir):
-    # _terminal_ls only validates the top level; a valid list with non-dict
-    # elements (or non-list tabs/windows) must degrade per-element, not crash
-    # the whole scan. The driver never emits this — guard, don't report.
     payload = [
         "not-a-dict",
         42,
@@ -205,7 +198,6 @@ def test_orphan_scan_tolerates_non_dict_elements(fresh_orchestrator_dir):
 
 
 def _panes_stdout(*rows):
-    # rows: (session, window_id, window_name, pane_id, cwd, pane_title, pid)
     return "\n".join(terminal._LS_FS.join(r) for r in rows) + "\n"
 
 
@@ -247,7 +239,6 @@ def test_terminal_ls_oserror_degrades(fresh_orchestrator_dir, monkeypatch):
 
 
 def test_terminal_ls_no_server_degrades_to_empty(fresh_orchestrator_dir, monkeypatch):
-    # tmux's "no server running" is a benign empty fleet, not an error.
     _reset_driver(monkeypatch)
     monkeypatch.setattr(sweep.subprocess, "run",
                         _fake_tmux_run(rc=1, stderr="no server running on /tmp/x"))
@@ -283,8 +274,6 @@ def test_orphan_mcp_client_flagged_with_evidence(fresh_orchestrator_dir):
 
 
 def test_client_with_live_claude_ancestor_never_flagged(fresh_orchestrator_dir):
-    # pid 200 -> 150 (zsh) -> 120 (claude): excluded by the ppid != 1 gate
-    # (a client still parented to its session is by definition not orphaned).
     findings = sweep.scan_orphan_mcp_clients(_ps_rows(), IMAGES)
     assert 200 not in [f["pid"] for f in findings]
 
@@ -302,10 +291,6 @@ def test_chain_walk_reaches_claude_across_hops(fresh_orchestrator_dir):
 
 
 def test_looks_like_session_matches_executable_token_only(fresh_orchestrator_dir):
-    # Only argv[0]'s basename counts: a claude/codex token anywhere else in the
-    # command line (mount args, container names, shell -c payloads) must not
-    # make a process read as a session. Empirically every real session's
-    # argv[0] is literally `claude`/`codex` (or an absolute path to it).
     assert sweep._looks_like_session("claude --settings {}")
     assert sweep._looks_like_session("/Users/testop/.local/bin/claude --resume abc")
     assert sweep._looks_like_session("codex resume xyz")
@@ -315,17 +300,12 @@ def test_looks_like_session_matches_executable_token_only(fresh_orchestrator_dir
 
 
 def test_claude_token_in_client_args_no_longer_hides_orphan(fresh_orchestrator_dir):
-    # A PPID==1 docker client whose own command carries a claude-shaped token
-    # (here a container name) used to read as a session at the walk's first
-    # step and hide the orphan. With argv[0]-only matching it is flagged.
     rows = [{"pid": 500, "ppid": 1, "etime": "01:00",
              "command": "docker run -i --rm --name claude crystaldba/postgres-mcp"}]
     assert [f["pid"] for f in sweep.scan_orphan_mcp_clients(rows, IMAGES)] == [500]
 
 
 def test_path_arg_ending_in_claude_does_not_hide_orphan(fresh_orchestrator_dir):
-    # A bare path token ending in /claude basename-matches the loose matcher
-    # and used to hide this genuine orphan.
     rows = [{"pid": 800, "ppid": 1, "etime": "01:00",
              "command": "docker run -i --rm --mount-from /mnt/claude crystaldba/postgres-mcp"}]
     assert [f["pid"] for f in sweep.scan_orphan_mcp_clients(rows, IMAGES)] == [800]
@@ -343,8 +323,6 @@ def test_ancestor_walk_survives_ppid_cycles(fresh_orchestrator_dir):
          "command": "docker run -i --rm crystaldba/postgres-mcp"},
         {"pid": 601, "ppid": 600, "etime": "01:00", "command": "zsh"},
     ]
-    # Not PPID==1, so not a candidate — but the walk must not loop forever
-    # when invoked on a cyclic snapshot.
     assert sweep._chain_reaches_live_session(600, {r["pid"]: r for r in rows}) is False
 
 
@@ -354,7 +332,7 @@ def test_leaked_containers_flagged_when_zero_clients(fresh_orchestrator_dir):
         {"container_id": "def456", "image": "crystaldba/postgres-mcp", "age": "3 days ago"},
         {"container_id": "zzz999", "image": "unrelated/img", "age": "1 hour ago"},
     ]
-    ps_rows = [r for r in _ps_rows() if r["pid"] not in (100, 200)]  # no clients
+    ps_rows = [r for r in _ps_rows() if r["pid"] not in (100, 200)]
     leaked, notes = sweep.scan_leaked_mcp_containers(containers, ps_rows, IMAGES)
     assert [c["container_id"] for c in leaked] == ["abc123", "def456"]
     assert notes == []
@@ -366,7 +344,7 @@ def test_containers_ambiguous_when_clients_exist(fresh_orchestrator_dir):
         {"container_id": "def456", "image": "crystaldba/postgres-mcp", "age": "3 days ago"},
         {"container_id": "ghi789", "image": "crystaldba/postgres-mcp", "age": "1 day ago"},
     ]
-    ps_rows = _ps_rows()  # pids 100 + 200 are clients of this image
+    ps_rows = _ps_rows()
     leaked, notes = sweep.scan_leaked_mcp_containers(containers, ps_rows, IMAGES)
     assert leaked == []
     assert len(notes) == 1
@@ -384,17 +362,13 @@ def test_containers_match_clients_no_findings(fresh_orchestrator_dir):
 
 
 def test_seconds_old_containers_not_flagged_as_leaked(fresh_orchestrator_dir):
-    # docker ps runs AFTER the ps snapshot: a container whose client started in
-    # between has no client in the snapshot and would false-flag as leaked.
-    # Sub-minute docker RunningFor strings are all seconds-scale — skip those,
-    # but say so (no silent caps).
     containers = [
         {"container_id": "old123", "image": "crystaldba/postgres-mcp", "age": "2 weeks ago"},
         {"container_id": "new456", "image": "crystaldba/postgres-mcp", "age": "5 seconds ago"},
         {"container_id": "new789", "image": "crystaldba/postgres-mcp",
          "age": "Less than a second ago"},
     ]
-    ps_rows = [r for r in _ps_rows() if r["pid"] not in (100, 200)]  # no clients
+    ps_rows = [r for r in _ps_rows() if r["pid"] not in (100, 200)]
     leaked, notes = sweep.scan_leaked_mcp_containers(containers, ps_rows, IMAGES)
     assert [c["container_id"] for c in leaked] == ["old123"]
     assert any("2 container(s) younger than a minute" in n for n in notes)
@@ -404,15 +378,13 @@ def test_all_young_containers_only_note_no_flags(fresh_orchestrator_dir):
     containers = [
         {"container_id": "new456", "image": "crystaldba/postgres-mcp", "age": "9 seconds ago"},
     ]
-    ps_rows = [r for r in _ps_rows() if r["pid"] not in (100, 200)]  # no clients
+    ps_rows = [r for r in _ps_rows() if r["pid"] not in (100, 200)]
     leaked, notes = sweep.scan_leaked_mcp_containers(containers, ps_rows, IMAGES)
     assert leaked == []
     assert any("younger than a minute" in n for n in notes)
 
 
 def test_young_containers_excluded_from_ambiguity_math(fresh_orchestrator_dir):
-    # 2 mature containers vs 2 clients balances out; the young third must not
-    # tip the image into the "3 vs 2, likely leaked" ambiguity note.
     containers = [
         {"container_id": "abc123", "image": "crystaldba/postgres-mcp", "age": "2 weeks ago"},
         {"container_id": "def456", "image": "crystaldba/postgres-mcp", "age": "3 days ago"},
@@ -453,9 +425,6 @@ def test_ps_snapshot_degrades(fresh_orchestrator_dir, monkeypatch):
 
 
 def test_ps_snapshot_no_parseable_rows_degrades(fresh_orchestrator_dir, monkeypatch):
-    # rc=0 with nothing parseable must degrade, NOT read as "zero clients" —
-    # a future --apply flagging every container off an empty snapshot would be
-    # exactly the disaster invariant 3 forbids. Real ps always lists itself.
     monkeypatch.setattr(sweep.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
         a[0], returncode=0, stdout="garbage\nmore garbage here too\n", stderr=""))
     rows, err = sweep._ps_snapshot()
@@ -507,8 +476,6 @@ def test_main_reports_all_three_scan_classes(fresh_orchestrator_dir, monkeypatch
     _write_active("sid-dead", pid=_dead_pid(), name="fix-tests",
                   started_at=started, last_turn_at=None)
     _write_active("sid-live", pid=os.getpid(), window_id="42", name="alive")
-    # Two images: crystaldba has 1 orphan client (pid 100) + 2 containers ->
-    # ambiguity note; other/mcp-img has 0 clients + 1 container -> flagged.
     monkeypatch.setenv("CLAUDE_SWEEP_MCP_IMAGES",
                        "crystaldba/postgres-mcp,other/mcp-img")
     orphan_client_rows = [r for r in _ps_rows() if r["pid"] != 200]
@@ -534,8 +501,8 @@ def test_main_reports_all_three_scan_classes(fresh_orchestrator_dir, monkeypatch
     assert "Leaked MCP containers (1):" in out
     assert "xyz000abcdef"[:12] in out and "9 days ago" in out
     assert "2 containers vs 1 clients" in out and "1 likely leaked" in out
-    assert "abc123" not in out  # ambiguous, never individually flagged
-    assert "worktree pruning" not in out  # no operator config -> hint suppressed (default "")
+    assert "abc123" not in out
+    assert "worktree pruning" not in out
 
 
 def test_main_clean_state(fresh_orchestrator_dir, monkeypatch, capsys):
@@ -563,7 +530,6 @@ def test_main_degrades_when_ps_unavailable(fresh_orchestrator_dir, monkeypatch, 
     rc = sweep.main([])
     out = capsys.readouterr().out
     assert rc == 0
-    # No ps data -> client liveness unknowable -> BOTH mcp scans skipped.
     assert "MCP docker scan skipped" in out and "boom" in out
     assert "Leaked MCP containers" not in out
 
@@ -574,7 +540,6 @@ def test_main_degrades_when_docker_unavailable(fresh_orchestrator_dir, monkeypat
     rc = sweep.main([])
     out = capsys.readouterr().out
     assert rc == 0
-    # Client scan still runs off ps; only the container side is skipped.
     assert "Orphan MCP docker clients (1):" in out
     assert "container scan skipped" in out and "daemon down" in out
 
@@ -609,17 +574,12 @@ def test_main_unknown_arg_usage_error(fresh_orchestrator_dir, capsys):
 
 def test_main_unpatched_terminal_ls_hits_conftest_absorb_and_degrades(
         fresh_orchestrator_dir, monkeypatch, capsys, no_live_tmux):
-    # conftest's no_live_tmux guard absorbs tmux subprocess calls with rc=0 +
-    # empty stdout, so an unpatched _terminal_ls returns an empty fleet (no
-    # panes) — proving the suite can never touch live tmux through sweep. ps and
-    # docker helpers are stubbed so no real host commands run.
     _reset_driver(monkeypatch)
     monkeypatch.setattr(sweep, "_ps_snapshot", lambda: ([], None))
     monkeypatch.setattr(sweep, "_docker_containers", lambda images: ([], None))
     rc = sweep.main([])
     out = capsys.readouterr().out
     assert rc == 0
-    # Empty absorbed stdout -> no orphan windows; the scan runs cleanly.
     assert "Orphan terminal windows in 'claude-workers' (0):" in out
 
 

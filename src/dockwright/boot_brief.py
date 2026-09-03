@@ -1,20 +1,3 @@
-"""`dockwright boot-brief` — expansion-free manager boot loader.
-
-Replaces the boot docs' inline memory-loader bash (E2E F-2): that one-liner
-carried $-expansions, which the permission system's expansion guard can never
-allowlist, so every manager boot ate an approval prompt on it. A plain
-`dockwright boot-brief --domain <d>` is prefix-allowlistable. Prints pointers
-only (the model Reads each path — Read paginates, nothing is dropped):
-
-    AGENT_LINES <n>
-    MEMORY <path>          (≤5, newest-first, mtime within 7 days)
-    NOTEBOOK <path> (<n> bytes)
-    NOTEBOOK_WARN [...]    (only when the notebook exceeds 4 KB)
-
-Exit 0 on every DATA condition — missing/empty stores, unreadable files — so a
-boot loader never fails the boot over absent state. (argparse still SystemExits(2)
-on unrecognized args, standard CLI behavior; that's a caller bug, not a data one.)
-"""
 from __future__ import annotations
 
 import argparse
@@ -49,10 +32,6 @@ def main(argv=None) -> int:
             pass
 
     now = time.time()
-    # Resolve the memory root through the config-honoring helper the WRITER uses
-    # (distill._write_memory_file_atomic → paths.manager_memory_domain_dir), so an
-    # operator with a custom `[paths] manager_memory` still gets MEMORY pointers
-    # instead of an empty read off the state root.
     mem_dir = paths.manager_memory_domain_dir(args.domain)
     entries: list[tuple[float, Path]] = []
     if mem_dir.is_dir():

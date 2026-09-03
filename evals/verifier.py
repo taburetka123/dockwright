@@ -1,20 +1,3 @@
-"""Drive dockwright's code-review verifier on a single case, offline.
-
-The verifier this harness reproduces is the production Tier-2 verifier binding
-(model: opus), spawned read-only with ``presets/verifier-settings.json`` and
-fed a git diff range. This module reproduces that verifier as a single headless
-``claude -p`` call:
-
-  * same reviewer prompt (the requesting-code-review template, verbatim core);
-  * same read-only guardrail preset (Write/Edit/mutating-git denied);
-  * the diff is supplied INLINE instead of via a git range, so a case is a
-    self-contained data file rather than a live worktree — the only adaptation
-    needed to make the harness re-runnable from committed data.
-
-A small machine-readable JSON tail is appended to the prompt purely so the
-verdict can be scored automatically; the review instructions above it are the
-production ones.
-"""
 from __future__ import annotations
 
 import json
@@ -27,7 +10,6 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_SETTINGS = os.path.join(
     REPO_ROOT, "deploy", "presets", "verifier-settings.json"
 )
-# Deployed location the live dockwright install actually points at; preferred if present.
 DEPLOYED_SETTINGS = os.path.expanduser(
     "~/.claude/dockwright/presets/verifier-settings.json"
 )
@@ -37,8 +19,6 @@ def settings_path() -> str:
     return DEPLOYED_SETTINGS if os.path.exists(DEPLOYED_SETTINGS) else DEFAULT_SETTINGS
 
 
-# Core review instructions lifted from
-# skills/requesting-code-review/code-reviewer.md (the production template).
 _REVIEW_BODY = """You are a Senior Code Reviewer with expertise in software architecture,
 design patterns, and best practices. Your job is to review a completed change
 against its stated intent and identify defects before they cascade.
@@ -101,17 +81,7 @@ def run_verifier(
     timeout: int = 240,
     cwd: str | None = None,
 ) -> dict:
-    """Invoke ``claude -p`` headless and return parsed result metadata.
-
-    Returns a dict with: result_text, cost_usd, duration_ms, usage,
-    session_id, is_error, num_turns, permission_denials. Raises VerifierError
-    on process failure / timeout / unparseable output so the runner can record
-    the failure rather than silently scoring garbage.
-    """
     settings = settings or settings_path()
-    # Neutral empty cwd so the verifier loads only global ~/.claude context and
-    # not whatever project CLAUDE.md happens to sit at the invocation dir —
-    # keeps every case's system prompt identical and reproducible.
     own_cwd = cwd is None
     cwd = cwd or tempfile.mkdtemp(prefix="verifier-cwd-")
     cmd = [
@@ -140,8 +110,6 @@ def run_verifier(
         raise VerifierError(f"claude -p timed out after {timeout}s") from exc
     finally:
         if own_cwd:
-            # rmtree (not rmdir): claude -p may drop a stray file in cwd; rmdir
-            # would leak the temp dir in that case.
             shutil.rmtree(cwd, ignore_errors=True)
 
     if proc.returncode != 0:

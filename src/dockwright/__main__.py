@@ -1,4 +1,3 @@
-"""CLI dispatcher: `dockwright <subcommand>`."""
 import sys
 
 USAGE = """\

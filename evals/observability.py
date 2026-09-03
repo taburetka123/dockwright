@@ -1,16 +1,3 @@
-"""Observability for eval runs.
-
-Two layers, both honest about what's wired:
-
-1. Local JSONL traces — ALWAYS on. One line per verifier run (per case x repeat)
-   capturing the prompt, the raw verdict, the parsed verdict, cost, latency and
-   token usage. This is the re-runnable, zero-dependency source of truth.
-
-2. Langfuse — OPTIONAL. If LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY are set
-   AND the `langfuse` package is importable, each run is also emitted as a
-   Langfuse generation span. Otherwise it degrades to a no-op and says so. No
-   key is required to run the eval; see docs/evals.md "Langfuse" for setup.
-"""
 from __future__ import annotations
 
 import json
@@ -20,7 +7,6 @@ from pathlib import Path
 
 
 class LocalTraceWriter:
-    """Append-only JSONL trace sink — the always-on local observability layer."""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -45,8 +31,6 @@ class LocalTraceWriter:
 
 
 class LangfuseTracer:
-    """Thin optional wrapper around Langfuse. Never raises on the caller's path;
-    if Langfuse is unavailable it becomes a no-op and ``enabled`` is False."""
 
     def __init__(self, run_id: str):
         self.enabled = False
@@ -57,9 +41,6 @@ class LangfuseTracer:
         pub = os.environ.get("LANGFUSE_PUBLIC_KEY")
         sec = os.environ.get("LANGFUSE_SECRET_KEY")
         if not (pub and sec):
-            # TODO(eval-harness): to enable Langfuse tracing, export
-            #   LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY (+ optional
-            #   LANGFUSE_HOST for self-hosted) and `pip install langfuse`.
             self._reason = "no LANGFUSE_PUBLIC_KEY/SECRET_KEY in env"
             return
         try:
@@ -95,7 +76,6 @@ class LangfuseTracer:
                 usage_details=usage or {},
             )
         except Exception:
-            # Observability must never take down the eval run.
             pass
 
     def flush(self) -> None:

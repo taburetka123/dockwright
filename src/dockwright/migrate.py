@@ -1,14 +1,3 @@
-"""One-shot state migration: ~/.claude/orchestrator (+ scattered dockwright
-state) -> ~/.claude/dockwright, leaving a compat symlink at every old path
-it actually moves (an absent legacy path is skipped, never linked).
-
-Live-fleet safe: a manager may be polling these dirs right now. Each row is
-os.rename + os.symlink back-to-back (µs window vs seconds-scale polls), and
-symlink EEXIST (a poller's mkdir re-creating the legacy dir mid-window) is
-handled by merging the reborn dir and retrying. Nothing is ever deleted or
-overwritten; file collisions abort loudly with both paths intact, and any
-aborted row is recoverable by re-running after reconciling.
-"""
 from __future__ import annotations
 
 import argparse
@@ -18,8 +7,6 @@ from pathlib import Path
 
 from . import config
 
-# (legacy-rel, new-rel) under the claude dir. Root row FIRST — it creates
-# dockwright/ that later rows nest under.
 ROWS: tuple[tuple[str, str], ...] = (
     ("orchestrator", "dockwright"),
     ("manager-memory", "dockwright/manager-memory"),
@@ -54,10 +41,6 @@ class MigrationError(RuntimeError):
 
 
 def _assert_no_legacy_toml_pins() -> None:
-    """An explicit legacy [paths] pin bypasses the fallback verbatim and would
-    break silently when the compat symlinks retire — fail the migration now.
-    Compared post-expansion so an absolute-path spelling of the same legacy
-    home is caught too."""
     paths_sec = config.load().get("paths")
     if not isinstance(paths_sec, dict):
         return
@@ -73,11 +56,6 @@ def _assert_no_legacy_toml_pins() -> None:
 
 
 def _merge(src: Path, dst: Path) -> None:
-    """Move src's children into dst. Recurse on real-dir/real-dir collisions;
-    abort loudly on any other collision — never overwrite state. A symlink on
-    EITHER side is never followed: a symlink child of src is renamed as-is,
-    and a symlink at dst is a collision (following it would silently relocate
-    state to wherever it points — worst case back into src)."""
     if (src.is_dir() and not src.is_symlink()
             and dst.is_dir() and not dst.is_symlink()):
         for child in sorted(src.iterdir()):
@@ -97,7 +75,6 @@ def _merge(src: Path, dst: Path) -> None:
 
 
 def _collision_scan(src: Path, dst: Path) -> list[str]:
-    """Read-only preview of _merge: the paths a real merge would abort on."""
     if (src.is_dir() and not src.is_symlink()
             and dst.is_dir() and not dst.is_symlink()):
         hits: list[str] = []
@@ -117,9 +94,6 @@ def _place_symlink(legacy: Path, target_rel: str, new: Path) -> None:
         except FileExistsError:
             if legacy.is_symlink():
                 break
-            # A live poller's mkdir re-created the legacy dir mid-window:
-            # fold whatever landed in it into the new home and retry. (If
-            # legacy vanished again in between, just retry the symlink.)
             if legacy.exists():
                 _merge(legacy, new)
     if not legacy.is_symlink():
@@ -155,11 +129,6 @@ def _migrate_row(claude_dir: Path, legacy_rel: str, new_rel: str,
             f"{legacy} is a symlink to {os.readlink(legacy)}, expected {new}"
         )
     if not legacy.exists():
-        # No legacy on disk = nothing to migrate — even when the new home
-        # exists. A crash-repair arm here used to re-link absent legacy
-        # paths; since setup.sh runs migrate-state on every deploy, that
-        # manufactured legacy symlinks on every 2nd+ run of homes that never
-        # had legacy state, and resurrected links operators had removed.
         return f"absent   {legacy_rel} (skip; created on demand at new home)"
     new_occupied = new.exists() or new.is_symlink()
     if dry_run:
@@ -177,10 +146,6 @@ def _migrate_row(claude_dir: Path, legacy_rel: str, new_rel: str,
         try:
             os.rename(legacy, new)
         except OSError as e:
-            # A concurrent ensure_dirs can create new (even non-empty)
-            # between the check above and the rename — fold into it. Any
-            # other failure (permissions, ...) stays inside the loud
-            # MigrationError contract.
             if not (new.exists() or new.is_symlink()):
                 raise MigrationError(
                     f"could not move {legacy} -> {new}: {e}") from e

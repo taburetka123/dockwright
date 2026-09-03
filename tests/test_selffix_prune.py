@@ -1,15 +1,3 @@
-"""Tests for the selffix-trigger.sh 14d findings reaper.
-
-Contract (arch-soundness review A1 / state-stores IMPORTANT-3): unreviewed
-findings are never age-pruned — they are the Gardener's input corpus and
-pending proposals reference them by basename. A finding is deleted only after
-review (its `.reviewed` sibling exists) and only once the review itself is
-older than 14 days. Dedup markers keep the plain 14d prune.
-
-Same harness as test_selffix_detect.py: the repo copy at
-deploy/scripts/selffix-trigger.sh is the source of truth; tests exec
-it directly under a tmp $HOME, no install required.
-"""
 import os
 import time
 from pathlib import Path
@@ -49,7 +37,6 @@ def _fire(selffix) -> None:
 
 
 def test_prune_keeps_old_unreviewed_findings(selffix):
-    """An unreviewed finding is never deleted, no matter how old."""
     md = _write_finding(selffix, "old-unreviewed", md_age=OLD)
     _fire(selffix)
     assert md.is_file(), "unreviewed finding was pruned — Gardener input corpus destroyed"
@@ -63,7 +50,6 @@ def test_prune_deletes_pairs_reviewed_over_14d_ago(selffix):
 
 
 def test_prune_keeps_recently_reviewed_pairs(selffix):
-    """Old finding, fresh review: retention clock starts at review time."""
     md = _write_finding(selffix, "fresh-review", md_age=OLD, reviewed_age=FRESH)
     _fire(selffix)
     assert md.is_file()

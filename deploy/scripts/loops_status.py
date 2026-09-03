@@ -1,25 +1,4 @@
 #!/usr/bin/env python3
-"""loops-status — read-only fleet health report over the loops registry.
-
-Reads the structured ```loop blocks from the loops registry (deployed at
-~/.claude/dockwright/loops-registry.md by setup.sh; source deploy/loops-registry.md
-in taburetka123/claude-orchestrator) and reconciles each loop's INTENDED state
-(the block's `status` field) against the machine:
-
-  - launchd: label loaded? last exit status (launchctl list)
-  - hook loops: hook_command wired into ~/.claude/settings.json?
-  - stop file present? (kill_switch fields that are paths)
-  - newest event_paths mtime age vs max_silence_hours → fresh/STALE
-  - runtime_program_path exists?
-
-Pure report: never mutates anything, always exits 0 (2 on usage/registry-missing
-errors). The ENFORCEMENT lives in tests/test_loops_registry.py, which imports
-parse_registry from this file so the registry format has exactly one parser.
-
-The same architecture review that mandated this tool found two loops dark for
-weeks (ticket-cleanup 8wk, pr-review-poller 17d) because nothing read launchd's
-own records — this is the thing that reads them.
-"""
 from __future__ import annotations
 
 import argparse
@@ -35,7 +14,6 @@ HOME = Path(os.environ.get("HOME", ""))
 
 
 def _prefer_new(new: Path, legacy: Path) -> Path:
-    # deprecated, one release: legacy fallback while orchestrator-era state migrates
     if new.exists():
         return new
     if legacy.exists():
@@ -53,11 +31,6 @@ LOOP_BLOCK_RE = re.compile(r"```loop\n(.*?)```", re.DOTALL)
 
 
 def _resolve_config():
-    """Best-effort import of dockwright.config so a deployed standalone
-    copy under /usr/bin/python3 (no package on PATH) can still resolve the
-    operator's [loops].label_prefix + [paths].overlay_dir. config is a stdlib-only
-    leaf module, so a sys.path insert of the repo src suffices. Mirrors
-    bootlite_watchdog._resolve_get_driver; returns the module or None."""
     try:
         from dockwright import config
         return config
@@ -78,8 +51,6 @@ _CONFIG = _resolve_config()
 
 
 def loop_label_prefix() -> str:
-    """The operator's launchd label namespace ([loops].label_prefix), or the
-    com.dockwright product default when config is unavailable (fail-open)."""
     if _CONFIG is not None:
         try:
             return _CONFIG.loop_label_prefix()
@@ -98,9 +69,6 @@ def _default_overlay_dir() -> Path:
 
 
 def _config_status_overrides() -> dict[str, dict]:
-    """The operator's per-loop status/status_why overrides
-    ([loops.status_overrides.<name>]), or {} when config is unavailable
-    (fail-open, mirroring loop_label_prefix)."""
     if _CONFIG is not None:
         try:
             return _CONFIG.loop_status_overrides()
@@ -118,10 +86,6 @@ VALID_STATUSES = ("live", "paused", "retiring", "retired", "pending-install")
 
 
 def parse_registry(text: str) -> list[dict]:
-    """Parse ```loop fenced blocks of `key: value` lines into dicts.
-
-    Values are plain strings (no quoting/nesting); unknown keys are kept so the
-    schema can grow without touching the parser."""
     loops = []
     for match in LOOP_BLOCK_RE.finditer(text):
         block: dict = {}
@@ -154,9 +118,6 @@ def registry_path(cli_arg: str | None) -> Path | None:
 
 def registry_paths(cli_arg: str | None = None,
                    overlay_dir: str | Path | None = None) -> list[Path]:
-    """Every registry file to union: the resolved core registry (deployed-or-repo)
-    first, then every `<overlay>/loops/*.md` (sorted). Missing pieces are simply
-    omitted — a single-file install with no overlay yields just the core path."""
     paths: list[Path] = []
     core = registry_path(cli_arg)
     if core is not None:
@@ -173,15 +134,6 @@ def load_all_loops(cli_arg: str | None = None,
                   overlay_dir: str | Path | None = None,
                   prefix: str | None = None,
                   status_overrides: dict | None = None) -> list[dict]:
-    """Parse + union the blocks from every registry_paths() file, expanding any
-    literal `{prefix}` in each block's `label` to the resolved label prefix. The
-    core registry ships `{prefix}.<name>` templates (product-generic); the overlay
-    keeps the operator's literal labels. `prefix` overrides the config-resolved
-    default (tests pass the live operator prefix; production leaves it None).
-    `status_overrides` ({name: {"status": …, "status_why": …}}) replaces those two
-    keys on the matching-name block after parsing — the core registry ships
-    neutral pending-install statuses; the operator flips loops live via
-    [loops.status_overrides] in dockwright.toml. None → config-resolved."""
     if prefix is None:
         prefix = loop_label_prefix()
     if status_overrides is None:
@@ -199,8 +151,10 @@ def load_all_loops(cli_arg: str | None = None,
     return loops
 
 
+LAUNCHCTL_LIST_HEADER = ["PID", "Status", "Label"]
+
+
 def launchctl_states() -> dict[str, str] | None:
-    """Map launchd label -> last-exit-status string, None if launchctl unavailable."""
     try:
         result = subprocess.run(["launchctl", "list"], capture_output=True,
                                 timeout=10, check=False, text=True)
@@ -211,7 +165,7 @@ def launchctl_states() -> dict[str, str] | None:
     states = {}
     for line in result.stdout.splitlines():
         parts = line.split("\t")
-        if len(parts) == 3 and parts[2].startswith("com."):
+        if len(parts) == 3 and parts != LAUNCHCTL_LIST_HEADER:
             states[parts[2]] = parts[1]
     return states
 

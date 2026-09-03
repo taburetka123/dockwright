@@ -86,7 +86,6 @@ def test_last_assistant_summary_truncates(tmp_path):
 
 
 def _make_session_tree(tmp_path, sid="del-sid", slug="-Users-x"):
-    """Synthetic ~/.claude/projects/<slug>/ tree: main log + subagents dir."""
     project_dir = tmp_path / ".claude" / "projects" / slug
     project_dir.mkdir(parents=True)
     log = project_dir / f"{sid}.jsonl"
@@ -127,23 +126,22 @@ def test_is_delegating_true_when_subagent_outlived_main_log(tmp_path, monkeypatc
     monkeypatch.setenv("HOME", str(tmp_path))
     log, subagents = _make_session_tree(tmp_path)
     now = time.time()
-    os.utime(log, (now - 60, now - 60))                  # main log froze at Stop
+    os.utime(log, (now - 60, now - 60))
     agent = subagents / "agent-aaa.jsonl"
     agent.write_text("{}")
-    os.utime(agent, (now - 5, now - 5))                  # subagent still writing
+    os.utime(agent, (now - 5, now - 5))
     record = {"claude_sid": "del-sid", "runtime": "claude"}
     assert is_delegating(record, now) is True
 
 
 def test_is_delegating_false_for_consumed_foreground_agent(tmp_path, monkeypatch):
-    """Foreground agent result consumed in-turn: main log has LATER writes."""
     monkeypatch.setenv("HOME", str(tmp_path))
     log, subagents = _make_session_tree(tmp_path)
     now = time.time()
     agent = subagents / "agent-aaa.jsonl"
     agent.write_text("{}")
     os.utime(agent, (now - 30, now - 30))
-    os.utime(log, (now - 5, now - 5))                    # worker wrote after the agent
+    os.utime(log, (now - 5, now - 5))
     record = {"claude_sid": "del-sid", "runtime": "claude"}
     assert is_delegating(record, now) is False
 
@@ -156,7 +154,7 @@ def test_is_delegating_false_when_subagent_quiet_past_grace(tmp_path, monkeypatc
     os.utime(log, (now - 2000, now - 2000))
     agent = subagents / "agent-aaa.jsonl"
     agent.write_text("{}")
-    os.utime(agent, (now - 1000, now - 1000))            # grew after log, but stale
+    os.utime(agent, (now - 1000, now - 1000))
     record = {"claude_sid": "del-sid", "runtime": "claude"}
     assert is_delegating(record, now) is False
 
@@ -169,7 +167,6 @@ def test_is_delegating_false_for_codex_runtime_and_missing_log(tmp_path, monkeyp
 
 
 def test_is_delegating_accepts_preresolved_log(tmp_path, monkeypatch):
-    """Callers that already resolved the session log pass it in — no second scan."""
     monkeypatch.setenv("HOME", str(tmp_path))
     log, subagents = _make_session_tree(tmp_path)
     now = time.time()
@@ -182,8 +179,6 @@ def test_is_delegating_accepts_preresolved_log(tmp_path, monkeypatch):
 
 
 def test_is_delegating_false_at_exact_mtime_tie(tmp_path, monkeypatch):
-    """Subagent mtime == main log mtime: the growth predicate is strict (>),
-    so an exact tie reads as not delegating (fail-safe grey)."""
     monkeypatch.setenv("HOME", str(tmp_path))
     log, subagents = _make_session_tree(tmp_path)
     now = time.time()
@@ -253,8 +248,8 @@ def test_is_delegating_survives_a_subagent_pause_past_the_turn_end_grace(tmp_pat
     agent.write_text("{}")
     os.utime(agent, (now - 300, now - 300))
     record = {"claude_sid": "del-sid", "runtime": "claude"}
-    assert delegation_fresh_sec() == 120        # the turn-end grace has expired
-    assert is_delegating(record, now) is True   # the display still reads delegating
+    assert delegation_fresh_sec() == 120
+    assert is_delegating(record, now) is True
 
 
 

@@ -51,7 +51,7 @@ Review the conversation history and identify what was suboptimal about the proce
    - **Clarity**: Were instructions to the AI ambiguous? Could a step be misinterpreted?
    - **Durability**: Does the process survive session restarts? Is intermediate state persisted?
 
-2b. **Mine engineer in-thread corrections (labeled failures — these are gold).** Scan the conversation's USER messages for places where the engineer CORRECTED the assistant: stated that its output, claim, assumption, or action was wrong (factually or procedurally), or reversed its decision. Tells: direct refutation ("это не так", "GRPC — это не штатный механизм", "you're checking the wrong table"), a reversal instruction after the assistant committed to a path, an in-session rule/skill edit prompted by the pushback. An ordinary instruction or answer is NOT a correction — the marker is the engineer contradicting something the assistant already asserted or did. Emit each as its own issue:
+2b. **Mine engineer in-thread corrections (labeled failures — these are gold).** Scan the conversation's USER messages for places where the engineer CORRECTED the assistant: stated that its output, claim, assumption, or action was wrong (factually or procedurally), or reversed its decision. Tells: direct refutation ("that's not how it works", "you're checking the wrong table" — in whatever language the engineer writes in), a reversal instruction after the assistant committed to a path, an in-session rule/skill edit prompted by the pushback. An ordinary instruction or answer is NOT a correction — the marker is the engineer contradicting something the assistant already asserted or did. Emit each as its own issue:
 
    ```
    ### Issue N: ⚖️ [CORRECTION] <short title> — <impact>/10

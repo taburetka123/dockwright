@@ -25,12 +25,11 @@ def test_ensure_worker_home_idempotent_on_existing(monkeypatch, tmp_path):
 
 
 def test_ensure_worker_home_failopen_when_mkdir_raises(monkeypatch, tmp_path):
-    # Parent is a regular file → mkdir(parents=True) raises OSError; swallowed.
     parent_file = tmp_path / "afile"
     parent_file.write_text("x")
     home = parent_file / "worker"
     monkeypatch.setenv("CLAUDE_ORCH_WORKER_HOME", str(home))
-    result = paths.ensure_worker_home()   # must NOT raise
+    result = paths.ensure_worker_home()
     assert result == home
     assert not home.is_dir()
 

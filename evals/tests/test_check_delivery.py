@@ -6,25 +6,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 
 SKILL_LINE = "Investigate by falsifying the hypothesis you most want to be true."
-assert len(SKILL_LINE) >= 40  # must clear check_delivery.PROBE_MIN_LEN
+assert len(SKILL_LINE) >= 40
 SKILL_TEXT = f"# Scratch investigate skill\n\n- {SKILL_LINE}\n"
 
 
 def _mk_transcript(config_dir: Path, sid: str, tool_input, result_text):
-    """Synthetic transcript in the shape ``value_grounding.parse_transcripts``
-    actually parses (deploy/scripts/value_grounding.py):
-
-    - pass 1 (:131-141) — ``type=assistant`` -> ``message.content[]`` ->
-      ``tool_use`` blocks, ``id`` mapped to ``name``, ``input`` json.dumps'd
-      into the tool_calls list.
-    - pass 2 (:142-154) — ``type=user`` -> ``message.content[]`` ->
-      ``tool_result`` blocks, matched to their tool by ``tool_use_id``, text
-      extracted by ``_block_text`` (:98-104: str content or list of
-      ``{"text": ...}`` blocks) and appended to the CORPUS.
-
-    ``tool_input`` lands only in the tool-call trace; ``result_text`` only in
-    the corpus — which is the whole distinction this checker now turns on.
-    """
     proj = config_dir / "projects" / "slug"
     proj.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -66,7 +52,6 @@ def _run(trace, skill, expect, config_dir):
 
 
 def test_all_delivered_exit_0(tmp_path):
-    """Skill CONTENT in the tool result -> DELIVERED."""
     skill = _mk_skill(tmp_path)
     _mk_transcript(tmp_path / "cfg", "s1",
                    {"file_path": "investigate-skill.md"},
@@ -79,9 +64,6 @@ def test_all_delivered_exit_0(tmp_path):
 
 
 def test_denied_read_of_bound_path_is_not_delivery(tmp_path):
-    """THE regression (eval-direction A2c): the tool CALL names the bound skill
-    path and the RESULT is a permission denial — the path-based predecessor
-    scored this DELIVERED and the sample investigated without the skill."""
     skill = _mk_skill(tmp_path)
     _mk_transcript(
         tmp_path / "cfg", "s1",
@@ -115,8 +97,6 @@ def test_missing_transcript_is_indeterminate_exit_2(tmp_path):
 
 
 def test_unreadable_skill_exits_2(tmp_path):
-    """The content source IS the instrument — a missing --skill must fail loud,
-    never verdict every sample NOT-READ off an empty probe set."""
     trace = tmp_path / "run.jsonl"
     _mk_trace(trace, ["s1"])
     _mk_transcript(tmp_path / "cfg", "s1", {"file_path": "x"}, "y")
@@ -126,8 +106,6 @@ def test_unreadable_skill_exits_2(tmp_path):
 
 
 def test_probeless_skill_exits_2(tmp_path):
-    """A skill with no line long enough to probe with cannot prove delivery —
-    that is an indeterminate instrument, not a fleet of NOT-READ samples."""
     skill = tmp_path / "SKILL.md"
     skill.write_text("# tiny\nshort line\n")
     trace = tmp_path / "run.jsonl"

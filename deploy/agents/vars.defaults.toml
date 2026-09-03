@@ -1,9 +1,3 @@
-# Generic defaults for {{vars}} in the core agent files (Step 3 carve).
-# Operator values (dockwright.toml [agent_vars]) override per-key; the
-# operator overlay carries the original operator bytes.
-# `<absolute-home>` inside a VALUE expands to the installing user's absolute
-# home at compose time (operator overrides may use it too); the literal
-# token surviving into composed output is a ComposeError.
 [agent_vars]
 a_bash_outage_anchor = ''
 a_brief_authoring_incident = ''
@@ -67,6 +61,7 @@ Before doing anything else: scan your initial task description for a task key (t
 Reason: the standing preference is that any keyed task runs through brainstorming/planning/subagent-driven-development/review, regardless of how trivial it looks. This rule exists because "trivial-looking" keyed tasks routinely surface scope or edge cases mid-implementation that would have been caught in brainstorming.'''
 model_roster_ref = ''
 no_implicit_deferral_rule_ref = 'your no-implicit-deferral rule'
+notebook_hygiene_skill_ref = ' Invoke `Skill: dockwright-notebook-hygiene` here; it carries how to run the pass.'
 phase2_roadmap_note = ''
 prep_script = 'a pre-created worktree'
 review_bot = 'bot reviewer'

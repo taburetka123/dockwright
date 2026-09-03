@@ -1,63 +1,4 @@
 #!/usr/bin/env python3
-"""Gardener Phase-1 artifact post-processor (PRD v2 §7.4–7.5, §12 Phase 1).
-
-Three CLI modes:
-
-  gardener_postrun.py postrun --run-id <id> [--known <file>]
-      Called by gardener-run.sh after a digest run. Validates every artifact
-      under proposals/pending/ and checks/ that the LEDGER does not already
-      know (basenames from prior proposal / check_armed / proposal_rejected /
-      decision events; an optional --known file supplements for tests).
-      Ledger-derived knowledge means an artifact can never escape validation
-      by appearing between runs — there is no snapshot window.
-      Validation mechanically enforces the FR-8 scope guard on BOTH the
-      declared `targets:` AND every path named in the ## Diff body, plus §7.4
-      completeness (required fields incl. kind / always_on_bytes presence /
-      check_window_days, and Evidence + Diff sections). Valid proposals stay
-      pending and get a `proposal` ledger event; valid checks get
-      `check_armed`; anything malformed, incomplete, or out-of-scope is
-      QUARANTINED to proposals/rejected/ with a `proposal_rejected` event
-      carrying the reasons.
-
-  gardener_postrun.py decide --proposal <path> --kind accept|decline --reason <text>
-      Called from the review sitting (dockwright-selffix-review — the proposals sitting)
-      after the human decides a cluster. The proposal must still be under
-      proposals/pending/ — deciding an already-moved file is refused, so a
-      double-decide cannot write contradictory ledger events. Mechanically:
-      moves the proposal to proposals/{accepted,declined}/ (collision-safe),
-      appends a `decision` ledger event, and batch-marks every member finding
-      reviewed (EXCEPTION: a `corpus-retire` decline marks nothing —
-      declining retirement keeps the members in the unreviewed corpus).
-      Members may be full finding basenames or unique prefixes
-      (sid-prefix-8): exact match first, then a prefix glob — an ambiguous
-      prefix is NOT marked and is reported, never guessed. Decline REQUIRES a
-      reason: the recorded decline is what stops the digest from re-surfacing
-      the cluster absent new members (PRD §7.5).
-      NOTE: the applying auto-commit SHA is not captured here — the decision
-      event records intent only. The `evaluate` mode below now records the
-      outcome-check verdict; capturing the applying SHA itself remains the
-      open Phase-2 item, if it still is.
-
-  gardener_postrun.py evaluate [--verdicts <file>] [--dry-run] [--now <epoch>]
-      Called from the review sitting (or a manager step) after an analyst has
-      formed the kept/violated judgment on each matured armed check (PRD §7 step
-      6 / §7.6). For every armed check whose window has matured (first
-      check_armed ts + check_window_days), and that has no outcome yet, appends
-      a `check_kept` / `check_violated` event keyed on check_id — copying the
-      expectation VERBATIM from the first (immutable) check_armed event
-      (append-only §7.6-1) and reading only the ledger + the analyst's verdicts
-      file, never proposals/ (blind-to-generation-context §7.6-2). `violated`
-      requires evidence (it feeds the next digest's revert/amend draft).
-      Un-matured checks are skipped; already-recorded checks are idempotent
-      no-ops; a bad verdicts file / structural anomaly exits 2. `--dry-run`
-      prints the planned appends without writing. Recording the outcome does NOT
-      draft the revert proposal — that is the next digest run's job.
-
-Frontmatter format (deliberately a tiny YAML subset — stdlib-only parser, no
-yaml dependency): `key: value` scalars and `key: [a, b, c]` inline lists,
-inside a leading `---` ... `---` block; surrounding quotes on values are
-stripped. The dockwright-gardener-digest skill emits exactly this shape.
-"""
 from __future__ import annotations
 
 import argparse
@@ -73,12 +14,10 @@ from pathlib import Path
 _HOME_ENV = os.environ.get("HOME")
 HOME = Path(_HOME_ENV) if _HOME_ENV else None
 if HOME is None:
-    # Module stays importable for tests; main() fails fast below.
     HOME = Path("/nonexistent-no-home")
 
 
 def _prefer_new(new: Path, legacy: Path) -> Path:
-    # deprecated, one release: legacy fallback while orchestrator-era state migrates
     if new.exists():
         return new
     if legacy.exists():
@@ -86,10 +25,6 @@ def _prefer_new(new: Path, legacy: Path) -> Path:
     return new
 
 
-# DOCKWRIGHT_GARDENER_DIR pins the state root by construction: any fresh
-# importlib load or CLI subprocess that sets it writes THERE, never the live
-# ~/.claude/dockwright/gardener/ ledger (I3 — an ad-hoc/test run must not need
-# to fake all of HOME to redirect the audit record). All derived paths follow.
 _GARDENER_DIR_ENV = os.environ.get("DOCKWRIGHT_GARDENER_DIR")
 if _GARDENER_DIR_ENV:
     GARDENER_DIR = Path(_GARDENER_DIR_ENV)
@@ -104,8 +39,6 @@ LEDGER_PATH = GARDENER_DIR / "ledger.jsonl"
 FINDINGS_DIR = _prefer_new(HOME / ".claude" / "dockwright" / "selffix" / "findings", HOME / ".claude" / "selffix-findings")
 
 def _scan_toml_str(text: str, section: str, key: str):
-    """Quoted `key = "value"` inside [section] — the tomllib-less fallback for
-    the py3.9 /usr/bin/python3 gardener-run.sh invokes this postrun under."""
     cur = None
     for raw in text.splitlines():
         line = raw.strip()
@@ -129,10 +62,6 @@ def _scan_toml_str(text: str, section: str, key: str):
 
 
 def config_path():
-    """dockwright.toml discovery: $DOCKWRIGHT_CONFIG, else XDG, else ~/.claude.
-    None when no file exists (env pointing at a missing file = no config).
-    Deployed scripts must NOT import dockwright, so discovery is
-    re-implemented."""
     env = os.environ.get("DOCKWRIGHT_CONFIG", "").strip()
     if env:
         p = Path(env).expanduser()
@@ -145,9 +74,6 @@ def config_path():
 
 
 def config_toml_str(section: str, key: str) -> str:
-    """Quoted string value of [section] key from dockwright.toml, "" when
-    unset/unreadable. tomllib when available; _scan_toml_str fallback for the
-    py3.9 /usr/bin/python3 this runs under via gardener-run.sh."""
     path = config_path()
     if path is None:
         return ""
@@ -166,9 +92,6 @@ def config_toml_str(section: str, key: str) -> str:
 
 
 def config_toml_int(section: str, key: str, default: int) -> int:
-    """[section] key as int, tolerating BOTH bare TOML ints (tomllib parses
-    them as int — config_toml_str drops non-str values) and quoted/fallback
-    string forms. Unparseable/missing ⇒ default."""
     path = config_path()
     if path is None:
         return default
@@ -192,22 +115,14 @@ def config_toml_int(section: str, key: str, default: int) -> int:
 
 
 def _dockwright_repo() -> str:
-    """[paths] dockwright_repo from dockwright.toml, ~-expanded ("" when unset)."""
     value = config_toml_str("paths", "dockwright_repo")
     return str(Path(value).expanduser()) if value else ""
 
 
-# FR-8 scope guard: the Gardener's domain is the Claude meta-system only —
-# ~/.claude plus the dockwright checkout ([paths] dockwright_repo, when set).
 _DOCKWRIGHT_REPO = _dockwright_repo()
 ALLOWED_TARGET_ROOTS = [HOME / ".claude"] + (
     [Path(_DOCKWRIGHT_REPO)] if _DOCKWRIGHT_REPO else [])
 
-# always_on_bytes is presence-checked separately: 0 is a legitimate value.
-# members is NOT unconditionally required: it is required (and UUID-shape
-# enforced) only for evidence_kind=findings — ops/external evidence has no
-# finding files to burn (arch review I3: the live `members: [ops-evidence]`
-# sentinel slipped through non-emptiness-only validation).
 PROPOSAL_REQUIRED_FIELDS = ("id", "run_id", "cluster", "targets", "lane",
                             "kind", "evidence_kind", "base_rev",
                             "expectation", "check_window_days", "revert")
@@ -221,11 +136,6 @@ CHECK_REQUIRED_FIELDS = ("id", "run_id", "expectation", "check_window_days")
 
 
 def ledger_append(event: str, **fields) -> None:
-    """Append a typed ledger event. Envelope: `type` is the canonical key
-    (matches the artifact-store events convention); `event` is emitted as a
-    duplicate during the transition so pre-rename readers (incl. live
-    notebook checks) keep working — drop it once those re-key. `v` versions
-    the vocabulary (B2)."""
     LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
     record = {"type": event, "event": event, "v": 1, "ts": time.time(), **fields}
     with LEDGER_PATH.open("a") as f:
@@ -240,8 +150,6 @@ def _strip_quotes(value: str) -> str:
 
 
 def parse_frontmatter(text: str):
-    """Parse the leading `---` frontmatter block. Returns (meta, body);
-    meta is None when no well-formed block exists (caller quarantines)."""
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
         return None, text
@@ -261,7 +169,7 @@ def parse_frontmatter(text: str):
                          if _strip_quotes(item)]
         else:
             meta[key] = _strip_quotes(value)
-    return None, text  # never saw the closing --- : malformed
+    return None, text
 
 
 def _target_in_scope(target: str) -> bool:
@@ -286,8 +194,6 @@ _DIFF_FENCE_RE = re.compile(r"^```diff\s*$", re.MULTILINE)
 
 
 def diff_paths(body: str) -> list[str]:
-    """Paths named in unified-diff headers inside the ## Diff section(s).
-    /dev/null (new/deleted-file markers) is ignored."""
     paths = []
     for match in _DIFF_HEADER_RE.finditer(body):
         path = match.group(1)
@@ -298,11 +204,6 @@ def diff_paths(body: str) -> list[str]:
 
 
 def _diff_path_violations(body: str, declared_targets: list[str]) -> list[str]:
-    """FR-8 for the diff body: absolute (or ~) diff paths must resolve inside
-    the allowed roots; relative paths (the `a/...`/`b/...` unified-diff form)
-    must suffix-match a declared target — a diff that patches something the
-    frontmatter didn't declare is a scope-guard bypass, not a formatting
-    nicety (verifier finding on #59: declare ~/.claude/x, patch ~/.ssh/config)."""
     violations = []
     resolved_targets = [str(Path(os.path.realpath(os.path.expanduser(t))))
                         for t in declared_targets]
@@ -311,7 +212,6 @@ def _diff_path_violations(body: str, declared_targets: list[str]) -> list[str]:
             if not _target_in_scope(raw):
                 violations.append(f"diff patches path outside allowed roots (FR-8): {raw}")
             elif str(Path(os.path.realpath(os.path.expanduser(raw)))) not in resolved_targets:
-                # in-roots but undeclared: symmetric with the a/<rel> rule below
                 violations.append(
                     f"diff patches a path not declared in targets: {raw}")
             continue
@@ -360,9 +260,6 @@ def validate_proposal(meta, body: str = "") -> list[str]:
 
 
 def _overlay_dir() -> str:
-    """[paths] overlay_dir from dockwright.toml, real-pathed, falling back to
-    the default exactly like config.py's overlay_dir() — this script stays
-    stdlib-only so it can't import that module directly."""
     value = config_toml_str("paths", "overlay_dir") or "~/.claude/dockwright-overlay"
     return os.path.realpath(os.path.expanduser(value))
 
@@ -373,11 +270,6 @@ _ALWAYS_ON_PARTS = frozenset({"rules", "agents"})
 
 
 def _is_always_on(resolved_path: str) -> bool:
-    """Always-loaded context per the digest skill's own definition (rules/
-    agent files, or an overlay drop-in that composes into a rendered agent
-    file). Named approximation (spec M4): a surface without a rules/agents
-    path component and outside the overlay dir (e.g. a bare CLAUDE.md) earns
-    no eviction credit. False-negative credit is the conservative direction."""
     if not _target_in_scope(resolved_path):
         return False
     if _ALWAYS_ON_PARTS.intersection(Path(resolved_path).parts):
@@ -387,12 +279,6 @@ def _is_always_on(resolved_path: str) -> bool:
 
 
 def _hunk_body_bytes(body_lines) -> int:
-    """Net UTF-8 byte delta of ONE hunk's body lines (the `@@` header
-    excluded). A +/- line contributes its content bytes plus one newline; a
-    `\\ No newline at end of file` marker undoes the newline byte counted for
-    the line above it; context lines (' '-prefixed or blank) contribute
-    nothing and reset the running sign. Shared by the strict and lenient
-    walks so the two paths cannot drift."""
     delta = 0
     prev_sign = None
     for ln in body_lines:
@@ -414,10 +300,6 @@ def _hunk_body_bytes(body_lines) -> int:
 
 
 def _strict_hunk_bodies(flat_hunks) -> list:
-    """The strict FileDiff.hunks is a flat line list with `@@` headers
-    interleaved; regroup it into one body-line list per hunk (headers
-    dropped) so it matches the lenient parser's per-hunk shape and both feed
-    the same _hunk_body_bytes walk."""
     bodies, cur = [], None
     for ln in flat_hunks:
         if ln.startswith("@@"):
@@ -429,52 +311,8 @@ def _strict_hunk_bodies(flat_hunks) -> list:
 
 
 def compute_always_on_delta(body: str, declared_targets: list):
-    """Net UTF-8 byte delta this proposal's diff applies to ALWAYS-LOADED
-    files, computed with the ACTUATOR'S OWN parse pipeline — never a
-    re-derivation (spec C1: a delta computed over a different reading of the
-    document than the one that gets applied validates the wrong document).
-    Mirrors the actuator's full strict→lenient fallback: the strict
-    split_file_diffs is tried first, and when it refuses — a bare, unnumbered
-    `@@` hunk header (the form the generator historically emits) or any
-    structure only the lenient parser accepts — the actuator's LENIENT parser
-    reads the SAME extract_diff_text output, exactly as apply's resolve_plan
-    does, and the byte walk runs over its per-file hunk bodies with identical
-    arithmetic. Path resolution stays _resolve_one against the declared
-    targets on both paths.
-
-    Even when strict SUCCEEDS its FULL per-file structure — the (old_raw,
-    new_raw) pair AND the hunk-body line lists the byte walk consumes — is
-    cross-checked against the lenient parse, because a hand-written hunk count
-    silently truncates the strict body in TWO shapes:
-      * OVERCOUNT (boundary swallow): the count drives the consumption loop
-        across the NEXT file's `--- `/`+++ ` header and `@@` line into the
-        first file's hunk body — strict still succeeds (the swallowed `@@`
-        balances its total_headers==parsed_headers assertion) but the second
-        file drops out of attribution. The pair lists themselves diverge.
-      * UNDERCOUNT (intra-file truncation): the count is SATISFIED early, so
-        strict stops mid-hunk and silently drops the trailing `+`/`-` body
-        lines WITHIN one file — no boundary crossed, the pair lists are
-        IDENTICAL, and a pair-only check would keep the truncated strict walk.
-        Only comparing the body line lists catches it.
-    ANY divergence ⇒ recompute the delta from the lenient parse — what the
-    actuator's re-anchor applies whenever git refuses the hand-written counts
-    (spec C1: validate the ACT). An exactly-equal structure keeps the strict
-    walk (byte-identical attribution). Harmless divergence is possible — a
-    trailing blank line between a hunk and the next file header that lenient
-    absorbs as blank CONTEXT while strict drops it — and needs no special
-    case: routing those to lenient changes nothing, since a blank body line
-    contributes 0 bytes to the walk.
-
-    None ⇒ fail-closed (no negative credit; the consistency check skips):
-    reached when BOTH parsers refuse the diff (genuinely malformed — the birth
-    gate independently quarantines it as `malformed`), when strict parses but
-    the lenient cross-check parser cannot read the same text (no trusted
-    reading to validate against), or when a diff path resolves outside the
-    declared targets (the scope guard refuses it) — the same residual the
-    actuator itself refuses. A bare-`@@` diff no longer falls into this class;
-    it is exactly what the lenient fallback reads."""
     try:
-        import gardener_apply  # lazy: gardener_apply imports THIS module
+        import gardener_apply
         diff_text = gardener_apply.extract_diff_text(body)
     except Exception:  # noqa: BLE001 — no ```diff fence ⇒ unknowable
         return None
@@ -490,20 +328,13 @@ def compute_always_on_delta(body: str, declared_targets: list):
         lenient = None
     if strict is None:
         if lenient is None:
-            return None  # BOTH parsers fail ⇒ truly malformed
+            return None
         per_file = lenient
     elif lenient is None:
-        # strict parsed but the actuator's own lenient reading cannot: no
-        # trusted reading to cross-check the swallow against ⇒ fail-closed
         return None
     elif strict == lenient:
-        # full per-file structure (pairs AND body line lists) identical —
-        # keep the strict walk (byte-identical attribution)
         per_file = strict
     else:
-        # ANY divergence ⇒ the lenient act: boundary swallow (overcount),
-        # intra-file truncation (undercount), or a harmless trailing-blank
-        # (0 bytes either way)
         per_file = lenient
     declared_abs = [os.path.realpath(os.path.expanduser(t))
                     for t in declared_targets]
@@ -526,28 +357,12 @@ _BYTES_TOLERANCE = 16
 
 
 def _bytes_tolerance() -> int:
-    """Noise floor in UTF-8 bytes: [gardener] bytes_tolerance, default 16
-    (EOF-newline edges). ONE value in TWO roles by design (spec I1): the 2b
-    declared-vs-computed mismatch tolerance AND the censor's
-    justification-free positive-delta floor — both mean "below this, a byte
-    delta is measurement noise", and the shared key keeps the roles from
-    drifting apart silently. A measurement parameter, never a byte budget:
-    the emission policy for positive deltas is the skill's structural
-    conditions + the human sitting, not this number."""
     return config_toml_int("gardener", "bytes_tolerance", _BYTES_TOLERANCE)
 
 
 def _always_on_bytes_violations(meta, body: str) -> list:
-    """§7.4 extensions, one accumulating pass (spec M1): (2b) the declared
-    always_on_bytes must match the diff-computed act within tolerance
-    (PR #208 class — validate the act, not the declaration); (censor, PRD
-    A5) a diff netting positive always-on bytes beyond the same tolerance
-    must carry a non-empty cost_justification. Skipped entirely when there
-    is no ```diff fence (build-brief prose diffs); an uncomputable diff
-    skips everything except the non-integer-declared report (apply-check
-    owns malformed diffs)."""
     if "always_on_bytes" not in meta:
-        return []  # presence is PROPOSAL_REQUIRED_PRESENT's job
+        return []
     if not _DIFF_FENCE_RE.search(body):
         return []
     violations = []
@@ -580,11 +395,6 @@ _FLOW_COST_NOISE = " \t\n`*'\".,:;-\u2014\u2013"
 
 
 def _flow_cost_violations(meta) -> list:
-    """§7.4 extension (PRD A7): the flow_cost contract lives in the
-    dockwright-gardener-digest skill's "Flow-cost question" section.
-    _as_list coerces the `[...]`-shaped value parse_frontmatter returns as a
-    list; an uncoerced list raises here and leaves the rest of the run's
-    artifacts unvalidated."""
     raw = "".join(_as_list(meta.get("flow_cost"))).strip(_FLOW_COST_NOISE)
     raw = "" if _FLOW_COST_PLACEHOLDER.search(raw) else raw
     if not raw:
@@ -613,24 +423,10 @@ _APPLY_CHECK_QUALIFY = ("clean", "reanchorable")
 
 
 def _apply_check(path: str, body: str):
-    """Apply-ability of a new pending proposal, via the actuator's own
-    classifier (the same parser/anchor pipeline apply uses — never a
-    re-derivation). Returns (verdict, detail): verdict is a pass token
-    (clean|reanchorable|no-diff|skipped-env) or a fail class from
-    _APPLY_CHECK_FAIL. Fence PRESENCE decides whether the gate fires —
-    kind: build-brief legitimately ships a prose ## Diff (gate on what the
-    body carries, not what the frontmatter declares). Environmental
-    problems must never quarantine a proposal (a generic install without
-    git-versioned roots would otherwise mass-reject on machine state)."""
     if not _DIFF_FENCE_RE.search(body):
         return "no-diff", ""
     try:
-        import gardener_apply  # lazy: gardener_apply imports THIS module
-        # Scope-sync (module identity): gardener_apply resolves scope via
-        # the gardener_postrun instance BOUND at ITS import — under a fresh
-        # importlib load of this module (tests) that is a different object.
-        # Sync the bound module's roots to THIS module's for the call so
-        # classification always judges against the caller's scope.
+        import gardener_apply
         bound = gardener_apply.gardener_postrun
         saved = bound.ALLOWED_TARGET_ROOTS
         bound.ALLOWED_TARGET_ROOTS = ALLOWED_TARGET_ROOTS
@@ -651,8 +447,6 @@ def validate_check(meta) -> list[str]:
 
 
 def _unique_dest(dest_dir: Path, name: str) -> Path:
-    """Collision-safe destination: never silently overwrite an artifact that
-    already landed in accepted/declined/rejected under the same basename."""
     dest = dest_dir / name
     if not dest.exists():
         return dest
@@ -672,9 +466,6 @@ def _quarantine(path: Path, reasons: list[str], run_id: str, lane: str = "digest
 
 
 def known_from_ledger() -> set[str]:
-    """Basenames of every artifact the ledger has already processed (any
-    event carrying a path). Authoritative known-set: an artifact written
-    between runs is still unknown and gets validated on the next postrun."""
     known: set[str] = set()
     if not LEDGER_PATH.is_file():
         return known
@@ -696,9 +487,6 @@ def known_from_ledger() -> set[str]:
 
 
 def _backpressure_stats():
-    """(streak, seen_run_ids) replayed over digest-lane backpressure events
-    in ledger order. Recomputed each call rather than trusted from the last
-    event — the ledger is small and replay is annotate-tolerant."""
     streak, seen = 0, set()
     for rec in _iter_ledger_events():
         if _event_type(rec) != "backpressure" or rec.get("lane") != "digest":
@@ -717,14 +505,6 @@ def _backpressure_stats():
 
 
 def record_backpressure(run_id: str, proposals: int, negative: int):
-    """Digest-lane back-pressure heartbeat + violation flag (spec 2c).
-    ALWAYS appends one event per digest postrun — a gate that is silent when
-    it had nothing to check is indistinguishable from a broken one. Returns
-    None when this run_id already has an event (whole-ledger idempotency);
-    else {"streak": int, "violation": bool}. Violation response is
-    flag-loud, never quarantine: the wrapper swallows exit codes, and
-    rejecting good additive proposals would only pressure the analyst to
-    fabricate evictions."""
     streak, seen = _backpressure_stats()
     if run_id in seen:
         return None
@@ -747,8 +527,6 @@ def record_backpressure(run_id: str, proposals: int, negative: int):
 
 
 def process_run_artifacts(run_id: str, known: set[str], lane: str = "") -> dict:
-    """Validate every artifact the ledger doesn't know yet. `known` is the
-    ledger-derived set (plus any --known supplement)."""
     summary = {"proposals": 0, "checks": 0, "rejected": 0, "skipped_env": 0,
                "digest_proposals": 0, "digest_negative": 0}
     for d in (PENDING_DIR, CHECKS_DIR, REJECTED_DIR):
@@ -763,15 +541,8 @@ def process_run_artifacts(run_id: str, known: set[str], lane: str = "") -> dict:
                         lane=str((meta or {}).get("lane") or lane or "digest"))
             summary["rejected"] += 1
             continue
-        # Birth gate: a newly-emitted proposal whose diff the actuator cannot
-        # apply is quarantined here, never silently enqueued. Runs only for
-        # proposals the ledger doesn't already know (the loop skips known ones
-        # above), so the live pending backlog is never retro-quarantined.
         verdict, detail = _apply_check(str(path), body)
         if verdict == "skipped-env":
-            # count it: a machine-wide vacuous birth gate (every proposal
-            # skipped-env) must be visible in the one-line postrun summary,
-            # not just on scattered stderr WARNINGs (M5).
             summary["skipped_env"] += 1
             print(f"WARNING: apply-check skipped (environment) for "
                   f"{path.name}: {detail}", file=sys.stderr)
@@ -821,9 +592,6 @@ def process_run_artifacts(run_id: str, known: set[str], lane: str = "") -> dict:
 
 
 def _resolve_member(sid: str):
-    """Finding file for a member id: exact basename first, then unique-prefix
-    glob (the skill historically emitted sid-prefix-8). Returns
-    (path|None, "exact"|"prefix"|"missing"|"ambiguous")."""
     exact = FINDINGS_DIR / f"{sid}.md"
     if exact.is_file():
         return exact, "exact"
@@ -836,7 +604,6 @@ def _resolve_member(sid: str):
 
 
 def decide(proposal_path: str, kind: str, reason: str, applied_rev=None) -> int:
-    """Review-sitting bookkeeping for one human decision. Returns exit code."""
     if kind not in ("accept", "decline"):
         print(f"gardener-decide: unknown kind {kind!r} (accept|decline)", file=sys.stderr)
         return 2
@@ -861,9 +628,6 @@ def decide(proposal_path: str, kind: str, reason: str, applied_rev=None) -> int:
         return 2
     members = _as_list(meta.get("members"))
     evidence_kind = str(meta.get("evidence_kind") or "findings")
-    # A corpus-retire DECLINE is a vote to keep clustering the evidence, not
-    # to bury it — marking members reviewed here would make decline behave
-    # identically to accept (PRD §A5: "DECLINE keeps them as evidence").
     keep_evidence = kind == "decline" and str(meta.get("kind", "")) == "corpus-retire"
     dest_dir = ACCEPTED_DIR if kind == "accept" else DECLINED_DIR
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -883,8 +647,6 @@ def decide(proposal_path: str, kind: str, reason: str, applied_rev=None) -> int:
             if not marker.exists():
                 marker.touch()
             marked.append(sid)
-    # ops/external evidence has no finding files: skipping the burn is BY
-    # DECLARATION, not a missing-file accident (arch review I3).
     ledger_append("decision", kind=kind, proposal_id=str(meta.get("id")),
                   path=str(dest), cluster=str(meta.get("cluster", "")),
                   members=",".join(members), reason=reason,
@@ -902,32 +664,16 @@ def decide(proposal_path: str, kind: str, reason: str, applied_rev=None) -> int:
     return 0
 
 
-# ---- evaluate mode: outcome-check recording sink (PRD §7 step 6 / §7.6) ----
-#
-# The keep/revert loop's recording half. `decide` records the human's
-# accept/decline; `evaluate` records the analyst's kept/violated verdict on a
-# *matured* armed check. Symmetric to decide by construction: the tool does not
-# form the verdict (that is a §7.6 judgment against post-acceptance data — a
-# self-grepping tool would verify a fantasy and would break the "blind to
-# generation context" constraint); it records the supplied verdict under
-# maturity + idempotency + append-only guards, writing ONLY the ledger.
-
 OUTCOME_EVENTS = ("check_kept", "check_violated")
 VERDICT_EVENT = {"kept": "check_kept", "violated": "check_violated"}
-# Dispositions that must fail the process loudly (bad input / structural anomaly
-# / append-only breach) even when other checks record cleanly.
 ANOMALY_KINDS = frozenset({"REFUSED", "UNKNOWN-CHECK", "WINDOW-PARSE-ERROR", "DUPLICATE-ARM"})
 
 
 def _event_type(rec: dict) -> str:
-    """Canonical event type, tolerating the pre-rename envelope (ledger_append
-    emits both `type` and `event`; older ledger lines carry only `event`)."""
     return rec.get("type") or rec.get("event") or ""
 
 
 def _iter_ledger_events():
-    """Yield each decodable ledger record; skip blank/undecodable lines and a
-    missing file (same tolerance as known_from_ledger)."""
     if not LEDGER_PATH.is_file():
         return
     try:
@@ -947,13 +693,6 @@ def _iter_ledger_events():
 
 
 def armed_checks_from_ledger() -> dict:
-    """{check_id: info} anchored to the FIRST check_armed per id — the immutable
-    append-only stamp (expectation + armed_ts). A later same-id arming with a
-    DIFFERENT expectation sets info['duplicate_arm']=True (surfaced as an
-    anomaly, never merged): taking the first, not the last, is what stops a
-    re-emitted `id: cX` file's weakened expectation from migrating into an
-    outcome event (known_from_ledger keys on basename, so a second arm is
-    mechanically possible)."""
     armed: dict = {}
     for rec in _iter_ledger_events():
         if _event_type(rec) != "check_armed":
@@ -977,7 +716,6 @@ def armed_checks_from_ledger() -> dict:
 
 
 def recorded_outcomes_from_ledger() -> set:
-    """check_ids that already carry any check_kept/check_violated event."""
     recorded = set()
     for rec in _iter_ledger_events():
         if _event_type(rec) in OUTCOME_EVENTS and rec.get("check_id"):
@@ -986,7 +724,6 @@ def recorded_outcomes_from_ledger() -> set:
 
 
 def _window_seconds(check_window_days):
-    """days → seconds, or None when unparseable (armed with a bad window)."""
     try:
         return int(str(check_window_days)) * 86400
     except (TypeError, ValueError):
@@ -994,8 +731,6 @@ def _window_seconds(check_window_days):
 
 
 def is_matured(armed_info: dict, now: float) -> bool:
-    """now >= armed_ts + window (inclusive). False for an unparseable window or
-    a non-numeric armed_ts (those are handled as WINDOW-PARSE-ERROR upstream)."""
     win = _window_seconds(armed_info.get("check_window_days"))
     ts = armed_info.get("armed_ts")
     if win is None or not isinstance(ts, (int, float)):
@@ -1004,10 +739,6 @@ def is_matured(armed_info: dict, now: float) -> bool:
 
 
 def _load_verdicts(path: str) -> dict:
-    """{check_id: {'verdict': str, 'evidence': str}}. The file value is either a
-    bare verdict string or a {verdict, evidence} object. Raises ValueError on a
-    structurally malformed file (not JSON-object) — a bad verdicts file must
-    fail loudly, never silently record nothing."""
     raw = json.loads(Path(path).read_text())
     if not isinstance(raw, dict):
         raise ValueError("verdicts file must be a JSON object (check_id -> verdict)")
@@ -1024,8 +755,6 @@ def _load_verdicts(path: str) -> dict:
 
 
 class Disposition:
-    """One armed check's evaluation decision. `event` is the dict of fields to
-    ledger_append (None = nothing to record)."""
     __slots__ = ("check_id", "kind", "message", "event")
 
     def __init__(self, check_id, kind, message, event=None):
@@ -1036,8 +765,6 @@ class Disposition:
 
 
 def plan_evaluations(armed: dict, recorded: set, verdicts: dict, now: float) -> list:
-    """Pure: one Disposition per armed check (+ UNKNOWN-CHECK per verdict naming
-    an un-armed id). No I/O, no clock — `now` is injected."""
     dispositions = []
     for cid in sorted(armed):
         info = armed[cid]
@@ -1099,7 +826,6 @@ def plan_evaluations(armed: dict, recorded: set, verdicts: dict, now: float) -> 
 
 
 def evaluate(verdicts_path, dry_run: bool, now: float) -> int:
-    """Record outcome events for matured armed checks. Returns exit code."""
     verdicts = {}
     if verdicts_path:
         try:
@@ -1132,12 +858,6 @@ def evaluate(verdicts_path, dry_run: bool, now: float) -> int:
 
 
 def annotate(ref: str, note: str) -> int:
-    """Append a correction/annotation event referencing an earlier ledger
-    entry. The ledger is an APPEND-ONLY audit record: the correct response to a
-    stray or erroneous event is an appended `annotate`, NEVER an in-place edit
-    of the audit file — editing the record is the DEEPER error the disclosed
-    incident warns against. Carries no top-level `path` key (known_from_ledger
-    keys on `path`; an annotation must not shadow a pending artifact)."""
     ledger_append("annotate", ref=ref, note=note)
     print(f"gardener-annotate: appended annotate ref={ref!r}")
     return 0

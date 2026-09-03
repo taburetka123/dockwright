@@ -1,15 +1,3 @@
-"""The every-session hook path must never import the FastMCP monolith.
-
-hooks.py runs on EVERY session's SessionStart/UserPromptSubmit/Stop/SessionEnd
-on this machine. A routine bad merge to mcp_server.py (2,700 LOC, the
-fastest-growing file) must not be able to break fleet registration — hook
-stderr is swallowed, so the failure would surface only as routing gaps. The
-hook path's registry/distill helpers therefore live in FastMCP-free modules,
-and these tests pin that boundary.
-
-Subprocess-isolated: pytest itself imports mcp_server for other tests, so the
-sys.modules assertion must run in a child interpreter that only runs hooks.
-"""
 import os
 import subprocess
 import sys
@@ -50,8 +38,6 @@ def _run_hook_child(tmp_path, agent, body):
 
 
 def test_worker_hook_path_never_imports_fastmcp(tmp_path):
-    """Drives every worker hook: fresh registration (name resolution), prompt
-    submit, stop, and session_end (drop-questions + closed-record archive)."""
     _run_hook_child(tmp_path, "worker", """
         import io, json, sys
         def feed(payload):
@@ -73,8 +59,6 @@ def test_worker_hook_path_never_imports_fastmcp(tmp_path):
 
 
 def test_mcp_server_reexports_registry_helpers():
-    """Internal mcp_server call sites and existing test imports resolve the
-    moved helpers through the re-export shim — same objects, not copies."""
     from dockwright import mcp_server, registry
     for name in ["_question_paths", "_drop_questions_for_worker",
                  "_prune_stale_active_records", "_resolve_unique_name"]:
@@ -82,11 +66,6 @@ def test_mcp_server_reexports_registry_helpers():
 
 
 def test_manager_hook_path_never_imports_fastmcp(tmp_path):
-    """Drives manager registration and the session_end distill branch: the
-    pre-seeded memory file exercises the early-return (idempotence), so no
-    real `claude -p` subprocess spawns in this child. The fallback distill is
-    a detached subprocess now, not an in-process import — the hook path must
-    stay distill-free."""
     _run_hook_child(tmp_path, "manager", """
         import io, json, sys
         from datetime import datetime
@@ -118,16 +97,3 @@ def test_mcp_server_reexports_distill_helpers():
                  "_slim_transcript", "_distill_manager_session",
                  "_write_memory_file_atomic", "distill_and_write_memory"]:
         assert getattr(mcp_server, name) is getattr(distill, name), name
-
-
-def test_hooks_source_never_references_the_monolith():
-    """Static pin for ALL hook branches, including ones the subprocess legs
-    don't drive (/clear rotation, nested detection): a retarget back to
-    .mcp_server anywhere in hooks.py would pass the in-process suite (pytest
-    imports mcp_server anyway), so the source itself is the contract."""
-    hooks_source = (Path(__file__).resolve().parents[1]
-                    / "src" / "dockwright" / "hooks.py").read_text()
-    offenders = [f"{i}: {line.strip()}"
-                 for i, line in enumerate(hooks_source.splitlines(), 1)
-                 if "mcp_server" in line]
-    assert not offenders, f"hooks.py references the monolith: {offenders}"

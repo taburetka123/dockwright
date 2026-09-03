@@ -1,23 +1,3 @@
-"""`dockwright spend-report`: fleet token-spend statistics.
-
-Sources, merged with sid dedup:
-  spend-ledger.jsonl — durable archive, one line per finished spend period
-  closed/            — only periods the ledger never saw: pre-ledger closures,
-                       and autoclosed records still awaiting prune/resume
-                       (closed_reason != "session_end" marks those)
-  active/            — live sessions' current period (never yet ledgered)
-  gardener ledger    — run_end events; gardener self-captures spend and is
-                       deliberately NOT CLAUDE_SPEND_CLASS-tagged (double-capture)
-
-Tokens only: no $-cost field exists anywhere in the captured data, so the
-report reports tokens and says so instead of inventing conversion rates.
-Day attribution is the period's END time (ledger ts / closed_at / today for
-live), local timezone — a long-running session lands entirely on its end day.
-
-A positional worker-name/sid switches to the per-session report (spend_session),
-which reads that one session's TRANSCRIPT — where per-call usage does exist — and
-so can report money. The fleet view above has no transcript to read.
-"""
 import argparse
 import json
 import os
@@ -29,7 +9,6 @@ from . import paths, state
 from .spend_ledger import read_events
 
 def _prefer_new(new: Path, legacy: Path) -> Path:
-    # deprecated, one release: legacy fallback while orchestrator-era state migrates
     if new.exists():
         return new
     if legacy.exists():
@@ -92,7 +71,6 @@ def _unit(name, agent, source, day, spend) -> dict:
 
 
 def collect_units() -> list[dict]:
-    """One unit per counted spend period across all four sources."""
     units = []
     ledger_sids = set()
     for event in read_events():
@@ -111,8 +89,6 @@ def collect_units() -> list[dict]:
         spend = _spend_of(record.get("spend"))
         if spend is None:
             continue
-        # A session_end closure wrote both this snapshot and a ledger line for
-        # the same period; an autoclose snapshot is a period the ledger never saw.
         if record.get("claude_sid") in ledger_sids and record.get("closed_reason") == "session_end":
             continue
         units.append(_unit(record.get("name") or record.get("claude_sid") or "?",
@@ -143,8 +119,6 @@ def _gardener_units() -> list[dict]:
             continue
         if not isinstance(event, dict) or event.get("event") != "run_end":
             continue
-        # ledger_append stores every value as a string; pre-#69 run_end events
-        # carry no token keys at all.
         spend = {}
         for key in _TOKEN_KEYS:
             coerced = _coerce_int(event.get(key))
@@ -159,17 +133,8 @@ def _gardener_units() -> list[dict]:
 
 
 def group_by_day(units: list[dict], since: date, until: date | None = None) -> list[dict]:
-    """[{date, rows: [...], total: {...}}] newest day first; rows merged by
-    (name, agent) within a day (a respawned task name is the same logical
-    task), summed, sorted by out_tokens desc.
-
-    Token key semantics: if a key is absent from EVERY unit merged into a row,
-    the row value is None (rendered as "-").  When present in at least one unit,
-    absent units contribute 0 (partial-sum semantics — same as turns)."""
     until = until or date.today()
     buckets: dict[date, dict] = {}
-    # Track source tags as sets to avoid false substring matches (e.g. "prune"
-    # inside "preflight_prune").  Finalised to a sorted "+"-joined string below.
     source_sets: dict[tuple, set] = {}
     for unit in units:
         if not (since <= unit["date"] <= until):
@@ -177,7 +142,6 @@ def group_by_day(units: list[dict], since: date, until: date | None = None) -> l
         rows = buckets.setdefault(unit["date"], {})
         row_key = (unit["date"], unit["name"], unit["agent"])
         if row_key not in rows:
-            # Initialise WITHOUT token keys — they are added on first presence.
             rows[row_key] = {"name": unit["name"], "agent": unit["agent"],
                              "source": "", "turns": None}
             source_sets[row_key] = set()
@@ -190,7 +154,6 @@ def group_by_day(units: list[dict], since: date, until: date | None = None) -> l
             value = unit["spend"].get(key_name)
             if value is not None:
                 row[key_name] = row.get(key_name, 0) + value
-    # Finalise source labels; set absent token keys to None for a stable shape.
     for row_key, srcs in source_sets.items():
         day, _name, _agent = row_key
         row = buckets[day][row_key]
@@ -326,9 +289,6 @@ def main(argv=None) -> int:
                   "covers the whole session", file=sys.stderr)
             return 2
         from .spend_session import run as session_run
-        # Flags first, then the `--` escape, then the name: a worker name that
-        # starts with a dash would otherwise reach the session parser as an
-        # unknown option, and a flag placed after `--` becomes a positional.
         forwarded = []
         if args.as_json:
             forwarded.append("--json")

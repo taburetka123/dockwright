@@ -1,18 +1,3 @@
-"""A read that failed is not an event that was delivered.
-
-The done and questions scans used to append the event's path to the cursor
-BEFORE parsing it, so any read failure — transient or permanent — consumed the
-event without ever emitting it. Both writers use write_json_atomic today, which
-makes a torn read unreachable from them, so this was a fail-open rather than a
-live bug; it is closed here because the property is the same one the lane-death
-incident violated, and a latent version of it survives exactly until someone
-adds a writer that is not atomic.
-
-The split matters and is the whole design:
-  * a PERMANENTLY malformed payload is consumed, loudly — retrying forever
-    would wedge the lane on one bad file it can never emit anyway;
-  * a TRANSIENT OSError is never consumed — it retries.
-"""
 import json
 
 import pytest
@@ -46,12 +31,6 @@ def _cursor(tmp_path, lane):
 
 
 def _explode_on(monkeypatch, target_name, error):
-    """Make Path.read_text raise for one specific file only.
-
-    Returns a switch so a test can heal the fault WITHOUT monkeypatch.undo(),
-    which would also revert the paths fixture and silently point the scan at
-    the real state root.
-    """
     from pathlib import Path
     original = Path.read_text
     failing = {"on": True}
@@ -90,7 +69,6 @@ def test_a_transient_read_error_never_consumes_a_done_event(scan_state, monkeypa
 
 
 def test_the_event_is_emitted_once_the_read_succeeds(scan_state, monkeypatch, capsys):
-    """The retry must actually deliver, not just decline to consume."""
     tmp_path = scan_state
     _write(paths.DONE / "mgr", "d1.json",
            {"worker_name": "w", "summary": "must survive"})
@@ -109,7 +87,6 @@ def test_the_event_is_emitted_once_the_read_succeeds(scan_state, monkeypatch, ca
 ])
 def test_a_permanently_malformed_payload_is_consumed_loudly(
         scan_state, capsys, lane, bucket, scan):
-    """A poison pill must not wedge the lane — but it must not be silent."""
     tmp_path = scan_state
     path = _write(getattr(paths, bucket.upper()) / "mgr", "bad.json", "{not json")
 
@@ -122,11 +99,6 @@ def test_a_permanently_malformed_payload_is_consumed_loudly(
 
 
 def test_an_undecodable_payload_is_consumed_not_retried_forever(scan_state, capsys):
-    """`read_text()` raises UnicodeDecodeError on invalid bytes, and that is a
-    ValueError but NOT a JSONDecodeError — so it escaped the malformed-payload
-    split, fell through to the retry ladder, and a permanently-undecodable file
-    wedged the lane after five scans. Permanently broken is permanently broken,
-    whichever exception says so."""
     tmp_path = scan_state
     bucket = paths.DONE / "mgr"
     bucket.mkdir(parents=True, exist_ok=True)

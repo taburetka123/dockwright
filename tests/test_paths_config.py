@@ -1,4 +1,3 @@
-"""paths.py routes its roots through config (defaults == today)."""
 import importlib
 
 import pytest
@@ -8,9 +7,6 @@ from dockwright import config, paths
 
 @pytest.fixture
 def reloading_paths(monkeypatch):
-    """Yield monkeypatch; on teardown UNDO the env patches FIRST, then reload
-    paths — a reload under a still-patched HOME would leave paths.* pointed
-    at the test tmp dir for every later test in the session."""
     yield monkeypatch
     monkeypatch.undo()
     importlib.reload(paths)

@@ -1,4 +1,3 @@
-"""compose engine — markers, drop-ins, vars, and the identity guarantee."""
 from pathlib import Path
 
 import pytest
@@ -11,10 +10,8 @@ def _d(name, body, insert_at=None):
     return DropIn(path=Path(f"/x/{name}"), insert_at=insert_at, body=body)
 
 
-# --- identity (the byte-equivalence foundation) ---
-
 @pytest.mark.parametrize("text", [
-    "",  # empty
+    "",
     "plain text\n",
     "no trailing newline",
     "line1\n\nline3\n",
@@ -27,8 +24,6 @@ def test_identity_without_markers_or_vars(text):
     assert composed == text
     assert warnings == []
 
-
-# --- markers ---
 
 CORE = "top\n<!-- overlay: hook -->\nbottom\n"
 
@@ -59,10 +54,8 @@ def test_duplicate_marker_fails():
 def test_marker_requires_exact_full_line():
     text = "  <!-- overlay: indented -->\nx <!-- overlay: inline -->\n"
     composed, _ = compose.compose_text(text, [], {})
-    assert composed == text  # neither is a marker; both survive
+    assert composed == text
 
-
-# --- end-append drop-ins ---
 
 def test_dropin_without_insert_at_appends_at_end():
     composed, _ = compose.compose_text("core\n", [_d("10-a.md", "extra\n")], {})
@@ -73,8 +66,6 @@ def test_end_append_adds_newline_when_core_lacks_one():
     composed, _ = compose.compose_text("core", [_d("10-a.md", "extra\n")], {})
     assert composed == "core\nextra\n"
 
-
-# --- vars ---
 
 def test_vars_substitute_in_core_and_dropins():
     composed, warnings = compose.compose_text(
@@ -91,8 +82,6 @@ def test_unbound_var_stays_literal_and_warns():
     assert warnings and "missing" in warnings[0]
 
 
-# --- drop-in parsing ---
-
 def test_parse_dropin_frontmatter_and_body(tmp_path):
     p = tmp_path / "10-x.md"
     p.write_text("---\ninsert_at: hook\nignored: y\n---\nBody line\n")
@@ -106,7 +95,7 @@ def test_parse_dropin_no_frontmatter(tmp_path):
     p.write_text("Just body")
     d = compose.parse_dropin(p)
     assert d.insert_at is None
-    assert d.body == "Just body\n"  # bodies normalize to end with newline
+    assert d.body == "Just body\n"
 
 
 def test_load_dropins_sorted_and_scoped(tmp_path):
@@ -121,8 +110,6 @@ def test_load_dropins_sorted_and_scoped(tmp_path):
     assert compose.load_dropins(tmp_path / "absent-overlay", "manager") == []
 
 
-# --- output_name (.core.md naming rule) ---
-
 def test_output_name_strips_core_suffix():
     assert compose.output_name("manager.core.md") == "manager.md"
 
@@ -132,11 +119,8 @@ def test_output_name_plain_md_unchanged():
 
 
 def test_output_name_does_not_mangle_short_names():
-    # "core.md" itself can't end with the (longer) ".core.md" suffix.
     assert compose.output_name("core.md") == "core.md"
 
-
-# --- vars.defaults.toml (defaults layer) ---
 
 def test_load_default_vars_absent_file_is_empty(tmp_path):
     assert compose.load_default_vars(tmp_path) == {}
@@ -166,14 +150,10 @@ def test_load_default_vars_corrupt_toml_is_fail_open(tmp_path):
 
 
 def test_load_default_vars_ignores_non_toml_extension(tmp_path):
-    # vars.defaults.toml itself is never treated as a core agent file — it's
-    # not a .md at all, so the core glob (*.md) already excludes it.
     (tmp_path / "vars.defaults.toml").write_text('[agent_vars]\nfoo = "bar"\n')
     core_files = sorted(tmp_path.glob("*.md"))
     assert core_files == []
 
-
-# --- <absolute-home> token: home expansion in var values + fail-closed sweep ---
 
 def test_home_token_in_var_value_expands_to_home():
     composed, warnings = compose.compose_text(
@@ -189,7 +169,6 @@ def test_home_token_expansion_reads_HOME_at_call_time(monkeypatch):
 
 
 def test_home_token_in_operator_style_var_also_expands():
-    # Expansion applies to the MERGED map uniformly, not just defaults.
     composed, _ = compose.compose_text(
         "{{a}} {{b}}\n", [],
         {"a": "<absolute-home>/one", "b": "plain"})
@@ -200,7 +179,7 @@ def test_home_token_in_core_text_fails_closed_even_without_vars():
     with pytest.raises(ComposeError) as exc:
         compose.compose_text("literal <absolute-home> here\n", [], {})
     assert "<absolute-home>" in str(exc.value)
-    assert "agent_vars" in str(exc.value)  # actionable: point at the supported mechanism
+    assert "agent_vars" in str(exc.value)
 
 
 def test_home_token_in_dropin_body_fails_closed():
