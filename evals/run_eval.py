@@ -48,14 +48,7 @@ def load_cases(limit: int | None = None) -> list[dict]:
     return cases[:limit] if limit else cases
 
 
-# ---------------------------------------------------------------- pure scoring
 def aggregate(records: list[dict], cases_by_id: dict[str, dict]) -> dict:
-    """Turn per-run records into the full metric bundle. Pure: no I/O.
-
-    A record is {case_id, label, flagged(bool|None on error), parsed_ok,
-    method, cost_usd, duration_ms, error}. Runs with error=True are excluded
-    from scoring but counted.
-    """
     by_case: dict[str, list[bool]] = defaultdict(list)
     errors = 0
     fallback = 0
@@ -76,7 +69,6 @@ def aggregate(records: list[dict], cases_by_id: dict[str, dict]) -> dict:
         by_case[r["case_id"]].append(r["flagged"])
         run_pairs.append((r["label"], r["flagged"]))
 
-    # case-level (majority vote across repeats)
     case_rows = []
     agreements = []
     flips = 0
@@ -142,15 +134,6 @@ def headline(agg: dict, model: str, repeats: int) -> str:
 
 
 def records_from_trace(trace_path, cases_by_id) -> tuple[list[dict], str, int]:
-    """Rebuild scoreable records from a committed trace + the CURRENT dataset.
-
-    Lets you re-score an existing run after a dataset fix WITHOUT spending API
-    calls — relabeling a case's defect_class (or fixing a label) does not change
-    the verifier's verdict, so the verdict (flagged/parsed_ok) and cost/latency
-    are replayed from the trace while label/defect_class are read fresh from the
-    dataset. Errored runs are not traced, so n_runs_errored reflects only what
-    the trace captured. Returns (records, model, repeats).
-    """
     records: list[dict] = []
     model = None
     per_case: dict[str, int] = defaultdict(int)
@@ -159,7 +142,7 @@ def records_from_trace(trace_path, cases_by_id) -> tuple[list[dict], str, int]:
             continue
         tr = json.loads(line)
         case = cases_by_id.get(tr["case_id"])
-        if case is None:  # case removed from dataset since the trace was taken
+        if case is None:
             continue
         model = model or tr.get("model")
         per_case[tr["case_id"]] += 1
@@ -179,8 +162,6 @@ def records_from_trace(trace_path, cases_by_id) -> tuple[list[dict], str, int]:
 
 
 def _rel(path) -> str:
-    """Repo-relative string for a trace path, robust to relative inputs and to
-    traces living outside the repo (falls back to the absolute path)."""
     p = Path(path).resolve()
     try:
         return str(p.relative_to(EVALS_DIR.parent))
@@ -204,10 +185,7 @@ def _write_results(agg, head, *, run_id, model, repeats, trace_rel, write_latest
     print(f"Wrote {RESULTS_DIR / (run_id + '.json')}")
 
 
-# --------------------------------------------------------------------- running
 def _dry_run_fn(case: dict):
-    """Deterministic fake verifier for plumbing checks — verdict == ground truth.
-    Produces an obvious 100%/0% result so a non-trivial number means real calls."""
     is_defect = case["label"] == "defect"
     text = (
         f"[DRY RUN] echoing label.\n```json\n"
@@ -227,11 +205,6 @@ def _dry_run_fn(case: dict):
 
 def evaluate(cases, run_one, *, repeats, concurrency, trace_writer=None,
              langfuse=None, on_progress=None) -> list[dict]:
-    """Run each (case, repeat) through run_one concurrently; return per-run records.
-
-    run_one(case) -> (Verdict, meta_dict). Exceptions become error records so a
-    single flaky call never aborts the whole eval.
-    """
     tasks = [(c, rep) for c in cases for rep in range(repeats)]
     records: list[dict] = []
 
@@ -240,7 +213,7 @@ def evaluate(cases, run_one, *, repeats, concurrency, trace_writer=None,
         try:
             verdict, meta = run_one(case)
             return case, rep, verdict, meta, None
-        except Exception as exc:  # verifier process failure / timeout
+        except Exception as exc:
             return case, rep, None, {}, str(exc)
 
     done = 0
@@ -287,7 +260,6 @@ def evaluate(cases, run_one, *, repeats, concurrency, trace_writer=None,
     return records
 
 
-# ------------------------------------------------------------------------ main
 def _print_report(agg: dict, head: str) -> None:
     print("\n" + "=" * 78)
     print("HEADLINE:", head)

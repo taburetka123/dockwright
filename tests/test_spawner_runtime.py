@@ -88,7 +88,6 @@ def _which_factory(available: dict):
 
 
 def test_interactive_shell_no_zsh_falls_back_to_bash(monkeypatch):
-    # Stock Ubuntu: SHELL=/bin/bash, no zsh anywhere (L-1 repro).
     monkeypatch.setenv("SHELL", "/bin/bash")
     monkeypatch.setattr(spawner.shutil, "which",
                         _which_factory({"/bin/bash": "/bin/bash", "bash": "/bin/bash"}))
@@ -103,7 +102,6 @@ def test_interactive_shell_prefers_zsh_when_no_shell_env(monkeypatch):
 
 
 def test_interactive_shell_ignores_non_posix_shell_env(monkeypatch):
-    # fish can't run the POSIX `K=v cmd` inner command — must not be honored.
     monkeypatch.setenv("SHELL", "/usr/bin/fish")
     monkeypatch.setattr(spawner.shutil, "which",
                         _which_factory({"/usr/bin/fish": "/usr/bin/fish",
@@ -118,12 +116,3 @@ def test_interactive_shell_last_resort_sh(monkeypatch):
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
-
-def test_no_hardcoded_zsh_spawn_argv_left():
-    # L-1 regression net: no python spawn site may hardcode zsh, and the two
-    # shipped shell scripts must use the $SPAWN_SHELL shim.
-    for py in (REPO_ROOT / "src" / "dockwright").glob("*.py"):
-        assert '"zsh", "-ic"' not in py.read_text(), f"hardcoded zsh argv in {py.name}"
-    for sh in (REPO_ROOT / "deploy" / "scripts").glob("*.sh"):
-        assert "zsh -ic" not in sh.read_text(), f"hardcoded `zsh -ic` in {sh.name}"

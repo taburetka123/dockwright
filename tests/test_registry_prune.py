@@ -1,6 +1,3 @@
-"""Prune pane-liveness gate: a dead-pid record whose tmux pane is alive is NOT
-stale (the Linux transient-$PPID shape records a pid that dies while the
-session lives on)."""
 import json
 
 import pytest
@@ -15,7 +12,6 @@ def reg(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "QUESTIONS", tmp_path / "questions")
     monkeypatch.setattr(paths, "SPEND_LEDGER", tmp_path / "spend-ledger.jsonl")
     (tmp_path / "active").mkdir()
-    # Every pid is dead unless a test overrides.
     monkeypatch.setattr(registry, "_pid_alive", lambda pid: False)
     return tmp_path
 
@@ -47,8 +43,6 @@ def test_dead_pid_absent_pane_is_reaped_with_forensic_line(reg, monkeypatch):
 
 
 def test_dead_pid_tmux_unanswerable_is_kept(reg, monkeypatch):
-    # None = error/timeout, distinct from "no server" (empty set): liveness is
-    # unknowable, and deletion is irreversible — defer to the next prune.
     monkeypatch.setattr(registry, "_live_pane_ids", lambda: None)
     path = _write_active(reg)
     registry._prune_stale_active_records()

@@ -1,13 +1,3 @@
-"""`dockwright accounts-sync` — reconcile every registered pool account's
-config-dir farm (symlink heal + .claude.json mcpServers refresh, both via
-spawner.ensure_account_config_dir) and print a parity report per account.
-
-Heals ONLY farms that already exist: the registry fail-opens to a default
-a/b pool, so eager provisioning would grow ~/.claude-<name> on installs that
-never spawn pool accounts; a never-spawned account builds its farm at first
-spawn exactly as before. Exit 2 = bad argv; 0 otherwise — drift is a report,
-not an install failure (setup.sh runs this under `set -euo pipefail` right
-before doctor)."""
 from __future__ import annotations
 
 import sys

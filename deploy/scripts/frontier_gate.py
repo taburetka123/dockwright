@@ -1,44 +1,4 @@
 #!/usr/bin/env python3
-"""LLM-free trigger gate for the FRONTIER loop — a separate registered loop,
-NOT a gardener_gate lane (arch-soundness review C1: a calendar-interval lane
-inside the accumulation gate is the loop-master runtime Part B rejected).
-
-The frontier loop re-runs the orchestrator frontier research sweep
-(the manual v1 sweep is run #0, 2026-06-11) on a fixed
-interval. It SHARES the Gardener's trust substrate — the artifact contract
-into proposals/pending/, the FR-8 postrun quarantine, the review sitting, the
-decision ledger, the analyst-run mutex — and shares NOTHING of the digest
-gate's decision chain or budget pool.
-
-Invoked daily by launchd (com.dockwright.gardener-frontier, installed by
-gardener-install.sh) and manually with --force. Decision order:
-
-  stopped     — ~/.claude/frontier-stop exists (per-loop kill switch, B3
-                convention). --force refuses too (exit 3): stopped means
-                stopped, and stopping the digest loop does NOT stop this one.
-  locked      — the shared analyst-run mutex is held by a live pid (one
-                claude -p / analyst session fleet-wide; rate-limiter guard).
-                Applies to --force as well (exit 4).
-  cooldown    — the newest lane=frontier run_start in the shared ledger is
-                younger than GARDENER_FRONTIER_RETRY_GAP seconds (default
-                48h). A failed web-heavy run retries in days, not hourly —
-                the marker only advances on ok, so without this a wedged run
-                would re-fire every tick.
-  not_armed   — the last-frontier-run marker is ABSENT. The first run is an
-                explicit human decision: gardener-install.sh arms the marker
-                at install (run #0 = the manual v1 research), so a fresh
-                deploy never fires a surprise token-heavy web sweep.
-  not_due     — marker younger than GARDENER_FRONTIER_INTERVAL_DAYS
-                (default 7).
-  frontier    — due; spawn gardener-run.sh --lane frontier (the run wrapper
-                is shared MECHANISM — tmux spawn, watchdog, write-guard,
-                audit, postrun — parameterized by lane; the gate decision
-                chains stay separate).
-
-The interval IS the budget: one run per interval, the retry gap bounds
-failure bursts, and digest-lane caps are untouched by construction.
-Every invocation appends one decision line to ~/.claude/dockwright/gardener/frontier-gate.log.
-"""
 from __future__ import annotations
 
 import argparse
@@ -68,9 +28,6 @@ def _env_positive_float(name: str, default: float) -> float:
 
 
 def _dockwright_config_file() -> Path | None:
-    """Discover dockwright.toml the way config.py does (env DOCKWRIGHT_CONFIG ->
-    XDG_CONFIG_HOME/dockwright -> ~/.claude/dockwright.toml). Deployed gates must
-    NOT import dockwright, so discovery is re-implemented."""
     env = os.environ.get("DOCKWRIGHT_CONFIG", "").strip()
     if env:
         p = Path(env).expanduser()
@@ -85,8 +42,6 @@ def _dockwright_config_file() -> Path | None:
 
 
 def _scan_toml_bool(text: str, section: str, key: str) -> bool | None:
-    """Bare `key = true|false` inside [section] — the tomllib-less fallback for
-    the py3.9 /usr/bin/python3 this gate's launchd plist runs it under."""
     cur = None
     for raw in text.splitlines():
         line = raw.strip()
@@ -110,9 +65,6 @@ def _scan_toml_bool(text: str, section: str, key: str) -> bool | None:
 
 
 def gardener_module_enabled() -> bool:
-    """[modules] gardener toggle from dockwright.toml (the frontier loop is part
-    of the Gardener subsystem, so it shares the switch). tomllib when available;
-    the bare-bool scanner otherwise. Default + fail-open: ENABLED."""
     path = _dockwright_config_file()
     if path is None:
         return True
@@ -134,7 +86,6 @@ HOME = Path(os.environ.get("HOME", ""))
 
 
 def _prefer_new(new: Path, legacy: Path) -> Path:
-    # deprecated, one release: legacy fallback while orchestrator-era state migrates
     if new.exists():
         return new
     if legacy.exists():
@@ -146,10 +97,7 @@ GARDENER_DIR = _prefer_new(HOME / ".claude" / "dockwright" / "gardener", HOME / 
 LEDGER_PATH = GARDENER_DIR / "ledger.jsonl"
 MARKER_PATH = GARDENER_DIR / "last-frontier-run"
 GATE_LOG_PATH = GARDENER_DIR / "frontier-gate.log"
-# deprecated, one release: operator stop-file honored at either home
 STOP_PATHS = (HOME / ".claude" / "dockwright" / "frontier-stop", HOME / ".claude" / "frontier-stop")
-# Neutral lock home shared with selffix-run.sh + gardener-run.sh
-# (deploy/scripts/runlock.sh owns the protocol — arch review A5).
 RUN_LOCK_DIR = HOME / ".claude" / "locks" / "analyst-run.lock"
 RUN_SCRIPT = HOME / ".claude" / "scripts" / "gardener-run.sh"
 
@@ -162,7 +110,6 @@ EXIT_FORCE_LOCKED = 4
 
 
 def _marker_mtime() -> float | None:
-    """None when the marker is absent (loop not armed)."""
     try:
         return MARKER_PATH.stat().st_mtime
     except OSError:
@@ -170,8 +117,6 @@ def _marker_mtime() -> float | None:
 
 
 def newest_frontier_run_age(now: float) -> float | None:
-    """Age of the newest lane=frontier run_start in the SHARED ledger.
-    Envelope key `type` with `event` tolerated. Corrupt lines skipped."""
     if not LEDGER_PATH.is_file():
         return None
     try:
@@ -200,10 +145,6 @@ def newest_frontier_run_age(now: float) -> float | None:
 
 
 def lock_held_by_live_pid() -> bool:
-    """Same protocol as gardener_gate (cheap advisory pre-check; the run
-    wrapper re-acquires atomically via runlock.sh, which owns the run-side
-    mutex semantics). Duplicated by the loop convention — gates are
-    self-contained domain code."""
     if not RUN_LOCK_DIR.is_dir():
         return False
     try:
@@ -272,7 +213,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if not gardener_module_enabled():
-        # gardener=false disables the frontier loop too — no dir, no gate.log.
         print("frontier-gate: module-off ([modules] gardener=false) — no-op")
         return EXIT_OK
 

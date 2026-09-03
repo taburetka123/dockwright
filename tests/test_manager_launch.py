@@ -6,10 +6,6 @@ import os
 
 
 def _assert_rc_parse_safe(argv):
-    """--remote-control [name] binds a following NON-dash token as the RC
-    session name; the trailing /manager* prompt must never sit there. Guards
-    the parsed shape, which exact-argv asserts alone cannot (a reorder
-    re-greens them, broken or not)."""
     if "--remote-control" in argv:
         i = argv.index("--remote-control")
         assert i + 1 < len(argv), f"--remote-control is last in {argv!r}"
@@ -24,9 +20,6 @@ class _Result:
 
 
 def _inside_env(monkeypatch, tmp_path, sock="dockwright"):
-    """Set $TMUX to the exact path tmux would use for socket `sock` under a
-    private TMUX_TMPDIR, so the test controls both sides of the same-server
-    comparison."""
     tmpdir = tmp_path / "tmuxtmp"
     (tmpdir / f"tmux-{os.getuid()}").mkdir(parents=True)
     monkeypatch.setenv("TMUX_TMPDIR", str(tmpdir))
@@ -85,9 +78,6 @@ def test_runtime_argv_no_settings_when_absent(monkeypatch, tmp_path):
 
 
 def test_runtime_argv_rc_opt_out(monkeypatch, tmp_path):
-    # DOCKWRIGHT_MANAGER_RC=0 is the public-operator escape hatch (spec
-    # Decision 2): RC behavior on an RC-unavailable account is unspiked, so
-    # the flag must be omittable without a code change.
     monkeypatch.setenv("DOCKWRIGHT_MANAGER_RC", "0")
     monkeypatch.setattr(manager_launch.paths, "PRESETS", tmp_path / "nope")
     monkeypatch.setattr(manager_launch, "_model", lambda: "opus[1m]")
@@ -162,8 +152,6 @@ def test_main_creates_detached_then_switches_when_mgr_missing(monkeypatch, tmp_p
 
 
 def test_inside_dockwright_server_realpath_normalizes_symlinked_tmpdir(monkeypatch, tmp_path):
-    # macOS: tmux realpaths the socket dir (/tmp -> /private/tmp), so $TMUX
-    # carries the resolved path while TMUX_TMPDIR may be the symlinked one.
     real = tmp_path / "real"
     (real / f"tmux-{os.getuid()}").mkdir(parents=True)
     link = tmp_path / "link"
@@ -274,12 +262,6 @@ def test_main_pretrusts_launch_cwd(monkeypatch, tmp_path):
 
 @pytest.mark.real_tmux
 def test_live_inside_tmux_creates_mgr_detached_and_switches(monkeypatch, tmp_path, real_tmux):
-    """F-1 end-to-end on a real throwaway server: `dockwright manager` typed in
-    a window of the dockwright server creates mgr DETACHED (claude shimmed via
-    PATH) and switch-clients the pty client onto it. The test process itself
-    never passes `-t mgr`/`-s mgr` to tmux (conftest hard-fails that in
-    real_tmux tests) — the child process inside the pane does, unpatched, on
-    the throwaway socket."""
     import fcntl
     import pty
     import select
@@ -374,9 +356,6 @@ def test_manager_claude_args_skip_perms_strict_opt_in(monkeypatch, tmp_path, val
 
 
 def test_manager_claude_args_skip_perms_independent_of_rc(monkeypatch, tmp_path):
-    # RC=0 + skip=1 (public RC-unavailable operator, sanctioned driver run)
-    # must still emit — guards against nesting the skip append inside the RC
-    # branch, which every other test in this file would fail to catch.
     monkeypatch.setenv("DOCKWRIGHT_MANAGER_RC", "0")
     monkeypatch.setenv("DOCKWRIGHT_MANAGER_SKIP_PERMS", "1")
     monkeypatch.setattr(manager_launch.paths, "PRESETS", tmp_path / "nope")
@@ -394,11 +373,6 @@ def test_runtime_argv_skip_perms_parse_safe(monkeypatch, tmp_path):
 
 
 def test_main_execvp_scrubs_env_after_argv_composition(monkeypatch, tmp_path):
-    """Server-birth stickiness guard (spec § Server-birth scrub): execvp'd tmux
-    inherits os.environ — a server born with the var would hand it to every
-    future window, making the opt-in sticky across recreates. The composed argv
-    must still carry the one-shot flag (pop-before-compose would silently
-    disable the feature)."""
     monkeypatch.delenv("TMUX", raising=False)
     monkeypatch.setattr(manager_launch, "_has_mgr_session", lambda: False)
     monkeypatch.setattr(manager_launch, "_server_alive", lambda: False)

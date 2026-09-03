@@ -1,6 +1,3 @@
-# tests/test_value_grounding.py
-"""Unit tests for deploy/scripts/value_grounding.py (imported via importlib —
-the script is standalone, not a package module; see test_gardener_postrun.py)."""
 import importlib.util
 import json
 import sys
@@ -15,9 +12,6 @@ VG_PATH = Path(__file__).resolve().parents[1] / "deploy" / "scripts" / "value_gr
 def vg():
     spec = importlib.util.spec_from_file_location("value_grounding_under_test", VG_PATH)
     mod = importlib.util.module_from_spec(spec)
-    # Register before exec so the @dataclass decorator can resolve its module
-    # (see test_worktree_prune.py — same gotcha with frozen dataclass + `from
-    # __future__ import annotations`).
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
@@ -45,7 +39,7 @@ class TestExtractTokens:
 
     def test_long_digit_run_and_boundaries(self, vg):
         toks = vg.extract_tokens("epoch 1720958400 port 8080", classes=("long_digit_run",))
-        assert _texts(toks) == ["1720958400"]  # 8080 is <6 digits
+        assert _texts(toks) == ["1720958400"]
 
     def test_ticket_key(self, vg):
         assert _texts(vg.extract_tokens("see TKT-8517.", classes=("ticket_key",))) == ["TKT-8517"]
@@ -65,7 +59,6 @@ class TestGrounding:
     def test_comma_count_grounded_by_bare_form_on_digit_boundary(self, vg):
         t = vg.Token("1,558", "comma_count")
         assert vg.is_grounded(t, "ApproximateNumberOfMessages: 1558")
-        # substring of a longer number does NOT ground it
         assert not vg.is_grounded(t, "id 91558723")
 
     def test_uuid_case_insensitive(self, vg):
@@ -112,7 +105,6 @@ def _write_jsonl(path, records):
 
 @pytest.fixture()
 def transcript_tree(tmp_path):
-    """Main transcript + subagents sidecar mimicking <cfg>/projects/<slug>/."""
     proj = tmp_path / "projects" / "-tmp-work"
     sid = "aaaaaaaa-1111-2222-3333-bbbbbbbbcccc"
     main = proj / f"{sid}.jsonl"
@@ -152,14 +144,14 @@ class TestParseTranscripts:
 
     def test_corpus_includes_user_text_and_real_tool_outputs(self, vg, transcript_tree):
         _, corpus = vg.parse_transcripts([str(transcript_tree["main"]), str(transcript_tree["sub"])])
-        assert "TKT-9999" in corpus            # user brief
-        assert "v1.900.537" in corpus          # Read output
-        assert "1558" in corpus                # subagent Grep output
+        assert "TKT-9999" in corpus
+        assert "v1.900.537" in corpus
+        assert "1558" in corpus
 
     def test_corpus_excludes_agent_results_and_assistant_text(self, vg, transcript_tree):
         _, corpus = vg.parse_transcripts([str(transcript_tree["main"]), str(transcript_tree["sub"])])
-        assert "v6.6.6" not in corpus          # Agent tool_result + toolUseResult both excluded
-        assert "v7.7.7" not in corpus          # assistant prose excluded
+        assert "v6.6.6" not in corpus
+        assert "v7.7.7" not in corpus
 
     def test_malformed_lines_skipped(self, vg, tmp_path):
         p = tmp_path / "bad.jsonl"

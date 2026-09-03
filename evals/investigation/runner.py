@@ -1,17 +1,3 @@
-"""Drive one investigation case through a headless ``claude -p`` worker, offline.
-
-A case is a self-contained directory (``scenario.md`` + ``fixtures/`` +
-``case.json`` + ``answer.json``). The worker is spawned with a read-only preset
-and an empty MCP config into a throwaway workdir that holds ONLY the scenario,
-the fixtures, and a copy of the bound investigation skill — never the answer
-key — so the model's evidence surface is exactly the fixture excerpts. After the run we recover the session transcripts via
-``value_grounding`` to reconstruct the tool-call trace (for the required-reads /
-value-grounding gates) alongside the model's textual findings.
-
-An errored run (nonzero exit, timeout, unparseable output) is a failed sample,
-not a crashed suite: ``run_case`` never raises — it returns a ``RunRecord`` with
-``error`` set and the remaining fields defaulted.
-"""
 from __future__ import annotations
 
 import json
@@ -29,7 +15,6 @@ REPO_ROOT = os.path.dirname(
 DEFAULT_SETTINGS = os.path.join(
     REPO_ROOT, "deploy", "presets", "investigation-eval-settings.json"
 )
-# Deployed location the live dockwright install actually points at; preferred if present.
 _DEPLOYED_SETTINGS = os.path.expanduser(
     "~/.claude/dockwright/presets/investigation-eval-settings.json"
 )
@@ -39,8 +24,6 @@ def settings_path() -> str:
     return _DEPLOYED_SETTINGS if os.path.exists(_DEPLOYED_SETTINGS) else DEFAULT_SETTINGS
 
 
-# Verbatim from deploy/agents/worker.core.md (the investigation findings block).
-# A test asserts this matches that source; do not edit one without the other.
 FINDINGS_BLOCK_SKELETON = (
     'ROOT_CAUSE: <one line, or "none">\n'
     "ROOT_CAUSE_CATEGORY: code_defect | data_state_gap | race_or_replay | "
@@ -103,19 +86,12 @@ def load_case(case_dir: str) -> dict:
     }
 
 
-# The investigation-discipline skill the evaluated worker is told to read.
-# Operator installs point this at their own skill via the env override.
 _DEFAULT_INVESTIGATE_SKILL = "~/.claude/skills/investigate/SKILL.md"
 
-# Name the bound skill takes inside the SUT workdir; the preamble names it too.
 WORKDIR_SKILL_NAME = "investigate-skill.md"
 
 
 def _toml_config() -> dict:
-    """dockwright.toml as a dict, {} when absent/corrupt. Uses dockwright.config
-    when importable so discovery never drifts from the package; replicates its
-    order (env DOCKWRIGHT_CONFIG > XDG > ~/.claude/dockwright.toml) for direct
-    `python -m` runs without the editable install."""
     try:
         from dockwright import config as dw_config
         return dw_config.load()
@@ -124,10 +100,6 @@ def _toml_config() -> dict:
     try:
         import tomllib
     except ModuleNotFoundError:
-        # py<3.11 without the editable install: no dockwright.config to defer
-        # to and no stdlib tomllib to parse with. Fail open to the harness
-        # default rather than crashing the caller — run_eval's missing-binding
-        # guard is what surfaces this loudly, not an unhandled traceback here.
         return {}
     home = os.path.expanduser("~")
     env = os.environ.get("DOCKWRIGHT_CONFIG", "").strip()
@@ -138,9 +110,6 @@ def _toml_config() -> dict:
         xdg_base = os.path.expanduser(xdg) if xdg else os.path.join(home, ".config")
         candidates = [os.path.join(xdg_base, "dockwright", "dockwright.toml"),
                       os.path.join(home, ".claude", "dockwright.toml")]
-    # First EXISTING candidate wins, then parse it once — mirroring
-    # dockwright.config.load() semantics. A parse error on that file returns
-    # {} rather than silently falling through to the next candidate.
     candidate = next((c for c in candidates if os.path.isfile(c)), None)
     if candidate is None:
         return {}
@@ -152,9 +121,6 @@ def _toml_config() -> dict:
 
 
 def investigate_skill_path() -> str:
-    """env DOCKWRIGHT_INVESTIGATE_SKILL > dockwright.toml [evals]
-    investigate_skill > harness default — the gardener eval-gate's order, so a
-    direct run binds the same skill the gated run does."""
     env = os.environ.get("DOCKWRIGHT_INVESTIGATE_SKILL", "").strip()
     if env:
         return os.path.expanduser(env)
@@ -174,7 +140,6 @@ def build_prompt(scenario: str) -> str:
 
 
 def prepare_workdir(case_dir: str) -> str:
-    """Copy scenario.md + fixtures/ (NOT case.json/answer.json) into a temp dir."""
     workdir = tempfile.mkdtemp(prefix="inv-eval-")
     shutil.copy2(
         os.path.join(case_dir, "scenario.md"),
@@ -197,12 +162,6 @@ def run_case(
 ) -> RunRecord:
     workdir = prepare_workdir(case["case_dir"])
     try:
-        # Structural delivery (eval-direction A2c): the bound skill is COPIED
-        # into the SUT's cwd instead of being read at its absolute path. Under
-        # the hermetic --setting-sources project session an out-of-cwd Read is
-        # permission-denied, and the denial is silent — samples investigated
-        # without the skill while the path-based delivery check still scored
-        # them DELIVERED. An in-cwd file is always readable.
         skill_src = investigate_skill_path()
         try:
             shutil.copy2(skill_src, os.path.join(workdir, WORKDIR_SKILL_NAME))
@@ -214,9 +173,6 @@ def run_case(
         cmd = [
             "claude", "-p", build_prompt(case["scenario"]), "--model", model,
             "--settings", settings or settings_path(), "--output-format", "json",
-            # Hermetic SUT context (eval-direction A2): no user-level settings,
-            # memory, or hooks — the bound skill must be the only instruction
-            # source, or a healthy ambient copy masks a degraded skill.
             "--setting-sources", "project",
             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
         ]

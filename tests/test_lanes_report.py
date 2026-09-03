@@ -1,14 +1,3 @@
-"""`dockwright lanes` — the check that must not be able to say OK while broken.
-
-A manager cannot distinguish "no events" from "my lane is dead": silence is
-both. This report answers it from two signals that fail independently — the
-heartbeat (which a broken lane cannot write) and the backlog (derived from the
-event directory and the cursor, never from the heartbeat).
-
-The load-bearing test here is
-test_fresh_heartbeat_plus_backlog_is_not_ok: delete the backlog arm and it goes
-red. Everything else is scaffolding around that one.
-"""
 import time
 
 import pytest
@@ -68,21 +57,12 @@ def test_stale_heartbeat_is_dead(lane_state):
 
 
 def test_heartbeat_within_the_grace_window_is_still_ok(lane_state):
-    """One slow scan must not read as death — the window is 3 intervals."""
     now = 10_000.0
     _heartbeat("mgr", "done", age_sec=lane_io.LANES["done"] * 2, now=now)
     assert _row(lanes.inspect("mgr", now=now), "done")["verdict"] == lanes.OK
 
 
 def test_fresh_heartbeat_plus_backlog_is_not_ok(lane_state):
-    """THE anti-'healthy while broken' test.
-
-    A lane can heartbeat honestly (its reader is alive, it flushed everything
-    it emitted) and still not be draining — a duplicate lane consuming the
-    events elsewhere, a cursor that raced, a scan crashing after preflight.
-    The backlog arm is derived from the event dir and the cursor, so it sees
-    that independently. Delete the arm and this goes red.
-    """
     now = 10_000.0
     _heartbeat("mgr", "done", age_sec=1, now=now)
     _done_event("mgr", "sid-a-1.json", age_sec=600, now=now)
@@ -101,7 +81,6 @@ def test_a_consumed_event_is_not_backlog(lane_state):
 
 
 def test_a_young_unconsumed_event_is_not_backlog(lane_state):
-    """An event that landed a second ago has not been missed, it is in flight."""
     now = 10_000.0
     _heartbeat("mgr", "done", age_sec=1, now=now)
     _done_event("mgr", "sid-a-1.json", age_sec=1, now=now)
@@ -109,10 +88,6 @@ def test_a_young_unconsumed_event_is_not_backlog(lane_state):
 
 
 def test_hold_semantics_lanes_report_backlog_as_not_applicable(lane_state):
-    """`turn-ends` HOLDS events without consuming them (delegation hold,
-    turn-burst hold, FS-ladder rungs to 4h) and `stale` has no per-event
-    cursor. Counting a backlog over them would cry wolf on healthy lanes, so
-    the report says n/a instead of claiming a check it never ran."""
     now = 10_000.0
     for lane in lane_io.LANES:
         _heartbeat("mgr", lane, age_sec=1, now=now)
@@ -124,14 +99,12 @@ def test_hold_semantics_lanes_report_backlog_as_not_applicable(lane_state):
 
 
 def test_report_covers_every_lane_the_dispatcher_knows(lane_state):
-    """Set equality, not a subset: a fifth lane must be reported or go red."""
     rows = lanes.inspect("mgr", now=1000.0)
     assert {r["lane"] for r in rows} == set(monitor._MONITOR_SUBCOMMANDS)
 
 
 def test_report_iterates_the_lane_set_rather_than_a_hardcoded_list(
         lane_state, monkeypatch):
-    """ADD-ONE: introduce a lane that did not exist when this was written."""
     extended = dict(lane_io.LANES)
     extended["brand-new"] = 7
     monkeypatch.setattr(lane_io, "LANES", extended)
@@ -155,12 +128,6 @@ def test_cli_rejects_extra_arguments(lane_state):
     assert lanes.main(["a", "b"]) == 2
 
 
-# While stale_monitor flags the manager as rate-limited, every lane HOLDS by
-# design: prints nothing, marks nothing seen. Events pile up on purpose. The
-# backlog arm must not report that as a fault at the one moment the manager
-# can least act on it — but the heartbeat arm must keep running, because a
-# held lane still scans and still has to prove it is alive.
-
 def _limit_manager(tmp_path, name="mgr"):
     (tmp_path / f".manager-limited-{name}").write_text("")
 
@@ -180,8 +147,6 @@ def test_a_rate_limit_hold_is_not_reported_as_a_backlog(lane_state):
 
 
 def test_a_rate_limit_hold_does_NOT_suppress_the_heartbeat_arm(lane_state):
-    """The suspension is scoped to the backlog arm only. A lane that stopped
-    scanning during a limit window is still dead, and must still say so."""
     now = 10_000.0
     _limit_manager(lane_state)
     _heartbeat("mgr", "done", age_sec=lane_io.LANES["done"] * 10, now=now)
@@ -192,10 +157,6 @@ def test_a_rate_limit_hold_does_NOT_suppress_the_heartbeat_arm(lane_state):
 
 
 def test_an_expired_limit_flag_restores_the_backlog_arm(lane_state):
-    """The flag is fail-closed and its only writer is the 60s stale loop; an
-    mtime past the TTL means that loop died, and monitor._manager_limited
-    already treats it as clear. This report must inherit that, or a stale flag
-    would blind the backlog check forever."""
     import os
     now = time.time()
     flag = lane_state / ".manager-limited-mgr"
@@ -209,10 +170,6 @@ def test_an_expired_limit_flag_restores_the_backlog_arm(lane_state):
     assert row["verdict"] == lanes.BACKLOGGED
 
 
-# "not checked" must never skim as "checked and fine". That substitution is the
-# whole failure this command exists to end, so the two renderings must not be
-# confusable — required explicitly, and checked here rather than eyeballed once.
-
 def _render(lane_state, lane, now):
     rows = lanes.inspect("mgr", now=now)
     return lanes._format(_row(rows, lane))
@@ -222,8 +179,8 @@ def test_an_unchecked_backlog_does_not_render_like_a_clean_one(lane_state):
     now = 10_000.0
     for lane in lane_io.LANES:
         _heartbeat("mgr", lane, age_sec=1, now=now)
-    checked = _render(lane_state, "done", now)        # backlog arm ran, found 0
-    unchecked = _render(lane_state, "turn-ends", now)  # backlog arm did not run
+    checked = _render(lane_state, "done", now)
+    unchecked = _render(lane_state, "turn-ends", now)
 
     assert "backlog 0" in checked
     assert "backlog 0" not in unchecked, (
@@ -232,15 +189,12 @@ def test_an_unchecked_backlog_does_not_render_like_a_clean_one(lane_state):
     assert "NOT CHECKED" in unchecked, (
         "the unchecked row must SAY it was not checked, in words a tired "
         "reader cannot skim past")
-    # The distinguishing token must not be a single character's difference.
     assert abs(len(checked) - len(unchecked)) > 10, (
         "the two rows are near-identical in shape; they must not be "
         "confusable at a glance")
 
 
 def test_the_two_unchecked_reasons_are_distinguishable(lane_state):
-    """'held by design' and 'held because the manager is rate-limited' are
-    different situations and only one of them is temporary."""
     now = 10_000.0
     for lane in lane_io.LANES:
         _heartbeat("mgr", lane, age_sec=1, now=now)
@@ -254,12 +208,6 @@ def test_the_two_unchecked_reasons_are_distinguishable(lane_state):
 
 def test_a_legacy_prefixed_cursor_line_is_not_a_phantom_backlog(
         lane_state, monkeypatch):
-    """The cursor can hold absolute paths written under the PRE-RENAME state
-    root; `monitor._load_seen` normalizes them. Reading the cursor raw meant
-    every legacy line failed to match mid-migration and the lane reported a
-    BACKLOGGED it did not have — a false alarm from the one check whose value
-    is being trustworthy when it fires.
-    """
     from dockwright import config, monitor
 
     now = 10_000.0

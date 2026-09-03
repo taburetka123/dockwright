@@ -1,26 +1,4 @@
 #!/usr/bin/env bash
-# Boot-lite watchdog installer (see deploy/loops-registry.md, bootlite-watchdog
-# block — deployed to ~/.claude/dockwright/loops-registry.md; set [loops.status_overrides.bootlite-watchdog]
-# in dockwright.toml to live after this runs).
-# Idempotent. Creates the bootlite state dir and generates + loads the hourly
-# launchd tick. The tick is LLM-free file/pid arithmetic (bootlite_watchdog.py);
-# it notifies when live worker records have no live parent manager and, ONLY
-# under CLAUDE_ORCH_AUTONUDGE=1, types a checkpoint-and-finish message into the
-# orphaned workers' panes.
-#
-# Knobs baked into the plist FROM THE INSTALLER'S ENVIRONMENT (launchd inherits
-# no shell env — an exported variable that isn't baked here is dead at tick time):
-#   CLAUDE_ORCH_AUTONUDGE=1     enable the worker nudge (default: notify only)
-#   BOOTLITE_RENOTIFY_SEC=N     renotify cadence per stretch (default 14400 = 4h)
-#   BOOTLITE_MAX_NOTIFY=N       notification cap per stretch (default 6)
-# Re-run this installer after changing any of them.
-#
-# DISABLE (one line):
-#   touch ~/.claude/dockwright/bootlite-stop            # soft stop: tick exits before scanning
-# UNINSTALL the scheduler (one line — label below is this operator's default,
-# com.dockwright; the actual label is dockwright.toml [loops].label_prefix +
-# ".bootlite-watchdog", see loop-label-prefix.sh):
-#   launchctl bootout "gui/$(id -u)/com.dockwright.bootlite-watchdog" && rm ~/Library/LaunchAgents/com.dockwright.bootlite-watchdog.plist
 
 set -euo pipefail
 
@@ -104,9 +82,6 @@ EOF
 echo "→ (Re)loading launchd job $PLIST_LABEL"
 launchctl bootout "gui/$(id -u)/$PLIST_LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
-# `launchctl list | grep -q` SIGPIPEs launchctl when grep exits early — under
-# pipefail the pipeline then "fails" and prints a spurious WARN. Query the
-# label directly instead.
 if launchctl list "$PLIST_LABEL" >/dev/null 2>&1; then
   echo "→ Loaded: $PLIST_LABEL (hourly)"
 else

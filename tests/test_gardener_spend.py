@@ -1,4 +1,3 @@
-"""gardener_spend.py — resolve a gardener run's transcript and sum its token usage."""
 import importlib.util
 import json
 from pathlib import Path
@@ -80,8 +79,6 @@ def test_find_run_transcript_none_when_no_match(spend_mod, tmp_path):
 
 
 def test_find_run_transcript_ignores_run_id_beyond_head_window(spend_mod, tmp_path):
-    # The run id is only a discriminator when it's in the session's FIRST
-    # prompt; a session that merely mentions the id later must not match.
     project = tmp_path / "-Users-x-repo"
     project.mkdir(parents=True)
     log = project / "chatty.jsonl"
@@ -118,9 +115,6 @@ def test_main_never_raises_on_bad_args(spend_mod, capsys):
 
 
 def test_script_runs_under_system_python(tmp_path):
-    # gardener-run.sh invokes the deployed copy with /usr/bin/python3 (macOS
-    # ships 3.9): modern-only syntax (e.g. `X | None` signature annotations)
-    # would crash at import and silently cost the ledger its spend keys.
     import subprocess
     system_python = "/usr/bin/python3"
     if not Path(system_python).exists():

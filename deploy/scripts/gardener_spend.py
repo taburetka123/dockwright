@@ -1,23 +1,4 @@
 #!/usr/bin/env python3
-"""Token spend for a gardener analyst run, printed as ledger key=value pairs.
-
-Usage: gardener_spend.py <session_cwd> <run_id>
-
-Resolves the run's transcript under ~/.claude/projects/<munged cwd>/ by the
-RUN_ID embedded in the session's first prompt — the cwd is shared with other
-sessions (workers, managers), so only a transcript whose HEAD carries the run
-id is the analyst session. Prints one line of space-separated key=value pairs
-for gardener-run.sh's ledger_append, or nothing when unresolvable. Always
-exits 0: spend is observability and must never fail a run.
-
-Standalone by design (deployed to ~/.claude/scripts/ next to gardener-run.sh);
-mirrors the claude-shape usage parsing in dockwright/transcript.py —
-split assistant events repeat the same message.id and usage, so each id
-counts once.
-
-Runs under macOS system python3 (3.9) — gardener-run.sh invokes
-/usr/bin/python3, so annotations stay behind `from __future__ import`.
-"""
 from __future__ import annotations
 
 import json
@@ -59,9 +40,6 @@ def _usage_int(usage: dict, key: str) -> int:
 
 
 def sum_usage(log_path: Path) -> dict:
-    """Whole-run totals, deduped by message id; malformed lines skipped."""
-    # Key names match src/dockwright/transcript.py (the canonical
-    # spend vocabulary — B2 alignment): out_tokens / in_tokens / cache_read_tokens.
     totals = {"out_tokens": 0, "in_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0}
     seen_ids: set[str] = set()
     try:

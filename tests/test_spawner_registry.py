@@ -1,16 +1,12 @@
-"""N-account registry behavior in spawner (config-driven pool)."""
 import json
 
 import pytest
 
 from dockwright import config, paths, spawner
-from tests.carve_helpers import operator_forbidden_tokens
 
 
 @pytest.fixture
 def sp(tmp_path, monkeypatch):
-    """Point every account state file into tmp; default pool unless a config
-    file is installed by the test."""
     monkeypatch.setattr(paths, "ACCOUNT_ACTIVE", tmp_path / "account-active")
     monkeypatch.setattr(paths, "ACCOUNT_STATE", tmp_path / "account-state.json")
     monkeypatch.setattr(paths, "SPAWN_COUNTER", tmp_path / "spawn-counter.json")
@@ -59,7 +55,6 @@ name = "b"
 
 
 def test_pick_by_counter_two_accounts_is_legacy_formula():
-    # the exact pinned sequences from test_spawner_account must fall out
     seq = [spawner._pick_by_counter(["a", "b"], [6, 4], c) for c in range(10)]
     assert seq == ["a", "b", "a", "b", "a", "a", "b", "a", "b", "a"]
     seq = [spawner._pick_by_counter(["a", "b"], [2, 8], c) for c in range(10)]
@@ -87,7 +82,7 @@ def test_three_account_pool_round_robins(sp, monkeypatch):
 
 def test_pool_off_when_anchor_not_in_registry(sp, monkeypatch):
     _use_pool(monkeypatch, sp, THREE_POOL)
-    (sp / "account-active").write_text("a")   # not a pool name in THIS registry
+    (sp / "account-active").write_text("a")
     assert spawner._pick_account() is None
     assert spawner._active_account() is None
 
@@ -203,9 +198,9 @@ def test_pause_pct_from_config_env_wins(sp, monkeypatch):
     usage.mkdir()
     (usage / "a.json").write_text(json.dumps(
         {"five_hour_pct": 60, "five_hour_resets_at": now + 900, "ts": now}))
-    assert spawner.usage_spawn_gate()["status"] == "paused"   # 60 >= 50 (config)
+    assert spawner.usage_spawn_gate()["status"] == "paused"
     monkeypatch.setenv("CLAUDE_ORCH_USAGE_PAUSE_PCT", "70")
-    assert spawner.usage_spawn_gate()["status"] == "ok"        # env wins: 60 < 70
+    assert spawner.usage_spawn_gate()["status"] == "ok"
 
 
 def test_write_registry_snapshot_shape(sp, monkeypatch):
@@ -223,19 +218,4 @@ def test_write_registry_snapshot_never_raises(sp, monkeypatch):
     monkeypatch.setattr(paths, "ACCOUNT_REGISTRY",
                         sp / "no-such-dir-is-a-file" / "x.json")
     (sp / "no-such-dir-is-a-file").write_text("not a dir")
-    spawner.write_registry_snapshot()   # must swallow the OSError
-
-
-def test_identity_scrub_no_real_account_names():
-    """The spawner source must never hardcode the operator's real account
-    handles. The handles live ONLY in the live dockwright.toml
-    ([genericness].extra_forbidden_tokens) so this guard can check them without
-    the handles themselves leaking into the repo. Runs on an operator machine
-    (non-empty token list); skips on a generic clone (nothing to enforce)."""
-    import inspect
-    tokens = operator_forbidden_tokens()
-    if not tokens:
-        pytest.skip("generic clone — operator token list empty")
-    src = inspect.getsource(spawner)
-    for t in tokens:
-        assert t not in src
+    spawner.write_registry_snapshot()

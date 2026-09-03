@@ -1,6 +1,3 @@
-"""The statusline usage-tap must write a usage record for ANY safe account
-name — headroom weighting and the pause threshold are silently dead for an
-account whose name never lands in usage/<name>.json (F4)."""
 import json
 import os
 import shutil

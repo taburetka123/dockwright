@@ -1,11 +1,3 @@
-"""Template + idempotently merge dockwright hooks into a settings/hooks JSON file.
-
-The committed settings.snippet.json carries an @@DOCKWRIGHT_BIN@@ placeholder in every
-hook command; setup.sh substitutes the absolute venv-binary path at install time so hooks
-invoke the orchestrator by explicit path, never via bare-PATH resolution. The merge
-converges: an existing hook invoking the same orchestrator subcommand (bare or absolute)
-is rewritten to the absolute-path command; a missing one is appended.
-"""
 from __future__ import annotations
 
 import argparse
@@ -19,38 +11,23 @@ PLACEHOLDER = "@@DOCKWRIGHT_BIN@@"
 ORCH_SUBCOMMANDS = ("session-start", "user-prompt-submit", "stop", "session-end")
 BACKUP_KEEP = 5
 
-_BIN_NAMES = r"(?:dockwright|orchestrator)"  # orchestrator: one-release legacy recognition
+_BIN_NAMES = r"(?:dockwright|orchestrator)"
 _SUBCMD_RE = re.compile(
     r"(?:^|[\s/])" + _BIN_NAMES + r"\s+(" + "|".join(re.escape(s) for s in ORCH_SUBCOMMANDS) + r")\b"
 )
 
 
 def orch_subcommand(command: str) -> str | None:
-    """Return the orchestrator subcommand a hook command invokes, else None.
-
-    Matches both bare `orchestrator <sub>` and any `/abs/path/orchestrator <sub>`.
-    """
     m = _SUBCMD_RE.search(command or "")
     return m.group(1) if m else None
 
 
-# Pull the orchestrator binary token out of a rendered canonical command, e.g.
-# "... /abs/.venv/bin/dockwright session-start" -> "/abs/.venv/bin/dockwright".
-# Greedy \S* backtracks to the LAST '/...dockwright|orchestrator' before a canonical
-# subcommand, so a path that itself contains "claude-orchestrator" resolves to the
-# trailing binary.
 _ORCH_BIN_RE = re.compile(
     r"(\S*" + _BIN_NAMES + r")\s+(?:" + "|".join(re.escape(s) for s in ORCH_SUBCOMMANDS) + r")\b"
 )
 
 
 def rendered_orch_bin(rendered: dict) -> str | None:
-    """The orchestrator binary path embedded in the rendered snippet's hook commands, else None.
-
-    The rendered snippet is ground truth for the binary path: render_snippet substitutes a single
-    orch_bin into every command. Used to anchor the prune discriminator precisely (vs. matching a
-    bare 'orchestrator' token, which would misclassify foreign hooks mentioning the word).
-    """
     for blocks in rendered.get("hooks", {}).values():
         for block in blocks:
             for hook in block.get("hooks", []):
@@ -61,22 +38,12 @@ def rendered_orch_bin(rendered: dict) -> str | None:
 
 
 def orch_owned_subcommand(command: str, orch_bin: str) -> str | None:
-    """Subcommand a hook invokes via the GIVEN orchestrator binary path (any subcommand,
-    canonical or stale), else None.
-
-    Matches orch_bin only in command (executable) position — preceded by start, whitespace, or a
-    quote — so a foreign hook that merely mentions 'orchestrator' as a path component or argument
-    (e.g. `git -C /repos/orchestrator status`) is NOT misclassified as orchestrator-owned. The
-    captured subcommand token is unconstrained, so a stale subcommand dropped from the canonical
-    set (e.g. manager-tts) is still recognized as orchestrator-owned and thus prunable.
-    """
     pat = re.compile(r"(?:^|[\s'\"])" + re.escape(orch_bin) + r"\s+([a-z][a-z0-9-]*)")
     m = pat.search(command or "")
     return m.group(1) if m else None
 
 
 def render_snippet(snippet: dict, orch_bin: str) -> dict:
-    """Deep-copy the snippet with @@DOCKWRIGHT_BIN@@ replaced by orch_bin in every command."""
     rendered = copy.deepcopy(snippet)
     for blocks in rendered.get("hooks", {}).values():
         for block in blocks:
@@ -87,14 +54,6 @@ def render_snippet(snippet: dict, orch_bin: str) -> dict:
 
 
 def merge_hooks(existing: dict, rendered: dict) -> dict:
-    """Merge rendered orchestrator hooks into existing settings (converging, idempotent).
-
-    Replaces an existing same-event hook invoking the same orchestrator subcommand with the
-    rendered (absolute-path) command; appends if absent. Leaves foreign hooks and all
-    non-hooks keys untouched. Finally prunes orchestrator-owned hooks whose subcommand has
-    left the canonical set (see prune_orphan_hooks) — that removal step is what makes the
-    merge truly converge to the snippet rather than only grow.
-    """
     merged = copy.deepcopy(existing)
     merged_hooks = merged.setdefault("hooks", {})
     for event, blocks in rendered.get("hooks", {}).items():
@@ -114,10 +73,6 @@ def merge_hooks(existing: dict, rendered: dict) -> dict:
                                         h[k] = new_hook[k]
                                 replaced = True
                 else:
-                    # Foreign hook (not an orchestrator subcommand): idempotent by
-                    # byte-identical command. Matches command only — a future timeout/type/matcher
-                    # change to an already-deployed foreign hook would NOT propagate (fine
-                    # for the stable canon-edit-guard.sh command).
                     new_cmd = new_hook.get("command", "")
                     for b in existing_blocks:
                         for h in b.get("hooks", []):
@@ -129,15 +84,6 @@ def merge_hooks(existing: dict, rendered: dict) -> dict:
 
 
 def prune_orphan_hooks(merged: dict, rendered: dict) -> dict:
-    """Remove orchestrator-owned hooks whose subcommand is not in the canonical (rendered) set
-    for their event. Leaves foreign hooks and canonical orchestrator hooks untouched.
-
-    Per-event: an event's allowed orchestrator subcommands are exactly those the rendered snippet
-    defines for it (empty if the event is absent from rendered). Foreign hooks (not invoking the
-    orchestrator binary) are always kept; a block keeps its non-hook keys (e.g. matcher). Blocks
-    whose hook list empties out and event keys with no blocks left are dropped. No-op when the
-    rendered snippet exposes no orchestrator binary path — never over-prunes a degenerate snippet.
-    """
     orch_bin = rendered_orch_bin(rendered)
     if orch_bin is None:
         return merged
@@ -174,12 +120,6 @@ def prune_orphan_hooks(merged: dict, rendered: dict) -> dict:
 
 
 def prune_backups(target: Path, keep: int = BACKUP_KEEP) -> None:
-    """Delete all but the newest `keep` timestamped backups of `target`.
-
-    Matches only <target-name>.bak.<digits> siblings (this module's own backup
-    convention); hand-named backups and the account-farm's .bak-<label>
-    variants never match.
-    """
     prefix = target.name + ".bak."
     stamped = []
     for sibling in target.parent.glob(prefix + "*"):
@@ -191,15 +131,6 @@ def prune_backups(target: Path, keep: int = BACKUP_KEEP) -> None:
 
 
 def merge_settings_file(target, snippet_path, orch_bin: str, mode: str) -> None:
-    """Render + merge the hooks snippet into `target`.
-
-    mode='claude': merge hooks into an existing settings.json, preserving all other keys
-      (creates a hooks-only file if absent); never writes mcpServers.
-    mode='codex': target holds only {"hooks": {...}}.
-    Backs up an existing target to <target>.bak.<epoch_ns> before any mutation; a
-    byte-identical no-op merge writes neither file nor backup; only the newest
-    BACKUP_KEEP timestamped backups are kept (older ones pruned every run).
-    """
     snippet = json.loads(Path(snippet_path).read_text())
     snippet.pop("mcpServers", None)
     snippet.pop("_note", None)

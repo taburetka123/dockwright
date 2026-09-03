@@ -1,9 +1,3 @@
-"""Tests for deploy/scripts/shadow_ledger.py (Phase D T12).
-
-Guards proven RED first (drift-guard-tests.md). The lessons under
-test: criteria immutable via the FIRST ledger stamp (a hand-edited
-criteria.json is caught by verbatim compare), and no criterion can pass
-silently without observations."""
 import importlib.util
 import json
 from pathlib import Path
@@ -52,14 +46,12 @@ class TestArm:
         assert arm(tmp_path) == 0
 
     def test_rearm_restores_deleted_criteria_file(self, tmp_path):
-        # M-c: an idempotent re-arm whose stamp matches must rewrite a missing
-        # criteria file (not just print ok) so report works again.
         assert arm(tmp_path) == 0
         (tmp_path / "demo.criteria.json").unlink()
         assert arm(tmp_path) == 0
         assert (tmp_path / "demo.criteria.json").exists()
         assert json.loads((tmp_path / "demo.criteria.json").read_text()) == CRITERIA
-        assert report(tmp_path) == 0  # criteria matches the stamp again
+        assert report(tmp_path) == 0
 
     def test_rearm_different_exit2(self, tmp_path):
         assert arm(tmp_path) == 0
@@ -100,7 +92,6 @@ class TestReport:
         t0 = 1_000_000.0
         for i, d in enumerate(["used", "used", "used", "edited"]):
             append(tmp_path, f"d{i}", d, at=t0)
-        # 3/4 used = 0.75, window 15d, min_abstained 0 satisfied.
         assert report(tmp_path, "--now", str(t0 + 15 * 86400)) == 0
         assert "GRADUATE" in capsys.readouterr().out
         assert report(tmp_path, "--require-graduate",
@@ -112,7 +103,7 @@ class TestReport:
         for i, d in enumerate(["used", "used", "edited", "edited"]):
             append(tmp_path, f"d{i}", d, at=t0)
         assert report(tmp_path, "--require-graduate",
-                      "--now", str(t0 + 15 * 86400)) == 1  # 0.5 < 0.75: NOT-YET
+                      "--now", str(t0 + 15 * 86400)) == 1
 
     def test_window_not_matured_not_yet(self, tmp_path):
         arm(tmp_path)
@@ -130,13 +121,13 @@ class TestReport:
         assert report(tmp_path, "--require-graduate",
                       "--now", str(t0 + 15 * 86400)) == 0
         out = capsys.readouterr().out
-        assert "min_n: 4/4" in out  # abstained NOT in the denominator
+        assert "min_n: 4/4" in out
 
     def test_tampered_criteria_file_exit2(self, tmp_path):
         arm(tmp_path)
         weakened = dict(CRITERIA, min_used_rate=0.01)
         (tmp_path / "demo.criteria.json").write_text(json.dumps(weakened))
-        assert report(tmp_path) == 2  # verbatim stamp compare catches the edit
+        assert report(tmp_path) == 2
 
     def test_missing_criteria_file_exit2(self, tmp_path):
         arm(tmp_path)
@@ -153,18 +144,15 @@ class TestReport:
         assert report(tmp_path) == 2
 
     def test_corrupt_ledger_line_report_exit2(self, tmp_path, capsys):
-        # M-d: a non-blank undecodable ledger line must fail closed (exit 2),
-        # not be silently skipped and a verdict computed over a damaged ledger.
         arm(tmp_path)
         append(tmp_path, "d1", "used")
         with (tmp_path / "demo.jsonl").open("a") as fh:
-            fh.write('{"type": "disposi')  # truncated, non-blank
+            fh.write('{"type": "disposi')
         capsys.readouterr()
         assert report(tmp_path) == 2
         assert "line" in capsys.readouterr().err
 
     def test_corrupt_ledger_line_report_blank_ok(self, tmp_path):
-        # M-d boundary: blank lines are not anomalies.
         arm(tmp_path)
         append(tmp_path, "d1", "used")
         with (tmp_path / "demo.jsonl").open("a") as fh:

@@ -1,13 +1,3 @@
-"""Deploy-time finalization of worker-spawn settings presets.
-
-The shipped worker-headless-settings.json stays generic; a headless worker
-still needs out-of-cwd access to the operator's code roots or its first
-task-repo write stalls on the directory-access gate (E2E rc.2 N-3).
-`additionalDirectories` values must be ABSOLUTE — tilde expansion there is
-undocumented — so setup.sh injects the resolved [paths] roots into the
-DEPLOYED copy after the overlay step. An operator-set key (even []) is
-respected verbatim.
-"""
 from __future__ import annotations
 
 import argparse
@@ -38,11 +28,6 @@ def headless_additional_dirs() -> list[str]:
 
 
 def finalize_headless_settings(path: Path) -> bool:
-    """Inject permissions.additionalDirectories into the deployed preset.
-
-    Returns True when injected; False when the key already exists (operator
-    intent — including an explicit [] — wins verbatim, file untouched).
-    """
     data = json.loads(path.read_text())
     perms = data.setdefault("permissions", {})
     if "additionalDirectories" in perms:

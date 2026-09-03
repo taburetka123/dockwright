@@ -38,13 +38,19 @@ Agent sizes are ceiling-gated on the RENDERED artifacts (`tests/test_agent_size_
 
 ## Adding a file that ships
 
-`shipped-files.txt` (repo root) lists every path the public export ships, one per
-line. A new file under an allowlisted directory does not reach the public repo
-until its line is there: `publish.sh verify` refuses to publish an export
-containing a path the list does not name. (`build_export` itself does not read
-the list — the file is built into the export tree and `verify` is what stops it.)
+`publish-allowlist.txt` and `publish-excludes.txt` (repo root) are the export
+policy: `export set = git ls-files(HEAD) ∩ allowlist − excludes`. They live here
+rather than in the operator's publish skill so `tests/export_surface.py` resolves
+them on a CI runner.
 
-Add the line in the same PR as the file: that is the point — `allowlist.txt`'s
+`shipped-files.txt` (repo root) lists every path that export ships, one per
+line. A new file under an allowlisted directory does not reach the public repo
+until its line is there: the ship-list gate fails on the mismatch, on your machine
+and in CI, and `publish.sh verify` refuses the export besides. (`build_export`
+itself does not read the list — the file is built into the export tree and the
+gate is what stops it.)
+
+Add the line in the same PR as the file: that is the point — `publish-allowlist.txt`'s
 directory entries let new content ship with no edit anywhere, which is how an
 employer auth fixture reached the public repo on 2026-07-15
 (`docs/specs/public-leak-rootcause.md`).
@@ -60,6 +66,12 @@ question from whether it belongs in this repo. Two gates enforce the surface and
 both are publish-excluded operator machinery: `tests/test_export_ship_list.py`
 and `tests/test_export_place_zones.py` (no place-naming IANA timezone may ship —
 use `Etc/UTC`, or `Etc/GMT-N` where a fixture needs a non-UTC clock).
+
+Employer and operator name tokens are refused separately, at publish time, by the
+`dockwright-publish` skill's `sweep.py` over the built export tree. Its whitelist
+cannot excuse one — not per file, not with a bare `*` — so a red gate is cleared
+by scrubbing the source or publish-excluding the file, never by widening the
+whitelist.
 
 ## Conventions
 

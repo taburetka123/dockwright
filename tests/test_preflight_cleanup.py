@@ -48,12 +48,11 @@ def _write_old(path: Path, age_sec: float) -> None:
 
 
 def test_prune_turn_ends_recurses_per_manager_subdirs(preflight):
-    """Stale turn-ends are pruned across per-manager subdirs and _unscoped, not just flat."""
     old_age = preflight.STALE_TURN_END_SEC + 60
     _write_old(preflight.TURN_ENDS / "manager-a" / "s1-1.json", old_age)
     _write_old(preflight.TURN_ENDS / "_unscoped" / "s2-2.json", old_age)
-    _write_old(preflight.TURN_ENDS / "legacy-flat.json", old_age)  # pre-scoping layout
-    _write_old(preflight.TURN_ENDS / "manager-a" / "fresh.json", 0)  # recent → keep
+    _write_old(preflight.TURN_ENDS / "legacy-flat.json", old_age)
+    _write_old(preflight.TURN_ENDS / "manager-a" / "fresh.json", 0)
 
     pruned = preflight._prune_turn_ends(time.time())
 
@@ -93,8 +92,6 @@ def test_prune_active_preserves_live_manager_records(preflight, monkeypatch):
 
 
 def test_prune_active_keeps_and_reports_alive_record_with_non_session_command(preflight, monkeypatch):
-    """A live pid whose process is NOT a claude/codex session (pid recycling, or a
-    record we can't explain) is odd-looking: never deleted, surfaced for a human."""
     state.write_json_atomic(preflight.ACTIVE / "mgr-recycled.json", {
         "claude_sid": "sid-recycled",
         "agent": "manager",
@@ -113,9 +110,6 @@ def test_prune_active_keeps_and_reports_alive_record_with_non_session_command(pr
 
 
 def test_looks_like_session_matches_executable_token_only(preflight):
-    """Mirrors sweep._looks_like_session: only argv[0]'s basename counts, so a
-    claude/codex token in args (mount paths, container names) can't make a
-    recycled pid read as a session."""
     assert preflight._looks_like_session("claude --settings {}")
     assert preflight._looks_like_session("/Users/testop/.local/bin/codex resume x")
     assert not preflight._looks_like_session("docker run -v /mnt/claude:/data img")
@@ -124,8 +118,6 @@ def test_looks_like_session_matches_executable_token_only(preflight):
 
 
 def test_looks_like_session_mirror_agrees_with_sweep(preflight):
-    """The duplication is intentional (stdlib-only script); this pins the two
-    implementations against drifting apart."""
     from dockwright import sweep
     commands = [
         "claude --settings {}",
@@ -142,8 +134,6 @@ def test_looks_like_session_mirror_agrees_with_sweep(preflight):
 
 
 def test_prune_active_reports_alive_wrapper_shell_as_odd(preflight, monkeypatch):
-    """A record whose alive pid is a wrapper shell (claude only as an argument)
-    is odd-looking under argv[0]-only matching: kept, surfaced for a human."""
     state.write_json_atomic(preflight.ACTIVE / "mgr-wrapper.json", {
         "claude_sid": "sid-wrapper",
         "agent": "manager",
@@ -162,8 +152,6 @@ def test_prune_active_reports_alive_wrapper_shell_as_odd(preflight, monkeypatch)
 
 
 def test_prune_active_keeps_and_reports_records_without_usable_pid(preflight, monkeypatch):
-    """Missing or non-positive pid can't prove the session dead — keep and report,
-    don't silently skip (missing pid) or delete (pid 0)."""
     state.write_json_atomic(preflight.ACTIVE / "mgr-no-pid.json", {
         "claude_sid": "sid-no-pid",
         "agent": "manager",
@@ -188,10 +176,6 @@ def test_prune_active_keeps_and_reports_records_without_usable_pid(preflight, mo
 
 
 def test_prune_active_keeps_and_reports_record_with_pid_beyond_os_range(preflight):
-    """os.kill raises OverflowError (not OSError) for pids above the C int range —
-    a poisoned record must be classified no-usable-pid (kept + reported), not
-    traceback the whole preflight at every /manager boot. No _pid_alive mock:
-    the test proves the guard fires before os.kill ever sees the huge pid."""
     state.write_json_atomic(preflight.ACTIVE / "mgr-huge-pid.json", {
         "claude_sid": "sid-huge-pid",
         "agent": "manager",
@@ -208,9 +192,6 @@ def test_prune_active_keeps_and_reports_record_with_pid_beyond_os_range(prefligh
 
 
 def test_prune_active_real_ps_path_keeps_own_pid_record(preflight):
-    """No mocks: the pytest process's own pid is alive and its real ps command
-    line is python, not claude/codex — the real _process_command/_looks_like_session
-    path must classify it odd-looking and keep it."""
     import os
     state.write_json_atomic(preflight.ACTIVE / "mgr-real-pid.json", {
         "claude_sid": "sid-real-pid",
@@ -245,8 +226,6 @@ def test_prune_active_prunes_dead_pid_record_and_names_it(preflight, monkeypatch
 
 
 def test_main_combined_summary_disambiguates_pruned_names_and_odd_reasons(preflight, monkeypatch, capsys):
-    """Pruned names ride in parentheses (the parts list is comma-joined, so a bare
-    ': name1, name2' would blur into the next part); odd reasons stay comma-free."""
     state.write_json_atomic(preflight.ACTIVE / "mgr-dead.json", {
         "claude_sid": "sid-dead",
         "agent": "manager",
@@ -311,8 +290,6 @@ def test_gc_stale_cursors_pruned(preflight):
 
 
 def test_gc_empty_bucket_dirs_removed(preflight):
-    """Per-manager bucket dirs are mkdir'd on demand and never rmdir'd —
-    empty ones are debris; non-empty (and the top-level dirs) stay."""
     (preflight.DONE / "dead-manager").mkdir(parents=True)
     (preflight.TURN_ENDS / "dead-manager").mkdir(parents=True)
     (preflight.QUESTIONS / "dead-manager").mkdir(parents=True)
@@ -351,8 +328,6 @@ def test_gc_prunes_old_fs_ladder_state(preflight):
 
 
 def test_gc_prunes_stale_outbox_entries_and_empty_buckets(preflight):
-    """Outbox entries are drained by live managers within minutes; anything
-    stale belongs to a dead manager and its now-empty bucket dir is debris."""
     old_age = preflight.STALE_CURSOR_SEC + 60
     outbox = preflight.NOTIFY_OUTBOX / "dead-mgr"
     _write_old_raw(outbox / "100-1-0.json", old_age)
@@ -362,7 +337,7 @@ def test_gc_prunes_stale_outbox_entries_and_empty_buckets(preflight):
     preflight._gc_husks(time.time())
 
     assert not (outbox / "100-1-0.json").exists()
-    assert not outbox.exists()            # emptied bucket dir removed
+    assert not outbox.exists()
     assert (fresh_outbox / "200-1-0.json").exists()
 
 
@@ -380,8 +355,6 @@ def test_prune_active_ledgers_spend(preflight, tmp_path, monkeypatch):
 
 
 def test_prune_closed_ledgers_only_autoclosed_spend(preflight, tmp_path, monkeypatch):
-    """session_end-reason closures were ledgered at close; re-appending at the
-    7d prune would double-count. Autoclose-reason records were never ledgered."""
     monkeypatch.setattr(preflight, "SPEND_LEDGER", tmp_path / "spend-ledger.jsonl")
     (tmp_path / "closed").mkdir()
     old = time.time() - 8 * 24 * 3600
@@ -459,7 +432,7 @@ def test_prune_active_keeps_dead_pid_when_tmux_unanswerable(preflight, tmp_path,
     pruned, kept_odd = preflight._prune_active()
     assert pruned == []
     assert (tmp_path / "active" / "s1.json").exists()
-    assert kept_odd  # surfaced, not silently kept
+    assert kept_odd
 
 
 def test_prune_active_windowless_dead_pid_still_reaps(preflight, tmp_path, monkeypatch):
@@ -501,8 +474,6 @@ def test_live_pane_ids_parses_pane_lines(preflight, monkeypatch):
 
 
 def test_gc_prunes_old_statusline_read_marks(preflight):
-    """.read-<sid> is the statusline's per-manager read mark. Only rewritten on
-    change, so a dead manager's mark would otherwise accumulate forever."""
     old_age = preflight.STALE_CURSOR_SEC + 60
     _write_old_raw(preflight.ROOT / ".read-dead-manager-sid", old_age)
     _write_old_raw(preflight.ROOT / ".read-dead-manager-sid.tmp", old_age)
@@ -516,18 +487,11 @@ def test_gc_prunes_old_statusline_read_marks(preflight):
 
 
 def test_gc_prunes_every_declared_cursor_pattern(preflight):
-    """Binds the GC's BEHAVIOUR to the DECLARED set: a pattern that is declared
-    but not actually swept fails here, and a sixth pattern added later gets its
-    case for free. It is deliberately blind to delete-one — removing an entry
-    removes its own case — which is what test_gc_prunes_old_statusline_read_marks
-    above covers. Neither test alone is the guard; the pair is."""
     old_age = preflight.STALE_CURSOR_SEC + 60
     for pattern in preflight.STALE_CURSOR_PATTERNS:
         _write_old_raw(preflight.ROOT / pattern.replace("*", "stale-x"), old_age)
         _write_old_raw(preflight.ROOT / pattern.replace("*", "fresh-x"), 0)
 
-    # Canaries: real ROOT dotfiles that are NOT cursors. An over-broad pattern
-    # (".*", ".r*") passes every assertion below while sweeping live state.
     canaries = (".deploy-stamp", ".account-flip.lock", ".readme-not-a-mark")
     for name in canaries:
         _write_old_raw(preflight.ROOT / name, old_age)

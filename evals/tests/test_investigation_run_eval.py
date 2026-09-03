@@ -30,8 +30,6 @@ def test_dry_findings_pass_the_gate(tmp_path):
         case, model="opus", timeout=5, repeats=None, skip_judge=True,
         run_case_fn=run_eval.dry_run_case, judge_fn=None)
     assert result["passed"], result
-    # transcript_missing surfaces per sample so a transcript-recovery failure is
-    # diagnosable in both results and traces, not disguised as gate noise.
     assert "transcript_missing" in result["samples"][0]
     built = run_eval._build_results("run", "opus", None, [result])
     assert "transcript_missing" in built["cases"][0]["samples"][0]
@@ -47,11 +45,11 @@ def test_min_pass_semantics(tmp_path):
                                 tool_calls=[("Read", '{"file_path": "fixtures/metrics.txt"}')],
                                 corpus="x", num_turns=1)
         bad = runner.RunRecord(case_id=case["case_id"], error="boom")
-        return good if calls["n"] % 3 else bad  # every 3rd sample errors
+        return good if calls["n"] % 3 else bad
     result = run_eval.evaluate_case(case, model="opus", timeout=5, repeats=None,
                                     skip_judge=True, run_case_fn=flaky_run, judge_fn=None)
-    assert calls["n"] == 3          # samples from answer.json
-    assert result["passed"]         # 2 of 3 >= min_pass 2
+    assert calls["n"] == 3
+    assert result["passed"]
 
 
 def test_repeats_overrides_samples(tmp_path):
@@ -107,8 +105,6 @@ def test_discover_cases_filters(tmp_path):
 
 
 def test_evaluate_case_feeds_fixture_content_to_gate(tmp_path):
-    """A glob-read sample (input names no file) passes the required-read gate
-    because evaluate_case loads the fixture content for the content check."""
     case = _case(tmp_path, dict(ANSWER, samples=1, min_pass=1))
     fixture_body = "metric window 13:00-14:00\nvalue returned to baseline entirely\n"
     (tmp_path / "cases" / "n99-demo" / "fixtures" / "metrics.txt").write_text(fixture_body)
@@ -143,8 +139,6 @@ def test_main_missing_binding_exits_2_without_running(tmp_path, monkeypatch, cap
     def no_run(case, **kw):
         called["n"] += 1
         return runner.RunRecord(case_id=case["case_id"], error="must not run")
-    # Stub so the red phase never spawns a real `claude -p`; post-fix the
-    # binding check must exit BEFORE any sample runs (called stays 0).
     monkeypatch.setattr(run_eval.runner, "run_case", no_run)
     rc = run_eval.main([])
     assert rc == 2

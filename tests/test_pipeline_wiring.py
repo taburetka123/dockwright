@@ -74,7 +74,7 @@ def test_enable_writes_backup_on_change(tmp_path):
 def test_dispatch_selffix_routes_to_pipeline_wiring(monkeypatch):
     from dockwright import __main__ as m
     called = {}
-    def _fake(argv):        # NOT a setdefault-lambda: setdefault returns the value, not 0
+    def _fake(argv):
         called["argv"] = argv
         return 0
     monkeypatch.setattr(pw, "selffix_main", _fake)
@@ -93,25 +93,23 @@ def _wire_selffix(tmp_path):
 
 @pytest.fixture(autouse=True)
 def _launchctl_present_by_default(monkeypatch):
-    # The platform gate keys on launchctl presence; pin it truthy so the
-    # pre-existing enable/disable behavior tests run identically on Linux CI.
     monkeypatch.setattr(pw.shutil, "which",
                         lambda cmd: "/bin/launchctl" if cmd == "launchctl" else None)
 
 
 def test_enable_gardener_refuses_without_selffix_for_digest(tmp_path):
-    sp = _settings(tmp_path)   # selffix NOT wired
+    sp = _settings(tmp_path)
     installer = tmp_path / "gardener-install.sh"
     installer.write_text("#!/bin/sh\n")
     calls = []
     rc = pw.enable_gardener("digest", settings_path=sp, installer_path=installer,
                             run=lambda cmd: calls.append(cmd) or 0)
     assert rc == 1
-    assert calls == []   # never ran the installer
+    assert calls == []
 
 
 def test_enable_gardener_frontier_lane_skips_selffix_gate(tmp_path):
-    sp = _settings(tmp_path)   # selffix NOT wired
+    sp = _settings(tmp_path)
     installer = tmp_path / "gardener-install.sh"
     installer.write_text("#!/bin/sh\n")
     calls = []
@@ -150,7 +148,7 @@ def test_disable_gardener_boots_out_and_unlinks_selected_lane(tmp_path):
                         run=lambda cmd: calls.append(cmd) or 0, uid=501)
     assert calls == [["launchctl", "bootout", "gui/501/com.dockwright.gardener-gate"]]
     assert not (la / "com.dockwright.gardener-gate.plist").exists()
-    assert (la / "com.dockwright.gardener-frontier.plist").exists()   # untouched
+    assert (la / "com.dockwright.gardener-frontier.plist").exists()
 
 
 def test_disable_gardener_all_removes_both(tmp_path):
@@ -167,7 +165,7 @@ def test_disable_gardener_missing_plist_is_noop_not_error(tmp_path):
     la = tmp_path / "LaunchAgents"
     la.mkdir()
     pw.disable_gardener("all", launch_agents_dir=la, label_prefix="com.dockwright",
-                        run=lambda cmd: 1, uid=501)   # bootout "fails" — swallowed
+                        run=lambda cmd: 1, uid=501)
 
 
 def test_dispatch_gardener_routes_to_pipeline_wiring(monkeypatch):
@@ -193,7 +191,7 @@ def test_enable_gardener_errors_without_launchctl(tmp_path, monkeypatch, capsys)
                             installer_path=installer,
                             run=lambda cmd: calls.append(cmd) or 0)
     assert rc == 2
-    assert calls == []                      # no installer side effects
+    assert calls == []
     assert "launchd" in capsys.readouterr().err
 
 
@@ -208,5 +206,5 @@ def test_disable_gardener_without_launchctl_unlinks_plists_only(tmp_path, monkey
                              label_prefix="com.dockwright",
                              run=lambda cmd: calls.append(cmd) or 0, uid=501)
     assert rc == 0
-    assert calls == []                      # launchctl never invoked
-    assert not list(la.glob("*.plist"))     # cleanup still happened
+    assert calls == []
+    assert not list(la.glob("*.plist"))

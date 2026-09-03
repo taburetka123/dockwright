@@ -14,7 +14,6 @@ def test_read_missing_returns_none(tmp_path):
 def test_write_atomic_no_partial(tmp_path):
     f = tmp_path / "x.json"
     write_json_atomic(f, {"a": 1})
-    # No leftover .tmp file
     assert not any(p.name.endswith(".tmp") for p in tmp_path.iterdir())
 
 def test_list_json_in_returns_parsed_records(tmp_path):
@@ -81,12 +80,11 @@ def test_parse_artifact_missing_frontmatter_raises():
 def test_parse_artifact_skips_malformed_line():
     text = serialize_artifact(_stamp(), "body")
     lines = text.splitlines()
-    # Corrupt the phase line (line 1, right after the opening delimiter)
     assert lines[1].startswith("phase:")
     lines[1] = "phase: {not json"
     stamp, body = parse_artifact("\n".join(lines))
-    assert "phase" not in stamp          # bad line skipped
-    assert stamp["name"] == "srs"        # good lines survive
+    assert "phase" not in stamp
+    assert stamp["name"] == "srs"
     assert body == "body"
 
 
@@ -120,7 +118,6 @@ def test_append_event_truncates_oversized_reason(tmp_path):
 
 
 def test_frontmatter_value_containing_delimiter_roundtrips():
-    # "---" inside a frontmatter VALUE must not sever the block (review Important #1)
     stamp = _stamp(name="acme---web")
     parsed, body = parse_artifact(serialize_artifact(stamp, "body"))
     assert parsed == stamp
@@ -142,18 +139,13 @@ def test_append_event_does_not_mutate_caller_dict(tmp_path):
 
 def test_append_event_caps_oversized_non_reason_fields(tmp_path):
     p = tmp_path / "events.jsonl"
-    append_event(p, {"type": "note", "name": "n" * 10_000})    # oversize NON-reason field
+    append_event(p, {"type": "note", "name": "n" * 10_000})
     (line,) = p.read_text().splitlines()
     assert len(line.encode()) <= 3500
-    json.loads(line)                                            # still valid JSON
+    json.loads(line)
 
 
 def test_write_json_atomic_unique_tmp_per_invocation(tmp_path, monkeypatch):
-    # Two writers of the SAME target must never share a tmp path: with a
-    # target-derived tmp, concurrent write_text+os.replace interleave across
-    # processes -> truncated JSON at the final path, or FileNotFoundError from
-    # the second os.replace (orch-audit finding 1; manager MCP process vs
-    # worker Stop hook both rewrite active/<sid>.json).
     target = tmp_path / "sid.json"
     srcs = []
     real_replace = os.replace
@@ -168,8 +160,6 @@ def test_write_json_atomic_unique_tmp_per_invocation(tmp_path, monkeypatch):
 
 
 def test_write_json_atomic_concurrent_writers_same_target(tmp_path):
-    # Thread hammer standing in for the cross-process interleave: no exception,
-    # final file always parses, no tmp litter.
     target = tmp_path / "sid.json"
     errors = []
     def writer(n):

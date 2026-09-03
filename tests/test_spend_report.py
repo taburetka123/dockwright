@@ -1,4 +1,3 @@
-"""spend-report: source merge, sid dedup, day bucketing."""
 import importlib
 import json
 import time
@@ -51,7 +50,6 @@ def test_closed_skipped_when_session_end_reason_and_sid_in_ledger(world):
 
 
 def test_closed_counted_when_not_in_ledger(world):
-    # pre-ledger closure (the existing post-#69 records): no ledger entry at all
     state.write_json_atomic(world / "closed" / "old.json", {
         "claude_sid": "old", "name": "w-old", "closed_at": _ts(days_ago=1),
         "closed_reason": "session_end", "spend": SPEND,
@@ -63,8 +61,6 @@ def test_closed_counted_when_not_in_ledger(world):
 
 
 def test_autoclosed_record_counted_even_with_other_ledger_periods(world):
-    # period A ledgered at a session_end close, worker resumed, then autoclosed:
-    # the closed snapshot is period B — a period the ledger never saw.
     spend_ledger.append_drop_event(
         {"claude_sid": "a", "agent": "worker", "name": "w1", "spend": SPEND}, "session_end")
     state.write_json_atomic(world / "closed" / "a.json", {
@@ -98,7 +94,6 @@ def test_nested_active_record_labeled_nested(world):
 
 
 def test_gardener_run_end_rows_with_string_values(world):
-    # gardener-run.sh's ledger_append stores ALL values as strings
     (world / "gardener-ledger.jsonl").write_text("\n".join([
         json.dumps({"event": "run_end", "ts": _ts(), "lane": "analyst",
                     "out_tokens": "86079", "in_tokens": "18434",
@@ -200,39 +195,26 @@ def test_humanize():
     assert spend_report._humanize(1_500_000_000) == "1.5G"
 
 
-# --- display-honesty: absent fields render as "-", not "0" ---
-
-# SPEND has no cache_creation_tokens — mirrors a record-sourced drop event
 _SPEND_NO_CACHE_CR = {"turns": 2, "out_tokens": 105_571, "in_tokens": 7_618,
                       "cache_read_tokens": 42_398_278}
 
 
 def test_record_rows_show_dash_for_uncaptured_cache_creation(world, capsys):
-    """A ledger drop event with no cache_creation_tokens must render '-' in the
-    cache-cr column for both the row line and the day-total line."""
     spend_ledger.append_drop_event(
         {"claude_sid": "a", "agent": "worker", "name": "w1",
          "spend": _SPEND_NO_CACHE_CR}, "session_end")
     assert spend_report.main(["--days", "1"]) == 0
     out = capsys.readouterr().out
-    # Find the w1 row line and split on whitespace to locate the cache-cr cell.
-    # Column order: name agent turns in out cache-rd cache-cr source
     w1_line = next(ln for ln in out.splitlines() if "w1" in ln)
     cells = w1_line.split()
-    # cells[0]='w1', [1]='worker', [2]=turns, [3]=in, [4]=out, [5]=cache-rd, [6]=cache-cr
     assert cells[6] == "-", f"cache-cr cell should be '-' but got {cells[6]!r} in: {w1_line!r}"
 
     day_total_line = next(ln for ln in out.splitlines() if "day total" in ln)
     dt_cells = day_total_line.split()
-    # "day total" spans two tokens; cells: ['day','total','',turns,in,out,cache-rd,cache-cr,source]
-    # Split keeps words so: ['day', 'total', turns, in, out, cache-rd, cache-cr]
-    # Find cache-cr as the cell at position -2 (last non-source cell before source which is '')
-    # Safer: just check the day total line also contains '-'
     assert "-" in dt_cells, f"day-total line should have '-' for cache-cr: {day_total_line!r}"
 
 
 def test_json_rows_null_for_uncaptured_keys(world, capsys):
-    """--json output: cache_creation_tokens must be null (None) when never captured."""
     spend_ledger.append_drop_event(
         {"claude_sid": "a", "agent": "worker", "name": "w1",
          "spend": _SPEND_NO_CACHE_CR}, "session_end")
@@ -247,8 +229,6 @@ def test_json_rows_null_for_uncaptured_keys(world, capsys):
 
 
 def test_non_dict_state_files_are_skipped_not_crashing(world, capsys):
-    """A valid-JSON-but-non-dict file in closed/ or active/ must not crash the
-    report, must not produce rows, and must not count as a spendless closure."""
     (world / "closed" / "garbage.json").write_text('["not", "a", "record"]')
     (world / "active" / "garbage.json").write_text('"just a string"')
     (world / "closed" / "real.json").write_text(json.dumps({
@@ -264,28 +244,21 @@ def test_non_dict_state_files_are_skipped_not_crashing(world, capsys):
 
 
 def test_mixed_presence_partial_sum(world, capsys):
-    """When a gardener event (has cache_creation_tokens) and a record-sourced event
-    (no cache_creation_tokens) land on the same day, the day total for
-    cache_creation_tokens is the gardener's value only (partial sum of present values)."""
-    # Gardener event with cache_creation_tokens=369651
     (world / "gardener-ledger.jsonl").write_text(
         json.dumps({"event": "run_end", "ts": _ts(), "lane": "analyst",
                     "out_tokens": "86079", "in_tokens": "18434",
                     "cache_read_tokens": "6832014",
                     "cache_creation_tokens": "369651"}) + "\n"
     )
-    # Record-sourced drop event (no cache_creation_tokens)
     spend_ledger.append_drop_event(
         {"claude_sid": "b", "agent": "worker", "name": "w1",
          "spend": _SPEND_NO_CACHE_CR}, "session_end")
     assert spend_report.main(["--days", "1", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     day = payload["days"][0]
-    # Grand total cache_creation_tokens == 369651 (only the gardener's contribution)
     assert payload["total"]["cache_creation_tokens"] == 369651, (
         f"grand total should be 369651 (gardener only) but got "
         f"{payload['total']['cache_creation_tokens']!r}")
-    # Day total also
     assert day["total"]["cache_creation_tokens"] == 369651
 
 

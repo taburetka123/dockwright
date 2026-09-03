@@ -1,26 +1,3 @@
-"""One-shot monitor scans for the Claude Code Monitor task to wrap in a loop.
-
-Each subcommand is invoked from a long-running Monitor task like:
-
-    while dockwright monitor done || exit $?; do sleep 2; done
-
-The loop is condition-driven, NOT `while true`: any non-zero exit ends the
-lane, so the Monitor task exits and the manager is notified. That is the only
-way a dead lane becomes visible — see lane_io for the incident this encodes.
-
-Identity is resolved per-scan via identity.resolve_manager() — cheap; lets
-the Monitor command be a literal one-liner (no substitution of name/sid).
-
-Questions, done, turn-ends, and stale scans live here so every trigger resolves
-the owning manager before emitting.
-
-Every scan follows one order, and the order is the contract:
-
-    preflight -> emit (flushed per line) -> commit cursor -> heartbeat
-
-Nothing is committed before its line is proven delivered, and the heartbeat is
-unreachable from a scan that failed to deliver.
-"""
 from __future__ import annotations
 
 import json
@@ -33,17 +10,11 @@ from . import config, identity, lane_io, paths, state
 from .lane_io import LaneDead, emit
 
 
-# Resolves once per scan in the public entry points; tests can monkey-patch.
 def _resolve() -> dict:
     return identity.resolve_manager()
 
 
 def _resolve_named(name: str) -> dict:
-    """Resolve a manager by explicit name from active manager records.
-
-    Same record filter as identity's resolvers; exits 2 loudly on no/ambiguous
-    match so scripted invocation fails visibly (E2E N-5).
-    """
     records = identity._list_manager_records()
     matches = [r for r in records if r.get("name") == name]
     if len(matches) == 1:
@@ -65,33 +36,13 @@ def _resolve_named(name: str) -> dict:
 
 
 def _seen_file(kind: str, manager_name: str) -> Path:
-    """Where to persist the SEEN file across one-shot invocations.
-
-    Production layout: ~/.claude/dockwright/.seen-<kind>-<manager-name>.
-    Per-manager so two managers' scans don't compete.
-
-    Resolved dynamically (function call) so that tests which monkeypatch
-    paths.ROOT see the updated location.
-    """
     return paths.ROOT / f".seen-{kind}-{manager_name}"
 
 
-# The flag is fail-closed and its only writer is the sleep-60 stale loop; if
-# that loop dies mid-outage the flag would hold events forever. The stale loop
-# refreshes the flag mtime on every limited scan, so an mtime older than this
-# means the loop is dead — fail open.
 MANAGER_LIMITED_FLAG_TTL_SEC = 600
 
 
 def _manager_limited(manager_name: str) -> bool:
-    """True while stale_monitor's scoped scan flags the owning manager as
-    bricked on a rate-limit banner (flag file lifecycle lives there). Held
-    scans print nothing and mark nothing seen — every line would be a
-    task-notification the bricked manager can't act on — so events replay in
-    full on the first scan after the flag clears. Sanitization mirrors
-    stale_monitor._limited_flag_path. A flag whose mtime is past the TTL means
-    the writer loop died: ignore it and best-effort unlink so the manager is
-    never permanently deaf."""
     flag = paths.ROOT / f".manager-limited-{paths._event_bucket(manager_name)}"
     try:
         age = time.time() - flag.stat().st_mtime
@@ -110,8 +61,6 @@ def _load_seen(seen_path: Path) -> set[str]:
     if not seen_path.exists():
         return set()
     lines = {line.rstrip("\n") for line in seen_path.read_text().splitlines() if line}
-    # One-release compat: pre-rename cursors carry absolute paths under the old
-    # state root; normalize so migrated events aren't replayed. deprecated, one release.
     legacy_prefix = str(config.legacy_state_root()) + "/"
     new_prefix = str(paths.ROOT) + "/"
     return {
@@ -129,28 +78,7 @@ def _append_seen(seen_path: Path, new_paths: list[Path]) -> None:
             f.write(f"{p}\n")
 
 
-# stale_monitor's scoped scan diverts informational lines (today: AUTOCLOSED)
-# into notify-outbox/<manager>/ instead of paging a dedicated wake. Any scan
-# that is already printing drains the outbox into the same stdout burst — the
-# Monitor harness batches lines printed within ~200ms into one notification,
-# so piggybacked lines cost zero extra manager turns. Writer-side mechanics
-# (divert, fallback-to-print, 30min timeout flush) live in stale_monitor.py;
-# the entry schema is the cross-file contract:
-# {"line": str, "kind": str, "buffered_at": epoch}.
-
-
 def _drain_notify_outbox(manager_name: str) -> None:
-    """Emit-then-unlink every buffered entry. At-least-once by construction:
-    a crash between emit and unlink replays the entry next drain, and a
-    FileNotFoundError means a concurrent drainer already delivered it — skip.
-    An undecodable entry is unlinked (with a stderr note) so it can never
-    block entries sorted after it; the durable closed/<sid>.json record
-    remains the fallback source for what it described.
-
-    The emit FLUSHES before the unlink, so a dead reader can never destroy an
-    outbox entry: LaneDead propagates out (past the blanket except below, which
-    deliberately does not swallow it) and the entry stays on disk for the
-    re-armed lane."""
     try:
         outbox = paths.notify_outbox_dir_for(manager_name)
         if not outbox.is_dir():
@@ -176,14 +104,10 @@ def _drain_notify_outbox(manager_name: str) -> None:
 
 
 def run_done_scan(mgr: dict | None = None) -> None:
-    """One-shot: emit any new done/<manager>/*.json files; persist SEEN."""
     mgr = mgr or _resolve()
     name = mgr["name"]
     lane_io.preflight()
     if _manager_limited(name):
-        # Deliberately silent, not broken: preflight already proved the reader
-        # is there, so the heartbeat is honest and `dockwright lanes` must not
-        # read a rate-limit hold as a dead lane.
         lane_io.write_heartbeat(name, "done", emitted=False)
         return
     target_dir = paths.DONE / name
@@ -198,16 +122,11 @@ def run_done_scan(mgr: dict | None = None) -> None:
         try:
             payload = json.loads(entry.read_text())
         except (json.JSONDecodeError, UnicodeDecodeError):
-            # Permanently malformed: consume it, loudly. Retrying forever would
-            # wedge the lane on one bad file and it can never emit anyway.
             print(f"monitor: dropped unparseable done event {entry.name}",
                   file=sys.stderr)
             new_paths.append(entry)
             continue
         except OSError:
-            # Transient (EMFILE, a mid-write rename, a flaky mount): do NOT
-            # consume. The old code appended BEFORE the read, so one transient
-            # error destroyed a real worker_done payload silently.
             continue
         worker = payload.get("worker_name") or payload.get("claude_sid", "?")
         summary = payload.get("summary", "")
@@ -220,75 +139,33 @@ def run_done_scan(mgr: dict | None = None) -> None:
     lane_io.write_heartbeat(name, "done", emitted=bool(printed))
 
 
-# Silent-finish detection over turn-end events. A worker that finishes its
-# work WITHOUT calling worker_done leaves only a turn-end behind; everything
-# else a turn-end can mean (worker reported done, worker kept working, worker
-# is asking a question) already has its own notification lane — so routine
-# turn-ends never reach the manager. ~95% of raw per-turn pings were discarded
-# as noise; the silent-finish case is the signal worth a wake-up. A turn-end
-# whose worker has a subagent transcript growing past it is a delegation —
-# held as PENDING, aged from the newest subagent write against
-# _episode_grace_sec() (default 900), NOT this constant.
-# Documentation constant: the live default is transcript.DELEGATION_FRESH_SEC
-# (same 120), read via _turn_end_grace_sec → transcript.delegation_fresh_sec —
-# this is the turn-end/young-file grace and nothing else.
 TURN_END_GRACE_SEC_DEFAULT = 120
-# worker_done fires DURING the final turn (an MCP call before the Stop hook),
-# so a done event normally predates its turn-end by seconds-to-minutes. The
-# lookback tolerates post-done cleanup work inside the same turn — keep it
-# MINUTES-scale: a suppressed turn-end is marked seen, so a too-wide lookback
-# doesn't delay a re-tasked worker's silent finish, it masks it forever
-# (caught by the #62 verifier at the original 1h). Cleanup running past the
-# lookback costs one spurious FINISHED_SILENTLY whose summary shows the done.
 DONE_FRESH_LOOKBACK_SEC = 600
+RETASK_GRACE_SEC = 2.0
 
-TURN_END_PENDING = "pending"        # within grace — re-evaluate next scan
-TURN_END_SUPPRESS = "suppress"      # routine — mark seen, never surface
-TURN_END_EMIT = "emit"              # probable silent finish
-TURN_END_EMIT_EXITED = "emit-exited"  # silent finish AND the session is gone
+TURN_END_PENDING = "pending"
+TURN_END_SUPPRESS = "suppress"
+TURN_END_EMIT = "emit"
+TURN_END_EMIT_EXITED = "emit-exited"
 
-# The silent-finish line is the actionable wake signal; widen past the old 160
-# so a multi-line pause status's substance survives. The live re-read uses it
-# too; the marker-fallback text was already baked at last_assistant_summary's
-# 200 default, so fallback lines stay <=200 (the list_workers/statusline cap).
 SILENT_FINISH_SUMMARY_MAX = 400
 
 
-# FINISHED_SILENTLY per-sid emit ladder. A worker in a poll/wait loop ends a
-# turn every ~10min; each lull past grace re-paged the manager (observed
-# 14/day from one worker; >=64% of the lane false). First FS of a lull pages
-# immediately; repeats for the SAME uninterrupted lull are HELD — not marked
-# seen, so the newest turn-end always eventually surfaces — until a doubling
-# rung matures. The rung is hard-capped: preflight prunes turn-end files at
-# 24h, so an uncapped ladder could out-wait its own evidence and lose a held
-# genuine finish. Resets to immediate when the manager re-engaged since the
-# last page (processing_since — stamped only by real prompt submissions,
-# never by task-notification wakes, so a poll loop cannot reset itself), when
-# a done event for the sid landed after the last page, or when the session
-# exited mid-lull (new information, page once).
 FS_LADDER_BASE_SEC_DEFAULT = 900
 FS_LADDER_RUNG_CAP_SEC = 4 * 3600
 FS_LADDER_ENTRY_TTL_SEC = 48 * 3600
 
-FS_EMIT_RESET = "emit-reset"   # new episode — emit now, level restarts at 1
-FS_EMIT_RUNG = "emit-rung"     # same lull, rung matured — emit, level += 1
-FS_HOLD = "hold"               # same lull, rung pending — not printed, NOT seen
+FS_EMIT_RESET = "emit-reset"
+FS_EMIT_RUNG = "emit-rung"
+FS_HOLD = "hold"
 
 
 def _turn_end_grace_sec() -> int:
-    # Thin delegate: transcript.delegation_fresh_sec owns the env read so the
-    # classifier grace and the read-side surfaces (list_workers, paint) cannot
-    # drift apart under a CLAUDE_ORCH_TURN_END_GRACE_SEC override.
     from .transcript import delegation_fresh_sec
     return delegation_fresh_sec()
 
 
 def _episode_grace_sec() -> int:
-    """Patience window for a worker demonstrably mid-episode: a delegation
-    whose subagent is between transcript writes (2a), or a poll/wait cadence
-    of closely-spaced turn-ends (2b). Clamped to >= the base turn-end grace so
-    raising CLAUDE_ORCH_TURN_END_GRACE_SEC past 900 cannot invert the two.
-    Value, env read and clamp live in transcript.episode_grace_sec."""
     from .transcript import episode_grace_sec
     return episode_grace_sec()
 
@@ -303,7 +180,19 @@ def _turn_end_ts(payload: dict, entry: Path) -> float:
         return 0.0
 
 
-def _has_fresh_done_event(manager_name: str, sid: str, turn_end_ts: float) -> bool:
+def _episode_start(record: dict | None) -> float:
+    if not isinstance(record, dict):
+        return 0.0
+    stamps = [record.get("tasked_at"), record.get("processing_since")]
+    return max((s for s in stamps if isinstance(s, (int, float))), default=0.0)
+
+
+def _predates_current_episode(event_ts: float, episode_start: float) -> bool:
+    return episode_start > 0 and event_ts < episode_start - RETASK_GRACE_SEC
+
+
+def _has_fresh_done_event(manager_name: str, sid: str, turn_end_ts: float,
+                          episode_start: float) -> bool:
     done_dir = paths.DONE / manager_name
     if not done_dir.is_dir():
         return False
@@ -315,37 +204,30 @@ def _has_fresh_done_event(manager_name: str, sid: str, turn_end_ts: float) -> bo
                 done_ts = done_path.stat().st_mtime
             except OSError:
                 continue
-        if done_ts >= turn_end_ts - DONE_FRESH_LOOKBACK_SEC:
-            return True
+        if done_ts < turn_end_ts - DONE_FRESH_LOOKBACK_SEC:
+            continue
+        if _predates_current_episode(done_ts, episode_start):
+            continue
+        return True
     return False
 
 
-def _has_pending_question_for_sid(sid: str) -> bool:
+def _has_pending_question_for_sid(sid: str, episode_start: float) -> bool:
     if not paths.QUESTIONS.is_dir():
         return False
     for question_path in paths.QUESTIONS.rglob("*.json"):
         record = state.read_json(question_path)
-        if record and record.get("worker_sid") == sid:
-            return True
+        if not record or record.get("worker_sid") != sid:
+            continue
+        asked_at = record.get("asked_at")
+        if isinstance(asked_at, (int, float)) and \
+                _predates_current_episode(asked_at, episode_start):
+            continue
+        return True
     return False
 
 
 def _delegation_hold(record: dict, sid: str, turn_end_ts: float, now: float) -> bool:
-    """A worker that dispatched a background subagent ends its TURN but not
-    its WORK (4 false FINISHED_SILENTLY in one day, 2026-06-12). Hold while
-    the newest subagent transcript write is at/after the turn-end AND fresh
-    within grace — the hold ages from the newest WRITE, so a dead subagent
-    goes quiet past grace and the alert still fires once. Crash-proof: any
-    failure reads as no-hold (pre-change behavior); the caller's outer
-    try/except stays the last resort. Deliberately NOT transcript.is_delegating:
-    the baseline here is the turn-end ts, not the main-log mtime.
-
-    Freshness ages on _episode_grace_sec (default 900s), NOT the 120s turn-end
-    grace: a live reviewer subagent can sit 3-4min between transcript writes
-    (thinking, long tool calls — observed 208s/239s gaps, 2026-07-16), and the
-    old shared bound paged the manager mid-delegation. Cost: a subagent that
-    DIES mid-delegation alerts once at <=episode grace (was <=2min). The
-    read-side is_delegating surfaces age on the SAME window."""
     try:
         if (record.get("runtime") or "claude") != "claude":
             return False
@@ -370,11 +252,6 @@ def _fs_ladder_base_sec() -> int:
 
 
 def _fs_ladder_path(manager_name: str) -> Path:
-    # Via _event_bucket, the one answer to "this name must be a single path
-    # segment" — an inline copy here disagreed with stale_monitor's about a
-    # "." or ".." name, so the two halves looked at different flag files. The
-    # sibling .seen-<kind>-<mgr> cursors deliberately keep RAW names — do not
-    # "fix" them to match; that would orphan live cursors.
     return paths.ROOT / f".fs-emitted-{paths._event_bucket(manager_name)}.json"
 
 
@@ -417,10 +294,6 @@ def _done_event_after(manager_name: str, sid: str, after_ts: float) -> bool:
 
 def _fs_ladder_gate(ladder: dict, sid: str, verdict: str,
                     manager_name: str, now: float) -> str:
-    """FS_EMIT_RESET / FS_EMIT_RUNG / FS_HOLD for one EMIT-classified turn-end.
-
-    Crash-proof like classify_turn_end, but failing OPEN to emission: a
-    duplicate page beats a silenced lull."""
     try:
         entry = ladder.get(sid)
         if not isinstance(entry, dict):
@@ -462,12 +335,6 @@ def _fs_ladder_record(ladder: dict, sid: str, verdict: str, gate: str,
 
 def classify_turn_end(payload: dict, entry: Path, manager_name: str,
                       own_sid: str | None, now: float) -> str:
-    """Classify one turn-end file for the silent-finish detector.
-
-    Drives the Claude-manager monitor scan's turn-end notification lane.
-    Crash-proof: any failure reads as SUPPRESS (a lost wake-up beats a crashed
-    scan; the 2h idle autoclose remains the catch-all).
-    """
     try:
         sid = payload.get("sid") or entry.name.rsplit("-", 1)[0]
         if own_sid and sid == own_sid:
@@ -476,16 +343,9 @@ def classify_turn_end(payload: dict, entry: Path, manager_name: str,
             return TURN_END_SUPPRESS
         ts = _turn_end_ts(payload, entry)
         if ts <= 0:
-            # No payload timestamp and stat failed — the file was likely
-            # pruned between glob and read. ts=0 would sail past the grace
-            # and emit a spurious exited-line; PENDING self-resolves (a gone
-            # file isn't globbed next scan).
             return TURN_END_PENDING
         if now - ts < _turn_end_grace_sec():
             return TURN_END_PENDING
-        # Superseded by a newer turn-end for the same sid: that file carries
-        # the current lull; emitting both would double-page one silence. The
-        # same pass collects the newest OLDER sibling ts as burst evidence.
         prior_ts = 0.0
         for sibling in entry.parent.glob(f"{sid}-*.json"):
             if sibling == entry:
@@ -495,29 +355,22 @@ def classify_turn_end(payload: dict, entry: Path, manager_name: str,
             if sibling_ts > ts:
                 return TURN_END_SUPPRESS
             prior_ts = max(prior_ts, sibling_ts)
-        # Accepted edge: done/ files are pruned at 24h. After a >24h manager
-        # outage a surviving unseen turn-end can lose its done file and fire
-        # one spurious FINISHED_SILENTLY on recovery — harmless next to the
-        # outage itself, and the line's summary shows the work completed.
-        if _has_fresh_done_event(manager_name, sid, ts):
-            return TURN_END_SUPPRESS
-        if _has_pending_question_for_sid(sid):
-            return TURN_END_SUPPRESS       # the questions monitor owns that wake
         record = state.read_json(paths.ACTIVE / f"{sid}.json")
+        episode_start = _episode_start(record)
+        if _has_fresh_done_event(manager_name, sid, ts, episode_start):
+            return TURN_END_SUPPRESS
+        if _has_pending_question_for_sid(sid, episode_start):
+            return TURN_END_SUPPRESS
         if record is None:
             return TURN_END_EMIT_EXITED
         if record.get("nested"):
-            return TURN_END_SUPPRESS       # parent process supervises it
+            return TURN_END_SUPPRESS
         if record.get("state") == "processing":
-            return TURN_END_SUPPRESS       # worker continued
+            return TURN_END_SUPPRESS
         if _delegation_hold(record, sid, ts, now):
-            return TURN_END_PENDING        # background subagent still working
+            return TURN_END_PENDING
         if prior_ts > 0 and ts - prior_ts <= _episode_grace_sec() \
                 and now - ts < _episode_grace_sec():
-            # Turn-burst hold: another turn ended <=episode grace before this
-            # one — a poll/wait cadence (background Bash waits, SDD loops),
-            # not a finish. Held PENDING (never seen-marked): fires once when
-            # the episode's LAST lull ages past the episode grace.
             return TURN_END_PENDING
         return TURN_END_EMIT
     except Exception as e:
@@ -527,15 +380,6 @@ def classify_turn_end(payload: dict, entry: Path, manager_name: str,
 
 
 def _resolve_live_summary(payload: dict) -> str | None:
-    """True last assistant message from the worker's LIVE transcript.
-
-    By emit time the turn-end is >= grace old, so the transcript has flushed
-    past the Stop-hook snapshot — which can freeze on a mid-turn narration when
-    the turn's final text frame lands after the hook reads (the staleness bug).
-    Reached only for EMIT/EMIT_EXITED, i.e. the worker is idle or gone, never
-    mid-new-turn (a resumed worker reads state=processing -> SUPPRESS upstream),
-    so the live last message is the relevant turn's final message. Returns None
-    on any failure so the caller falls back to the marker's last_summary."""
     try:
         sid = payload.get("sid")
         if not sid:
@@ -563,20 +407,6 @@ def _format_silent_finish_line(payload: dict, entry: Path, verdict: str) -> str:
 
 
 def run_turn_ends_scan(mgr: dict | None = None) -> None:
-    """One-shot: silent-finish detector over new turn-end files.
-
-    A turn-end is held (NOT marked seen) until it is GRACE old, then
-    classified — suppressed when the worker reported done, kept working, has
-    a pending question, is nested, or is the manager itself; held while a
-    background subagent still writes (the delegation hold); held while an
-    older sibling turn-end sits within the episode grace (the turn-burst
-    hold — a poll/wait cadence); emitted as
-    `FINISHED_SILENTLY <name>: <summary>` otherwise (with a `(session
-    exited)` variant when the active record is gone). Routine turn-ends
-    never reach the manager. Repeats for the same uninterrupted lull are
-    rate-limited by the per-sid emit ladder (HELD, not seen-marked, until a
-    doubling rung matures — see the FS_LADDER constants). A scan that pages
-    also drains the notify outbox into the same burst."""
     mgr = mgr or _resolve()
     name = mgr["name"]
     lane_io.preflight()
@@ -610,21 +440,12 @@ def run_turn_ends_scan(mgr: dict | None = None) -> None:
             sid = payload.get("sid") or entry.name.rsplit("-", 1)[0]
             gate = _fs_ladder_gate(ladder, sid, verdict, name, now)
             if gate == FS_HOLD:
-                # Same uninterrupted lull, rung pending: not printed and NOT
-                # marked seen — the newest turn-end keeps carrying the lull,
-                # re-evaluated every scan until the rung matures or a reset
-                # (re-instruction / done / session-exit) fires.
                 continue
             emit(_format_silent_finish_line(payload, entry, verdict))
             printed += 1
             _fs_ladder_record(ladder, sid, verdict, gate, now)
             ladder_dirty = True
         new_paths.append(entry)
-    # Ordering (spec I4): emit -> ladder write -> seen append. Every crash
-    # window between the steps degrades to a rate-limited duplicate page,
-    # never a silenced lull. The emit now FLUSHES, so a dead reader aborts the
-    # scan here and neither the ladder nor the cursor records a page the
-    # manager never saw.
     if ladder_dirty:
         try:
             state.write_json_atomic(ladder_path, ladder)
@@ -637,7 +458,6 @@ def run_turn_ends_scan(mgr: dict | None = None) -> None:
 
 
 def run_questions_scan(mgr: dict | None = None) -> None:
-    """One-shot: emit any new questions/<manager>/*.json files; persist SEEN."""
     mgr = mgr or _resolve()
     name = mgr["name"]
     lane_io.preflight()
@@ -661,7 +481,7 @@ def run_questions_scan(mgr: dict | None = None) -> None:
             new_paths.append(entry)
             continue
         except OSError:
-            continue                   # transient — retry, never consume
+            continue
         worker = payload.get("worker_name") or payload.get("worker_sid", "?")
         question = payload.get("question", "")
         emit(f"{worker} asks: {question}")
@@ -674,27 +494,6 @@ def run_questions_scan(mgr: dict | None = None) -> None:
 
 
 def run_stale_scan(mgr: dict | None = None) -> None:
-    """One-shot: run the packaged stale monitor with the resolved manager name.
-
-    Runs `sys.executable -m dockwright.stale_monitor` — a fresh
-    interpreter, same as the old deployed-script shell-out, so module-level
-    env reads stay per-scan. Output flows straight through (STALE_PROCESSING /
-    STALE_QUESTION / AUTOCLOSED lines on stdout). Errors surface via stderr;
-    non-zero exit propagates.
-
-    The child inherits this fd 1, so it owns its own emit discipline (it keeps
-    a stdlib copy — it cannot import the package) AND writes its own heartbeat.
-    That split matters: a heartbeat written HERE would certify the child's exit
-    CODE, not that anything was delivered, and `stale` has no backlog arm to
-    cross-check it with.
-
-    Exit codes are triaged rather than blanket-propagated. `sys.exit` raises
-    SystemExit, which main() re-raises past the retry ladder, so forwarding
-    every non-zero code would end this lane on the FIRST transient — and this
-    is the lane with the largest failure surface (tmux calls, keychain probes,
-    transcript IO across ~900 lines, plus the `-m` import itself, which fails
-    for everyone at once during a `pip install -e .`).
-    """
     mgr = mgr or _resolve()
     lane_io.preflight()
     result = subprocess.run(
@@ -705,30 +504,15 @@ def run_stale_scan(mgr: dict | None = None) -> None:
     if result.returncode == lane_io.EXIT_LANE_DEAD:
         raise LaneDead("stale_monitor reported its stdout reader is gone")
     if result.returncode == lane_io.EXIT_LANE_WEDGED:
-        # The child already ran its own ladder; do not re-ladder its verdict.
         lane_io.detach_stdout()
         sys.exit(lane_io.EXIT_LANE_WEDGED)
     if result.returncode != 0:
-        # Anything else is presumed transient and goes through the ladder like
-        # an exception raised in-process.
         raise RuntimeError(
             f"stale_monitor exited {result.returncode}")
 
 
-# Derived, never re-listed: `dockwright lanes` iterates the same mapping, so a
-# fifth lane is reported by construction instead of by someone remembering to
-# update a second copy.
 _MONITOR_SUBCOMMANDS = tuple(lane_io.LANES)
 
-# The dispatch table, module-level so a test can compare it against the
-# canonical lane set. As a local dict it was a SECOND hand-maintained list: a
-# lane added to LANES but not here passes subcommand validation and then raises
-# KeyError, which the retry ladder reads as a transient and retries five times
-# before wedging — a missing implementation reported as a flaky one.
-# Values are NAMES, resolved through globals() at call time. Holding the
-# function OBJECTS froze them at import, so a test (or a caller) replacing
-# monitor.run_done_scan no longer reached the dispatch — the table silently
-# stopped describing what actually runs.
 _SCANS = {
     "questions": "run_questions_scan",
     "done": "run_done_scan",
@@ -738,22 +522,6 @@ _SCANS = {
 
 
 def main(argv: list[str]) -> None:
-    """Dispatch for `dockwright monitor <subcommand> [manager-name]`.
-
-    Validates the subcommand BEFORE resolving the positional manager name, so
-    an unknown subcommand reports as such even when the name is also bogus —
-    `monitor bogus-sub no-such-mgr` must not be misreported as a name-lookup
-    failure.
-
-    Exit codes are the lane's contract with its
-    `while dockwright monitor <lane> || exit $?; do sleep N; done` wrapper:
-    0 keeps the lane looping, anything else ends it AND propagates out of the
-    shell, so the Monitor task exits non-zero rather than looking like a clean
-    finish.
-    2 = bad usage or the owning manager can no longer be resolved (its session
-    is gone — this is what makes an orphaned loop terminate itself instead of
-    scanning for a week). EXIT_LANE_DEAD = the reader is gone.
-    """
     lanes = " | ".join(_MONITOR_SUBCOMMANDS)
     usage = f"Usage: dockwright monitor <{'|'.join(_MONITOR_SUBCOMMANDS)}> [manager-name]"
     if not argv:
@@ -767,17 +535,6 @@ def main(argv: list[str]) -> None:
     if len(argv) > 2:
         print(f"Unexpected arguments {argv[2:]!r}. {usage}", file=sys.stderr)
         sys.exit(2)
-    # Resolved HERE rather than inside each scan so an unexpected failure below
-    # still knows which lane to charge the error to. An unresolvable identity
-    # exits 2 from the resolver itself, which is correct: the owning manager is
-    # gone, and that is what makes an orphaned loop terminate instead of
-    # scanning for a week.
-    # Bucket for error accounting when identity itself failed and there is no
-    # manager name yet. A reserved name in the SAME store, not a second
-    # mechanism — the alternative was leaving resolution outside the ladder,
-    # where an unreadable active/ dir (PermissionError propagates: is_dir() is
-    # True for a dir you cannot read, and list_json_in's iterdir has no guard)
-    # ends a healthy lane on one transient.
     mgr = None
     try:
         mgr = _resolve_named(argv[1]) if len(argv) == 2 else _resolve()
@@ -791,10 +548,6 @@ def main(argv: list[str]) -> None:
     except SystemExit:
         raise
     except Exception as e:
-        # Everything else is presumed TRANSIENT and retried, because the
-        # wrapper now ends the lane on any non-zero exit: a momentarily
-        # unreadable state dir must not permanently deafen a healthy manager.
-        # A persistent fault still ends the lane, just not on the first scan.
         cap = lane_io.max_consecutive_errors(sub)
         run = lane_io.record_scan_error(
             mgr["name"] if mgr else lane_io.UNRESOLVED_BUCKET, sub)

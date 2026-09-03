@@ -29,7 +29,6 @@ def test_render_substitutes_placeholder():
     snippet = {"hooks": {"Stop": [{"hooks": [_hook("x @@DOCKWRIGHT_BIN@@ stop")]}]}}
     out = ei.render_snippet(snippet, ABS)
     assert out["hooks"]["Stop"][0]["hooks"][0]["command"] == f"x {ABS} stop"
-    # original untouched (deep copy)
     assert "@@DOCKWRIGHT_BIN@@" in snippet["hooks"]["Stop"][0]["hooks"][0]["command"]
 
 def test_merge_converts_bare_to_abs_in_place():
@@ -37,7 +36,7 @@ def test_merge_converts_bare_to_abs_in_place():
     rendered = {"hooks": {"SessionStart": [{"hooks": [_hook(f"bash -c '$PPID {ABS} session-start'")]}]}}
     merged = ei.merge_hooks(existing, rendered)
     cmds = [h["command"] for b in merged["hooks"]["SessionStart"] for h in b["hooks"]]
-    assert cmds == [f"bash -c '$PPID {ABS} session-start'"]  # replaced, not duplicated
+    assert cmds == [f"bash -c '$PPID {ABS} session-start'"]
 
 def test_merge_is_idempotent_on_abs():
     rendered = {"hooks": {"Stop": [{"hooks": [_hook(f"$PPID {ABS} stop")]}]}}
@@ -86,13 +85,10 @@ def test_rendered_orch_bin_extracts_path_and_handles_empty():
     assert ei.rendered_orch_bin({}) is None
 
 def test_orch_owned_subcommand_is_precise():
-    # orchestrator-owned (carry the real bin path in executable position)
     assert ei.orch_owned_subcommand(f"bash -c '$PPID {ABS} manager-tts'", ABS) == "manager-tts"
     assert ei.orch_owned_subcommand(f"bash -c '$PPID {ABS} stop'", ABS) == "stop"
-    # foreign bash-script hooks -> not owned
     assert ei.orch_owned_subcommand("bash /U/.claude/scripts/auto-commit-on-edit.sh", ABS) is None
     assert ei.orch_owned_subcommand("bash /U/.claude/scripts/selffix-trigger.sh", ABS) is None
-    # contrived false-positive cases (orchestrator as arg / dir / different binary) -> not owned
     assert ei.orch_owned_subcommand("echo orchestrator status", ABS) is None
     assert ei.orch_owned_subcommand("git -C /repos/orchestrator status", ABS) is None
     assert ei.orch_owned_subcommand("bash /opt/orchestrator deploy.sh", ABS) is None
@@ -109,8 +105,6 @@ def test_merge_prunes_orphan_keeps_canonical():
     assert any(c == f"bash -c '$PPID {ABS} stop'" for c in cmds)
 
 def test_merge_preserves_foreign_hook_sharing_block_during_prune():
-    # Mirrors the deployed SessionEnd shape: one block mixes canonical session-end + foreign
-    # selffix; the orphan manager-tts sits in its own block.
     existing = {"hooks": {"SessionEnd": [
         {"hooks": [
             _hook(f"bash -c '$PPID {ABS} session-end'"),
@@ -171,9 +165,6 @@ def test_prune_preserves_block_matcher_key():
     assert any("stop" in c for c in cmds)
 
 def test_merge_settings_file_claude_prunes_orphan_and_preserves_everything_else(tmp_path):
-    # The manager-specified regression: settings.json with an orphan orchestrator hook + a
-    # canonical snippet WITHOUT it -> orphan gone, non-orchestrator hooks preserved, canonical
-    # orchestrator hooks present, foreign top-level keys preserved.
     snippet = tmp_path / "snippet.json"
     snippet.write_text(json.dumps({"hooks": {
         "Stop": [{"hooks": [_hook("bash -c '$PPID @@DOCKWRIGHT_BIN@@ stop'")]}],
@@ -199,12 +190,12 @@ def test_merge_settings_file_claude_prunes_orphan_and_preserves_everything_else(
     ei.merge_settings_file(target, snippet, ABS, "claude")
     out = json.loads(target.read_text())
     cmds = [h["command"] for blocks in out["hooks"].values() for b in blocks for h in b["hooks"]]
-    assert not any("manager-tts" in c for c in cmds)                       # orphan pruned
-    assert any(c == f"bash -c '$PPID {ABS} stop'" for c in cmds)           # canonical present
-    assert any("session-end" in c and ABS in c for c in cmds)             # canonical present
-    assert any("auto-commit-on-edit.sh" in c for c in cmds)               # sibling-block foreign
-    assert any("selffix-trigger.sh" in c for c in cmds)                   # mixed-block foreign
-    assert out["model"] == "opus"                                          # foreign top key
+    assert not any("manager-tts" in c for c in cmds)
+    assert any(c == f"bash -c '$PPID {ABS} stop'" for c in cmds)
+    assert any("session-end" in c and ABS in c for c in cmds)
+    assert any("auto-commit-on-edit.sh" in c for c in cmds)
+    assert any("selffix-trigger.sh" in c for c in cmds)
+    assert out["model"] == "opus"
 
 def test_merge_settings_file_claude_prune_is_idempotent(tmp_path):
     snippet = tmp_path / "snippet.json"
@@ -297,12 +288,12 @@ def test_noop_rerun_writes_no_backup_and_no_write(tmp_path):
     snippet = _cap_snippet(tmp_path)
     target = tmp_path / "settings.json"
     ei.merge_settings_file(target, snippet, ABS, "claude")
-    assert _bak_names(tmp_path) == []  # fresh create: nothing to back up
+    assert _bak_names(tmp_path) == []
     ei.merge_settings_file(target, snippet, ABS, "claude")
-    assert _bak_names(tmp_path) == []  # byte-identical re-run: no backup minted
+    assert _bak_names(tmp_path) == []
     mtime = target.stat().st_mtime_ns
     ei.merge_settings_file(target, snippet, ABS, "claude")
-    assert target.stat().st_mtime_ns == mtime  # and no rewrite either
+    assert target.stat().st_mtime_ns == mtime
 
 def test_mutating_run_still_backs_up_first(tmp_path):
     snippet = _cap_snippet(tmp_path)
@@ -317,11 +308,9 @@ def test_backups_capped_at_keep(tmp_path):
     snippet = _cap_snippet(tmp_path)
     target = tmp_path / "settings.json"
     for i in range(ei.BACKUP_KEEP + 4):
-        # alternate the orch bin so every run is a real mutation
         ei.merge_settings_file(target, snippet, f"{ABS}{i}", "claude")
     baks = _bak_names(tmp_path)
     assert len(baks) == ei.BACKUP_KEEP
-    # newest survive: suffixes strictly increasing, so the kept set is the max-5
     suffixes = sorted(int(n.rsplit(".", 1)[1]) for n in baks)
     assert suffixes == sorted(suffixes)[-ei.BACKUP_KEEP:]
 

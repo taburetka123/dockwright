@@ -118,7 +118,7 @@ Most manager-side read tools take `manager_sid` — the caller's **own session U
 | `list_pending_questions(manager_sid?)` | Pending questions, oldest first. |
 | `answer_question(question_id, text)` | Writes `answers/<qid>.json`, unlinks the question. |
 | `send_manager_to_worker(worker, text, auto_resume=false)` | Types the content **directly into the worker's pane**, prefixed `[MANAGER] ` (bracketed paste + single Enter — multi-line safe). tmux buffers if the worker is mid-turn. No inbox file EVER — RAISES when the worker has no live window. With `auto_resume=true`, a closed worker with a resumable transcript is resumed and the message delivered in one call (result carries `resumed: true`); still RAISES when nothing is resumable. Status: `delivered`. |
-| `send_manager_to_manager(name, text)` | Message a **peer manager** by funny name. Idle-guarded: peer's input box empty → types directly (`delivered_live`); human mid-typing → does NOT type (`peer_busy`, delivered=False) — no inbox; RAISES when the peer has no live/readable window. |
+| `send_manager_to_manager(name, text)` | Message a **peer manager** by funny name. Idle-guarded: peer's input box empty → types directly (`delivered_live`), prefixed `[MANAGER <sender name> · <sender domain>] ` — the sender comes from its own active record, never a caller argument, so a leading slash arrives as plain text; the result carries `sender` (null when the record could not be resolved, which degrades the prefix to `[MANAGER] `); human mid-typing → does NOT type (`peer_busy`, delivered=False) — no inbox; RAISES when the peer has no live/readable window. |
 | `list_managers()` | All active managers: name, domain, sid, window id, runtime. |
 | `kill_worker(worker)` | Drops pending questions, then **gracefully closes the worker's tmux pane** (SIGHUP → grace → SIGKILL) so the worker's SessionEnd hook fires (selffix retro + closed/ archive). Not SIGTERM. |
 | `get_worker_summary(worker)` | Full un-truncated last assistant message. |
@@ -256,7 +256,7 @@ Why filing is not a safe fallback: `claude-architect` issue #14 was filed correc
 
 Applied to an existing notebook: sweep out every entry that is a review residue asserting its own harmlessness, and keep the ones recording an observed misbehaviour. Everything swept still goes to the archive in full — the archive is the record, it is just not an agenda.
 
-**Review-by triage.** An entry past its `review-by` surfaces in the startup brief even if unripe. Triage explicitly with the user: re-date, drop (archive with a reason), or act now. Never silently re-date.
+**Review-by triage.** An entry past its `review-by` surfaces in the startup brief even if unripe. ⛔ Run its `check:` BEFORE putting it to the user — the agent file's § Manager notebook re-derivation gate binds this triage, and an expired entry is the likeliest one to be dead already. Then triage explicitly with the user: re-date, drop (archive with a reason), or act now. Never silently re-date.
 
 **Gardener stays separate.** The Gardener ledger (`~/.claude/dockwright/gardener/ledger.jsonl`) is machine-parsed JSONL with its own piggybacked check cadence — it does NOT move into the notebook. Notebook entries may reference ledger state in their `check:`, linking by reference.
 

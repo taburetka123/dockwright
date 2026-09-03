@@ -1,24 +1,4 @@
 #!/usr/bin/env python3
-"""One-shot dockwright hygiene at /manager startup.
-
-Prunes:
-  - handoffs/<id>.json older than 1h with consumed_at == null  (aborted recreations)
-  - handoffs/<id>.json older than 24h with consumed_at != null (already used, can go)
-  - done/<id>.json older than 24h                              (manager already saw them)
-  - closed/<sid>.json older than 7d                            (auto-closed workers, unresumed)
-  - active/<sid>.json with a provably-dead positive pid        (orphan active records;
-    odd-looking ones — no usable pid, or pid alive but not a claude/codex
-    process — are kept and reported, never deleted)
-  - unowned debris (arch review B5): monitor cursors
-    (STALE_CURSOR_PATTERNS, currently .seen-* / .batch-turn-ends-* /
-    .last-seen* / .fs-emitted-* / .read-*) >7d, stale
-    notify-outbox entries >7d, empty per-manager bucket dirs under done/
-    turn-ends/ questions/ notify-outbox/, and the dead manager.lock husk
-
-Prints one line summary; silent if everything's clean. Standalone — only uses stdlib
-so it can be run as `python3 ~/.claude/scripts/preflight_cleanup.py` without the
-orchestrator's venv on PATH.
-"""
 from __future__ import annotations
 
 import errno
@@ -29,31 +9,18 @@ import sys
 import time
 from pathlib import Path
 
-STALE_UNCONSUMED_HANDOFF_SEC = 60 * 60        # 1 hour
-STALE_CONSUMED_HANDOFF_SEC = 24 * 60 * 60     # 24 hours
-STALE_DONE_SEC = 24 * 60 * 60                 # 24 hours
-STALE_TURN_END_SEC = 24 * 60 * 60             # 24 hours
-STALE_CLOSED_SEC = 7 * 24 * 60 * 60           # 7 days
-STALE_CURSOR_SEC = 7 * 24 * 60 * 60           # 7 days
-# The dot-file cursors the husk GC sweeps. Hoisted out of _gc_husks so the test
-# iterates THIS tuple and a pattern added here gets its case for free. It is a
-# hand-maintained list and the test cannot see what is MISSING from it — a
-# cursor family nobody declared here is swept by nothing (`.stale-emitted-*`
-# from stale_monitor.py is one such family today, out of scope for this change).
-# .read-*: the statusline's per-manager "he has seen this message" marks (plus
-# their per-pid .tmp siblings). Only rewritten when the message changes, so a
-# live but silent manager's mark ages out — one spurious light per week of
-# silence, the safe direction.
+STALE_UNCONSUMED_HANDOFF_SEC = 60 * 60
+STALE_CONSUMED_HANDOFF_SEC = 24 * 60 * 60
+STALE_DONE_SEC = 24 * 60 * 60
+STALE_TURN_END_SEC = 24 * 60 * 60
+STALE_CLOSED_SEC = 7 * 24 * 60 * 60
+STALE_CURSOR_SEC = 7 * 24 * 60 * 60
 STALE_CURSOR_PATTERNS = (".seen-*", ".batch-turn-ends-*", ".last-seen*",
                          ".fs-emitted-*", ".read-*")
 
-# os.kill raises OverflowError (not OSError) for pids above the C int range, so a
-# poisoned record would traceback the whole preflight — and never get cleaned, so
-# it repeats at every /manager boot. Pids beyond this bound are "no usable pid".
 MAX_OS_PID = 0x7FFFFFFF
 
 def _prefer_new(new: Path, legacy: Path) -> Path:
-    # deprecated, one release: legacy fallback while orchestrator-era state migrates
     if new.exists():
         return new
     if legacy.exists():
@@ -62,11 +29,6 @@ def _prefer_new(new: Path, legacy: Path) -> Path:
 
 
 _HOME = Path(os.environ.get("HOME", ""))
-# Test-isolation + relocation seam (mirrors gardener's DOCKWRIGHT_GARDENER_DIR):
-# an explicit state dir wins over the HOME-derived default, so fresh loads under
-# pytest can never bind the live ledger/state. Honored by this script only —
-# the package's config.state_root() does not read it; a global relocation
-# still goes through dockwright.toml [paths] state_root.
 _ENV_STATE_DIR = os.environ.get("DOCKWRIGHT_STATE_DIR", "").strip()
 ROOT = (Path(_ENV_STATE_DIR) if _ENV_STATE_DIR
         else _prefer_new(_HOME / ".claude" / "dockwright", _HOME / ".claude" / "orchestrator"))
@@ -99,10 +61,6 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _process_command(pid: int) -> str:
-    """Command line of pid's CURRENT process, or "" when it can't be read.
-
-    Any lookup failure reads as "" (= not a session), which downstream only ever
-    KEEPS a record — never deletes on an unreadable command line."""
     try:
         result = subprocess.run(
             ["ps", "-o", "command=", "-p", str(pid)],
@@ -116,24 +74,17 @@ def _process_command(pid: int) -> str:
 
 
 def _looks_like_session(command: str) -> bool:
-    """Mirrors sweep._looks_like_session (intentionally duplicated, stdlib-only):
-    argv[0]'s basename only, so a claude/codex-shaped token in the args can't
-    make a recycled pid read as a session."""
     tokens = command.split()
     return bool(tokens) and os.path.basename(tokens[0]) in ("claude", "codex")
 
 
 def _tmux_socket() -> str:
     return (os.environ.get("DOCKWRIGHT_TMUX_SOCKET")
-            or os.environ.get("CLAUDE_ORCH_TMUX_SOCKET")  # deprecated, one release
+            or os.environ.get("CLAUDE_ORCH_TMUX_SOCKET")
             or "dockwright")
 
 
 def _live_pane_ids():
-    """Pane ids alive on the orchestrator tmux server; None when tmux cannot
-    answer (error/timeout), set() when the server simply isn't running.
-    Mirrors registry._live_pane_ids semantics — intentionally duplicated to
-    keep this script stdlib-only, the same way _prune_active mirrors registry."""
     try:
         proc = subprocess.run(
             ["tmux", "-L", _tmux_socket(), "list-panes", "-a", "-F", "#{pane_id}"],
@@ -172,7 +123,6 @@ def _prune_done(now: float) -> int:
     if not DONE.is_dir():
         return 0
     pruned = 0
-    # rglob recurses the per-manager subdirs + _unscoped + any legacy flat files.
     for p in DONE.rglob("*.json"):
         try:
             mtime = p.stat().st_mtime
@@ -188,7 +138,6 @@ def _prune_turn_ends(now: float) -> int:
     if not TURN_ENDS.is_dir():
         return 0
     pruned = 0
-    # rglob recurses the per-manager subdirs + _unscoped + any legacy flat files.
     for p in TURN_ENDS.rglob("*.json"):
         try:
             mtime = p.stat().st_mtime
@@ -216,8 +165,6 @@ def _prune_closed(now: float) -> int:
                 continue
         if now - closed_at > STALE_CLOSED_SEC:
             if record and record.get("closed_reason") != "session_end":
-                # session_end closures were ledgered at close; autoclosed
-                # records' spend exists only here — last chance to keep it.
                 _append_spend_drop(record, "closed_prune")
             p.unlink(missing_ok=True)
             pruned += 1
@@ -225,9 +172,6 @@ def _prune_closed(now: float) -> int:
 
 
 def _append_spend_drop(record: dict, source: str) -> None:
-    """Mirrors dockwright/spend_ledger.append_drop_event — intentionally
-    duplicated to keep this script stdlib-only, the same way _prune_active
-    mirrors registry. Best-effort: hygiene must never fail on observability."""
     try:
         spend = record.get("spend")
         spend = spend if isinstance(spend, dict) else {}
@@ -236,9 +180,6 @@ def _append_spend_drop(record: dict, source: str) -> None:
                               "cache_read_tokens", "cache_creation_tokens")
                   if isinstance(spend.get(key), int) and not isinstance(spend.get(key), bool)}
         if not totals and source != "preflight_prune":
-            # A preflight prune unlinks the record with no other durable trace,
-            # so it ledgers even at zero spend; closed_prune records were
-            # already ledgered at their original drop.
             return
         entry = {
             "ts": time.time(),
@@ -268,24 +209,6 @@ def _drop_questions_for_worker(worker_sid: str) -> None:
 
 
 def _prune_active() -> tuple[list[str], list[str]]:
-    """Mirrors registry._prune_stale_active_records (intentionally duplicated to
-    keep this script stdlib-only), with a stricter never-delete-live invariant —
-    the MCP mirror shares the in-range-positive-pid-and-dead deletion bar but
-    skips the per-record `ps` check (subprocess latency on MCP request paths).
-    Deletion requires an in-OS-range positive int pid that os.kill(pid, 0) says
-    is dead. Anything else odd — no usable pid, or pid alive but its process
-    command line isn't a claude/codex session (pid recycling) — is KEPT and
-    reported (todo 1779779425-d1511675).
-
-    Closed lanes: pid<=0 / out-of-range / missing pid, and alive-pid records
-    whose process isn't a session. A recycled pid claimed by ANOTHER claude
-    session is indistinguishable from the record's own and is kept silently —
-    still the safe direction. Residual lane closed by the pane gate: a record
-    whose stored pid is dead while its pane lives (Linux transient-$PPID
-    registrations, recycled pids) is KEPT and reported; only a dead pid with
-    no surviving pane deletes.
-
-    Returns (pruned_labels, kept_odd_labels)."""
     if not ACTIVE.is_dir():
         return [], []
     pruned: list[str] = []
@@ -328,13 +251,7 @@ def _prune_active() -> tuple[list[str], list[str]]:
 
 
 def _gc_husks(now: float) -> int:
-    """Unowned-debris GC (arch-soundness review B5). Everything here is
-    either re-created on demand by its writer (cursors, bucket dirs) or
-    referenced by no code path at all (the May-era manager.lock husk)."""
     pruned = 0
-    # Monitor cursors: live managers' cursors are touched on every append, so
-    # only dead managers' cursors age past the threshold. The events they
-    # index die at 24h, so losing a cursor at worst re-shows <24h of events.
     for pattern in STALE_CURSOR_PATTERNS:
         for p in ROOT.glob(pattern):
             try:
@@ -343,10 +260,6 @@ def _gc_husks(now: float) -> int:
                     pruned += 1
             except OSError:
                 continue
-    # Lane heartbeats: a live lane rewrites its own every poll interval, so
-    # only a dead manager's heartbeats age past the threshold. `dockwright
-    # lanes` treats a stale one as DEAD, which is correct while the manager
-    # exists and pure noise once it is gone.
     lane_health = ROOT / "lane-health"
     if lane_health.is_dir():
         for p in lane_health.rglob("*.json"):
@@ -356,8 +269,6 @@ def _gc_husks(now: float) -> int:
                     pruned += 1
             except OSError:
                 continue
-    # Outbox entries are drained (unlinked) by live managers' scans within
-    # minutes; anything 7d old belongs to a dead manager and will never drain.
     if NOTIFY_OUTBOX.is_dir():
         for p in NOTIFY_OUTBOX.rglob("*.json"):
             try:
@@ -366,8 +277,6 @@ def _gc_husks(now: float) -> int:
                     pruned += 1
             except OSError:
                 continue
-    # Per-manager bucket dirs are mkdir'd on demand and never rmdir'd; every
-    # scan walks all of them. rmdir refuses non-empty dirs by contract.
     for bucket in (DONE, TURN_ENDS, QUESTIONS, NOTIFY_OUTBOX, lane_health):
         if not bucket.is_dir():
             continue

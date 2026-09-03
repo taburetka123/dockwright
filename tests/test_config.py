@@ -1,5 +1,3 @@
-"""config.py — dockwright.toml loader. Defaults must reproduce every current
-hardcode; missing/corrupt file is fail-open to defaults."""
 import tomllib
 from pathlib import Path
 
@@ -10,7 +8,6 @@ from dockwright import config
 
 @pytest.fixture
 def no_config(monkeypatch, tmp_path):
-    """No dockwright.toml anywhere: env unset, HOME pointed at an empty tree."""
     monkeypatch.delenv(config.ENV_CONFIG_PATH, raising=False)
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -22,8 +19,6 @@ def _write(tmp_path, text, name="dockwright.toml"):
     p.write_text(text)
     return p
 
-
-# --- defaults (the zero-regression contract) ---
 
 def test_defaults_without_any_config_file(no_config):
     home = no_config
@@ -58,8 +53,6 @@ def test_defaults_without_any_config_file(no_config):
     assert config.repo_roots() == "~/projects/work,~/projects/personal"
 
 
-# --- discovery order ---
-
 def test_env_path_wins(no_config, monkeypatch, tmp_path):
     explicit = _write(tmp_path, '[spawn]\nworker_model = "sonnet"\n', "explicit.toml")
     xdg = tmp_path / "xdg" / "dockwright"
@@ -72,7 +65,6 @@ def test_env_path_wins(no_config, monkeypatch, tmp_path):
 
 
 def test_env_path_missing_file_means_no_config(no_config, monkeypatch, tmp_path):
-    """An explicit $DOCKWRIGHT_CONFIG pointing nowhere is authoritative: no fallback."""
     xdg = tmp_path / "xdg" / "dockwright"
     xdg.mkdir(parents=True)
     (xdg / "dockwright.toml").write_text('[spawn]\nworker_model = "haiku"\n')
@@ -103,8 +95,6 @@ def test_claude_home_fallback(no_config):
     assert config.worker_model() == "claude-home"
 
 
-# --- fail-open ---
-
 def test_corrupt_toml_is_fail_open_but_load_error_reports(no_config, monkeypatch, tmp_path):
     bad = _write(tmp_path, "this is not toml [[[")
     monkeypatch.setenv(config.ENV_CONFIG_PATH, str(bad))
@@ -121,8 +111,6 @@ def test_wrong_types_fall_back_per_key(no_config, monkeypatch, tmp_path):
     assert config.worker_model() == "custom"
 
 
-# --- values + expansion ---
-
 def test_path_values_are_tilde_expanded(no_config, monkeypatch, tmp_path):
     p = _write(tmp_path, '[paths]\nstate_root = "~/custom/orch"\nworker_home = "~/w"\n')
     monkeypatch.setenv(config.ENV_CONFIG_PATH, str(p))
@@ -136,8 +124,6 @@ def test_double_slash_after_tilde_stays_under_home(no_config, monkeypatch, tmp_p
     assert config.state_root() == no_config / "custom"
     assert config.state_root() != Path("/custom")
 
-
-# --- legacy fallback (dockwright-rename, deprecated one release) ---
 
 def test_state_root_default_fresh_home_is_dockwright(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -232,8 +218,6 @@ def test_legacy_state_root(tmp_path, monkeypatch):
     assert config.legacy_state_root() == tmp_path / ".claude" / "orchestrator"
 
 
-# --- account registry ---
-
 def test_pool_parses_names_weights_config_dirs(no_config, monkeypatch, tmp_path):
     p = _write(tmp_path, '''
 [accounts]
@@ -272,13 +256,13 @@ name = "y"
 
 
 @pytest.mark.parametrize("pool_toml", [
-    '[[accounts.pool]]\nweight = 1\n',                                  # missing name
-    '[[accounts.pool]]\nname = ""\n',                                   # empty name
-    '[[accounts.pool]]\nname = "a"\n[[accounts.pool]]\nname = "a"\n',   # dup name
-    '[[accounts.pool]]\nname = "a"\nweight = 0\n',                      # weight < 1
-    '[[accounts.pool]]\nname = "a"\nweight = "x"\n',                    # weight not int
-    '[[accounts.pool]]\nname = "a"\nweight = true\n',                   # bool weight
-    '[[accounts.pool]]\nname = "a"\nconfig_dir = 3\n',                  # bad config_dir
+    '[[accounts.pool]]\nweight = 1\n',
+    '[[accounts.pool]]\nname = ""\n',
+    '[[accounts.pool]]\nname = "a"\n[[accounts.pool]]\nname = "a"\n',
+    '[[accounts.pool]]\nname = "a"\nweight = 0\n',
+    '[[accounts.pool]]\nname = "a"\nweight = "x"\n',
+    '[[accounts.pool]]\nname = "a"\nweight = true\n',
+    '[[accounts.pool]]\nname = "a"\nconfig_dir = 3\n',
 ])
 def test_malformed_pool_falls_back_whole(no_config, monkeypatch, tmp_path, pool_toml):
     p = _write(tmp_path, pool_toml)
@@ -286,8 +270,6 @@ def test_malformed_pool_falls_back_whole(no_config, monkeypatch, tmp_path, pool_
     assert config.accounts() == [config.Account(name="a")]
     assert config.default_account() == "a"
 
-
-# --- pricing overrides ---
 
 def test_pricing_overrides_parse_and_skip_invalid(no_config, monkeypatch, tmp_path):
     p = _write(tmp_path, '''
@@ -302,11 +284,9 @@ custom = [1, 2]
         "opus": (6.0, 30.0), "custom": (1.0, 2.0)}
 
 
-# --- DEFAULT_TOML drift guard ---
-
 def test_default_toml_parses_and_matches_code_defaults(no_config, monkeypatch, tmp_path):
     data = tomllib.loads(config.DEFAULT_TOML)
-    assert data  # non-empty: the template carries explicit values
+    assert data
     p = _write(tmp_path, config.DEFAULT_TOML)
     monkeypatch.setenv(config.ENV_CONFIG_PATH, str(p))
     home = no_config
@@ -336,8 +316,6 @@ def test_default_toml_parses_and_matches_code_defaults(no_config, monkeypatch, t
     assert config.repo_roots() == "~/projects/work,~/projects/personal"
 
 
-# --- overlay_dir / agent_vars ---
-
 def test_overlay_dir_default_and_override(no_config, monkeypatch, tmp_path):
     assert config.overlay_dir() == no_config / ".claude" / "dockwright-overlay"
     p = _write(tmp_path, f'[paths]\noverlay_dir = "{tmp_path}/my-overlay"\n')
@@ -352,8 +330,6 @@ def test_agent_vars_default_empty_and_parse(no_config, monkeypatch, tmp_path):
     assert config.agent_vars() == {"ticket_regex": "[A-Z]+-1"}
 
 
-# --- loop_label_prefix ---
-
 def test_loop_label_prefix_default_and_override(no_config, monkeypatch, tmp_path):
     assert config.loop_label_prefix() == "com.dockwright"
     p = _write(tmp_path, '[loops]\nlabel_prefix = "com.example"\n')
@@ -367,8 +343,6 @@ def test_loop_label_prefix_wrong_type_falls_back(no_config, monkeypatch, tmp_pat
     assert config.loop_label_prefix() == "com.dockwright"
 
 
-# --- loop_status_overrides ---
-
 def test_loop_status_overrides(monkeypatch, tmp_path):
     p = tmp_path / "d.toml"
     p.write_text('[loops.status_overrides.selffix]\nstatus = "live"\nstatus_why = "op"\n')
@@ -381,8 +355,6 @@ def test_loop_status_overrides_absent(monkeypatch, tmp_path):
     assert config.loop_status_overrides() == {}
 
 
-# --- worktree_cleanup_hint (DEFAULT_WORKTREE_CLEANUP flipped to "") ---
-
 def test_worktree_cleanup_hint_default_empty(no_config):
     assert config.worktree_cleanup_hint() == ""
 
@@ -392,8 +364,6 @@ def test_worktree_cleanup_hint_operator_override(no_config, monkeypatch, tmp_pat
     monkeypatch.setenv(config.ENV_CONFIG_PATH, str(p))
     assert config.worktree_cleanup_hint() == "~/bin/my-cleanup --dry-run"
 
-
-# --- modules.gardener ---
 
 def test_gardener_module_enabled_default_true(no_config):
     assert config.gardener_module_enabled() is True
@@ -411,19 +381,15 @@ def test_gardener_module_wrong_type_falls_back(no_config, monkeypatch, tmp_path)
     assert config.gardener_module_enabled() is True
 
 
-# --- spawn.env ---
-
 def test_spawn_env_default_empty(no_config):
     assert config.spawn_env() == {}
 
 
 def test_spawn_env_reads_table_str_only(no_config, monkeypatch, tmp_path):
-    p = _write(tmp_path, '[spawn.env]\nSUPERPOWERS_AUTONOMOUS = "true"\nBAD = 3\n')
+    p = _write(tmp_path, '[spawn.env]\nWORKER_AUTONOMOUS = "true"\nBAD = 3\n')
     monkeypatch.setenv(config.ENV_CONFIG_PATH, str(p))
-    assert config.spawn_env() == {"SUPERPOWERS_AUTONOMOUS": "true"}
+    assert config.spawn_env() == {"WORKER_AUTONOMOUS": "true"}
 
-
-# --- task_keys.key_regex ---
 
 def test_task_key_regex_default_none(no_config):
     assert config.task_key_regex() is None
@@ -447,8 +413,6 @@ def test_task_key_regex_wrong_type_falls_back(no_config, monkeypatch, tmp_path):
     assert config.task_key_regex() is None
 
 
-# --- gardener.high_skills ---
-
 def test_gardener_high_skills_default_empty(no_config):
     assert config.gardener_high_skills() == ()
 
@@ -464,8 +428,6 @@ def test_gardener_high_skills_wrong_type_falls_back(no_config, monkeypatch, tmp_
     monkeypatch.setenv(config.ENV_CONFIG_PATH, str(p))
     assert config.gardener_high_skills() == ()
 
-
-# --- paths.dockwright_repo / worktree_roots / repo_roots ---
 
 def test_dockwright_repo_default_empty(no_config):
     assert config.dockwright_repo() == ""
@@ -505,8 +467,6 @@ def test_repo_roots_override(no_config, monkeypatch, tmp_path):
     assert config.repo_roots() == "~/r1,~/r2"
 
 
-# --- spawn.worker_headless_preset ---
-
 def test_worker_headless_preset_default_true(monkeypatch):
     monkeypatch.setattr(config, "load", lambda: {})
     assert config.worker_headless_preset() is True
@@ -522,15 +482,13 @@ def test_worker_headless_preset_non_bool_falls_back_true(monkeypatch):
     assert config.worker_headless_preset() is True
 
 
-# --- accounts.usage_pause_pct ---
-
 def test_usage_pause_pct(tmp_path, monkeypatch):
     cfg = tmp_path / "dockwright.toml"
     monkeypatch.setenv(config.ENV_CONFIG_PATH, str(cfg))
-    assert config.usage_pause_pct() is None                       # missing file
+    assert config.usage_pause_pct() is None
     cfg.write_text("[accounts]\nusage_pause_pct = 72.5\n")
     assert config.usage_pause_pct() == 72.5
     cfg.write_text("[accounts]\nusage_pause_pct = true\n")
-    assert config.usage_pause_pct() is None                       # bool is not a number
+    assert config.usage_pause_pct() is None
     cfg.write_text("[accounts]\nusage_pause_pct = -3\n")
-    assert config.usage_pause_pct() is None                       # non-positive
+    assert config.usage_pause_pct() is None

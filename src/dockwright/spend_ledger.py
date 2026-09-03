@@ -1,17 +1,3 @@
-"""Durable token-spend ledger: one JSONL line per finished spend period.
-Prune-sourced drops append even at zero spend — a pruned record has no closed/
-successor, so this line is its only forensic trace.
-
-Capture-side counterpart of `dockwright spend-report`. Every path that drops
-a spend-carrying session record (session_end unlink, /clear rotation, dead-pid
-prunes, resume reclaiming an autoclosed record) appends here, so spend survives
-the closed/ 7-day prune. Headless env-stripped `claude -p` runs land here too,
-via the CLAUDE_SPEND_CLASS contract — the ledger is their ONLY capture (no
-active record, no Stop-hook accumulation).
-
-Hook-path module: must stay FastMCP-free and cheap to import, same contract as
-registry.py (tests/test_import_graph.py pins it transitively).
-"""
 import json
 import os
 import time
@@ -40,24 +26,10 @@ def _append_line(entry: dict) -> None:
         os.close(fd)
 
 
-# Sources that UNLINK a record leaving no other durable trace (no closed/
-# record, no successor active record): the ledger line is the only forensics
-# a reaped session gets, so these append even at zero spend. Other drop
-# sources keep the skip — their drops leave another durable record, and
-# unconditional appends would add one line per session end fleet-wide
-# (nested teammates, zero-spend codex workers) to a file with no rotation.
 _TRACELESS_DROP_SOURCES = frozenset({"prune", "preflight_prune"})
 
 
 def append_drop_event(record, source: str) -> None:
-    """Archive a record's drop — spend totals when present, and for prune sources even without (drop forensics).
-
-    Best-effort: spend is observability; the drop paths calling this (teardown
-    hooks, prunes, resume) must proceed no matter what happens here. Cursor
-    fields (last_msg_id, last_turn_out) are stripped — a validated
-    superset of mcp_server._spend_totals's vocabulary (adds cache_creation_tokens
-    + int-validation).
-    """
     try:
         if not isinstance(record, dict):
             return
@@ -70,7 +42,6 @@ def append_drop_event(record, source: str) -> None:
             "ts": time.time(),
             "sid": record.get("claude_sid"),
             "name": record.get("name"),
-            # closed/ records carry no agent key; only workers are archived there.
             "agent": "nested" if record.get("nested") else (record.get("agent") or "worker"),
             "parent_manager_name": record.get("parent_manager_name"),
             "runtime": record.get("runtime") or "claude",
@@ -84,7 +55,6 @@ def append_drop_event(record, source: str) -> None:
 
 
 def append_headless_event(spend_class, sid, transcript_path) -> None:
-    """Whole-transcript spend for an env-stripped tagged headless run."""
     try:
         if not spend_class or not transcript_path:
             return
@@ -105,8 +75,6 @@ def append_headless_event(spend_class, sid, transcript_path) -> None:
 
 
 def read_events() -> list[dict]:
-    """All ledger entries; malformed lines skipped (many writers, a torn line
-    must not hide the rest)."""
     try:
         raw = paths.SPEND_LEDGER.read_text(errors="replace")
     except OSError:

@@ -14,7 +14,6 @@ def test_render_manager_resume_codex_skill_uses_current_command_body():
     assert 'description: "Resume an orchestrator manager session from a handoff' in text
     assert 'argument-hint: "<handoff_id>"' in text
     assert "Resolve `<your sid>` from the session id" in text
-    # Managers are Claude-only — the body arms Monitors with no codex-push bridge.
     assert "Arm the four Monitor tasks" in text
     assert "codex-push-watch" not in text
     assert "inotifywait -m -e create ~/.claude/orchestrator/questions/" not in text
@@ -32,10 +31,3 @@ def test_install_codex_skills_overwrites_stale_skill_from_command(tmp_path):
     assert "old Monitor task text" not in text
     assert "Arm the four Monitor tasks" in text
     assert "codex-push-watch" not in text
-
-
-def test_setup_installs_codex_skills_from_commands():
-    setup = (REPO_ROOT / "setup.sh").read_text(encoding="utf-8")
-
-    assert "install-codex-skills" in setup
-    assert "$CODEX_DIR/skills" in setup

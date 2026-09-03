@@ -1,9 +1,3 @@
-"""`dockwright init` — write the documented-defaults dockwright.toml.
-
-The written file reproduces every default explicitly (the drift test in
-tests/test_config.py guarantees template values == code defaults), so a fresh
-operator gets a self-documenting config that changes nothing until edited.
-"""
 from __future__ import annotations
 
 import argparse

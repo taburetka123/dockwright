@@ -1,20 +1,3 @@
-"""`dockwright uninstall` — provenance-driven removal of the installed footprint.
-
-Reverses setup.sh and the optional loop installers: boots out the launchd
-loops, deregisters the MCP server, strips exactly the orchestrator-owned hooks
-out of settings.json / hooks.json (foreign hooks and every other settings key
-survive), then removes the deployed files. Removal is DERIVED, never a
-hardcoded glob: `# deployed-from:` provenance stamps for scripts, the
-.compose-stamp.json sidecar for agents, the repo's deploy/ listing for
-commands/skills, config-resolved paths for state. A file this tool cannot
-positively identify as its own is left alone.
-
-Deliberately kept (printed as notes): the clone itself, settings.json
-(stripped, not deleted) plus a fresh <name>.uninstall-bak.<ns> safety copy —
-a suffix chosen OUTSIDE the .bak.<digits> pattern so the bak-pile sweep can
-never delete it — a hand-authored ~/.claude/dockwright.toml, and the operator
-overlay dir.
-"""
 from __future__ import annotations
 
 import argparse
@@ -33,7 +16,7 @@ from . import config
 from .env_install import ORCH_SUBCOMMANDS, orch_owned_subcommand, orch_subcommand
 
 MCP_SERVER_NAME = "dockwright"
-LEGACY_MCP_SERVER_NAME = "claude-orchestrator"   # one-release: uninstall both
+LEGACY_MCP_SERVER_NAME = "claude-orchestrator"
 PROVENANCE_MARKER = "# deployed-from: dockwright@"
 LEGACY_PROVENANCE_MARKER = "# deployed-from: claude-orchestrator@"
 CANON_GUARD_MARKER = "canon-edit-guard.sh"
@@ -60,7 +43,7 @@ class Roots:
 @dataclass
 class HookEdit:
     target: Path
-    new_text: str | None  # None => delete the file (codex hooks.json emptied out)
+    new_text: str | None
     removed: int
 
 
@@ -79,8 +62,6 @@ class Plan:
 
 
 def _orch_bins(settings: dict, extra: list[str]) -> set[str]:
-    """Every orchestrator binary path the settings' own canonical hooks name,
-    plus caller-supplied candidates (repo venv bin, symlink target)."""
     bins = {b for b in extra if b}
     for blocks in settings.get("hooks", {}).values():
         for block in blocks:
@@ -93,12 +74,6 @@ def _orch_bins(settings: dict, extra: list[str]) -> set[str]:
 
 def strip_orchestrator_hooks(settings: dict, snippet: dict | None,
                              extra_bins: list[str]) -> dict:
-    """Inverse of env_install.merge_hooks: drop exactly the hooks this tool
-    installed — canonical subcommands (bare or by path), stale subcommands
-    owned by any known orchestrator binary, and the snippet's foreign-shaped
-    hooks (canon-edit-guard; its script is deleted by the uninstall, so the
-    hook would fire a dead command on every Edit). Everything else survives
-    byte-identical."""
     our_foreign = set()
     if snippet:
         for blocks in snippet.get("hooks", {}).values():
@@ -170,8 +145,6 @@ def _add(plan: Plan, path: Path) -> None:
 
 
 def build_plan(roots: Roots) -> Plan:
-    """Read-only footprint derivation. Every path appended here is positively
-    identified as dockwright's own; foreign files are never matched."""
     plan = Plan()
 
     prefix = config.loop_label_prefix()
@@ -187,10 +160,6 @@ def build_plan(roots: Roots) -> Plan:
     snippet = _load_snippet(roots.repo_dir)
     extra_bins = [str(roots.repo_dir / ".venv" / "bin" / "dockwright"),
                   str(roots.repo_dir / ".venv" / "bin" / "orchestrator")]
-    # Both console-script link names may exist in ~/.local/bin: setup.sh creates
-    # `dockwright`; the pre-rename `orchestrator` link persists until removed.
-    # Inspect BOTH — feed each target into extra_bins for hook stripping, and
-    # decide removal per link below.
     bin_links: list[tuple[Path, str]] = []
     for link_name in ("dockwright", "orchestrator"):
         link = roots.local_bin_dir / link_name
@@ -212,8 +181,6 @@ def build_plan(roots: Roots) -> Plan:
         stripped = strip_orchestrator_hooks(data, snippet, extra_bins)
         removed = _count_hooks(data) - _count_hooks(stripped)
         if mode == "codex" and not stripped:
-            # Empty after stripping => every byte of content was orchestrator-owned;
-            # a single foreign key (or hook) keeps the file alive on the elif path.
             plan.hook_edits.append(HookEdit(target, None, removed))
         elif stripped != data:
             plan.hook_edits.append(
@@ -234,11 +201,6 @@ def build_plan(roots: Roots) -> Plan:
     for name in core_names:
         _add(plan, agents_dir / name)
         _add(plan, roots.codex_dir / "agents" / (Path(name).stem + ".toml"))
-        # compose writes <agent>.md.bak(.N) when the deployed file held text living
-        # in NEITHER the core NOR the overlay. Removing those would recreate the very
-        # loss the drift guard exists to prevent — so they are reported, never planned
-        # for removal. Derived per deployed agent name, like every other claim here:
-        # a .bak beside a FOREIGN agent file is not ours to describe.
         solo = agents_dir / (name + ".bak")
         if solo.is_file():
             drift_baks.append(solo)
@@ -273,21 +235,12 @@ def build_plan(roots: Roots) -> Plan:
             if f.is_file() and (f.name in deploy_script_names or _has_provenance_stamp(f)):
                 plan.remove.append(f)
 
-    # State artifacts live at TWO homes during the one-release migration window:
-    # the new ~/.claude/dockwright/ tree (state_root removes it wholesale) and the
-    # legacy top-level ~/.claude/<name> paths — real files on an un-migrated
-    # install, compat symlinks after `migrate-state` ran. List both so uninstall
-    # is correct pre- AND post-migration. _add is existence-gated; _remove_path
-    # unlinks a (possibly dangling) symlink without following it, so removing the
-    # new tree then the legacy `orchestrator -> dockwright` link is order-safe.
     dockwright_home = roots.claude_dir / "dockwright"
     for p in (
-        roots.claude_dir / "statusline-command.sh",   # top-level, never migrated
+        roots.claude_dir / "statusline-command.sh",
         roots.state_root,
         roots.manager_memory_root,
         roots.xdg_config_dir,
-        # New dockwright/ home. Redundant with state_root removal unless state_root
-        # is pinned elsewhere (migrate.py always targets ~/.claude/dockwright/*).
         dockwright_home / "loops-registry.md",
         dockwright_home / "manager-memory",
         dockwright_home / "gardener",
@@ -299,9 +252,6 @@ def build_plan(roots: Roots) -> Plan:
         dockwright_home / "bootlite-stop",
         dockwright_home / "worktree-prune-stop",
         dockwright_home / ".deploy-stamp",
-        # Legacy top-level home: real dirs/files on an un-migrated install, compat
-        # symlinks after migrate-state (removed here so none dangle). Includes the
-        # `orchestrator -> dockwright` state-root link itself.
         roots.claude_dir / "orchestrator",
         roots.claude_dir / "loops-registry.md",
         roots.claude_dir / "manager-memory",
@@ -336,7 +286,7 @@ def build_plan(roots: Roots) -> Plan:
                 plan.notes.append(
                     f"kept {link} — symlink target {link_target!r} is not a dockwright venv binary")
 
-    _add(plan, roots.repo_dir / ".venv")  # LAST: the running binary lives here
+    _add(plan, roots.repo_dir / ".venv")
 
     plan.prune_if_empty = [roots.codex_dir / "agents", roots.codex_dir / "commands",
                            roots.codex_dir / "skills", roots.codex_dir]
@@ -358,8 +308,6 @@ def _remove_path(path: Path) -> None:
 
 
 def execute_plan(plan: Plan, run=subprocess.run) -> None:
-    """Apply the plan. EVERY subprocess effect (launchctl, claude/codex mcp)
-    goes through `run` so tests inject a recorder and never touch the machine."""
     for label, plist in plan.launchd:
         if shutil.which("launchctl"):
             run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"],
@@ -369,9 +317,6 @@ def execute_plan(plan: Plan, run=subprocess.run) -> None:
         run(argv, check=False, capture_output=True)
     for edit in plan.hook_edits:
         if edit.new_text is None:
-            # Whole-file delete: everything inside was positively orchestrator-owned
-            # (reproducible from the repo snippet), so no backup — a leftover
-            # .uninstall-bak would keep the emptied ~/.codex dir from pruning.
             edit.target.unlink()
             continue
         current = edit.target.read_text()
@@ -453,10 +398,6 @@ def main(argv=None, run=subprocess.run) -> int:
         return 1
     if plan.empty():
         print("Nothing to uninstall.")
-        # A drift .bak is never planned for removal, so plan.empty() can be true
-        # while backups sit in ~/.claude/agents. Preserve-and-ANNOUNCE: silently
-        # leaving the operator's only copy of that text is the very hide this
-        # branch exists to prevent, so report them even on the nothing-to-do path.
         for bak in plan.kept_baks:
             print(f"note: kept drift backup {bak} — it holds text that existed only "
                   f"in your deployed agent files and has no home in the repo or your "

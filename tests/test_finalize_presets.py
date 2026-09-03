@@ -1,12 +1,3 @@
-"""Deploy-time injection of permissions.additionalDirectories into the
-DEPLOYED worker-headless preset (E2E rc.2 N-3).
-
-Why deploy-time and absolute: the preset's permission mode is documented to
-auto-accept edits in additionalDirectories, but tilde expansion in the settings
-VALUE is undocumented — so the shipped fixture stays generic and setup.sh
-resolves the operator's [paths] code roots to absolute paths at deploy. An
-operator-set key (even []) is intent and must survive verbatim.
-"""
 import json
 import os
 from pathlib import Path
@@ -46,10 +37,8 @@ def test_default_roots_injected_absolute_and_deduped(no_config, deployed):
         str(home / "worktrees"),
         str(home / "worktrees-personal"),
     ])
-    # worker_home (~/projects/work/worker) is nested under a repo root → deduped.
     assert not any(d.endswith("/worker") for d in dirs)
     assert not any("~" in d for d in dirs)
-    # All other keys survive value-identically.
     original = json.loads(FIXTURE.read_text())
     data["permissions"].pop("additionalDirectories")
     assert data == original
@@ -96,6 +85,5 @@ def test_cli_missing_file_fails(no_config, tmp_path, capsys):
 
 
 def test_repo_fixture_stays_generic():
-    # The fixture ships without the key — injection is deploy-time only.
     data = json.loads(FIXTURE.read_text())
     assert "additionalDirectories" not in data.get("permissions", {})

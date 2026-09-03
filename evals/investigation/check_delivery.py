@@ -32,16 +32,11 @@ import sys
 
 from evals.investigation import gates
 
-# A probe must be long enough that its appearance in the corpus is the skill
-# and not a coincidence; five of them so one edited line cannot flip a run.
 PROBE_MIN_LEN = 40
 PROBE_COUNT = 5
 
 
 def content_probes(skill_text: str) -> list[str]:
-    """The skill's longest distinctive lines, stripped. Stripping is what makes
-    them robust to the corpus's own framing — a Read result prefixes each line
-    with a line number, but the line's own characters stay contiguous."""
     seen, lines = set(), []
     for raw in skill_text.splitlines():
         line = raw.strip()

@@ -1,50 +1,3 @@
-"""Compose deployed agent files: core + overlay drop-ins + config vars.
-
-The OSS-split compose seam (Step 2). setup.sh and `dockwright compose`
-render ~/.claude/agents/*.md from deploy/agents/*.md instead of cp.
-
-Semantics:
-- A line that is exactly `<!-- overlay: <name> -->` is an insertion point.
-  Drop-ins bound to it (frontmatter `insert_at: <name>`) replace the marker
-  line, sorted by filename; with no bound drop-ins the marker line is removed.
-  A duplicate marker name in one core file is an error (ambiguous target).
-- Drop-ins live at <overlay_dir>/<agent-stem>/*.md with an optional
-  `---`-delimited frontmatter block; the only recognized key is `insert_at`.
-  Drop-ins without insert_at are appended at end-of-file.
-- `{{name}}` substitutes dockwright.toml [agent_vars] entries across the
-  composed text; an unbound `{{name}}` stays literal and is reported as a
-  warning, never an error.
-- `<absolute-home>` inside a var VALUE expands to the installing user's
-  absolute home (`Path.home()`, honors $HOME) at compose time. If the literal
-  token survives anywhere in composed output (core prose, a drop-in body) the
-  compose FAILS LOUD with ComposeError — a deployed agent file carrying the
-  token is exactly the broken artifact this prevents. Narrow amendment to the
-  IDENTITY GUARANTEE below: token-bearing text errors instead of passing
-  through; token-free text is untouched.
-- A drop-in naming an unknown marker FAILS LOUD (ComposeError listing the
-  valid markers) — a silently misplaced overlay section would be worse.
-- IDENTITY GUARANTEE: composing a core text with no markers and no vars
-  returns it byte-for-byte (trailing-newline state included). The Step-2
-  byte-equivalence gate rests on this.
-- Provenance is a SIDECAR stamp (.compose-stamp.json in the out dir), never
-  an in-file header — deployed agent files carry only prompt content.
-- Core-dir naming (Step 3): `X.core.md` composes to OUTPUT `X.md`; a plain
-  `X.md` composes to itself unchanged. Both present for the same output stem
-  is ambiguous and FAILS LOUD. Drop-ins for either form live at
-  `<overlay_dir>/X/*.md` — keyed by the OUTPUT stem, not the core filename.
-- `<core_dir>/vars.defaults.toml` `[agent_vars]` is an optional defaults
-  layer (same str-key/str-value validation as config.agent_vars()); operator
-  vars (dockwright.toml `[agent_vars]`) win per-key over the defaults.
-- The stamp's `core` keys are the deployed OUTPUT basenames (so a mirror
-  step keyed off `stamp["core"]` resolves deployed files unchanged); the
-  core SOURCE filename per output is recorded separately in
-  `stamp["core_sources"]` (informational).
-- The stamp's `outputs` records what compose last successfully WROTE per
-  output basename — not necessarily what is on disk now. They diverge
-  exactly when a file was skipped (its backup failed) or hand-edited since;
-  that divergence IS the drift signal, so a reader must treat "differs from
-  disk" as drift, never as a stale stamp.
-"""
 from __future__ import annotations
 
 import argparse
@@ -105,8 +58,6 @@ def load_dropins(overlay_dir: Path, agent_stem: str) -> list[DropIn]:
 
 
 def compose_text(core_text: str, dropins, vars) -> tuple[str, list[str]]:
-    """(composed, warnings). Only marker lines and var matches are touched —
-    everything else passes through byte-for-byte."""
     lines = core_text.splitlines(keepends=True)
     markers: list[str] = []
     for line in lines:
@@ -158,18 +109,12 @@ CORE_SUFFIX = ".core.md"
 
 
 def output_name(core_filename: str) -> str:
-    """`X.core.md` -> `X.md`; any other filename (incl. a plain `X.md`) is
-    returned unchanged."""
     if core_filename.endswith(CORE_SUFFIX):
         return core_filename[: -len(CORE_SUFFIX)] + ".md"
     return core_filename
 
 
 def load_default_vars(core_dir) -> dict[str, str]:
-    """`<core_dir>/vars.defaults.toml` `[agent_vars]` table — same per-entry
-    str-key/str-value validation as config.agent_vars(). Missing file,
-    missing/malformed section, or an unparseable file is fail-open to {}
-    (mirrors config.load()'s fail-open discipline)."""
     path = Path(core_dir) / "vars.defaults.toml"
     if not path.is_file():
         return {}
@@ -199,14 +144,10 @@ class _Rendered:
     composed: str
     warnings: list[str]
     dropins: list[DropIn]
-    core_name: str  # source filename in core_dir, e.g. "manager.core.md"
+    core_name: str
 
 
 def _compose_all(core_dir: Path, overlay_dir: Path, vars) -> dict[str, _Rendered]:
-    """Compose every core file IN MEMORY first — a ComposeError must abort
-    before anything is written (no half-deployed agent set). Keyed by OUTPUT
-    name (the deployed basename): `X.core.md` -> `X.md`, a plain `X.md` is
-    unchanged. Both forms present for the same output stem is ambiguous."""
     core_files = sorted(Path(core_dir).glob("*.md"))
     if not core_files:
         raise ComposeError(f"no core agent files in {core_dir}")
@@ -229,9 +170,6 @@ def _compose_all(core_dir: Path, overlay_dir: Path, vars) -> dict[str, _Rendered
 
 
 def _prev_outputs(out_dir: Path) -> dict:
-    """Output hashes the LAST compose wrote, or {} when unavailable (first
-    deploy, a pre-`outputs` stamp, an unreadable or corrupt one). Fail-open:
-    with no history we make no drift claim — never a false one."""
     try:
         data = json.loads((out_dir / STAMP_NAME).read_text())
     except (OSError, ValueError):
@@ -243,21 +181,12 @@ def _prev_outputs(out_dir: Path) -> dict:
 @dataclass(frozen=True)
 class _Drift:
     message: str
-    saved: bool  # False: the backup failed, so the write MUST be skipped
-    # Two lines for the abort summary main() prints LAST when ANY file was
-    # skipped: `abort_line` for a skipped file (saved=False), `backup_line` for
-    # one that WAS rewritten in that same run (saved=True). Both self-contained
-    # on purpose: they are the last thing an operator sees before set -e halts
-    # setup.sh, so neither may lean on the DRIFT line scrolled above.
+    saved: bool
     abort_line: str = ""
     backup_line: str = ""
 
 
 def _pick_backup_path(target: Path, current: bytes) -> Path:
-    """A backup path that will not clobber a DIFFERENT saved copy: `<name>.bak`
-    when it is free or already holds exactly these bytes, else `<name>.bak.2`,
-    `.bak.3`, … A backup we cannot read counts as differing — the whole point is
-    that the content it holds may exist nowhere else."""
     backup = target.with_name(target.name + ".bak")
     n = 1
     while backup.exists():
@@ -273,10 +202,6 @@ def _pick_backup_path(target: Path, current: bytes) -> Path:
 
 def _backup_drifted(target: Path, prev_sha, about_to_write: bytes,
                     overlay_dir: Path) -> _Drift | None:
-    """A deployed file whose bytes differ from what compose last wrote holds
-    content with no home in core or overlay — the write that follows would
-    destroy it with no trace. Copy it aside and report it. Returns the drift,
-    or None when this write destroys nothing."""
     if not isinstance(prev_sha, str) or not prev_sha or not target.is_file():
         return None
     try:
@@ -286,9 +211,6 @@ def _backup_drifted(target: Path, prev_sha, about_to_write: bytes,
     if hashlib.sha256(current).hexdigest() == prev_sha:
         return None
     if current == about_to_write:
-        # The edit already matches what we are about to write (the operator
-        # hand-applied their core change to the deployed copy). Mirrors
-        # setup.sh's `! cmp -s` guard: no change, nothing to preserve.
         return None
     remedy = (f"to keep it, move the wanted lines into a drop-in at "
               f"{overlay_dir / Path(target.name).stem}/*.md and rerun")
@@ -296,10 +218,6 @@ def _backup_drifted(target: Path, prev_sha, about_to_write: bytes,
     try:
         backup.write_bytes(current)
     except OSError as exc:
-        # Prescribe from what is ACTUALLY there, not from the errno: _pick_backup_path
-        # only ever returns a free name or one already holding these exact bytes, so a
-        # non-existent backup means the DIRECTORY refused the new entry — telling the
-        # operator to clear an obstruction at a file that is not there is a dead end.
         unblock = (f"make {backup} writable (or move it aside), then rerun"
                    if backup.exists() else
                    f"make the directory {backup.parent} writable, then rerun")
@@ -329,8 +247,6 @@ def compose_agents(core_dir, out_dir, overlay_dir, vars) -> dict:
     stamp: dict = {
         "composed_at": time.time(),
         "core": {}, "core_sources": {}, "overlay": {}, "outputs": {},
-        # Hashed over the UNEXPANDED merged map — informational only; do not
-        # build freshness logic on it (it never moves when $HOME differs).
         "vars_sha256": hashlib.sha256(
             json.dumps(dict(sorted(merged_vars.items()))).encode()).hexdigest(),
         "core_git_sha": _git_sha(core_dir),
@@ -342,17 +258,11 @@ def compose_agents(core_dir, out_dir, overlay_dir, vars) -> dict:
     backed_up: list[str] = []
     for out_name, r in rendered.items():
         target = out_dir / out_name
-        # write_text() encodes with the platform default; comparing against UTF-8
-        # can only make the guard MORE conservative (a false "differs", never a
-        # false "same"), so the fail-safe direction is preserved off-UTF-8.
         drifted = _backup_drifted(target, prev_outputs.get(out_name),
                                   r.composed.encode(), overlay_dir)
         if drifted is not None:
             drift.append(drifted.message)
         if drifted is not None and not drifted.saved:
-            # Fail closed: the operator's only copy could not be preserved, so
-            # leave the file alone. Carrying the PREVIOUS hash (never the
-            # hand-edited file's) keeps the next compose re-detecting this drift.
             skipped.append(out_name)
             skip_details.append(drifted.abort_line)
             stamp["outputs"][out_name] = prev_outputs[out_name]
@@ -360,10 +270,6 @@ def compose_agents(core_dir, out_dir, overlay_dir, vars) -> dict:
             if drifted is not None:
                 backed_up.append(drifted.backup_line)
             target.write_text(r.composed)
-            # Hash the bytes READ BACK rather than the in-memory string: defence
-            # in depth so the stamp reflects what a reader finds on disk even if
-            # the platform encoding altered them on the way out. No test can
-            # distinguish the two on a UTF-8 host.
             stamp["outputs"][out_name] = hashlib.sha256(target.read_bytes()).hexdigest()
         stamp["core"][out_name] = hashlib.sha256(
             (core_dir / r.core_name).read_bytes()).hexdigest()
@@ -432,18 +338,6 @@ def main(argv=None) -> int:
     for d in result["drift"]:
         print(f"DRIFT: {d}", file=sys.stderr)
     if result["skipped"]:
-        # This is the last thing an operator sees: setup.sh runs under `set -e`, so
-        # returning 1 here aborts the deploy mid-run. Every element below is load
-        # bearing — which file, the backup path AND the OS error, what happened to
-        # each edited file, and the one action that unblocks it.
-        #
-        # The headline is CONDITIONAL because the loop above has three outcomes, not
-        # two: skipped (untouched), drifted-and-backed-up (REWRITTEN, copy saved),
-        # and clean. "NOTHING WAS OVERWRITTEN" is true only when no sibling was
-        # rewritten this run; claiming it otherwise would tell an operator whose
-        # worker.md was just overwritten that they have nothing to look for — the
-        # DRIFT line naming that backup has already scrolled away, which is the
-        # entire reason this self-contained block exists.
         if result["backed_up"]:
             print(f"compose: ERROR: YOUR EDITS ARE NOT LOST — but this run did BOTH: "
                   f"{len(result['skipped'])} file(s) were NOT rewritten and still hold "

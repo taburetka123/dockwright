@@ -21,7 +21,7 @@ def test_get_driver_singleton_and_tmux_default(monkeypatch):
     monkeypatch.setattr(terminal, "_DRIVER", None)
     d = get_driver()
     assert isinstance(d, TmuxDriver)
-    assert get_driver() is d  # singleton
+    assert get_driver() is d
 
 
 def test_tmux_socket_default_and_env(monkeypatch):
@@ -51,7 +51,6 @@ def test_tmux_current_pane_id(monkeypatch):
 
 
 def test_get_driver_always_tmux(monkeypatch):
-    # get_driver() returns TmuxDriver unconditionally, regardless of any env.
     from dockwright import terminal as term
     for val in [None, "", "tmux", "weird", "kitty"]:
         monkeypatch.setattr(term, "_DRIVER", None)
@@ -60,7 +59,6 @@ def test_get_driver_always_tmux(monkeypatch):
         else:
             monkeypatch.setenv("CLAUDE_ORCH_TERMINAL", val)
         assert isinstance(term.get_driver(), TmuxDriver), val
-    # singleton: same instance on repeat
     monkeypatch.setattr(term, "_DRIVER", None)
     d = term.get_driver()
     assert term.get_driver() is d
@@ -95,11 +93,11 @@ def test_tmux_conf_legacy_fallback_order(monkeypatch, tmp_path):
     monkeypatch.setattr(paths, "TMUX_CONF", new)
     monkeypatch.setattr(paths, "TMUX_CONF_LEGACY", legacy)
     d = TmuxDriver()
-    assert d._tmux_base() == ["tmux", "-L", "S"]                      # both absent
+    assert d._tmux_base() == ["tmux", "-L", "S"]
     legacy.write_text("# legacy\n")
-    assert d._tmux_base() == ["tmux", "-L", "S", "-f", str(legacy)]   # legacy only
+    assert d._tmux_base() == ["tmux", "-L", "S", "-f", str(legacy)]
     new.write_text("# new\n")
-    assert d._tmux_base() == ["tmux", "-L", "S", "-f", str(new)]      # new wins
+    assert d._tmux_base() == ["tmux", "-L", "S", "-f", str(new)]
 
 
 def test_tmux_spawn_new_session_sources_conf_workers(monkeypatch, tmp_path):
@@ -113,9 +111,9 @@ def test_tmux_spawn_new_session_sources_conf_workers(monkeypatch, tmp_path):
     pane = asyncio.run(TmuxDriver().spawn(cwd="/tmp/x", title="t", argv=["zsh"],
                                           route_to_workers_window=True))
     assert pane == "%7"
-    assert calls[0][:5] == ["tmux", "-L", "S", "-f", str(conf)]   # -f at birth
+    assert calls[0][:5] == ["tmux", "-L", "S", "-f", str(conf)]
     assert "new-session" in calls[0]
-    assert calls[1] == ["tmux", "-L", "S", "source-file", str(conf)]  # heal AFTER spawn
+    assert calls[1] == ["tmux", "-L", "S", "source-file", str(conf)]
 
 
 def test_tmux_spawn_new_session_sources_conf_mgr(monkeypatch, tmp_path):
@@ -133,7 +131,6 @@ def test_tmux_spawn_new_session_sources_conf_mgr(monkeypatch, tmp_path):
 
 
 def test_tmux_spawn_new_session_no_conf_no_source(monkeypatch):
-    # conftest pins both conf names absent by default
     monkeypatch.setenv("CLAUDE_ORCH_TMUX_SOCKET", "S")
     calls = _fake_exec_capture_all(monkeypatch, b"%7\n")
     async def none(self): return None
@@ -174,8 +171,6 @@ def test_tmux_spawn_failure_no_source(monkeypatch, tmp_path):
 
 
 def test_tmux_spawn_new_session_sources_legacy_conf(monkeypatch, tmp_path):
-    # 2026-07-07 incident replay: rename shipped, setup.sh not re-run yet —
-    # only the legacy-named conf is on disk. Birth must still carry it.
     monkeypatch.setenv("CLAUDE_ORCH_TMUX_SOCKET", "S")
     legacy = tmp_path / "claude-orch.tmux.conf"
     legacy.write_text("# legacy\n")
@@ -251,7 +246,7 @@ def test_tmux_find_group_pane(monkeypatch):
     assert asyncio.run(TmuxDriver().find_group_pane()) == "%4"
     assert cap["args"] == ["tmux","-L","S","list-panes","-t","claude-workers",
                            "-F","#{pane_id}"]
-    _fake_exec_capture(monkeypatch, b"", rc=1)  # no session
+    _fake_exec_capture(monkeypatch, b"", rc=1)
     assert asyncio.run(TmuxDriver().find_group_pane()) is None
 
 
@@ -269,17 +264,13 @@ def test_tmux_pane_exists(monkeypatch):
 def test_tmux_send_text_sequence_and_strip(monkeypatch):
     monkeypatch.setenv("CLAUDE_ORCH_TMUX_SOCKET", "S")
     calls = _capture_run(monkeypatch)
-    TmuxDriver().send_text("%5", "line1\nline2\n\n")  # trailing newlines stripped
-    # call[0] = ensure pin (fire-and-forget)
+    TmuxDriver().send_text("%5", "line1\nline2\n\n")
     assert calls[0]["args"] == ["tmux","-L","S","set-option","-s",
                                 "extended-keys-format","xterm"]
-    # call[1] = load-buffer with stripped bytes via stdin
     assert calls[1]["args"] == ["tmux","-L","S","load-buffer","-b","orch_5","-"]
     assert calls[1]["kwargs"]["input"] == b"line1\nline2"
-    # call[2] = paste-buffer bracketed + delete
     assert calls[2]["args"] == ["tmux","-L","S","paste-buffer","-p","-d",
                                 "-b","orch_5","-t","%5"]
-    # call[3] = single Enter
     assert calls[3]["args"] == ["tmux","-L","S","send-keys","-t","%5","Enter"]
 
 
@@ -288,14 +279,11 @@ def test_tmux_send_text_swallows_and_default_submits_enter(monkeypatch):
     def boom(args, *a, **kw):
         raise RuntimeError("boom")
     monkeypatch.setattr(subprocess, "run", boom)
-    # _ensure_inject_safe's own swallow eats the first raise (the pin) before the
-    # inject try; the inject try then swallows the rest. exception swallowed, None.
     assert TmuxDriver().send_text("%5", "x") is None
 
 
 def test_tmux_send_text_checked_short_circuits(monkeypatch):
     monkeypatch.setenv("CLAUDE_ORCH_TMUX_SOCKET", "S")
-    # load-buffer fails -> False, no paste, no enter (ensure pin runs first, ignored)
     seq = []
     def fake(args, *a, **kw):
         seq.append(list(args))
@@ -313,7 +301,7 @@ def test_tmux_send_text_checked_paste_fail(monkeypatch):
         rc = 1 if "paste-buffer" in args else 0
         return subprocess.CompletedProcess(args, rc, "", "")
     monkeypatch.setattr(subprocess, "run", fake)
-    assert TmuxDriver().send_text_checked("%5", "x") is False  # no enter
+    assert TmuxDriver().send_text_checked("%5", "x") is False
 
 
 def test_tmux_send_text_checked_success_and_text_mode(monkeypatch):
@@ -325,18 +313,17 @@ def test_tmux_send_text_checked_success_and_text_mode(monkeypatch):
         return subprocess.CompletedProcess(args, 0, "", "")
     monkeypatch.setattr(subprocess, "run", fake)
     assert TmuxDriver().send_text_checked("%5", "hi") is True
-    assert seen["input"] == "hi" and seen["text"] is True  # str, text=True
+    assert seen["input"] == "hi" and seen["text"] is True
 
 
 def test_tmux_send_text_checked_ignores_failing_pin(monkeypatch):
-    # Important #1: a failing set-option pin must NOT change the result
     monkeypatch.setenv("CLAUDE_ORCH_TMUX_SOCKET", "S")
     def fake(args, *a, **kw):
         if "set-option" in args:
-            return subprocess.CompletedProcess(args, 1, "", "boom")  # pin fails
+            return subprocess.CompletedProcess(args, 1, "", "boom")
         return subprocess.CompletedProcess(args, 0, "", "")
     monkeypatch.setattr(subprocess, "run", fake)
-    assert TmuxDriver().send_text_checked("%5", "hi") is True  # still drives off inject
+    assert TmuxDriver().send_text_checked("%5", "hi") is True
 
 
 def test_tmux_capture_screen_argv(monkeypatch):
@@ -351,7 +338,6 @@ def test_tmux_capture_screen_argv(monkeypatch):
 
 
 def _panes_stdout(*rows):
-    # rows: (session, window_id, window_name, pane_id, cwd, pane_title, pid)
     return "\n".join(terminal._LS_FS.join(r) for r in rows) + "\n"
 
 
@@ -386,7 +372,7 @@ def test_tmux_ls_with_error_no_server(monkeypatch):
         s = msg if kw.get("text") else msg.encode()
         return subprocess.CompletedProcess(args, 1, s, s)
     monkeypatch.setattr(subprocess, "run", fake)
-    assert TmuxDriver().ls_with_error() == ([], None)  # benign empty fleet
+    assert TmuxDriver().ls_with_error() == ([], None)
     assert TmuxDriver().ls() == []
 
 
@@ -417,7 +403,7 @@ def test_tmux_ls_timeouts(monkeypatch):
 def test_tmux_close(monkeypatch):
     calls = _capture_run(monkeypatch)
     TmuxDriver().close("")
-    assert calls == []  # no-op on empty
+    assert calls == []
     monkeypatch.setenv("CLAUDE_ORCH_TMUX_SOCKET", "S")
     calls2 = _capture_run(monkeypatch)
     TmuxDriver().close("%5")
@@ -428,7 +414,7 @@ def test_tmux_set_tab_title(monkeypatch):
     monkeypatch.delenv("TMUX_PANE", raising=False)
     calls = _capture_run(monkeypatch)
     TmuxDriver().set_tab_title("hi")
-    assert calls == []  # no-op without current pane
+    assert calls == []
     monkeypatch.setenv("TMUX_PANE", "%5")
     monkeypatch.setenv("CLAUDE_ORCH_TMUX_SOCKET", "S")
     calls2 = _capture_run(monkeypatch)
@@ -470,7 +456,7 @@ def test_send_text_submit_false_omits_enter_tmux(monkeypatch):
     assert not any("send-keys" in c["args"] and c["args"][-1] == "Enter" for c in calls)
     assert any("paste-buffer" in c["args"] for c in calls)
     calls.clear()
-    TmuxDriver().send_text("%5", "hi")  # default sends Enter
+    TmuxDriver().send_text("%5", "hi")
     assert any("send-keys" in c["args"] and c["args"][-1] == "Enter" for c in calls)
 
 

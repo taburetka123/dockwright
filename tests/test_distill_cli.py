@@ -14,11 +14,6 @@ def _transcript(tmp_path, monkeypatch, events):
 
 
 def test_distill_cli_exits_0_when_the_session_never_ran(tmp_path, monkeypatch, capsys):
-    """A bricked predecessor is the recovery lane's whole reason to exist, and
-    it is exactly the shape the no-model-turn gate skips. Exiting 1 there makes
-    every recovery-lane distill look like a broken tool, so the step-9 subagent
-    reports a failure against a correctly-working guard.
-    """
     _transcript(tmp_path, monkeypatch, [
         {"type": "user", "message": {"content": "/manager-takeover-recovery ..."}},
         {"type": "assistant", "isApiErrorMessage": True, "message": {
@@ -37,9 +32,6 @@ def test_distill_cli_exits_0_when_the_session_never_ran(tmp_path, monkeypatch, c
 
 
 def test_distill_cli_still_exits_1_on_a_real_failure(tmp_path, monkeypatch, capsys):
-    """The skip must not swallow genuine failures: a session that DID run and
-    whose distill fails is still an error the caller needs to see.
-    """
     _transcript(tmp_path, monkeypatch, [
         {"type": "user", "message": {"content": "go"}},
         {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}},

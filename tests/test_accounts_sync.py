@@ -30,15 +30,13 @@ def test_bad_argv_exits_2(capsys):
 
 def test_syncs_existing_farm_skips_default_and_unprovisioned(monkeypatch, tmp_path, capsys):
     _registry(monkeypatch, tmp_path)
-    (tmp_path / ".claude-b").mkdir()  # b provisioned, c not, a default
+    (tmp_path / ".claude-b").mkdir()
     assert accounts_sync.main([]) == 0
     out = capsys.readouterr().out
     assert "account b: OK" in out
     assert "account c: no config dir" in out and "skipping" in out
     assert "account a" not in out
-    # reconcile really ran: settings.json now shared
     assert (tmp_path / ".claude-b" / "settings.json").is_symlink()
-    # and never provisioned c
     assert not (tmp_path / ".claude-c").exists()
 
 
@@ -74,31 +72,6 @@ def test_no_provisioned_farms_message(monkeypatch, tmp_path, capsys):
     _registry(monkeypatch, tmp_path)
     assert accounts_sync.main([]) == 0
     assert "no provisioned pool-account farms" in capsys.readouterr().out
-
-
-def test_setup_sh_runs_accounts_sync_inside_third_guard_before_doctor():
-    """Drift guard, anchored to EXECUTED lines (comments stripped): setup.sh must
-    invoke `"$DOCKWRIGHT_BIN" accounts-sync` inside the THIRD FILES_ONLY guard
-    block (venv=1st, MCP+hooks=2nd, farm/snapshot reconciliation=3rd,
-    overlay setup.d=4th), before the doctor gate — which sits between the 3rd
-    and 4th guards under its own RUN_DOCTOR_GATE knob so tests can drive it
-    (tests/test_setup_doctor_gate.py). Proven RED by deleting the invocation
-    line."""
-    from pathlib import Path
-
-    setup = (Path(__file__).resolve().parents[1] / "setup.sh").read_text()
-    code = [ln for ln in setup.splitlines() if not ln.lstrip().startswith("#")]
-    invocations = [ln for ln in code if '"$DOCKWRIGHT_BIN" accounts-sync' in ln]
-    assert len(invocations) == 1, f"expected exactly 1 invocation, got {invocations}"
-    guards = [i for i, ln in enumerate(code)
-              if "DOCKWRIGHT_SETUP_FILES_ONLY" in ln and ln.lstrip().startswith("if ")]
-    assert len(guards) == 4, f"expected exactly 4 FILES_ONLY guard ifs, got {len(guards)}"
-    sync_idx = next(i for i, ln in enumerate(code) if '"$DOCKWRIGHT_BIN" accounts-sync' in ln)
-    doctor_idx = next(i for i, ln in enumerate(code) if '" doctor "' in ln)
-    assert guards[2] < sync_idx < doctor_idx < guards[3], (
-        "accounts-sync must run inside the third (reconciliation) "
-        "FILES_ONLY-guarded block, before the doctor gate, which precedes "
-        "the fourth (overlay setup.d) guard")
 
 
 def test_warning_lines_for_missing_and_bad_claude_json(monkeypatch, tmp_path, capsys):

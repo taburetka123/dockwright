@@ -1,29 +1,3 @@
-"""Report-only maintenance scan: `dockwright sweep [--dry-run]`.
-
-Prints three classes of debris with per-item evidence, modifying NOTHING:
-
-  - Dead active/ records: active/<sid>.json whose pid is no longer alive — the
-    session died without its SessionEnd hook firing (crash, force-quit, SIGHUP).
-  - Orphan terminal windows: worker windows in the "claude-workers" group
-    with no backing active/ record.
-  - Orphan MCP docker clients/containers: sessions spawn stdio MCP servers as
-    `docker run -i --rm <image>` host processes; a dead session reparents the
-    client to PPID 1 and leaks the container.
-
-Deliberately stricter than the destructive pruners (preflight_cleanup.py,
-registry._prune_stale_active_records): anything whose session still has a
-pending question under questions/ is never flagged — the manager can still
-answer_question + resume_worker it. A future --apply must inherit these
-invariants; today this module performs no destructive operation at all.
-
-Worktree pruning is out of scope and deliberately unowned: the daily
-`ticket-cleanup` launchd loop was retired 2026-06-11 (its plist had pointed at
-a deleted binary since 2026-04-17, failing silently every day — arch-soundness
-review A4). Manual fallback: the command named by dockwright.toml
-`[hints].worktree_cleanup` (default: unset — no hint line is printed unless an
-operator configures their own cleanup command). Reviving the loop is a
-deliberate re-add: plist + stop-file + loops-registry row, not a path fix.
-"""
 from __future__ import annotations
 
 import os
@@ -40,9 +14,6 @@ from .state import _pid_alive, window_id_of
 USAGE = "Usage: dockwright sweep [--dry-run]"
 DEFAULT_MCP_IMAGES = ("crystaldba/postgres-mcp",)
 MCP_IMAGES_ENV = "CLAUDE_SWEEP_MCP_IMAGES"
-# Mirrors stale_monitor.GARDENER_WINDOW_PROTECT_TTL_SEC — a live gardener run's
-# wrapper shields its pane via gardener/live-windows/<run_id>.window, honored
-# only while mtime-fresh (fail toward flagging on a crashed wrapper's leak).
 GARDENER_WINDOW_PROTECT_TTL_SEC = 7200
 
 
@@ -115,8 +86,6 @@ def _protected_window_ids(pending_sids: set[str]) -> set[str]:
 
 
 def scan_orphan_terminal_windows(os_windows: list, protected: set[str]) -> list[dict]:
-    # _terminal_ls only validates the top level; per-element isinstance guards keep
-    # a valid list with malformed elements degrading per-element, not crashing.
     orphans: list[dict] = []
     for osw in os_windows:
         if not isinstance(osw, dict) or osw.get("wm_class") != WORKERS_OS_WINDOW_CLASS:
@@ -173,9 +142,6 @@ def _ps_snapshot() -> tuple[list[dict] | None, str | None]:
         rows.append({"pid": int(pid_s), "ppid": int(ppid_s),
                      "etime": etime, "command": command})
     if not rows:
-        # rc=0 with nothing parseable must degrade, not read as "zero clients" —
-        # the container scan would otherwise flag every container of a known
-        # image off an empty snapshot. Real ps always lists at least itself.
         return None, "ps returned no parseable rows"
     return rows, None
 
@@ -204,9 +170,6 @@ def _docker_containers(images: tuple[str, ...]) -> tuple[list[dict] | None, str 
 
 
 def _image_matches(image: str, images: tuple[str, ...]) -> bool:
-    # Bare-name comparison: a registry-qualified report (docker.io/crystaldba/
-    # postgres-mcp) does NOT match the bare default — put the qualified name in
-    # CLAUDE_SWEEP_MCP_IMAGES if your daemon reports images that way.
     return any(
         image == known
         or image.startswith(f"{known}:")
@@ -216,9 +179,6 @@ def _image_matches(image: str, images: tuple[str, ...]) -> bool:
 
 
 def _is_mcp_client(command: str, images: tuple[str, ...]) -> bool:
-    """Deliberately looser than the literal `docker run -i --rm` (no flag
-    matching) — the image list is the real constraint, and report-only false
-    positives only add report lines."""
     tokens = command.split()
     if not tokens or os.path.basename(tokens[0]) != "docker":
         return False
@@ -228,13 +188,6 @@ def _is_mcp_client(command: str, images: tuple[str, ...]) -> bool:
 
 
 def _looks_like_session(command: str) -> bool:
-    """argv[0]'s basename only. A claude/codex-shaped token elsewhere in the
-    command line (a path arg ending in /claude, a container --name claude)
-    must not read as a session — it would hide a genuine orphan, and the
-    preflight mirror would trust a recycled pid. Every real session's argv[0]
-    is literally `claude`/`codex` or an absolute path to it (the `zsh -ic
-    claude ...` spawn wrapper never matters: the claude child it forks is
-    always the process actually checked or walked through)."""
     tokens = command.split()
     return bool(tokens) and os.path.basename(tokens[0]) in ("claude", "codex")
 
@@ -275,11 +228,6 @@ def scan_leaked_mcp_containers(
     ps_rows: list[dict],
     images: tuple[str, ...],
 ) -> tuple[list[dict], list[str]]:
-    """Per image: zero live docker-run clients means every running container of
-    it is client-less, i.e. leaked — flag each. When clients exist, the precise
-    client<->container mapping is unknowable from the host side (the docker-run
-    cmdline carries no container id), so a count mismatch only earns an
-    image-level ambiguity note, never individual flags."""
     clients_per_image: dict[str, int] = {known: 0 for known in images}
     for row in ps_rows:
         if not _is_mcp_client(row["command"], images):
@@ -293,10 +241,6 @@ def scan_leaked_mcp_containers(
         own = [c for c in containers if _image_matches(c["image"], (known,))]
         if not own:
             continue
-        # docker ps runs after the ps snapshot — a container whose client
-        # started in between has no client in the snapshot and would
-        # false-flag. Sub-minute RunningFor strings are all seconds-scale;
-        # skip those from flagging and the ambiguity math, but say so.
         mature = [c for c in own if "second" not in c["age"].lower()]
         if len(mature) < len(own):
             notes.append(
@@ -316,8 +260,6 @@ def scan_leaked_mcp_containers(
 
 
 def _ticket_cleanup_hint() -> "str | None":
-    """The worktree-pruning hint line, or None when the operator configured
-    an empty command (hint suppressed)."""
     cmd = config.worktree_cleanup_hint()
     if not cmd.strip():
         return None

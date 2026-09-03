@@ -1,16 +1,3 @@
-"""Terminal driver abstraction — a tmux driver behind one interface.
-
-All terminal remote-control command construction in the package funnels through
-get_driver(), which returns the process-wide TmuxDriver. The TerminalDriver
-Protocol is the backend-agnostic seam: callers depend on the Protocol, not on
-TmuxDriver directly, so a future frontend can swap in behind get_driver()
-without touching call sites.
-
-FastMCP-free by construction (stdlib + paths only): hooks.py imports this on
-the every-session hook path, which tests/test_import_graph.py forbids from
-importing mcp_server / mcp. Call subprocess.run / asyncio.create_subprocess_exec
-as MODULE ATTRIBUTES so the test guards intercept them.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -22,7 +9,7 @@ from typing import Protocol, runtime_checkable
 from . import paths
 
 WORKERS_OS_WINDOW_CLASS = "claude-workers"
-MANAGER_SESSION = "mgr"  # tmux session for manager panes (mirrors bootstrap-recreate.sh)
+MANAGER_SESSION = "mgr"
 
 
 @runtime_checkable
@@ -46,7 +33,7 @@ class TerminalDriver(Protocol):
     def set_tab_color(self, active_bg: str, inactive_bg: str) -> None: ...
 
 
-_LS_FS = "\x1f"  # field separator for list-panes -F (survives | in titles/paths)
+_LS_FS = "\x1f"
 _LS_FORMAT = _LS_FS.join([
     "#{session_name}", "#{window_id}", "#{window_name}",
     "#{pane_id}", "#{pane_current_path}", "#{pane_title}", "#{pane_pid}",
@@ -54,22 +41,15 @@ _LS_FORMAT = _LS_FS.join([
 
 
 class TmuxDriver:
-    # ---- shared / identity (d) ----
     def socket(self) -> str:
         return (os.environ.get("DOCKWRIGHT_TMUX_SOCKET")
-                or os.environ.get("CLAUDE_ORCH_TMUX_SOCKET")  # deprecated, one release
+                or os.environ.get("CLAUDE_ORCH_TMUX_SOCKET")
                 or "dockwright")
 
     def current_pane_id(self) -> str | None:
         return os.environ.get("TMUX_PANE")
 
     def _resolve_conf(self) -> Path | None:
-        # `-f <conf>` is read by tmux ONLY at server birth (a no-op on a running
-        # server). Prefer the deployed conf; fall back to the pre-rename name for
-        # installs whose setup.sh hasn't redeployed since the identity rename
-        # (deprecated, one release — retire with CLAUDE_ORCH_TMUX_SOCKET). None
-        # when neither exists: tmux's own default config loading beats a hard
-        # failure on the every-session hook path.
         for conf in (paths.TMUX_CONF, paths.TMUX_CONF_LEGACY):
             if conf.exists():
                 return conf
@@ -82,7 +62,6 @@ class TmuxDriver:
     def _tmux_base(self) -> list:
         return ["tmux", "-L", self.socket(), *self._tmux_conf_args()]
 
-    # ---- spawn (a) ----
     async def find_group_pane(self) -> str | None:
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -162,12 +141,6 @@ class TmuxDriver:
         return pane
 
     async def _source_conf_best_effort(self) -> None:
-        # A server that pre-existed BARE (born without -f — e.g. the manual
-        # `tmux -L dockwright new-session` operator lane during a socket
-        # cutover) never re-reads the conf on its own; -f on later commands is
-        # a no-op. new-session is the birth-adjacent branch, so re-source here.
-        # Same resolution as -f (can't diverge); safe to re-apply per the conf's
-        # own header. Fire-and-forget: never fails the spawn.
         conf = self._resolve_conf()
         if conf is None:
             return
@@ -180,13 +153,10 @@ class TmuxDriver:
         except Exception:
             pass
 
-    # ---- inject (b) ----
     def _buffer_name(self, pane: str) -> str:
         return "orch_" + str(pane).replace("%", "")
 
     def _ensure_inject_safe(self) -> None:
-        # Pin extended-keys-format=xterm (Claude Code #43169 csi-u newline loss).
-        # Fully isolated, fire-and-forget: result ignored, never affects inject return.
         try:
             subprocess.run([*self._tmux_base(), "set-option", "-s",
                             "extended-keys-format", "xterm"],
@@ -197,7 +167,7 @@ class TmuxDriver:
     def send_text(self, pane: str, text: str, submit: bool = True) -> None:
         self._ensure_inject_safe()
         buf = self._buffer_name(pane)
-        body = text.rstrip("\n")  # #4098: single explicit Enter is the only submit
+        body = text.rstrip("\n")
         try:
             subprocess.run([*self._tmux_base(), "load-buffer", "-b", buf, "-"],
                            input=body.encode("utf-8"), capture_output=True,
@@ -254,7 +224,6 @@ class TmuxDriver:
             return None
         return completed.stdout
 
-    # ---- lifecycle (c) ----
     def _parse_panes(self, text: str) -> list:
         sessions: dict = {}
         order: list = []
@@ -262,9 +231,6 @@ class TmuxDriver:
             if not line:
                 continue
             parts = line.split(_LS_FS)
-            # tmux escapes a literal \x1f in titles/paths to the 4-char \037 in -F
-            # output, so a legit field never splits a line into >7 parts; the skip
-            # only drops truly truncated lines.
             if len(parts) != 7:
                 continue
             sess, win_id, win_name, pane_id, cwd, pane_title, pid = parts
@@ -325,17 +291,10 @@ class TmuxDriver:
             pass
 
     def set_tab_color(self, active_bg: str, inactive_bg: str) -> None:
-        # Color THIS window's status-line entry per state by styling its
-        # status-line entry: active_bg -> the entry when this is the current
-        # window, inactive_bg -> when it isn't. tmux has no per-PANE background,
-        # but window-status-current-style / window-status-style ARE per-window
-        # options, so the orchestrator hooks' existing set_tab_color calls
-        # (idle/busy/question/manager) drive tmux coloring with no hook change.
-        # Best-effort, fire-and-forget: a bad value or down server is swallowed.
         pane = self.current_pane_id()
         if not pane:
             return
-        fg = "#ffffff"  # one readable fg across every state bg
+        fg = "#ffffff"
         for opt, bg in (("window-status-current-style", active_bg),
                         ("window-status-style", inactive_bg)):
             try:
@@ -350,7 +309,6 @@ _DRIVER: "TerminalDriver | None" = None
 
 
 def get_driver() -> TerminalDriver:
-    """Return the process-wide tmux terminal driver (cached)."""
     global _DRIVER
     if _DRIVER is None:
         _DRIVER = TmuxDriver()

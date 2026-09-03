@@ -19,7 +19,6 @@ def test_find_detects_pth_and_distinfo_without_finder(fs):
     found = hc.find_brew_editable(Path("/opt/homebrew"), "dockwright")
     assert len(found) == 1
     assert found[0].python_bin == Path("/opt/homebrew/bin/python3.14")
-    # no finder.py exists; detection still succeeds
     assert not any("finder" in p.name for p in found[0].artifacts)
 
 
@@ -30,8 +29,6 @@ def test_find_collects_finder_when_present(fs):
 
 
 def test_find_does_not_collect_sibling_dist_finder(fs):
-    # The real finder name embeds the version (digit after the dist token); a sibling
-    # distribution (dockwright_extra) starts with a letter and must NOT be collected.
     site = _seed_editable(fs, with_finder=True)
     fs.create_file(site / "__editable___dockwright_extra_0_1_finder.py")
     found = hc.find_brew_editable(Path("/opt/homebrew"), "dockwright")
@@ -61,19 +58,18 @@ def test_clean_uninstalls_per_interp_removes_script_and_verifies(fs):
     calls = []
     def fake_run(cmd, **kw):
         calls.append(cmd)
-        class R: returncode = 1  # import check fails => gone
+        class R: returncode = 1
         return R()
     report = hc.clean(Path("/opt/homebrew"), "dockwright", "orchestrator", run=fake_run)
     assert any("uninstall" in c for c in calls)
     assert report["removed_scripts"] == ["/opt/homebrew/bin/orchestrator"]
-    # artifacts physically removed
     assert hc.find_brew_editable(Path("/opt/homebrew"), "dockwright") == []
 
 
 def test_clean_raises_on_residual_import(fs):
     _seed_editable(fs)
     def fake_run(cmd, **kw):
-        class R: returncode = 0  # import check still succeeds => residual
+        class R: returncode = 0
         return R()
     with pytest.raises(hc.CleanupError):
         hc.clean(Path("/opt/homebrew"), "dockwright", "orchestrator", run=fake_run)
@@ -84,4 +80,4 @@ def test_clean_dry_run_does_nothing(fs):
     def boom(*a, **k): raise AssertionError("should not run")
     report = hc.clean(Path("/opt/homebrew"), "dockwright", "orchestrator", run=boom, dry_run=True)
     assert report["dry_run"] is True
-    assert hc.find_brew_editable(Path("/opt/homebrew"), "dockwright")  # still present
+    assert hc.find_brew_editable(Path("/opt/homebrew"), "dockwright")

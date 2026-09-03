@@ -52,8 +52,6 @@ def gate(tmp_path, monkeypatch):
     gardener_dir.mkdir(parents=True)
     findings_dir.mkdir(parents=True)
     closed_dir.mkdir(parents=True)
-    # Healthy default world for the producer asserts: both expected SessionEnd
-    # hooks present, no closed-session records (no activity ⇒ no stale signal).
     settings_path.write_text(json.dumps({"hooks": {"SessionEnd": [{"hooks": [
         {"type": "command",
          "command": "bash -c 'CLAUDE_PARENT_PID=$PPID orchestrator session-end'"},
@@ -194,7 +192,6 @@ class TestRunRateCap:
     def test_three_recent_runs_hit_cap(self, gate):
         for i in range(8):
             _write_finding(gate, f"f{i}")
-        # newest run is past the 6h cooldown so the cap is what fires
         _write_ledger_runs(gate, [7 * 3600, 86400, 3 * 86400])
         decision, detail = gate.decide(NOW, force=False)
         assert decision == "cap"
@@ -271,9 +268,6 @@ class TestCooldown:
 
 
 class TestLaneIsolation:
-    """The shared ledger carries the frontier loop's runs too; the digest
-    gate's cap and cooldown must count ONLY the digest lane (arch-soundness
-    C2: the lane-blind pool breaks silently)."""
 
     def test_frontier_runs_do_not_consume_digest_cap(self, gate):
         for i in range(8):
@@ -380,9 +374,6 @@ class TestMain:
 
 
 class TestProducerAsserts:
-    """Producer-liveness asserts (arch review A1): the hourly gate is the one
-    tick that can notice the findings supply died — a severed SessionEnd hook
-    or a stale producer must warn, never silently quiesce."""
 
     def _write_closed(self, gate, name: str, age_sec: float) -> None:
         p = gate.CLOSED_DIR / f"{name}.json"
@@ -429,8 +420,6 @@ class TestProducerAsserts:
         assert any(w.startswith("hooks_missing") and "session-end" in w for w in warnings)
 
     def test_stale_producer_warns(self, gate):
-        """Sessions closing for 3 days while the newest finding is older still
-        ⇒ the producer is dead, not the workload quiet."""
         _write_finding(gate, "f1", age_sec=10 * 86400)
         self._write_closed(gate, "s1", age_sec=600)
         warnings = gate.producer_warnings()
@@ -446,13 +435,12 @@ class TestProducerAsserts:
         assert not any(w.startswith("producer_stale") for w in gate.producer_warnings())
 
     def test_no_closed_records_no_stale_warning(self, gate):
-        """No session activity ⇒ no findings expected ⇒ no false positive."""
         _write_finding(gate, "f1", age_sec=30 * 86400)
         assert gate.producer_warnings() == []
 
     def test_main_logs_warnings_to_gate_log(self, gate, monkeypatch):
         monkeypatch.setattr(gate, "spawn_run", lambda trigger: None)
-        self._write_closed(gate, "s1", age_sec=600)  # no findings ⇒ stale
+        self._write_closed(gate, "s1", age_sec=600)
         rc = gate.main(["--dry-run"])
         assert rc == gate.EXIT_OK
         log = gate.GATE_LOG_PATH.read_text()
@@ -465,7 +453,7 @@ class TestProducerAsserts:
         self._write_closed(gate, "s1", age_sec=600)
         gate.main(["--dry-run"])
         assert len(notified) == 1
-        gate.main(["--dry-run"])  # marker is fresh now — throttled
+        gate.main(["--dry-run"])
         assert len(notified) == 1
         old = NOW - 2 * 86400
         os.utime(gate.WARN_MARKER_PATH, (old, old))
@@ -474,7 +462,7 @@ class TestProducerAsserts:
 
     def test_warnings_never_change_decision_or_exit_code(self, gate, monkeypatch):
         monkeypatch.setattr(gate, "spawn_run", lambda trigger: None)
-        self._write_closed(gate, "s1", age_sec=600)  # stale producer
+        self._write_closed(gate, "s1", age_sec=600)
         rc = gate.main(["--dry-run"])
         assert rc == gate.EXIT_OK
         assert "no_material" in gate.GATE_LOG_PATH.read_text()
@@ -572,8 +560,6 @@ class TestRetryQueue:
         assert calls == []
 
     def test_main_retry_suppresses_digest_spawn_this_tick(self, gate, monkeypatch, tmp_path):
-        """Accum is armed AND a retry is queued: the retry wins the tick (the
-        two would contend on the analyst-run mutex); digest re-decides next tick."""
         digest_spawns = []
         monkeypatch.setattr(gate, "spawn_run", lambda trigger: digest_spawns.append(trigger))
         retry_calls = self._capture_spawn(gate, monkeypatch)
@@ -610,7 +596,6 @@ class TestRetryQueue:
         assert retry_calls == [] and entry.exists()
 
     def test_main_force_skips_retry_prestep(self, gate, monkeypatch, tmp_path):
-        """--force is a human-initiated digest; the retry pre-step yields."""
         digest_spawns = []
         monkeypatch.setattr(gate, "spawn_run", lambda trigger: digest_spawns.append(trigger))
         retry_calls = self._capture_spawn(gate, monkeypatch)
@@ -621,16 +606,6 @@ class TestRetryQueue:
 
 
 class TestNotifyPytestGuard:
-    """_notify must never fire a real notification from inside a pytest run.
-
-    test_module_toggle.py execs this script as a REAL subprocess (HOME in the
-    pytest tmpdir), where no monkeypatch can reach: main() always runs
-    _warn_producer, the bare HOME makes settings.json unreadable
-    (hooks_missing), the fresh HOME has no throttle marker — so without a
-    guard IN THE SCRIPT every full-suite run fired real 'gardener-gate'
-    desktop notifications (2026-07-03 leak). The guard keys on
-    PYTEST_CURRENT_TEST, which pytest exports and {**os.environ} child envs
-    inherit (inheritance pinned in test_module_toggle.py)."""
 
     def _record_runs(self, monkeypatch):
         calls = []
@@ -646,9 +621,6 @@ class TestNotifyPytestGuard:
         assert calls == []
 
     def test_notify_invokes_real_osascript_outside_pytest(self, monkeypatch):
-        """Deterministic repro of the leak mechanics + production-behavior pin:
-        outside pytest, _notify really invokes /usr/bin/osascript with a
-        'display notification … "gardener-gate"' payload."""
         mod = _load_gate()
         calls = self._record_runs(monkeypatch)
         monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)

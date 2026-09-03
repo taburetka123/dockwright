@@ -1,26 +1,9 @@
-"""Promote the current live (plain) claude session into an orchestrator worker.
-
-`claude --resume <sid>` re-opens a session with its full history AND reuses the
-original session id (verified: no `--fork-session` => same sid, same transcript
-appended). Worker recognition is launch-time env (`CLAUDE_AGENT=worker`,
-`CLAUDE_WORKER_NAME`, `CLAUDE_PARENT_MANAGER`) read by the SessionStart hook —
-it can't be retrofitted into a live process. So the only clean promotion is to
-relaunch the session under that env via `--resume`, which the hook then
-registers as a worker. We deliberately do NOT hand-write the active record:
-letting the hook do it is the whole point of the relaunch path.
-
-This module reads `~/.claude/dockwright/active/*.json` directly (no MCP
-dependency) so it works from a plain session that never connected to the
-orchestrator MCP server.
-"""
 import os
 import sys
 from typing import Callable, Optional
 
 
 def _pid_alive(pid: int) -> bool:
-    """True if a process with `pid` currently exists. PermissionError means the
-    process exists but is owned by someone else — still alive for our purposes."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -36,17 +19,6 @@ def resolve_general_manager(
     records: list[dict],
     is_alive: Callable[[int], bool] = _pid_alive,
 ) -> tuple[Optional[dict], list[dict], Optional[str]]:
-    """Pick the live general-domain manager to assign to.
-
-    Returns (chosen, others, error):
-      - chosen: the selected manager record, or None when there is none.
-      - others: the remaining live general managers (non-empty only when >1).
-      - error: a human message when no manager was found (chosen is None), else None.
-
-    A manager is eligible when agent=="manager", its domain is general (treating
-    absent/null/empty as general), and its pid is still alive. Among eligible
-    managers the newest by started_at wins.
-    """
     managers = []
     for record in records:
         if record.get("agent") != "manager":
@@ -54,9 +26,6 @@ def resolve_general_manager(
         domain = record.get("domain")
         if domain not in (None, "", "general"):
             continue
-        # Records are read straight off disk and may carry a malformed pid
-        # (foreign tool, older schema) — a non-numeric pid must not crash the
-        # whole resolution; treat it as "can't prove dead" and keep the manager.
         pid = record.get("pid")
         try:
             pid_int = int(pid) if pid is not None else None
@@ -78,13 +47,6 @@ def _read_active_records() -> list[dict]:
 
 def _write_promoted_assignment(sid: str, name: str, manager_name: str,
                                task_key: str | None = None) -> None:
-    """Ownership record for an adopted live session. The promote path knows its
-    own sid already (it resumes itself), so it writes assignments/<sid>.json
-    directly — no pending/claim dance, and the resumed session's SessionStart
-    must not claim anything (no CLAUDE_ASSIGNMENT_ID is set on this lane).
-    There is no spawn prompt by construction → initial_prompt stays None.
-    Best-effort: never blocks or fails the promotion.
-    """
     import time
 
     from . import paths, state
@@ -109,18 +71,10 @@ def _write_promoted_assignment(sid: str, name: str, manager_name: str,
             "spawned_at": time.time(),
         })
     except Exception:
-        # "never fails the promotion" includes _safe_segment's ValueError on a
-        # malformed sid, not just filesystem errors.
         pass
 
 
 def assign_to_manager_cli() -> None:
-    """CLI entry: `dockwright assign-to-manager [--name N] [--sid S]`.
-
-    Relaunches THIS session as a worker (resuming its own sid) in the workers
-    window, assigned to the chosen general manager. The session id and
-    window are read from the live shell env; --sid is an override for testing.
-    """
     import argparse
     import asyncio
 
@@ -166,18 +120,11 @@ def assign_to_manager_cli() -> None:
             "picked the newest by started_at."
         )
 
-    # Keep promoted workers off the phone remote-control enrolment. Intentionally does NOT use
-    # _claude_worker_settings_args (which also sets enableAllProjectMcpServers for fresh-worktree
-    # workers): promote resumes an already-interactive session in os.getcwd(), where any MCP-enable
-    # prompt was already cleared — so only the remote-control-off settings apply here.
     extra_args = ["--settings", '{"remoteControlAtStartup": false, "disableRemoteControl": true}']
     env = {"CLAUDE_PARENT_MANAGER": manager_name}
 
     from .spawner import spawn_worker_tab
 
-    # Mirror spawn_worker_impl: bound the spawn at 15s and treat a missing/hung
-    # tmux (FileNotFoundError → OSError, refused connection, timeout) as a clean
-    # launch failure rather than an uncaught traceback or an infinite hang.
     async def _spawn_with_timeout():
         async with asyncio.timeout(15):
             return await spawn_worker_tab(

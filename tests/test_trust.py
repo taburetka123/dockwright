@@ -1,8 +1,3 @@
-"""trust.pretrust_dir: official project pre-trust in a Claude config JSON.
-
-Evidence (VM E2E 2026-07-16 B2, both runs): flags WRITTEN to ~/.claude.json
-persist across concurrent sessions and exits and suppress the trust dialog;
-interactive accepts do not reliably persist (finding L-11)."""
 import json
 from pathlib import Path
 

@@ -1,11 +1,3 @@
-"""Worktree prune loop — merged+clean+unowned gating, dry-run by default.
-
-Loads the standalone script the same way test_bootlite_watchdog.py loads the
-watchdog (importlib spec_from_file_location). The fleet is never touched: a fake
-`run` callable returns canned subprocess output, and active-records / lsof inputs
-are injected directly. The safety invariant under test is "only ever under-prune"
-— every error / parse failure / unavailable signal must resolve to SKIP.
-"""
 import importlib.util
 import json
 import os
@@ -27,7 +19,6 @@ DEAD_PID = 4222
 def _load():
     spec = importlib.util.spec_from_file_location("worktree_prune_under_test", SCRIPT_PATH)
     mod = importlib.util.module_from_spec(spec)
-    # Register before exec so the @dataclass decorator can resolve its module.
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
@@ -45,8 +36,6 @@ def wp(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "CHECK_LOG_PATH", wtdir / "check.log")
     monkeypatch.setattr(mod, "STOP_PATHS", (tmp_path / "worktree-prune-stop", tmp_path / "legacy-worktree-prune-stop"))
     monkeypatch.setattr(mod, "ORCH_ACTIVE", tmp_path / "active")
-    # The keep-list's ABSENCE stops the whole run by design, so every test needs
-    # a present (empty) one; cases that exercise the stop delete or repoint it.
     wtdir.mkdir(parents=True, exist_ok=True)
     keep = wtdir / "keep.txt"
     keep.write_text("# holds, one path or glob per line\n")
@@ -65,12 +54,7 @@ def _RR(wp, rc=0, out="", err=""):
 
 
 def _infra_rr(wp, args):
-    """Canned answers for calls every scan makes regardless of the case under
-    test. Returns None when `args` is not one of them, so a stub can fall
-    through to its own assertions."""
     if "for-each-ref" in args:
-        # Default: the commit is on origin/main, so a detached candidate is
-        # contained. Cases about containment override this with their own stub.
         if wp.PROOF_MAIN_REF in args:
             return _RR(wp, 0, wp.PROOF_MAIN_REF + "\n")
         return _RR(wp, 0, "")
@@ -84,32 +68,16 @@ def _infra_rr(wp, args):
 
 
 def _gh_head_branch(args):
-    """Branch from a gh argv, whichever subcommand shape it is. Reading a fixed
-    index breaks silently when `pr view <branch>` becomes `pr list --head <b>`."""
     if "--head" in args:
         return args[args.index("--head") + 1]
     return args[3]
 
 
 def _gh_body(args, state, head, number=1):
-    """`pr list` -> array, `pr view` -> object. gate_terminal reads the array and
-    gate_merged the object; a stub emitting one shape tests only one gate."""
     obj = {"number": number, "state": state, "headRefOid": head}
     return json.dumps([obj] if "list" in args else obj)
 
 
-def _gh_reply(wp, args, head, state="MERGED"):
-    """`pr list` yields an ARRAY, `pr view` an object — the two gates read
-    different shapes and a stub that conflates them proves nothing."""
-    if "list" in args:
-        return _RR(wp, 0, json.dumps([{"number": 1, "state": state,
-                                       "headRefOid": head}]))
-    return _RR(wp, 0, json.dumps({"state": state, "headRefOid": head}))
-
-
-# ----------------------------------------------------------------------------
-# Task 1 — scaffolding, stop-file gate
-# ----------------------------------------------------------------------------
 class TestStopFile:
     def test_stop_file_short_circuits_and_runs_nothing(self, wp):
         wp.STOP_PATHS[0].touch()
@@ -153,9 +121,6 @@ class TestStopFile:
         assert _ledger_events(wp) == []
 
 
-# ----------------------------------------------------------------------------
-# Task 2 — enumerate candidates (both roots, both layouts, main/off-root excl.)
-# ----------------------------------------------------------------------------
 def _mk_clone(parent: Path, name: str) -> Path:
     clone = parent / name
     (clone / ".git").mkdir(parents=True)
@@ -172,7 +137,6 @@ class TestEnumerate:
         personal = tmp_path / "projects" / "personal"
         clone_a = _mk_clone(work, "repo-a")
         clone_b = _mk_clone(personal, "repo-b")
-        # a non-repo dir under a clone-parent must be ignored (no run call)
         (personal / "loose-dir").mkdir()
 
         roots = [str(tmp_path / "worktrees"), str(tmp_path / "worktrees-personal")]
@@ -211,7 +175,6 @@ class TestEnumerate:
         assert str(clone_a) not in by_path
         assert str(clone_b) not in by_path
         assert str(offroot_wt) not in by_path
-        # loose-dir has no .git, so no worktree-list call was issued for it
         assert sorted(seen_clones) == sorted([str(clone_a), str(clone_b)])
 
         assert by_path[str(nested_wt)].branch == "feat-nested"
@@ -241,9 +204,6 @@ def _cand(wp, head="h1", branch="feat", detached=False, path="/wt", clone="/clon
     return wp.Candidate(path=path, head=head, branch=branch, detached=detached, clone=clone)
 
 
-# ----------------------------------------------------------------------------
-# Task 3 — Gate A: merged (headRefOid guard + ancestor fallback)
-# ----------------------------------------------------------------------------
 class TestGateMerged:
     def test_merged_with_matching_head(self, wp):
         cand = _cand(wp, head="abc")
@@ -275,8 +235,6 @@ class TestGateMerged:
         assert seen["cwd"] == "/wt-x"
 
     def test_merged_but_head_mismatch_is_not_merged(self, wp):
-        """Post-merge local commits: PR is MERGED but HEAD moved past it — must
-        NOT prune (would drop the local-only commits)."""
         cand = _cand(wp, head="abc")
 
         def run(args, cwd=None):
@@ -285,7 +243,7 @@ class TestGateMerged:
                 return rr
             if args[0] == "gh":
                 return _RR(wp, 0, json.dumps({"state": "MERGED", "headRefOid": "DEADBEEF"}))
-            return _RR(wp, 1)  # also not an ancestor
+            return _RR(wp, 1)
 
         assert wp.gate_merged(run, cand) is False
 
@@ -377,9 +335,6 @@ class TestGateMerged:
         assert wp.gate_merged(run, cand) is False
 
 
-# ----------------------------------------------------------------------------
-# Task 4 — Gate B: clean (untracked-injected-only)
-# ----------------------------------------------------------------------------
 class TestGateClean:
     def _run_status(self, wp, out, rc=0):
         cand = _cand(wp, path="/wt")
@@ -405,8 +360,6 @@ class TestGateClean:
         assert self._run_status(wp, out) is True
 
     def test_tracked_modified_claude_md_is_dirty(self, wp):
-        # A substring grep -v CLAUDE.md would wrongly pass this; the status-code
-        # check must treat a tracked modification as dirty.
         assert self._run_status(wp, " M CLAUDE.md\n") is False
 
     def test_untracked_non_injected_is_dirty(self, wp):
@@ -433,10 +386,6 @@ class TestGateClean:
         assert wp.gate_clean(run, cand) is False
 
 
-# ----------------------------------------------------------------------------
-# Task 5 — Gate C: unowned (active records + lsof + self-guard)
-# gate_unowned returns True = UNOWNED (eligible), False = owned (SKIP).
-# ----------------------------------------------------------------------------
 def _live(p):
     return p == LIVE_PID
 
@@ -489,9 +438,6 @@ class TestGateUnowned:
         assert wp.gate_unowned(cand, recs, [], "/elsewhere") is False
 
 
-# ----------------------------------------------------------------------------
-# Task 6 — decide() + dry-run output + ledger/check-log
-# ----------------------------------------------------------------------------
 def _ledger_by_event(wp):
     events = {}
     for e in _ledger_events(wp):
@@ -499,10 +445,6 @@ def _ledger_by_event(wp):
     return events
 
 
-# Mirrors the shapes `_scan` actually produces: `contained` and `ignored_ok` are
-# tuple-valued (they can fail for more than one distinguishable cause), the rest
-# are bare bools. A fixture that drifts from production is how a shape change
-# stops being noticed.
 ALL_PASS = {"kept": False, "not_locked": True, "in_progress_clear": True,
             "contained": (True, None), "terminal": True, "clean": True,
             "ignored_ok": (True, None), "unowned": True}
@@ -538,24 +480,15 @@ class TestDecide:
         assert wp.decide(_cand(wp), gates) == ("SKIP", why)
 
     def test_kept_outranks_every_other_failure(self, wp):
-        # by_reason["kept"] must be the true hold count, so `kept` is checked
-        # before any gate that could also fail on the same candidate.
         gates = {k: (False if k != "contained" else (False, "uncontained"))
                  for k in ALL_PASS}
         gates["kept"] = True
         assert wp.decide(_cand(wp), gates) == ("SKIP", "kept")
 
     def test_decide_order_covers_every_gate_key(self, wp):
-        # Pins DECIDE_ORDER against the TEST fixture. Necessary but not
-        # sufficient: it cannot see the production dict growing a gate — that is
-        # test_every_gate_in_the_scan_dict_is_consulted, below.
         assert {k for k, _ in wp.DECIDE_ORDER} == set(ALL_PASS)
 
     def test_every_gate_in_the_scan_dict_is_consulted(self, wp, monkeypatch):
-        # ADD-ONE, bound to PRODUCTION. `decide` iterates DECIDE_ORDER, so a key
-        # present in the scan's dict but absent from that tuple is never read:
-        # the gate does nothing, reports nothing, and the suite stays green. A
-        # real safety gate added that way would silently not run.
         seen = {}
         real = wp.decide
         monkeypatch.setattr(wp, "decide",
@@ -636,7 +569,6 @@ class TestDryRun:
         assert led["would_remove"][0]["path"] == "/wt/elig"
         assert wp.CHECK_LOG_PATH.is_file()
 
-        # no destructive op issued in dry-run
         for args in calls:
             assert "remove" not in args
             assert not (args[:2] == ["git", "-C"] and "branch" in args and "-D" in args)
@@ -675,14 +607,10 @@ class TestDryRun:
         assert res["/wtB"]["action"] == "SKIP"
         assert res["/wtB"]["reason"] == "fetch_failed"
         assert res["/wtA"]["action"] == "WOULD-REMOVE"
-        # candB's gates were never evaluated
         assert "B" not in gh_branches
         assert info["summary"]["by_reason"].get("fetch_failed") == 1
 
 
-# ----------------------------------------------------------------------------
-# Task 7 — --apply removal (re-verify B+C, force-remove, branch -D, rate cap)
-# ----------------------------------------------------------------------------
 REMOVE = ["git", "-C", "/clone", "worktree", "remove", "--force", "/wt"]
 BRANCH_D = ["git", "-C", "/clone", "branch", "-D", "feat"]
 
@@ -723,7 +651,7 @@ class TestApply:
             if "status" in args:
                 return _RR(wp, 0, "")
             if "rev-parse" in args:
-                return _RR(wp, 0, "h\n")  # HEAD unchanged since scan
+                return _RR(wp, 0, "h\n")
             if "remove" in args:
                 return _RR(wp, 0)
             if _is_branch_delete(args):
@@ -812,9 +740,9 @@ class TestApply:
             if "status" in args:
                 return _RR(wp, 0, "")
             if "merge-base" in args:
-                return _RR(wp, 0)  # ancestor -> merged
+                return _RR(wp, 0)
             if "rev-parse" in args:
-                return _RR(wp, 0, "h\n")  # detached HEAD unchanged since scan
+                return _RR(wp, 0, "h\n")
             if "remove" in args:
                 return _RR(wp, 0)
             raise AssertionError(args)
@@ -874,7 +802,7 @@ class TestApply:
             if "status" in args:
                 return _RR(wp, 0, "")
             if "rev-parse" in args:
-                return _RR(wp, 0, "h\n")  # HEAD unchanged since scan
+                return _RR(wp, 0, "h\n")
             if "remove" in args:
                 return _RR(wp, 1, "", "cannot remove worktree")
             if _is_branch_delete(args):
@@ -889,9 +817,6 @@ class TestApply:
         assert info["summary"]["removed"] == 0
 
     def test_apply_reverify_head_moved_skips(self, wp, monkeypatch):
-        # A commit lands on the merged branch between scan and removal: it stays
-        # clean (committed) + unowned (process exited), but HEAD != the scan-time
-        # SHA -> removing would destroy a tip carrying commits not in origin/main.
         cand = _cand(wp, path="/wt", branch="feat", head="h", clone="/clone")
         self._wire(wp, monkeypatch, [cand])
 
@@ -946,9 +871,6 @@ class TestApply:
         assert info["summary"]["removed"] == 0
 
 
-# ----------------------------------------------------------------------------
-# Task 8 — CLI (main, --apply, --json) + summary line
-# ----------------------------------------------------------------------------
 class TestCLI:
     def _stub(self, wp, monkeypatch, decision, info, seen=None):
         def fake_run_prune(now, apply=False, **kw):
@@ -999,7 +921,6 @@ class TestCLI:
         assert "scanned" in out and "would_remove" in out
 
     def test_dry_run_overrides_apply(self, wp, monkeypatch):
-        # Footgun guard: --apply --dry-run must resolve to the SAFE direction.
         seen = {}
         self._stub(wp, monkeypatch, "dry-run",
                    {"results": [], "summary": wp._empty_summary()}, seen)
@@ -1007,9 +928,6 @@ class TestCLI:
         assert seen["apply"] is False
 
 
-# ----------------------------------------------------------------------------
-# Review findings — direct coverage for helpers previously only monkeypatched
-# ----------------------------------------------------------------------------
 class TestCollectLsof:
     def test_rc0_parses_n_lines(self, wp):
         out = "p100\nn/path/a\np200\nn/path/b\n"
@@ -1024,9 +942,6 @@ class TestCollectLsof:
         assert wp._collect_lsof_cwds(run) == ["/path/a", "/path/b"]
 
     def test_rc_nonzero_with_output_keeps_paths(self, wp):
-        # Load-bearing safety branch: a permission-limited lsof exits non-zero
-        # while still listing accessible cwds — discarding them would turn a
-        # real owner into a false "no owner" and over-prune.
         out = "p100\nn/path/a\n"
 
         def run(args, cwd=None):
@@ -1098,7 +1013,6 @@ class TestIsUnder:
         assert wp._is_under("/wt", "/wt") is True
 
     def test_sibling_prefix_is_not_under(self, wp):
-        # /wt-foo must NOT count as under /wt (string-prefix bug guard)
         assert wp._is_under("/wt-foo", "/wt") is False
 
     def test_unrelated_is_not_under(self, wp):
@@ -1147,7 +1061,6 @@ class TestScanGateException:
 
 class TestNowTimestamp:
     def test_ledger_ts_uses_now(self, wp, monkeypatch):
-        # The run-scoped `now` is threaded into ledger timestamps (determinism).
         cand = _cand(wp, path="/wt", branch="feat", head="h", clone="/clone")
         monkeypatch.setattr(wp, "enumerate_candidates", lambda r, cp, roots: [cand])
         monkeypatch.setattr(wp, "_load_active_records", lambda d: [])
@@ -1191,14 +1104,6 @@ class TestHomeFallback:
         assert mod.WT_DIR == claude / "worktree-prune"
 
 
-# ----------------------------------------------------------------------------
-# Widening — real-repo fixtures
-#
-# Several guards here cannot be proven against a stubbed `run`: the thing under
-# test IS git's behaviour (what survives `worktree remove`, what `--git-path`
-# accepts, which refs `--contains` reports). Those use throwaway repos and a
-# SELECTIVE run — real git, canned gh.
-# ----------------------------------------------------------------------------
 import subprocess as _sp
 
 
@@ -1211,7 +1116,6 @@ def _git(cwd, *args, check=True):
 
 
 def _real_run(wp, gh_json=None):
-    """git for real, gh canned. gh has no repo here, so it must be stubbed."""
     def run(args, cwd=None):
         if args and args[0] == wp.GH_BIN:
             if gh_json is None:
@@ -1226,7 +1130,6 @@ def _real_run(wp, gh_json=None):
 
 @pytest.fixture
 def repo(tmp_path):
-    """A clone with one commit on main, no remote."""
     clone = tmp_path / "clone"
     clone.mkdir()
     _git(clone, "init", "-q", "-b", "main", ".")
@@ -1247,9 +1150,6 @@ class TestContainmentRealRepo:
                 for r in recs if r["path"] != str(clone)], run
 
     def test_detached_held_only_by_a_deletable_branch_is_skipped(self, wp, repo, tmp_path):
-        # The class that cost two review rounds: X is held ONLY by refs/heads/feat,
-        # a ref this loop can `branch -D`. Removing the detached tree on that
-        # strength orphans X the moment the branch goes — same run or next week.
         _git(repo, "worktree", "add", "-q", "-b", "feat", str(tmp_path / "w1"))
         (tmp_path / "w1" / "u.txt").write_text("u")
         _git(tmp_path / "w1", "add", "u.txt")
@@ -1276,8 +1176,6 @@ class TestContainmentRealRepo:
             return _real_run(wp)(args, cwd)
 
         assert wp.gate_contained(run, det) == (True, None)
-        # A tag is durable on its own; confirming it against a server would be
-        # a network call for nothing.
         assert not any("ls-remote" in a for a in calls)
 
     @pytest.mark.parametrize("ns,ref", [
@@ -1286,8 +1184,6 @@ class TestContainmentRealRepo:
         ("heads", "refs/heads/rescue-x"),
     ])
     def test_non_durable_namespaces_are_not_proof(self, wp, repo, tmp_path, ns, ref):
-        # ADD-ONE over the namespaces someone would plausibly re-admit.
-        # refs/heads is the highest-value member: it is the one just removed.
         _git(repo, "worktree", "add", "-q", "--detach", str(tmp_path / "w"))
         (tmp_path / "w" / "z.txt").write_text("z")
         _git(tmp_path / "w", "add", "z.txt")
@@ -1301,16 +1197,12 @@ class TestContainmentRealRepo:
         assert ok is False, f"{ref} must not count as durable proof"
 
     def test_allowlisted_namespaces_are_pinned(self, wp):
-        # `==` so a namespace appended to the proof set has to come here first.
         assert (wp.PROOF_MAIN_REF, wp.PROOF_TAG_NAMESPACE, wp.PROOF_REMOTE_NAMESPACE) \
             == ("refs/remotes/origin/main", "refs/tags/", "refs/remotes/")
 
 
 class TestInProgressRealGit:
     def test_marker_flag_is_repeated_per_marker(self, wp, repo, tmp_path):
-        # `rev-parse --git-path a b c` is an ERROR, not a batch. Getting this
-        # wrong makes every candidate look in-progress and silently no-ops the
-        # whole loop, so assert against real git, not a stub.
         _git(repo, "worktree", "add", "-q", "--detach", str(tmp_path / "w"))
         cand = wp.Candidate(path=str(tmp_path / "w"), head="", branch=None,
                             detached=True, clone=str(repo))
@@ -1325,30 +1217,20 @@ class TestInProgressRealGit:
         assert argv.count("--git-path") == len(wp.IN_PROGRESS_MARKERS)
 
     def test_paused_rebase_blocks_removal(self, wp, repo, tmp_path):
-        # A paused `rebase -i` is detached AND porcelain-clean, so gate_clean
-        # cannot see it. This gate is the only thing that can.
         for i in (1, 2):
             (repo / f"f{i}").write_text(str(i))
             _git(repo, "add", f"f{i}")
             _git(repo, "commit", "-qm", f"c{i}")
         wt = tmp_path / "w"
         _git(repo, "worktree", "add", "-q", "-b", "rb", str(wt))
-        # `sed -i ''` is BSD sed. GNU sed reads the '' as its script, the editor
-        # fails, the rebase never pauses, and this test's whole premise is gone
-        # — which is why it passed on macOS and failed on CI. A python editor
-        # behaves identically on both.
         seq_editor = tmp_path / "seq_editor.py"
         seq_editor.write_text(
             "import sys\n"
             "path = sys.argv[1]\n"
             "lines = open(path, encoding='utf-8').readlines()\n"
-            # The old sed was anchored (`2s/^pick/edit/`) and no-op'd on any
-            # other line; say the assumption out loud instead of slicing blind.
             "assert lines[1].startswith('pick '), lines[1]\n"
             "lines[1] = 'edit' + lines[1][len('pick'):]\n"
             "open(path, 'w', encoding='utf-8').writelines(lines)\n")
-        # git runs GIT_SEQUENCE_EDITOR through a shell, so both words are quoted:
-        # a space in sys.executable or in tmp_path would otherwise split them.
         env_editor = f"{shlex.quote(sys.executable)} {shlex.quote(str(seq_editor))}"
         _sp.run(["git", "rebase", "-i", "HEAD~2"], cwd=str(wt), capture_output=True,
                 env=dict(os.environ, GIT_SEQUENCE_EDITOR=env_editor,
@@ -1364,7 +1246,6 @@ class TestInProgressRealGit:
                                         "MERGE_HEAD", "CHERRY_PICK_HEAD",
                                         "REVERT_HEAD", "sequencer"])
     def test_every_marker_blocks(self, wp, repo, tmp_path, marker):
-        # Derived per member rather than three hand-written cases.
         wt = tmp_path / "w"
         _git(repo, "worktree", "add", "-q", "--detach", str(wt))
         cand = wp.Candidate(path=str(wt), head="", branch=None, detached=True,
@@ -1384,8 +1265,6 @@ class TestInProgressRealGit:
 
 class TestIgnoredContent:
     def test_allowlist_is_pinned(self, wp):
-        # `==`, so adding an ignored name has to come through here — and through
-        # the RED proof below — rather than being appended quietly.
         assert wp.IGNORED_ARTIFACT_NAMES == frozenset({
             "target", "node_modules", ".venv", "venv", "__pycache__",
             ".pytest_cache", "build", "dist", ".gradle", "out", "coverage",
@@ -1400,20 +1279,17 @@ class TestIgnoredContent:
         ".tox", ".claude", "CLAUDE.md", ".mcp.json", ".codex", ".DS_Store",
         ".flattened-pom.xml"}))
     def test_every_allowlisted_name_passes_at_top_level_and_nested(self, wp, name):
-        # Derived over the set, not three hand-picked cases: build output nests
-        # (common/target/), so a top-level-only match would block most trees.
         assert wp.ignored_ok_from_porcelain(f"!! {name}\n") is True
         assert wp.ignored_ok_from_porcelain(f"!! service/{name}/\n") is True
 
     @pytest.mark.parametrize("entry", [
-        "docs/", "docs/superpowers/specs/x-design.md", ".superpowers/",
+        "docs/", "docs/sidecar/specs/x-design.md", ".sidecar/",
         "notes.md", "service/src/main/graphql/sibi/schema.json", ".idea/",
     ])
     def test_unknown_ignored_content_blocks(self, wp, entry):
         assert wp.ignored_ok_from_porcelain(f"!! {entry}\n") is False
 
     def test_ignored_lines_are_not_dirt_for_gate_b(self, wp):
-        # The two gates read one porcelain text; `!!` belongs to B2 only.
         text = "!! docs/\n"
         assert wp.clean_from_porcelain(text) is True
         assert wp.ignored_ok_from_porcelain(text) is False
@@ -1446,7 +1322,7 @@ class TestIgnoredContent:
             if args[0] == wp.GH_BIN:
                 return _RR(wp, 0, _gh_body(args, "MERGED", "h"))
             if "status" in args:
-                return _RR(wp, 0, "!! target/\n!! docs/superpowers/specs/d.md\n")
+                return _RR(wp, 0, "!! target/\n!! docs/sidecar/specs/d.md\n")
             if "remove" in args:
                 raise AssertionError("must not remove a tree holding a design doc")
             return _RR(wp, 0, "")
@@ -1479,7 +1355,6 @@ class TestKeepList:
         assert decision == "stopped"
 
     def test_glob_with_a_missing_prefix_stops_the_run(self, wp):
-        # `~/worktrees/*` unexpanded has prefix `~`, which is not a directory.
         wp.KEEPLIST_PATH.write_text("/nope/definitely/*\n")
         decision, _ = wp.run_prune(NOW, apply=False, run=self._run_never(wp))
         assert decision == "stopped"
@@ -1492,11 +1367,6 @@ class TestKeepList:
         assert wp.keeplist_matches(entries, str(tmp_path / "worktrees" / "TKT-1"))
 
     def test_matching_is_case_insensitive(self, wp, tmp_path):
-        # load_keeplist_text requires the ENTRY to exist, so create exactly the
-        # path it is handed; keeplist_matches never requires the CANDIDATE to
-        # exist, so the case difference lives there instead. Creating one case
-        # and querying the other made this pass only on a case-INSENSITIVE
-        # filesystem: green on APFS, keeplist_entry_missing on CI's ext4.
         held = tmp_path / "tkt-9855"
         held.mkdir()
         entries, fatal = wp.load_keeplist_text(str(held))
@@ -1533,8 +1403,6 @@ class TestKeepList:
         assert info["summary"]["by_reason"].get("kept") == 1
 
     def test_a_held_tree_in_a_fetch_failing_clone_still_reports_kept(self, wp, monkeypatch, tmp_path):
-        # Holds are computed before the fetch loop, so by_reason["kept"] is the
-        # true hold count rather than being masked by fetch_failed.
         held = tmp_path / "held"
         held.mkdir()
         wp.KEEPLIST_PATH.write_text(str(held) + "\n")
@@ -1562,8 +1430,6 @@ class TestProtectedBranchesAndLocks:
 
     @pytest.mark.parametrize("branch", sorted({"main", "master"}))
     def test_protected_branch_is_never_deleted(self, wp, monkeypatch, branch):
-        # A worktree under a root sitting on main passes `is-ancestor` trivially,
-        # so without this the loop deletes the clone's main branch.
         cand = _cand(wp, path="/wt", branch=branch, head="h", clone="/clone")
         self._wire(wp, monkeypatch, cand)
         calls = []
@@ -1598,8 +1464,6 @@ class TestProtectedBranchesAndLocks:
 
     @pytest.mark.parametrize("line", ["locked", "locked engineer is bisecting"])
     def test_both_locked_spellings_are_parsed(self, wp, line):
-        # `git worktree lock --reason "..."` emits the second form, and that is
-        # the one an operator who cares actually uses.
         recs = wp._parse_worktree_porcelain(
             f"worktree /wt\nHEAD h\ndetached\n{line}\n\n")
         assert recs[0].get("locked") is True
@@ -1625,9 +1489,6 @@ class TestProtectedBranchesAndLocks:
         assert (row["action"], row["reason"]) == ("SKIP", "locked")
 
     def test_removal_passes_exactly_one_force(self, wp, monkeypatch):
-        # git's own hint for a locked tree is "use 'remove -f -f' to override".
-        # That single character is the guard; assert the RECORDED argv, because
-        # both this script's docstring and the installer mention `remove -f`.
         cand = _cand(wp, path="/wt", branch="feat", head="h", clone="/clone")
         self._wire(wp, monkeypatch, cand)
         seen = []
@@ -1680,12 +1541,10 @@ class TestTerminalityAndGhVisibility:
         def run(args, cwd=None):
             if args[0] == wp.GH_BIN:
                 return _RR(wp, 0, _gh_body(args, state, "h"))
-            return _RR(wp, 1)  # not an ancestor
+            return _RR(wp, 1)
         assert wp.gate_terminal(run, _cand(wp, branch="feat", head="h")) is expected
 
     def test_an_open_pr_beats_a_closed_one_on_the_same_head(self, wp):
-        # `pr view` returns ONE pr; a head carrying both a stale CLOSED and a
-        # live OPEN pr must not read as terminal.
         def run(args, cwd=None):
             if args[0] == wp.GH_BIN:
                 return _RR(wp, 0, json.dumps([
@@ -1696,19 +1555,15 @@ class TestTerminalityAndGhVisibility:
 
     @pytest.mark.parametrize("gh", ["fail", "empty"])
     def test_ancestor_is_a_peer_signal_not_a_gh_fallback(self, wp, gh):
-        # "no PR at all, but HEAD already on main" is removable today and must
-        # stay removable — including when gh answers perfectly with [].
         def run(args, cwd=None):
             if args[0] == wp.GH_BIN:
                 return _RR(wp, 1, "", "boom") if gh == "fail" else _RR(wp, 0, "[]")
             if "merge-base" in args:
-                return _RR(wp, 0)  # IS an ancestor
+                return _RR(wp, 0)
             return _RR(wp, 0, "")
         assert wp.gate_terminal(run, _cand(wp, branch="feat", head="h")) is True
 
     def test_gh_failures_are_counted(self, wp, monkeypatch):
-        # A gh failure is not a skip reason, so without this counter a broken gh
-        # is indistinguishable from a repo full of unmerged branches.
         cand = _cand(wp, path="/wt", branch="feat", head="h", clone="/clone")
         self._wire(wp, monkeypatch, cand)
 
@@ -1770,13 +1625,10 @@ class TestRemoteConfirmation:
         assert wp.gate_contained(run, self._det(wp)) == (True, None)
 
     def test_force_push_is_caught(self, wp):
-        # The name still exists; the history under it no longer holds X. Checking
-        # existence alone would confirm this, which is why the SHA is compared.
         run = self._run(wp, "rewritten\trefs/heads/gw/feat\n")
         assert wp.gate_contained(run, self._det(wp)) == (False, "remote_unconfirmed")
 
     def test_branch_deleted_server_side_is_caught(self, wp):
-        # GitHub's delete-head-branch-on-merge shape: rc=0 with no rows.
         run = self._run(wp, "")
         assert wp.gate_contained(run, self._det(wp)) == (False, "remote_unconfirmed")
 
@@ -1787,17 +1639,13 @@ class TestRemoteConfirmation:
     @pytest.mark.parametrize("ref,expected", [
         ("refs/remotes/origin/feat", ("origin", "feat")),
         ("refs/remotes/origin/gw/steal-phase-d", ("origin", "gw/steal-phase-d")),
-        ("refs/remotes/upstream/copilot/tkt-8696-x", ("upstream", "copilot/tkt-8696-x")),
+        ("refs/remotes/upstream/bot/tkt-8696-x", ("upstream", "bot/tkt-8696-x")),
         ("refs/heads/feat", None),
     ])
     def test_remote_and_branch_split_on_the_first_slash(self, wp, ref, expected):
-        # 15 of 17 remote-proven trees here carry a slash in the branch name, so
-        # splitting on the last slash would query a branch that does not exist.
         assert wp._remote_and_branch(ref) == expected
 
     def test_head_pseudo_ref_is_never_used_as_proof(self, wp):
-        # refs/remotes/origin/HEAD sorts before every branch name, and
-        # `ls-remote --heads origin HEAD` returns rc=0 with no rows.
         def run(args, cwd=None):
             if "for-each-ref" in args:
                 if wp.PROOF_REMOTE_NAMESPACE in args:
@@ -1809,9 +1657,6 @@ class TestRemoteConfirmation:
 
 class TestForensics:
     def test_removal_records_head_and_reflog(self, wp, monkeypatch, repo, tmp_path):
-        # 223 removals before this change recorded no SHA at all. After
-        # `worktree remove` the objects survive unreachable for ~2 weeks, so a
-        # logged SHA is the difference between irreversible and recoverable.
         wt = tmp_path / "w"
         _git(repo, "worktree", "add", "-q", "-b", "feat", str(wt))
         (wt / "u.txt").write_text("u")
@@ -1861,8 +1706,6 @@ class TestCapabilityProbe:
         assert wp.capabilities() == [t for t, _ in wp.CAPABILITY_IMPLS]
 
     def test_a_missing_implementation_drops_its_token(self, wp, monkeypatch):
-        # The point of a behavioural probe: deleting the code deletes the token,
-        # where a `grep keep.txt` over the file would still match the docstring.
         monkeypatch.delitem(wp.__dict__, "load_keeplist_text")
         assert "keeplist" not in wp.capabilities()
 
@@ -1871,7 +1714,6 @@ INSTALLER = REPO_ROOT / "deploy" / "scripts" / "worktree-prune-install.sh"
 
 
 def _render_plist(tmp_path, env_extra):
-    """Run the installer far enough to produce a plist, without touching launchd."""
     home = tmp_path / "home"
     (home / ".claude" / "scripts").mkdir(parents=True, exist_ok=True)
     (home / "Library" / "LaunchAgents").mkdir(parents=True, exist_ok=True)
@@ -1889,8 +1731,6 @@ def _render_plist(tmp_path, env_extra):
 
 
 def _plist_program_args(text):
-    """The <string> elements of ProgramArguments — NOT a substring search over
-    the file: the installer's own comments mention `--apply`."""
     import re
     block = re.search(r"<key>ProgramArguments</key>\s*<array>(.*?)</array>",
                       text, re.S).group(1)
@@ -1904,8 +1744,6 @@ class TestInstaller:
         assert "--apply" in _plist_program_args(plist)
 
     def test_no_apply_mode_omits_the_flag(self, tmp_path):
-        # The dry-run first tick is the only measurement taken before the first
-        # irreversible action, and it is impossible if the flag is hard-coded.
         _proc, plist = _render_plist(tmp_path, {"WORKTREE_PRUNE_INSTALL_APPLY": "0"})
         assert plist is not None
         assert "--apply" not in _plist_program_args(plist)
@@ -1925,8 +1763,6 @@ class TestInstaller:
         assert keep.read_text() == "/my/hold\n"
 
     def test_install_is_refused_over_a_script_without_the_keeplist(self, tmp_path):
-        # Behavioural probe. A grep would pass here, because the stub below still
-        # carries the word `keep.txt` in its docstring.
         home = tmp_path / "home"
         (home / ".claude" / "scripts").mkdir(parents=True)
         (home / "Library" / "LaunchAgents").mkdir(parents=True)
@@ -1945,9 +1781,6 @@ class TestInstaller:
         assert not list((home / "Library" / "LaunchAgents").glob("*.plist"))
 
     def test_gh_binding_survives_a_bare_re_run(self, tmp_path):
-        # `worktree-prune-install.sh` is documented as idempotent and its own
-        # header shows bare re-runs. Dropping the binding on one would return the
-        # loop to the 62-run defect with nothing reporting it.
         _proc, plist = _render_plist(tmp_path, {"WORKTREE_PRUNE_GH": "/opt/mygh"})
         assert "<string>/opt/mygh</string>" in plist
         proc2, plist2 = _render_plist(tmp_path, {})
@@ -1961,15 +1794,7 @@ class TestInstaller:
         assert "WORKTREE_PRUNE_GH is unset" in proc.stderr
 
 
-
 class TestArtifactLaundering:
-    """One artifact-named directory must not launder the path around it.
-
-    `_is_artifact_path` originally matched ANY segment, so a single `target/`,
-    `out/` or `dist/` anywhere in an ignored path made the whole thing read as
-    build output — reopening, inside the gate, the exact blind spot the gate
-    exists to close.
-    """
 
     @pytest.mark.parametrize("entry", [
         "docs/target/notes.md",
@@ -1977,7 +1802,7 @@ class TestArtifactLaundering:
         "src/dist/README-IMPORTANT.md",
         "docs/build/spec-v2.md",
         "planning/coverage/decisions.md",
-        "docs/superpowers/specs/design.md",
+        "docs/sidecar/specs/design.md",
     ])
     def test_a_middle_artifact_segment_does_not_launder_the_path(self, wp, entry):
         assert wp._is_artifact_path(entry) is False
@@ -1989,24 +1814,15 @@ class TestArtifactLaundering:
         "packages/web/node_modules/", "service/x.egg-info/", ".DS_Store",
     ])
     def test_real_artifact_shapes_still_pass(self, wp, entry):
-        # `git status --ignored` collapses a wholly-ignored directory, so the
-        # shapes that actually occur carry the name first or last, never buried.
         assert wp._is_artifact_path(entry) is True
 
     def test_only_the_first_or_last_segment_is_consulted(self, wp):
-        # Pins the rule itself: a name in the middle is inert in both directions.
-        assert wp._is_artifact_path("target/x/y") is True      # first
-        assert wp._is_artifact_path("x/y/target") is True      # last
-        assert wp._is_artifact_path("x/target/y") is False     # middle only
+        assert wp._is_artifact_path("target/x/y") is True
+        assert wp._is_artifact_path("x/y/target") is True
+        assert wp._is_artifact_path("x/target/y") is False
 
 
 class TestBranchDeleteProof:
-    """The proof that governs `git branch -D`, which the split must NOT widen.
-
-    Removal only needs the work terminal — the branch ref survives it. Deleting
-    that ref destroys commits, so it keeps the original, stricter proof. A CLOSED
-    (abandoned, never merged) PR is terminal and proves nothing.
-    """
 
     CASES = [
         ("merged at this head", "MERGED", "h", True),
@@ -2053,7 +1869,6 @@ class TestBranchDeleteProof:
         assert deleted is expect_delete, f"{label}: branch -D should be {expect_delete}"
 
     def test_a_closed_pr_removes_the_tree_but_keeps_the_branch(self, wp, monkeypatch):
-        # The whole point of the split, stated as one case.
         calls, info = self._drive(wp, monkeypatch, "CLOSED", "h")
         assert info["summary"]["removed"] == 1
         assert not any(_is_branch_delete(a) for a in calls)
@@ -2068,8 +1883,6 @@ class TestBranchDeleteProof:
         assert info["summary"]["removed"] == 0
 
     def test_gate_merged_is_reachable_from_production(self, wp, monkeypatch):
-        # The defect this class exists for: gate_merged was live, tested, and
-        # called from nowhere, so 9 green tests implied a proof that was unwired.
         seen = []
         real = wp.gate_merged
         monkeypatch.setattr(wp, "gate_merged",
@@ -2078,9 +1891,6 @@ class TestBranchDeleteProof:
         assert seen, "gate_merged must be consulted before `branch -D`"
 
     def test_gate_merged_uses_the_named_gh_binary(self, wp, monkeypatch):
-        # GH_BIN defaults to the literal "gh", so asserting argv[0] == GH_BIN is
-        # vacuous unless GH_BIN is bound to something else first: a hard-coded
-        # "gh" would satisfy it forever. Bind a distinctive path.
         monkeypatch.setattr(wp, "GH_BIN", "/opt/distinct-gh")
         seen = {}
 
@@ -2094,8 +1904,6 @@ class TestBranchDeleteProof:
 
 class TestKeepListHardening:
     def test_a_glob_that_matches_nothing_stops_the_run(self, wp, tmp_path):
-        # An existing PREFIX is not enough: `TKT-9855-*` (one hyphen too many)
-        # has a real prefix and holds nothing, which is the dangerous direction.
         (tmp_path / "worktrees" / "TKT-9855").mkdir(parents=True)
         entries, fatal = wp.load_keeplist_text(str(tmp_path / "worktrees" / "TKT-9855-*"))
         assert fatal == "keeplist_entry_missing"
@@ -2108,11 +1916,6 @@ class TestKeepListHardening:
         assert wp.keeplist_matches(entries, str(tmp_path / "worktrees" / "TKT-9855"))
 
     def test_wrong_case_directory_hold_still_covers_children(self, wp, tmp_path):
-        # Case-insensitivity and directory-containment are documented as
-        # composing; testing each axis alone leaves the crossing unguarded.
-        # Same fixture rule as test_matching_is_case_insensitive: the entry is
-        # the path actually created, and the candidate carries the case
-        # difference, so neither side needs a case-insensitive filesystem.
         held = tmp_path / "worktrees" / "tkt-9855"
         held.mkdir(parents=True)
         entries, fatal = wp.load_keeplist_text(str(held))
@@ -2123,18 +1926,12 @@ class TestKeepListHardening:
 
 class TestReflogIdentity:
     def test_reflog_is_read_from_the_worktrees_own_gitdir(self, wp, repo, tmp_path):
-        # Git de-duplicates the admin id with a numeric suffix, and this layout
-        # gives many worktrees the same basename, so deriving the path reads
-        # ANOTHER tree's reflog and reports a complete-looking wrong SHA list.
         a = tmp_path / "t1" / "repo"
         b = tmp_path / "t2" / "repo"
         a.parent.mkdir(parents=True)
         b.parent.mkdir(parents=True)
         _git(repo, "worktree", "add", "-q", "-b", "fa", str(a))
         _git(repo, "worktree", "add", "-q", "-b", "fb", str(b))
-        # Distinct, non-colliding names: the fixture already holds `a.txt`, and
-        # APFS is case-insensitive, so `A.txt` would overwrite it rather than
-        # create a new file.
         for wt, name in ((a, "alpha"), (b, "beta")):
             (wt / f"{name}.txt").write_text(name)
             _git(wt, "add", f"{name}.txt")
@@ -2170,8 +1967,6 @@ class TestGhFailedSurfaces:
         return run
 
     def test_gh_failed_reaches_check_log_and_last_scan(self, wp, monkeypatch, capsys):
-        # The in-memory summary is the one surface no operator sees. The plist
-        # runs without --json, so stdout, check.log and last-scan.json are it.
         cand = _cand(wp, path="/wt", branch="feat", head="h", clone="/clone")
         monkeypatch.setattr(wp, "enumerate_candidates", lambda r, cp, roots: [cand])
         monkeypatch.setattr(wp, "_load_active_records", lambda d: [])
@@ -2195,10 +1990,6 @@ class TestGhFailedSurfaces:
 
 class TestSubmoduleIgnoredContent:
     def test_ignored_file_inside_a_submodule_blocks_removal(self, wp, tmp_path):
-        # The superproject's `status --porcelain --ignored` is EMPTY for this
-        # shape — a submodule is a separate repository and --ignored does not
-        # descend. Every other submodule state surfaces as ` M sub` already.
-        # Feeding the gate a porcelain string cannot catch this; only a real repo can.
         up = tmp_path / "sub-origin"
         up.mkdir()
         _git(up, "init", "-q", "-b", "main", ".")
@@ -2235,8 +2026,6 @@ class TestSubmoduleIgnoredContent:
             "the submodule sweep is what must catch it"
 
     def test_the_scan_path_also_consults_the_submodule_sweep(self, wp, monkeypatch):
-        # Testing gate_ignored directly leaves the wiring in `_scan` unguarded:
-        # `_scan` computes ignored_ok itself rather than calling gate_ignored.
         cand = _cand(wp, path="/wt", branch="feat", head="h", clone="/clone")
         monkeypatch.setattr(wp, "enumerate_candidates", lambda r, cp, roots: [cand])
         monkeypatch.setattr(wp, "_load_active_records", lambda d: [])
@@ -2271,16 +2060,7 @@ class TestSubmoduleIgnoredContent:
         assert wp.gate_ignored(run, _cand(wp, path="/wt")) is False
 
 
-
 class TestPostRemovalBlindness:
-    """Everything the delete step needs must be computed while the tree EXISTS.
-
-    `gate_merged` shells out with cwd = the worktree and `_worktree_reflog_shas`
-    reads that worktree's gitdir. After `remove --force` both fail rc!=0 on the
-    missing directory — silently, in the safe direction. A stub `run` that
-    ignores `cwd` is green through all of it, which is why these use a `run` that
-    honours cwd the way `_default_run` does.
-    """
 
     def _cwd_honouring_run(self, wp, removed, state="MERGED", oid="h"):
         def run(args, cwd=None):
@@ -2294,7 +2074,7 @@ class TestPostRemovalBlindness:
             if args[0] == wp.GH_BIN:
                 return _RR(wp, 0, _gh_body(args, state, oid))
             if "merge-base" in args:
-                return _RR(wp, 1)          # squash-merged: never an ancestor
+                return _RR(wp, 1)
             if "status" in args:
                 return _RR(wp, 0, "")
             if "rev-parse" in args:
@@ -2306,10 +2086,6 @@ class TestPostRemovalBlindness:
         return run
 
     def test_squash_merged_branch_is_still_deleted_after_removal(self, wp, monkeypatch):
-        # The inverted defect: with the proof evaluated after `remove`, gh can
-        # never answer, every branch falls through to `is-ancestor`, and a
-        # squash-merged branch is never an ancestor — so the loop would refuse
-        # nearly every branch while logging it as intentional.
         cand = _cand(wp, path="/wt", branch="feat", head="h", clone="/clone")
         monkeypatch.setattr(wp, "enumerate_candidates", lambda r, cp, roots: [cand])
         monkeypatch.setattr(wp, "_load_active_records", lambda d: [])
@@ -2329,7 +2105,6 @@ class TestPostRemovalBlindness:
             "the merge proof must be evaluated while the worktree still exists"
 
     def test_closed_pr_branch_still_refused_with_a_cwd_honouring_run(self, wp, monkeypatch):
-        # The same ordering must not accidentally start deleting CLOSED branches.
         cand = _cand(wp, path="/wt", branch="feat", head="h", clone="/clone")
         monkeypatch.setattr(wp, "enumerate_candidates", lambda r, cp, roots: [cand])
         monkeypatch.setattr(wp, "_load_active_records", lambda d: [])
@@ -2348,9 +2123,6 @@ class TestPostRemovalBlindness:
         assert not any(_is_branch_delete(a) for a in calls)
 
     def test_removed_rows_keep_the_pre_removal_reflog(self, wp, monkeypatch, repo, tmp_path):
-        # last-scan.json is the file deploy step 2 tells the operator to read.
-        # Recomputing the reflog after removal records [] for exactly the trees
-        # that were destroyed.
         wt = tmp_path / "victim"
         _git(repo, "worktree", "add", "-q", "-b", "feat", str(wt))
         (wt / "u.txt").write_text("u")
@@ -2371,9 +2143,9 @@ class TestPostRemovalBlindness:
             if args and args[0] == wp.GH_BIN:
                 return _RR(wp, 0, _gh_body(args, "MERGED", head))
             if "fetch" in args:
-                return _RR(wp, 0)          # the fixture clone has no remote
+                return _RR(wp, 0)
             if "merge-base" in args:
-                return _RR(wp, 0)          # treat as merged; gh agrees above
+                return _RR(wp, 0)
             return gitreal(args, cwd)
 
         _d, info = wp.run_prune(NOW, apply=True, run=run, clone_parents=["/cp"],
@@ -2386,8 +2158,6 @@ class TestPostRemovalBlindness:
         assert lost in {c["path"]: c for c in snap["candidates"]}[str(wt)]["reflog"]
 
     def test_the_null_sha_is_not_recorded(self, wp, repo, tmp_path):
-        # `logs/HEAD`'s creation line carries 0000…0000, which passes a bare
-        # 40-hex-char test and would sit in a list presented as recoverable.
         wt = tmp_path / "w"
         _git(repo, "worktree", "add", "-q", "-b", "f", str(wt))
         cand = wp.Candidate(path=str(wt), head="", branch="f", detached=False,
@@ -2397,8 +2167,6 @@ class TestPostRemovalBlindness:
         assert "0" * 40 not in shas
 
     def test_a_failed_removal_still_records_the_shas(self, wp, monkeypatch):
-        # `remove --force` can delete the directory and still exit non-zero, so
-        # the SHAs must be logged on this path too — they are already in hand.
         cand = _cand(wp, path="/wt", branch="feat", head="h", clone="/clone")
         monkeypatch.setattr(wp, "enumerate_candidates", lambda r, cp, roots: [cand])
         monkeypatch.setattr(wp, "_load_active_records", lambda d: [])
@@ -2430,12 +2198,6 @@ class TestPostRemovalBlindness:
 
 
 class TestIgnoredChokePoint:
-    """N1: the composition lived in three places and only one was exercised.
-
-    The apply-time copy is the last look before the destructive command — the one
-    that catches content appearing in the scan→apply window, which is exactly when
-    a worker writes a design doc. Removing it left the whole suite green.
-    """
 
     def _drive(self, wp, monkeypatch, sub_out="", sub_rc=0, apply=True,
                at_apply_only=False, status_at_apply=None):
@@ -2449,7 +2211,7 @@ class TestIgnoredChokePoint:
             if "submodule" in args:
                 seen["sub"] += 1
                 if at_apply_only and seen["sub"] == 1:
-                    return _RR(wp, 0, "")      # clean at scan, dirty at apply
+                    return _RR(wp, 0, "")
                 return _RR(wp, sub_rc, sub_out)
             rr = _infra_rr(wp, args)
             if rr is not None:
@@ -2460,8 +2222,6 @@ class TestIgnoredChokePoint:
                 return _RR(wp, 0, _gh_body(args, "MERGED", "h"))
             if "status" in args:
                 seen["status"] += 1
-                # The SUPERPROJECT half arrives as check_ignored's `text` arg, so
-                # a stale-text caller is invisible unless this differs too.
                 if status_at_apply is not None and seen["status"] > 1:
                     return _RR(wp, 0, status_at_apply)
                 return _RR(wp, 0, "")
@@ -2475,11 +2235,9 @@ class TestIgnoredChokePoint:
                             roots=["/r"], self_path="/elsewhere")
 
     def test_superproject_content_appearing_in_the_window_blocks(self, wp, monkeypatch):
-        # A worker writing docs/superpowers/specs/x-design.md between the scan
-        # and the removal: gitignored, in the SUPERPROJECT, not a submodule.
         _d, info = self._drive(
             wp, monkeypatch,
-            status_at_apply="!! docs/superpowers/specs/x-design.md\n")
+            status_at_apply="!! docs/sidecar/specs/x-design.md\n")
         row = {r["path"]: r for r in info["results"]}["/wt"]
         assert row["action"] == "SKIP"
         assert row["reason"] == "toctou_ignored_content"
@@ -2492,7 +2250,6 @@ class TestIgnoredChokePoint:
         assert (row["action"], row["reason"]) == ("SKIP", "ignored_content")
 
     def test_content_appearing_in_the_scan_to_apply_window_blocks(self, wp, monkeypatch):
-        # Only the apply-time copy can see this; the scan said clean.
         _d, info = self._drive(wp, monkeypatch, "!! sub/notes/\n", at_apply_only=True)
         row = {r["path"]: r for r in info["results"]}["/wt"]
         assert row["action"] == "SKIP"
@@ -2500,8 +2257,6 @@ class TestIgnoredChokePoint:
         assert info["summary"]["removed"] == 0
 
     def test_a_broken_sweep_is_not_reported_as_successful_protection(self, wp, monkeypatch):
-        # N2: `ignored_content` reads as "the gate worked". A sweep that could not
-        # RUN must say so, or the widening goes dead while last-scan.json looks fine.
         _d, info = self._drive(wp, monkeypatch, "", sub_rc=1, apply=False)
         row = {r["path"]: r for r in info["results"]}["/wt"]
         assert row["reason"] == "submodule_sweep_failed"
@@ -2515,8 +2270,6 @@ class TestIgnoredChokePoint:
         assert r1 != r2
 
     def test_every_caller_routes_through_the_choke_point(self, wp, monkeypatch):
-        # Pins the generator, not the instances: if a call site stops using
-        # check_ignored, this counts fewer visits than there are gate evaluations.
         calls = []
         real = wp.check_ignored
         monkeypatch.setattr(wp, "check_ignored",
@@ -2527,9 +2280,6 @@ class TestIgnoredChokePoint:
 
 class TestHoldListDocsMatchTheRule:
     def test_the_shipped_template_does_not_teach_a_loop_stopping_example(self, wp, tmp_path):
-        # The installer writes keep.txt only if absent, so whatever ships is
-        # permanent for anyone installing from this commit. Every uncommented
-        # example must satisfy the rule the code enforces.
         _proc, _plist = _render_plist(tmp_path, {})
         keep = tmp_path / "home" / ".claude" / "dockwright" / "worktree-prune" / "keep.txt"
         body = keep.read_text()
@@ -2540,32 +2290,14 @@ class TestHoldListDocsMatchTheRule:
         assert (entries, fatal) == ([], None), \
             "the shipped template must not stop the loop as written"
 
-    def test_the_template_states_the_matches_nothing_rule(self, tmp_path):
-        _proc, _plist = _render_plist(tmp_path, {})
-        keep = tmp_path / "home" / ".claude" / "dockwright" / "worktree-prune" / "keep.txt"
-        body = keep.read_text().lower()
-        assert "matches no existing path" in body or "match something that exists" in body
-        assert "parent directory is not enough" in body
-
-
 
 class TestFailedGatesFidelity:
-    """`failed_gates` must agree with `reason`, for every gate shape.
-
-    `decide` treats any tuple-valued gate as carrying its own reason. The loop
-    that builds `failed_gates` reads the same dict, so it has to enumerate the
-    same way — classifying by gate NAME meant a failing tuple gate (truthy!) was
-    recorded as a pass, and the row contradicted itself on the gate carrying the
-    most weight.
-    """
 
     def _row(self, wp, monkeypatch, gates, cand=None):
         cand = cand or _cand(wp, path="/wt", branch="feat", head="h", clone="/clone")
         monkeypatch.setattr(wp, "enumerate_candidates", lambda r, cp, roots: [cand])
         monkeypatch.setattr(wp, "_load_active_records", lambda d: [])
         monkeypatch.setattr(wp, "_collect_lsof_cwds", lambda r: [])
-        # Drive the gate values directly: this is about the bookkeeping, not the
-        # gates, and forcing each real gate would not reach every shape.
         monkeypatch.setattr(wp, "_porcelain", lambda r, c: "")
         monkeypatch.setattr(wp, "clean_from_porcelain", lambda x: gates["clean"])
         monkeypatch.setattr(wp, "check_ignored",
@@ -2591,22 +2323,15 @@ class TestFailedGatesFidelity:
         return {"clean": True, "ignored_ok": (True, None), "in_progress_clear": True,
                 "contained": (True, None), "terminal": True, "unowned": True}
 
-    # Derived from the gate set, not hand-listed — the promise the comment used
-    # to make while the decorator quietly omitted `contained`, the original
-    # tuple-valued gate and the very shape this class exists for. `kept` is
-    # excluded because it is recorded on the passing branch, not the failing one.
     @pytest.mark.parametrize("key", sorted(set(ALL_PASS) - {"kept"}))
     def test_every_failing_gate_appears_in_failed_gates(self, wp, monkeypatch, key):
         gates = self._pass_all()
         cand = None
         if key == "contained":
-            # _scan short-circuits containment for a branch worktree, so the
-            # patched gate can only take effect on a detached candidate.
             cand = wp.Candidate(path="/wt", head="h", branch=None, detached=True,
                                 clone="/clone")
             gates["contained"] = (False, "uncontained")
         elif key == "not_locked":
-            # Comes from the Candidate, not from a patchable function.
             cand = wp.Candidate(path="/wt", head="h", branch="feat", detached=False,
                                 clone="/clone", locked=True)
         elif isinstance(gates.get(key), tuple):
@@ -2625,7 +2350,6 @@ class TestFailedGatesFidelity:
         assert row["failed_gates"], "a SKIP must name at least one failing gate"
 
     def test_reason_and_failed_gates_cannot_disagree(self, wp, monkeypatch):
-        # Two gates failing at once: the reported reason must be among the misses.
         gates = self._pass_all()
         gates["ignored_ok"] = (False, "ignored_content")
         gates["unowned"] = False
@@ -2635,9 +2359,6 @@ class TestFailedGatesFidelity:
         assert "unowned" in row["failed_gates"]
 
     def test_contained_has_a_meaningful_default_reason(self, wp):
-        # `None` would fall through to "error", which is the string _scan's
-        # except-handler produces — a real failure and a crash would be
-        # indistinguishable in by_reason.
         defaults = dict(wp.DECIDE_ORDER)
         assert defaults["contained"] == "uncontained"
         assert wp.decide(_cand(wp), {**{k: True for k, _ in wp.DECIDE_ORDER},

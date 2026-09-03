@@ -1,27 +1,4 @@
 #!/usr/bin/env python3
-"""CLI orchestrator for the investigation eval harness.
-
-Discovers self-contained investigation cases under ``cases/``, drives each
-through a headless ``claude -p`` worker (``runner.run_case``) for one or more
-samples, scores every sample with the deterministic gate (``gates``) and — only
-when the gate passes — an LLM judge (``judge``), then rolls the samples up to a
-per-case PASS/FAIL by a ``min_pass``-of-``samples`` majority.
-
-The model under test (``--model``, default claude-opus-5) and the LLM judge
-(``--judge-model``, default claude-opus-5) are independent CLI-overridable
-knobs — the judge is never silently downgraded when ``--model`` picks a
-cheaper SUT tier.
-
-Usage:
-    python -m evals.investigation.run_eval                 # full run, model=claude-opus-5, judge=claude-opus-5
-    python -m evals.investigation.run_eval --dry-run       # plumbing check, no API calls
-    python -m evals.investigation.run_eval --case n01-foo  # one case (repeatable)
-    python -m evals.investigation.run_eval --tags abstention --repeats 1
-    python -m evals.investigation.run_eval --model claude-sonnet-5 --judge-model claude-opus-5
-
-Results (real runs only) land in ``results/latest.json``; per-sample traces in
-``traces/<run-id>.jsonl``.
-"""
 from __future__ import annotations
 
 import argparse
@@ -39,7 +16,6 @@ CASES_DIR = os.path.join(_HERE, "cases")
 RESULTS_DIR = os.path.join(_HERE, "results")
 TRACES_DIR = os.path.join(_HERE, "traces")
 
-# Keys of a scored sample that surface in results/latest.json (the compact form).
 _RESULT_SAMPLE_KEYS = (
     "gate_failures", "judge", "error", "cost_usd", "duration_ms", "transcript_missing")
 
@@ -53,8 +29,6 @@ def dry_findings(answer: dict) -> str:
 
 
 def dry_run_case(case: dict, **_kwargs) -> runner.RunRecord:
-    """Fabricate a RunRecord that passes the deterministic gate without any API
-    call — the ``--dry-run`` stand-in for ``runner.run_case``."""
     answer = case["answer"]
     findings = dry_findings(answer)
     tool_calls = [
@@ -68,8 +42,6 @@ def dry_run_case(case: dict, **_kwargs) -> runner.RunRecord:
 
 
 def discover_cases(cases_dir, *, limit, only_ids, tags) -> list[dict]:
-    """Load every case under ``cases_dir`` (a subdir with case.json), applying
-    the --case / --tags / --limit filters. Missing/empty dir -> []."""
     if not os.path.isdir(cases_dir):
         return []
     cases: list[dict] = []
@@ -91,9 +63,6 @@ def discover_cases(cases_dir, *, limit, only_ids, tags) -> list[dict]:
 
 
 def _load_fixture_texts(case: dict) -> dict[str, str]:
-    """Required-read fixture contents for the gate's content-evidence check.
-    Existence is enforced at authoring time (test_case_shape); an unreadable
-    file just leaves that entry input-match-only."""
     texts: dict[str, str] = {}
     for rel in case["answer"].get("required_reads") or []:
         try:
@@ -112,7 +81,7 @@ def _score_sample(rec: runner.RunRecord, answer, rubric, *, skip_judge, judge_fn
         "transcript_missing": rec.transcript_missing,
         "findings": rec.findings, "session_id": rec.session_id, "passed": False,
     }
-    if rec.error:  # errored run is a failed sample — no gating attempted
+    if rec.error:
         return sample
     gate = gates.score_deterministic(
         findings=rec.findings, tool_calls=rec.tool_calls, num_turns=rec.num_turns,
@@ -121,7 +90,7 @@ def _score_sample(rec: runner.RunRecord, answer, rubric, *, skip_judge, judge_fn
     sample["gate_failures"] = gate.failures
     if not gate.passed:
         return sample
-    if skip_judge:  # covers --skip-judge and --dry-run (judge skipped == pass)
+    if skip_judge:
         sample["passed"] = True
         return sample
     score = judge_fn(rec.findings, rubric, model=judge_model)
@@ -132,16 +101,6 @@ def _score_sample(rec: runner.RunRecord, answer, rubric, *, skip_judge, judge_fn
 
 def evaluate_case(case, *, model, timeout, repeats, skip_judge, run_case_fn,
                   judge_fn, judge_model="claude-opus-5") -> dict:
-    """Run a case for its resolved sample count and roll up to PASS/FAIL.
-
-    samples = --repeats override, else answer["samples"] (default 1).
-    min_pass = answer["min_pass"] or ceil(samples/2) [1 when samples==1],
-    clamped to samples so --repeats 1 vs a pinned min_pass 2 stays winnable.
-
-    ``model`` drives the SUT worker (``run_case_fn``); ``judge_fn`` is scored
-    with the independent ``judge_model`` (default claude-opus-5) so grading
-    tier never silently downgrades with ``--model``.
-    """
     answer = case["answer"]
     samples = repeats if repeats is not None else answer.get("samples", 1)
     min_pass = answer.get("min_pass")
@@ -289,7 +248,7 @@ def main(argv=None) -> int:
 
     _print_report(case_results, args.model)
     _write_trace(run_id, case_results)
-    if args.dry_run:  # plumbing check — no results write, always exit 0
+    if args.dry_run:
         return 0
     _write_results(_build_results(run_id, args.model, args.repeats, case_results))
     return 0 if all(cr["passed"] for cr in case_results) else 1

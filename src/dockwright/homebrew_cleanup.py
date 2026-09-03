@@ -1,11 +1,3 @@
-"""Surgically remove a Homebrew system-python editable install of a distribution.
-
-The canonical install is the tool's own venv. A duplicate editable install in Homebrew's
-externally-managed system python (PEP 668) puts a second console script on PATH and a
-global .pth that a worktree `pip install -e` can hijack. This removes ONLY the named
-distribution's own artifacts (pip uninstall by name uses the package's RECORD) — never
-unrelated Homebrew packages.
-"""
 from __future__ import annotations
 
 import argparse
@@ -32,11 +24,6 @@ def _under(dist_name: str) -> str:
 
 
 def find_brew_editable(brew_prefix, dist_name: str) -> list:
-    """Homebrew interpreters with an editable install of dist_name.
-
-    Detection key: `__editable__.<dist>-*.pth` OR `<dist>-*.dist-info`. The
-    `__editable___<dist>_*finder.py` form is collected if present, never required.
-    """
     brew_prefix = Path(brew_prefix)
     dist = _under(dist_name)
     out = []
@@ -49,13 +36,12 @@ def find_brew_editable(brew_prefix, dist_name: str) -> list:
         if not pths and not distinfos:
             continue
         artifacts = pths + distinfos + list(site.glob(f"__editable___{dist}_[0-9]*finder.py"))
-        python_bin = brew_prefix / "bin" / site.parent.name  # .../python3.14/site-packages -> python3.14
+        python_bin = brew_prefix / "bin" / site.parent.name
         out.append(BrewEditable(python_bin=python_bin, site_packages=site, artifacts=artifacts))
     return out
 
 
 def find_stray_console_script(bin_dir, console_script: str, brew_prefix) -> Path | None:
-    """Return bin_dir/console_script iff it exists and its shebang points into brew_prefix."""
     path = Path(bin_dir) / console_script
     if not path.is_file():
         return None
@@ -91,7 +77,7 @@ def clean(brew_prefix, dist_name: str, console_script: str, *, bin_dir=None,
             run([str(e.python_bin), "-m", "pip", "uninstall", "-y",
                  "--break-system-packages", dist_name], check=False)
             report["uninstalled"].append(str(e.python_bin))
-        for art in e.artifacts:    # remove anything pip didn't (e.g. a hijacked orphan .pth)
+        for art in e.artifacts:
             _remove(art)
     if stray and stray.exists():
         stray.unlink()

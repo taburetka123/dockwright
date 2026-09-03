@@ -85,8 +85,6 @@ def test_strip_is_idempotent_and_does_not_mutate_input():
     assert json.dumps(settings) == snapshot
 
 def test_strip_resolves_bin_from_settings_itself():
-    # No extra_bins passed: the canonical Stop hook names the bin; the stale
-    # manager-tts hook using the SAME bin must still strip.
     settings = {"hooks": {
         "Stop": [{"hooks": [_hook(f"bash -c '$PPID {ABS} stop'")]}],
         "PreCompact": [{"hooks": [_hook(f"bash -c '$PPID {ABS} manager-tts'")]}],
@@ -119,7 +117,6 @@ class FakeRunner:
 
 @pytest.fixture
 def fake_install(tmp_path, monkeypatch):
-    """A complete fake installed footprint + foreign sentinels, fully under tmp."""
     home = tmp_path / "home"
     claude = home / ".claude"; codex = home / ".codex"
     lagents = home / "LaunchAgents"; lbin = home / ".local" / "bin"
@@ -133,13 +130,10 @@ def fake_install(tmp_path, monkeypatch):
                    f'[paths]\noverlay_dir = "{tmp_path / "no-overlay"}"\n')
     monkeypatch.setenv("DOCKWRIGHT_CONFIG", str(cfg))
 
-    # Deterministic tool presence: never depend on the host having claude /
-    # codex / launchctl on PATH (and never risk resolving the real ones).
     monkeypatch.setattr(
         un.shutil, "which",
         lambda name: f"/fake/bin/{name}" if name in ("claude", "codex", "launchctl") else None)
 
-    # fake repo: deploy mirror + venv
     (repo / "deploy" / "agents").mkdir(parents=True)
     (repo / "deploy" / "agents" / "manager.core.md").write_text("core")
     (repo / "deploy" / "agents" / "worker.core.md").write_text("core")
@@ -156,7 +150,6 @@ def fake_install(tmp_path, monkeypatch):
     venv_bin = repo / ".venv" / "bin"; venv_bin.mkdir(parents=True)
     orch_bin = venv_bin / "orchestrator"; orch_bin.write_text("#!/bin/sh\n")
 
-    # deployed claude surface
     (claude / "agents").mkdir(parents=True)
     (claude / "agents" / "manager.md").write_text("deployed")
     (claude / "agents" / "worker.md").write_text("deployed")
@@ -206,7 +199,6 @@ def fake_install(tmp_path, monkeypatch):
         },
     }))
 
-    # deployed codex surface (+ foreign sentinels)
     (codex / "agents").mkdir(parents=True)
     (codex / "agents" / "manager.toml").write_text("t")
     (codex / "agents" / "worker.toml").write_text("t")
@@ -223,7 +215,7 @@ def fake_install(tmp_path, monkeypatch):
     (codex / "hooks.json").write_text(json.dumps({
         "hooks": {"Stop": [{"hooks": [_hook(f"bash -c 'CLAUDE_PARENT_PID=$PPID {abs_bin} stop'")]}]}}))
     (codex / "hooks.json.bak.555").write_text("{}")
-    (codex / "config.toml").write_text("USER CODEX CONFIG")  # must survive
+    (codex / "config.toml").write_text("USER CODEX CONFIG")
 
     lagents.mkdir(parents=True)
     (lagents / "com.dw-test.gardener-gate.plist").write_text("<plist/>")
@@ -299,7 +291,6 @@ def test_full_footprint_removed_foreign_preserved(fake_install):
                  fx["repo"] / ".venv"):
         assert not gone.exists() and not gone.is_symlink(), f"should be gone: {gone}"
 
-    # foreign survivors, byte-identical
     assert (claude / "agents" / "foreign-agent.md").read_text() == "FOREIGN"
     assert (claude / "commands" / "foreign-cmd.md").read_text() == "FOREIGN"
     assert (claude / "skills" / "foreign-skill" / "SKILL.md").read_text() == "FOREIGN"
@@ -309,9 +300,8 @@ def test_full_footprint_removed_foreign_preserved(fake_install):
     assert (codex / "skills" / "foreign-tool" / "SKILL.md").read_text() == "FOREIGN"
     assert (codex / "config.toml").read_text() == "USER CODEX CONFIG"
     assert (fx["lagents"] / "com.other-tool.something.plist").read_text() == "FOREIGN"
-    assert codex.exists()  # config.toml keeps it alive; agents/commands stay (foreign files)
+    assert codex.exists()
 
-    # settings.json stripped, not deleted; foreign hook + top-level key survive
     out = json.loads((claude / "settings.json").read_text())
     assert out["model"] == "opus"
     cmds = [h["command"] for blocks in out.get("hooks", {}).values()
@@ -320,7 +310,6 @@ def test_full_footprint_removed_foreign_preserved(fake_install):
     baks = list(claude.glob("settings.json.uninstall-bak.*"))
     assert len(baks) == 1 and "orchestrator" in baks[0].read_text()
 
-    # subprocess effects went through the runner only
     bootouts = [c for c in runner.calls if c[:2] == ["launchctl", "bootout"]]
     assert {c[2].rsplit("/", 1)[1] for c in bootouts} == {
         "com.dw-test.gardener-gate", "com.dw-test.gardener-frontier"}
@@ -350,7 +339,7 @@ def test_symlink_plan_removes_dockwright_target(fake_install):
 
 
 def test_symlink_plan_removes_orchestrator_target(fake_install):
-    fx = fake_install  # fixture default: link -> repo/.venv/bin/orchestrator
+    fx = fake_install
     link = fx["lbin"] / "orchestrator"
     plan = un.build_plan(_roots_from(fx))
     assert link in plan.remove
@@ -369,11 +358,8 @@ def test_symlink_plan_keeps_foreign_target_with_note(fake_install):
 
 
 def test_symlink_plan_removes_both_link_names(fake_install):
-    """setup.sh creates a `dockwright` link while the pre-rename `orchestrator`
-    link may still exist — uninstall inspects BOTH and removes each whose target
-    is a recognized venv binary."""
     fx = fake_install
-    orch_link = fx["lbin"] / "orchestrator"  # fixture default → orchestrator bin
+    orch_link = fx["lbin"] / "orchestrator"
     dock_bin = fx["repo"] / ".venv" / "bin" / "dockwright"
     dock_bin.write_text("#!/bin/sh\n")
     dock_link = fx["lbin"] / "dockwright"
@@ -384,8 +370,6 @@ def test_symlink_plan_removes_both_link_names(fake_install):
 
 
 def test_symlink_plan_keeps_foreign_dockwright_link_with_note(fake_install):
-    """The keep-with-note discipline applies to the new `dockwright` link name
-    too: a dockwright link pointing at a non-venv target is kept, not removed."""
     fx = fake_install
     foreign = fx["tmp"] / "foreign-bin"
     foreign.write_text("#!/bin/sh\n")
@@ -410,7 +394,7 @@ def test_codex_dir_pruned_when_fully_emptied(fake_install):
 def test_dry_run_removes_nothing(fake_install):
     fx = fake_install
     runner = FakeRunner()
-    assert un.main(fx["argv"][1:] + ["--dry-run"], run=runner) == 0  # drop --yes
+    assert un.main(fx["argv"][1:] + ["--dry-run"], run=runner) == 0
     assert (fx["claude"] / "agents" / "manager.md").exists()
     assert (fx["repo"] / ".venv").exists()
     assert runner.calls == []
@@ -420,7 +404,7 @@ def test_non_tty_without_yes_exits_2(fake_install, monkeypatch):
     fx = fake_install
     monkeypatch.setattr("sys.stdin", type("S", (), {"isatty": staticmethod(lambda: False)})())
     runner = FakeRunner()
-    assert un.main(fx["argv"][1:], run=runner) == 2  # argv without --yes
+    assert un.main(fx["argv"][1:], run=runner) == 2
     assert (fx["claude"] / "agents" / "manager.md").exists()
     assert runner.calls == []
 
@@ -468,11 +452,6 @@ def test_corrupt_settings_json_fails_closed(fake_install):
 
 
 def test_uninstall_removes_both_homes_and_compat_symlinks(tmp_path, monkeypatch):
-    """Post-migration (State B) layout: real state lives under ~/.claude/dockwright/,
-    with compat symlinks at the legacy top-level paths. Uninstall must remove the
-    new dockwright/ tree AND every now-dangling legacy compat symlink (including the
-    `orchestrator -> dockwright` state-root link) — while keeping the operator
-    overlay."""
     home = tmp_path / "home"
     claude = home / ".claude"
     dock = claude / "dockwright"
@@ -488,7 +467,6 @@ def test_uninstall_removes_both_homes_and_compat_symlinks(tmp_path, monkeypatch)
     for stop in stops:
         (dock / stop).write_text("")
 
-    # compat symlinks at the legacy top-level names (what migrate-state leaves).
     links = {
         "orchestrator": "dockwright",
         "manager-memory": "dockwright/manager-memory",
@@ -503,7 +481,6 @@ def test_uninstall_removes_both_homes_and_compat_symlinks(tmp_path, monkeypatch)
     for name, target_rel in links.items():
         (claude / name).symlink_to(target_rel)
 
-    # operator overlay (new home) + its own compat symlink — both KEPT.
     overlay = claude / "dockwright-overlay"
     (overlay / "commands").mkdir(parents=True)
     (claude / "orchestrator-overlay").symlink_to("dockwright-overlay")
@@ -531,15 +508,12 @@ def test_uninstall_removes_both_homes_and_compat_symlinks(tmp_path, monkeypatch)
     plan = un.build_plan(roots)
     un.execute_plan(plan, run=FakeRunner())
 
-    # new dockwright/ home fully removed
     assert not dock.exists() and not dock.is_symlink()
-    # every legacy compat symlink removed — none left dangling
     for name in links:
         p = claude / name
         assert not p.exists() and not p.is_symlink(), f"compat symlink survived: {name}"
-    # operator overlay content kept (the compat symlink points at kept content)
     assert (overlay / "commands").exists()
-    assert not (claude / "statusline-command.sh").exists()  # deployed, removed
+    assert not (claude / "statusline-command.sh").exists()
 
 
 def _drift_notes(plan):
@@ -547,10 +521,6 @@ def _drift_notes(plan):
 
 
 def test_drift_backups_are_reported_and_never_removed(fake_install, capsys):
-    """compose writes <agent>.md.bak(.N) when a deployed agent file held text that
-    exists in NEITHER the repo core NOR the operator overlay. Deleting those is the
-    exact silent destruction the drift guard prevents — so uninstall must preserve
-    them AND say so; preserve-and-hide only moves the surprise later."""
     fx = fake_install
     agents = fx["claude"] / "agents"
     (agents / "manager.md.bak").write_text("PRECIOUS operator text\n")
@@ -563,15 +533,15 @@ def test_drift_backups_are_reported_and_never_removed(fake_install, capsys):
         assert agents / bak not in plan.remove, bak
     note = _drift_notes(plan)
     assert len(note) == 1, plan.notes
-    assert "3" in note[0]                                  # how many
-    assert str(agents) in note[0]                          # where
+    assert "3" in note[0]
+    assert str(agents) in note[0]
     for bak in ("manager.md.bak", "manager.md.bak.2", "worker.md.bak"):
         assert bak in note[0], (bak, note[0])
-    assert "no home in the repo or your overlay" in note[0]   # what they contain
-    assert "your call" in note[0]                             # whose decision it is
+    assert "no home in the repo or your overlay" in note[0]
+    assert "your call" in note[0]
 
     assert un.main(fx["argv"], run=FakeRunner()) == 0
-    assert "drift backup" in capsys.readouterr().out       # the operator actually sees it
+    assert "drift backup" in capsys.readouterr().out
     assert (agents / "manager.md.bak").read_text() == "PRECIOUS operator text\n"
     assert (agents / "manager.md.bak.2").read_text() == "PRECIOUS second copy\n"
     assert (agents / "worker.md.bak").read_text() == "PRECIOUS worker text\n"
@@ -582,23 +552,16 @@ def test_no_drift_backups_means_no_extra_note(fake_install):
 
 
 def test_kept_baks_are_announced_even_when_the_plan_is_empty(tmp_path, monkeypatch, capsys):
-    """The R8 corner: a drift .bak is never planned for removal, so on a host with
-    neither CLI on PATH and everything else already gone, plan.empty() is True while
-    the backup sits there. Preserve-and-hide is exactly the surprise this branch
-    forbids, so the Nothing-to-uninstall path must still name the backup."""
     home = tmp_path / "home"
     claude = home / ".claude"
     agents = claude / "agents"
     agents.mkdir(parents=True)
-    # A re-run: the deployed manager.md AND the compose stamp are already gone; only
-    # the bak survives. core_names then comes from the repo glob, not the stamp — so
-    # nothing is left to remove, yet the backup must still be named.
     (agents / "manager.md.bak").write_text("PRECIOUS operator text\n")
     monkeypatch.setenv("HOME", str(home))
     cfg = tmp_path / "dockwright.toml"
     cfg.write_text(f'[paths]\noverlay_dir = "{tmp_path / "no-overlay"}"\n')
     monkeypatch.setenv("DOCKWRIGHT_CONFIG", str(cfg))
-    monkeypatch.setattr(un.shutil, "which", lambda name: None)  # no claude/codex -> no mcp
+    monkeypatch.setattr(un.shutil, "which", lambda name: None)
 
     repo = tmp_path / "repo"
     (repo / "deploy" / "agents").mkdir(parents=True)
@@ -610,7 +573,7 @@ def test_kept_baks_are_announced_even_when_the_plan_is_empty(tmp_path, monkeypat
         manager_memory_root=claude / "manager-memory", xdg_config_dir=home / ".config" / "dockwright")
     plan = un.build_plan(roots)
 
-    assert plan.empty()                                        # the corner: nothing to remove
+    assert plan.empty()
     assert plan.kept_baks == [agents / "manager.md.bak"]
     argv = ["--yes", "--claude-dir", str(claude), "--codex-dir", str(home / ".codex"),
             "--launch-agents-dir", str(home / "LaunchAgents"),
@@ -621,14 +584,11 @@ def test_kept_baks_are_announced_even_when_the_plan_is_empty(tmp_path, monkeypat
     assert un.main(argv, run=FakeRunner()) == 0
     out = capsys.readouterr().out
     assert "Nothing to uninstall." in out
-    assert "manager.md.bak" in out                             # announced, not hidden
+    assert "manager.md.bak" in out
     assert (agents / "manager.md.bak").read_text() == "PRECIOUS operator text\n"
 
 
 def test_a_foreign_agents_bak_is_not_claimed_as_a_drift_backup(fake_install):
-    """The claim is DERIVED, like every other path in the plan: only backups of an
-    agent file this tool deploys are named. A bak beside a foreign agent is not ours
-    to describe, and never to remove."""
     fx = fake_install
     foreign = fx["claude"] / "agents" / "foreign-agent.md.bak"
     foreign.write_text("SOMEONE ELSE'S\n")
@@ -640,12 +600,12 @@ def test_a_foreign_agents_bak_is_not_claimed_as_a_drift_backup(fake_install):
 
 
 def test_strip_removes_selffix_sessionend_hook():
-    foreign = _hook("bash /other/native-hook.sh")          # genuinely foreign → survives
+    foreign = _hook("bash /other/native-hook.sh")
     settings = {"hooks": {"SessionEnd": [
         {"hooks": [foreign]},
         {"hooks": [_hook("bash /home/u/.claude/scripts/selffix-trigger.sh", timeout=30)]},
     ]}}
     out = un.strip_orchestrator_hooks(settings, None, [])
     cmds = [h["command"] for b in out.get("hooks", {}).get("SessionEnd", []) for h in b["hooks"]]
-    assert cmds == ["bash /other/native-hook.sh"]           # foreign survives, selffix stripped
+    assert cmds == ["bash /other/native-hook.sh"]
     assert not any("selffix-trigger.sh" in c for c in cmds)

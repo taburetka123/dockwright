@@ -1,30 +1,4 @@
 #!/usr/bin/env python3
-"""Shadow graduation ledger (Phase D T12).
-
-A lane (a capability running in shadow: drafts a human disposes of) is
-ARMED with graduation criteria BEFORE data collection; every human
-disposition appends one line; REPORT computes graduation against the
-armed criteria and prints per-criterion evidence counts - a criterion
-with zero observations can never pass silently (a criterion that is read
-but never written must not be able to gate; closed by construction).
-
-Criteria are first-stamp-immutable: `arm` writes <lane>.criteria.json AND
-stamps the same JSON into the lane ledger; `report` verbatim-compares the
-file against the FIRST stamp - a hand-edited criteria file is caught as a
-mismatch (exit 2). The closed criteria vocabulary is exactly:
-min_n, min_used_rate, min_window_days, min_abstained - all four required
-(opt out of abstention with min_abstained: 0); an unknown key is exit 2.
-
-used_rate = used / (used + edited + discarded): an EDITED draft counts
-AGAINST the rate (the conservative choice), abstained sits outside the
-denominator and is measured by min_abstained alone. min_n counts the same
-denominator. The window runs from the FIRST disposition entry.
-
-Exit codes: 0 = report computed (GRADUATE or NOT-YET) / arm ok / append ok;
-1 = --require-graduate and the lane is NOT-YET; 2 = anomaly (unarmed lane,
-unknown key/disposition, missing or tampered criteria, empty lane under
---require-graduate). Standalone, stdlib-only, py3.9-compatible.
-"""
 from __future__ import annotations
 
 import argparse
@@ -43,12 +17,7 @@ DISPOSITIONS = ("used", "edited", "discarded", "abstained")
 
 
 class LedgerCorruption(ValueError):
-    """A non-blank undecodable ledger line. Enforcement, precisely: `report`
-    fails closed over a damaged line ANYWHERE in the ledger (a verdict is
-    never computed from a partial read), and a damaged line at or before the
-    first criteria stamp blocks arm/append/report alike. arm/append scan only
-    up to the first stamp, so corruption strictly after it does not stop
-    them — the graduation-verdict path is the fail-closed one."""
+    pass
 
 
 def _canonical(criteria: dict) -> str:
@@ -128,8 +97,6 @@ def cmd_arm(lane: str, criteria_json: str, shadow_dir: Path) -> int:
                   "criteria is the failure mode this guards)", file=sys.stderr)
             return 2
         if not criteria_path.exists():
-            # The stamp is authoritative and matches; restore a deleted criteria
-            # file so report's verbatim compare works again (idempotent re-arm).
             criteria_path.parent.mkdir(parents=True, exist_ok=True)
             criteria_path.write_text(json.dumps(criteria, sort_keys=True, indent=1) + "\n")
         print(f"shadow-ledger: lane {lane} already armed (idempotent)")

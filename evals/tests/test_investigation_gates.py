@@ -88,9 +88,6 @@ def test_grounding_skipped_when_not_required():
     assert r.passed
 
 
-# The 2026-07-28 03:17 flake shape: every fixture read via a bash glob
-# (`for f in scenario.md fixtures/*; do cat "$f"; done`) — the input names no
-# file, but the corpus provably holds the content.
 GLOB_CALLS = [("Bash", '{"command": "for f in scenario.md fixtures/*; do cat \\"$f\\"; done"}')]
 FIXTURE_TEXT = (
     "error_rate queried 13:15 UTC\n"
@@ -159,10 +156,6 @@ def test_content_satisfied_single_line_never_passes():
 
 
 def test_content_satisfied_two_lines_both_present_passes():
-    """Pins the count floor at <2 (not <3): a fixture with exactly 2
-    distinctive lines, both present in the corpus, must pass the content arm.
-    p02's pool-metrics.txt sits at exactly 2 lines — a drift of the floor
-    from <2 to <3 would silently fail it."""
     fixture_text = "alpha_line_one\nbeta_line_two\n"
     assert len(gates._distinctive_lines(fixture_text)) == 2
     assert gates._content_satisfied(fixture_text, fixture_text) is True

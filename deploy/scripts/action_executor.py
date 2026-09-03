@@ -1,54 +1,4 @@
 #!/usr/bin/env python3
-"""Typed-proposal -> deterministic executor (Phase D T10).
-
-A worker/engine writes a machine proposal FILE (flat items); a human or a
-standing trust line authorizes acting on it; THIS script validates every
-item fail-closed against an operator-authored verb-config and performs the
-write by dispatching the operator's actuator argv - the model never types
-action arguments into commands. Every outcome (executed / filtered /
-refused / failed) is an append-only ledger event.
-
-Gate on what runs, never on what is declared: predicates and syntax
-patterns are evaluated on the fields of the proposal file being executed
-(its sha256 is recorded in the `run` event), never on a summary.
-
-Verb-config lives at <actions-dir>/verbs/<verb>.json, e.g.:
-
-  {"verb": "queue-replay",
-   "actuator": ["/path/to/actuator", "replay", "{queue}", "{message_id}"],
-   "id_template": "{queue}/{message_id}",
-   "patterns": {"queue": "^[a-z0-9][a-z0-9-]*$", "message_id": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
-   "require": {"replay": "transient"},
-   "forbid": {"source": "external-ci"},
-   "allow": {"queue": ["a-dlq", "b-dlq"]},
-   "ground_in": {"message_id": "/path/to/raw/{queue}.json"},
-   "max_items": 50, "timeout_sec": 60, "max_age_sec": 3600}
-
-`ground_in` files MUST be valid JSON; grounding is exact membership against
-LEAF values (dict keys excluded) — a plain-text dump grounds nothing and
-every item is REFUSED.
-
-Every field substituted into argv, id_template, or a ground_in path MUST
-have an entry in `patterns` (full-match) - an unpatterned templated field
-is a config anomaly (exit 2), because that is exactly the channel where an
-adversarial value (`--flag`, `../x`, whitespace) rides into a URL path or
-gets parsed as a CLI flag by the actuator.
-
-Exit codes:
-  0  every item executed or filtered (policy mismatch / duplicate are
-     EXPECTED outcomes; counters are printed explicitly - the everyday
-     all-hold run is a loud no-op, not an error)
-  1  >=1 item refused (structural per-item anomaly) or failed (actuator)
-  2  structural call anomaly: unparseable proposal/config, format or verb
-     mismatch, unpatterned templated field, over-cap, stale proposal,
-     ledger lock busy. Never degrades to an empty success.
-
-Sibling, not shared: gardener_apply.py is the separate governance-file patch
-actuator (locates hunks, git-applies) with its own ledger and exit contract -
-the "proposal"/"ledger.jsonl" nomenclature is shared but the state is disjoint.
-
-Standalone, stdlib-only, py3.9-compatible (deployed-script convention).
-"""
 from __future__ import annotations
 
 import argparse
@@ -74,13 +24,10 @@ CONFIG_REQUIRED = ("verb", "actuator", "id_template", "patterns", "max_items")
 
 
 class LedgerAnomaly(Exception):
-    """The ledger is damaged or holds an unresolved dispatch intent. Either
-    means the dedup set can no longer be trusted, so the whole run fails
-    closed (exit 2) rather than risk a silent double-fire."""
+    pass
 
 
 class Disposition:
-    """One item's classification. argv is set only for kind=EXECUTE."""
     __slots__ = ("kind", "reason", "id_key", "argv")
 
     def __init__(self, kind, reason, id_key="", argv=None):
@@ -160,7 +107,6 @@ def validate_config(config: dict) -> list:
             re.compile(pattern)
         except re.error as exc:
             problems.append(f"invalid pattern for {field}: {exc}")
-    # The C1 guard: every templated field must carry a syntax pattern.
     for field in sorted(templated_fields(config)):
         if field not in patterns:
             problems.append(f"templated field has no syntax pattern: {field}")
@@ -203,24 +149,18 @@ def _referenced_fields(config: dict) -> set:
 
 
 def _leaf_values(node, acc: set) -> set:
-    """Collect the LEAF VALUES of a parsed-JSON tree as strings. Dict values
-    are recursed but keys are NOT collected (a JSON key must never ground an
-    id); lists are recursed; str/int/float/bool leaves are added as str(leaf).
-    Membership against this set is exact - never a substring."""
     if isinstance(node, dict):
         for value in node.values():
             _leaf_values(value, acc)
     elif isinstance(node, list):
         for value in node:
             _leaf_values(value, acc)
-    elif isinstance(node, (str, int, float)):  # bool is a subclass of int
+    elif isinstance(node, (str, int, float)):
         acc.add(str(node))
     return acc
 
 
 def _grounding_values(path: str, ground_cache: dict):
-    """Cache and return (status, values) for a grounding file. status is one of
-    'ok' (values is the leaf-value set), 'unreadable', or 'invalid'."""
     if path not in ground_cache:
         try:
             raw = Path(path).read_text()
@@ -237,8 +177,6 @@ def _grounding_values(path: str, ground_cache: dict):
 
 
 def classify_item(item, config, compiled_patterns, executed_keys, ground_cache):
-    """Fail-closed pipeline: presence -> syntax -> policy -> grounding ->
-    idempotency. Returns a Disposition; never raises on item content."""
     for field in sorted(_referenced_fields(config)):
         if field not in item:
             return Disposition("REFUSED", f"missing field: {field}")
@@ -286,9 +224,6 @@ def ledger_append(actions_dir: Path, event: str, **fields) -> None:
 
 
 def executed_keys_from_ledger(actions_dir: Path, verb: str) -> set:
-    """Dedup set for `verb` = id_keys with a recorded action_executed. Fails
-    closed: a non-blank undecodable line, or a dispatch intent (M-a) with no
-    recorded outcome, raises LedgerAnomaly - never a silently shrunk set."""
     keys = set()
     dispatched = set()
     resolved = set()
@@ -326,9 +261,6 @@ def executed_keys_from_ledger(actions_dir: Path, verb: str) -> set:
 
 
 def _acquire_lock(actions_dir: Path):
-    """Non-blocking exclusive lock for the whole run; busy -> None (exit 2).
-    A parallel invocation must not interleave between the executed-keys read
-    and the appends - that window is how a duplicate write would slip in."""
     actions_dir.mkdir(parents=True, exist_ok=True)
     fd = os.open(actions_dir / "ledger.lock", os.O_CREAT | os.O_WRONLY, 0o644)
     try:
@@ -340,7 +272,6 @@ def _acquire_lock(actions_dir: Path):
 
 
 def _dispatch(disposition, timeout_sec: int):
-    """Run one actuator; returns (ok, exit_code_or_reason, stderr_tail)."""
     try:
         proc = subprocess.run(disposition.argv, capture_output=True,
                               timeout=timeout_sec)
@@ -430,11 +361,6 @@ def main(argv=None) -> int:
             disposition = classify_item(item, config, compiled, executed_keys,
                                         ground_cache)
             if disposition.kind == "EXECUTE":
-                # Intra-run dedup: a second item resolving to the same id_key
-                # within ONE proposal must not dispatch twice. Kept SEPARATE
-                # from executed_keys (the cross-run ledger set) so the reason is
-                # honest - the first instance may still fail, so reusing the
-                # ledger-idempotency reason here would mislabel it.
                 if disposition.id_key in batch_keys:
                     disposition = Disposition(
                         "FILTERED", "duplicate id within proposal",
@@ -443,9 +369,6 @@ def main(argv=None) -> int:
                     batch_keys.add(disposition.id_key)
             dispositions.append(disposition)
         if any(d.kind != "REFUSED" and not d.id_key for d in dispositions):
-            # An empty id_key is invisible to the dedup set AND the
-            # unresolved-intent check (both filter on truthiness) — a record
-            # that participates in nothing while everything reports success.
             print("action-executor: empty id_key from id_template — such a "
                   "record is invisible to idempotency; refusing the whole "
                   "call, fix patterns/id_template", file=sys.stderr)
@@ -483,9 +406,6 @@ def main(argv=None) -> int:
                 ledger_append(actions_dir, "action_refused", verb=args.verb,
                               id_key=disposition.id_key, reason=disposition.reason)
                 continue
-            # WAL intent: recorded BEFORE the actuator runs, so a crash in the
-            # window before the outcome append is caught as UNRESOLVED on rerun
-            # (executed_keys_from_ledger) instead of silently re-firing.
             ledger_append(actions_dir, "action_dispatch", verb=args.verb,
                           id_key=disposition.id_key, argv=disposition.argv)
             ok, code, tail = _dispatch(disposition, timeout_sec)

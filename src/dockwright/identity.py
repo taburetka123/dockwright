@@ -1,19 +1,3 @@
-"""Resolve the calling subprocess's owning manager.
-
-Used by the `monitor` CLI to figure out which manager's events to watch,
-WITHOUT having to substitute the manager's funny-name into the Monitor
-command at arm time.
-
-Resolution order:
-  1. Current pane id (TMUX_PANE): match
-     against active manager records' window_id (state.window_id_of handles the
-     iterm_sid legacy key).
-  2. PPID-walk: walk up `os.getppid()` chain up to MAX_HOPS times, matching
-     each pid against active manager records' pid.
-  3. Fail loudly to stderr + exit 2 with an actionable message.
-
-Each fallback step logs to stderr so the failure mode is observable.
-"""
 from __future__ import annotations
 
 import os
@@ -28,8 +12,6 @@ MAX_HOPS = 8
 def _list_manager_records() -> list[dict]:
     if not paths.ACTIVE.is_dir():
         return []
-    # Nested manager-agent records (claude -p children of a manager) are
-    # ghosts, never THE manager — resolving one would scope monitors to it.
     return [r for r in state.list_json_in(paths.ACTIVE)
             if r.get("agent") == "manager" and not r.get("nested")]
 
@@ -82,16 +64,21 @@ def _resolve_via_ppid_walk(records: list[dict]) -> dict | None:
     return None
 
 
-def resolve_manager() -> dict:
-    """Return {'name': ..., 'sid': ...} for the calling subprocess's manager.
-
-    Exits 2 with an actionable stderr message on failure.
-    """
-    records = _list_manager_records()
+def resolve_manager_record(records: list[dict] | None = None) -> dict | None:
+    if records is None:
+        records = _list_manager_records()
     for resolver in (_resolve_via_pane_id, _resolve_via_ppid_walk):
         match = resolver(records)
         if match is not None:
-            return {"name": match["name"], "sid": match["claude_sid"]}
+            return match
+    return None
+
+
+def resolve_manager() -> dict:
+    records = _list_manager_records()
+    match = resolve_manager_record(records)
+    if match is not None:
+        return {"name": match["name"], "sid": match["claude_sid"]}
     names = sorted(r.get("name", "?") for r in records)
     print(
         f"dockwright monitor: cannot resolve owning manager. "

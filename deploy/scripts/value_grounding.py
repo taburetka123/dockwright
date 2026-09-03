@@ -1,14 +1,4 @@
 #!/usr/bin/env python3
-"""Value-grounding checker: numbers/versions/ids asserted in a report must
-appear in a tool output captured on disk (the session transcript JSONL).
-
-Checks run against the tool-call record, which the model does not author —
-provenance-presence checks in prose are defeated by provenance fabrication
-(see the Phase B design spec).
-
-Standalone + stdlib-only: deployed verbatim to ~/.claude/scripts/ by setup.sh.
-Consumed three ways: CLI (the integrator agent), importlib (evals gates + tests).
-"""
 from __future__ import annotations
 
 import argparse
@@ -51,8 +41,6 @@ def extract_tokens(text: str, classes: tuple[str, ...] = ALL_CLASSES) -> list[To
         for match in _CLASS_RES[cls].finditer(text or ""):
             tok = match.group(0)
             if cls == "version":
-                # A year-leading dotted token (2026.06.29) is a date, not a version;
-                # service versions start well below 2000 (year-guard).
                 if int(tok.lstrip("vV").split(".", 1)[0]) >= 2000:
                     continue
             key = (tok, cls)
@@ -78,7 +66,7 @@ def is_grounded(token: Token, corpus: str) -> bool:
         return text.lower() in corpus.lower()
     if token.token_class == "long_digit_run":
         return _digit_boundary_search(text, corpus)
-    return re.search(rf"{re.escape(text)}(?!\d)", corpus) is not None  # ticket_key
+    return re.search(rf"{re.escape(text)}(?!\d)", corpus) is not None
 
 
 def ungrounded(report: str, corpus: str, classes: tuple[str, ...] = ALL_CLASSES) -> list[Token]:
@@ -105,12 +93,6 @@ def _block_text(block) -> str:
 
 
 def parse_transcripts(paths: list[str]) -> tuple[list[tuple[str, str]], str]:
-    """Merged (tool_calls, evidence_corpus) across transcript JSONL files.
-
-    Corpus = user text + tool outputs whose tool is NOT Agent/Task (a subagent's
-    final report is model-authored prose — counting it would launder fabricated
-    values into "grounded"). Assistant text never enters the corpus.
-    """
     tool_calls: list[tuple[str, str]] = []
     corpus_parts: list[str] = []
     for path in paths:
@@ -127,7 +109,7 @@ def parse_transcripts(paths: list[str]) -> tuple[list[tuple[str, str]], str]:
                         records.append(rec)
         except OSError:
             continue
-        for rec in records:  # pass 1: map tool_use ids to names, collect calls
+        for rec in records:
             if rec.get("type") != "assistant":
                 continue
             for block in _content_blocks(rec.get("message")):
@@ -139,7 +121,7 @@ def parse_transcripts(paths: list[str]) -> tuple[list[tuple[str, str]], str]:
                     except (TypeError, ValueError):
                         input_str = str(block.get("input", ""))
                     tool_calls.append((name, input_str))
-        for rec in records:  # pass 2: corpus from user records
+        for rec in records:
             if rec.get("type") != "user":
                 continue
             rec_has_excluded_result = False

@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""Render the latest eval result into the RESULTS block of docs/evals.md.
-
-Keeps the committed headline in sync with evals/results/latest.json so the doc
-is reproducible: `python -m evals.run_eval && python -m evals.render_results`.
-"""
 from __future__ import annotations
 
 import json

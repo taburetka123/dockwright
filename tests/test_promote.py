@@ -13,17 +13,12 @@ def _always_alive(_pid):
 
 
 def _pin_tmux(monkeypatch):
-    """Legacy manager records carry no `terminal` stamp (= tmux default). Pin
-    this process's backend to tmux so resolve_general_manager matches them;
-    these tests verify selection/CLI logic, not the default backend."""
     import dockwright.terminal as terminal
     monkeypatch.setenv("CLAUDE_ORCH_TERMINAL", "tmux")
     terminal._DRIVER = None
 
 
 def _arrange_spawn_failure(monkeypatch, exc):
-    """Wire assign_to_manager_cli so it reaches the spawn call, where
-    spawn_worker_tab raises `exc`. Uses a live pid so the manager resolves."""
     _pin_tmux(monkeypatch)
     monkeypatch.setattr(sys, "argv", ["orchestrator", "assign-to-manager", "--sid", "abc12345"])
     monkeypatch.setattr(
@@ -41,7 +36,6 @@ def _arrange_spawn_failure(monkeypatch, exc):
 
 
 def test_spawn_oserror_exits_cleanly(monkeypatch, capsys):
-    # tmux missing from PATH surfaces as FileNotFoundError (an OSError).
     _arrange_spawn_failure(monkeypatch, FileNotFoundError("tmux"))
     with pytest.raises(SystemExit) as exc:
         promote.assign_to_manager_cli()

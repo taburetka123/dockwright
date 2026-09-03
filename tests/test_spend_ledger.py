@@ -1,4 +1,3 @@
-"""Durable spend ledger: append-at-drop + headless capture + tolerant read."""
 import json
 
 import pytest
@@ -46,7 +45,6 @@ def test_append_drop_event_labels_nested(ledger):
 
 
 def test_append_drop_event_defaults_agentless_closed_record_to_worker(ledger):
-    # closed/ records carry no agent key — only workers are archived there.
     record = _record()
     record.pop("agent")
     spend_ledger.append_drop_event(record, "resume_reclaim")
@@ -72,7 +70,6 @@ def test_append_drop_event_carries_account(ledger):
 
 
 def test_append_drop_event_account_null_when_absent(ledger):
-    # Nested teammates and pre-fix records carry no account -> honest null.
     spend_ledger.append_drop_event(_record(), "session_end")
     assert json.loads(ledger.read_text())["account"] is None
 
@@ -117,9 +114,6 @@ def test_read_events_missing_file_returns_empty(ledger):
 
 
 def test_append_drop_event_prune_source_writes_zero_spend_line(ledger):
-    # A prune UNLINKS the record with no other durable trace — the ledger
-    # line is the only forensics a reaped session gets (the M-2 ghost-worker
-    # incident left nothing), so prune sources append even at zero spend.
     spend_ledger.append_drop_event(_record(spend=None), "prune")
     entry = json.loads(ledger.read_text())
     assert entry["source"] == "prune"

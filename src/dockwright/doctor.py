@@ -1,7 +1,3 @@
-"""Verify dockwright's environment wiring is canonical: explicit venv-binary path
-everywhere (hooks + Claude/Codex MCP), no Homebrew editable duplicate, venv import OK.
-`dockwright doctor` is the manager's post-deploy validator and setup.sh's fail-loud gate.
-"""
 from __future__ import annotations
 
 import argparse
@@ -65,10 +61,6 @@ def check_venv_import(orch_bin: str, run=subprocess.run) -> Check:
 
 
 def check_account_pointer() -> Check:
-    """account-active, when present, must name a registry account. A stale
-    pointer (e.g. left by a pre-registry flip onto a since-removed account)
-    reads as pool-off everywhere — silently, forever: nothing writes the
-    pointer back."""
     try:
         raw = paths.ACCOUNT_ACTIVE.read_text().rstrip("\n")
     except FileNotFoundError:
@@ -85,11 +77,6 @@ def check_account_pointer() -> Check:
 
 
 def _login_fix_command(name: str, default: str) -> str:
-    """Exact re-login command for an account. The default account rides the
-    HOME-root login: pointing the CLI at ~/.claude via CLAUDE_CONFIG_DIR reads
-    a directory that never held the config, reports a healthy login as dead,
-    and seeds a stray skeleton there (2026-07-29 incident) — so the default's
-    command carries NO CLAUDE_CONFIG_DIR."""
     if name == default:
         return "claude"
     farm = paths.account_config_dir(name)
@@ -97,21 +84,6 @@ def _login_fix_command(name: str, default: str) -> str:
 
 
 def check_accounts_login(host_claude_json: "Path | None" = None) -> Check:
-    """Every declared pool account should show login evidence. A non-default
-    account's evidence is oauthAccount in its farm .claude.json — farm
-    assembly pops oauthAccount on every rebuild
-    (spawner._ensure_account_claude_json), so PRESENCE can only come from a
-    real /login in that config dir. The DEFAULT account rides the HOME-root
-    ~/.claude.json (the file a no-CLAUDE_CONFIG_DIR login actually writes;
-    paths.HOST_CLAUDE_JSON models it, but the path is resolved HERE at call
-    time so tests can fake HOME); its registry config_dir, if any, is ignored,
-    mirroring spawner._build_account_prefix. ABSENCE is weaker than presence
-    (a corrupt farm rebuild drops the marker while the keychain login
-    survives), and presence is login EVIDENCE, not liveness — an expired
-    token 401s with the marker intact; the reactive AUTH_401 lane owns
-    liveness. Hence a doctor flag, never a spawn-time gate. Missing or
-    unreadable files FAIL loud — never skip (the pre-2026-07-29 check skipped
-    the default account entirely and PASSed through a dead default login)."""
     default = config.default_account()
     host = host_claude_json if host_claude_json is not None else Path.home() / ".claude.json"
     missing = []
@@ -121,7 +93,6 @@ def check_accounts_login(host_claude_json: "Path | None" = None) -> Check:
         fix = f"fix: {_login_fix_command(account.name, default)}, then /login"
         try:
             data = json.loads(marker_file.read_text())
-            # bool(): a present-but-null/empty marker is not login evidence
             has_marker = isinstance(data, dict) and bool(data.get("oauthAccount"))
         except FileNotFoundError:
             missing.append(f"{account.name} (no {marker_file} — never logged in? — {fix})")
@@ -153,12 +124,6 @@ def check_config() -> Check:
 
 
 def check_compose_fresh(core_dir, out_dir, overlay_dir=None) -> Check:
-    """Deployed agent files match a recompose of core+overlay+vars.
-
-    Runs only when the caller passes --compose-out-dir (setup.sh does) so an
-    ad-hoc flagless doctor stays hermetic. Deployed agents without a stamp =
-    a legacy pre-compose deploy — fail loud, the fix is one setup.sh run.
-    """
     from . import compose, config
     out = Path(out_dir)
     deployed = sorted(out.glob("*.md")) if out.is_dir() else []
@@ -179,9 +144,6 @@ def check_compose_fresh(core_dir, out_dir, overlay_dir=None) -> Check:
 
 
 def _default_orch_bin() -> str:
-    """The console script beside the running interpreter — identical to the
-    $DOCKWRIGHT_BIN setup.sh passes, so a bare `dockwright doctor` (README) and
-    the setup.sh invocation verify the same wiring."""
     return str(Path(sys.executable).parent / "dockwright")
 
 
@@ -189,9 +151,6 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Verify canonical dockwright env wiring.")
     p.add_argument("--orch-bin", default=_default_orch_bin())
     p.add_argument("--claude-json", type=Path, default=Path.home() / ".claude.json")
-    # Deliberately separate from --claude-json (which feeds only the mcp:claude
-    # parse check): pointing --claude-json at a farm file to debug its MCP
-    # wiring must not make that farm read as the DEFAULT account's login evidence.
     p.add_argument("--host-claude-json", type=Path, default=None)
     p.add_argument("--settings", type=Path,
                    default=config.claude_config_home() / "settings.json")
@@ -202,7 +161,7 @@ def main(argv=None) -> int:
     p.add_argument("--brew-prefix", type=Path, default=Path("/opt/homebrew"))
     p.add_argument("--dist-name", default="dockwright")
     p.add_argument("--server-name", default="dockwright")
-    p.add_argument("--strict", action="store_true")  # accepted for setup.sh symmetry; all checks already hard
+    p.add_argument("--strict", action="store_true")
     p.add_argument("--compose-core-dir", type=Path)
     p.add_argument("--compose-out-dir", type=Path)
     p.add_argument("--compose-overlay-dir", type=Path)
@@ -220,11 +179,6 @@ def main(argv=None) -> int:
                                           args.compose_overlay_dir))
 
     def _parsed(label, path, loader):
-        """Parse an existing config file, or return a FAILING parse Check.
-
-        A file that exists but won't parse must FAIL the fail-loud gate — never
-        skip (skipping would let the dependent check pass vacuously on {}).
-        """
         try:
             return loader(Path(path).read_text()), None
         except (OSError, ValueError, tomllib.TOMLDecodeError) as e:
