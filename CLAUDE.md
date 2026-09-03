@@ -51,9 +51,8 @@ itself does not read the list — the file is built into the export tree and the
 gate is what stops it.)
 
 Add the line in the same PR as the file: that is the point — `publish-allowlist.txt`'s
-directory entries let new content ship with no edit anywhere, which is how an
-employer auth fixture reached the public repo on 2026-07-15
-(`docs/specs/public-leak-rootcause.md`).
+directory entries let new content ship with no edit anywhere, so without the
+manifest line nothing puts a newly shipped file in front of a reviewer.
 
 ⚠️ **Only seven directories are allowlisted**: `src`, `deploy`, `tests`,
 `scripts`, `evals/dataset`, `evals/tests`, `evals/investigation/cases`. The rest

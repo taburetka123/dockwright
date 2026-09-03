@@ -1284,7 +1284,7 @@ class TestIgnoredContent:
 
     @pytest.mark.parametrize("entry", [
         "docs/", "docs/sidecar/specs/x-design.md", ".sidecar/",
-        "notes.md", "service/src/main/graphql/sibi/schema.json", ".idea/",
+        "notes.md", "service/src/main/codegen/output/schema.json", ".idea/",
     ])
     def test_unknown_ignored_content_blocks(self, wp, entry):
         assert wp.ignored_ok_from_porcelain(f"!! {entry}\n") is False
@@ -1638,7 +1638,7 @@ class TestRemoteConfirmation:
 
     @pytest.mark.parametrize("ref,expected", [
         ("refs/remotes/origin/feat", ("origin", "feat")),
-        ("refs/remotes/origin/gw/steal-phase-d", ("origin", "gw/steal-phase-d")),
+        ("refs/remotes/origin/gw/feature-slug", ("origin", "gw/feature-slug")),
         ("refs/remotes/upstream/bot/tkt-8696-x", ("upstream", "bot/tkt-8696-x")),
         ("refs/heads/feat", None),
     ])
