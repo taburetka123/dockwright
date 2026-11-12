@@ -1,8 +1,3 @@
-from pathlib import Path
-
-SCRIPTS = Path(__file__).resolve().parent.parent / "deploy" / "scripts"
-
-
 def test_distill_does_not_fall_back_to_the_denylist(tmp_path, monkeypatch):
     from dockwright import distill
 

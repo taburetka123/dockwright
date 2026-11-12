@@ -5,11 +5,24 @@ MODEL_RATES = {
     "opus": (5.0, 25.0),
     "sonnet": (3.0, 15.0),
     "haiku": (1.0, 5.0),
+    "claude-sonnet-5": (2.0, 10.0),
+    "claude-sonnet-5-5": (2.0, 10.0),
+    "claude-opus-5-5": (4.0, 20.0),
+    "claude-fable-5-2": (8.0, 40.0),
+    "claude-haiku-5-5": (0.10, 0.50),
 }
 
 CACHE_READ_MULT = 0.1
 CACHE_WRITE_5M_MULT = 1.25
 CACHE_WRITE_1H_MULT = 2.0
+
+CACHE_READ_MULT_BY_MODEL = {
+    "claude-fable-5-1": 0.025,
+    "claude-fable-5-2": 0.025,
+    "claude-mythos-5-1": 0.025,
+    "claude-opus-5-5": 0.05,
+    "claude-sonnet-5-5": 0.05,
+}
 
 _FAMILY_PREFIXES = (
     ("claude-fable-", "fable"),
@@ -37,6 +50,19 @@ def normalize_model(model_id):
         if key.startswith(prefix):
             return canonical
     return None
+
+
+def cache_read_mult(model_id):
+    key = _strip_model_id(model_id)
+    if key is None:
+        return CACHE_READ_MULT
+    exact = CACHE_READ_MULT_BY_MODEL.get(key)
+    if exact is not None:
+        return exact
+    for model, mult in CACHE_READ_MULT_BY_MODEL.items():
+        if key.startswith(model + "-"):
+            return mult
+    return CACHE_READ_MULT
 
 
 def get_rates():
@@ -69,7 +95,7 @@ def cost_breakdown(model_id, *, rates=None, output_tokens=0, input_tokens=0,
     per = 1_000_000
     input_cost = input_tokens / per * in_rate
     output_cost = output_tokens / per * out_rate
-    cache_read_cost = cache_read_tokens / per * in_rate * CACHE_READ_MULT
+    cache_read_cost = cache_read_tokens / per * in_rate * cache_read_mult(model_id)
     cache_write_cost = (
         cache_creation_5m_tokens / per * in_rate * CACHE_WRITE_5M_MULT
         + cache_creation_1h_tokens / per * in_rate * CACHE_WRITE_1H_MULT

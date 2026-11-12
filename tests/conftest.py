@@ -1,13 +1,15 @@
 import asyncio
 import os
+import shlex
 import shutil
 import subprocess
+import sys
 import types
 from pathlib import Path
 
 import pytest
 
-from dockwright import paths, terminal
+from dockwright import config, paths, terminal
 
 _REAL_SUBPROCESS_RUN = subprocess.run
 
@@ -75,7 +77,7 @@ def _absorbed_exec_stdout(argv) -> bytes:
 
 @pytest.fixture(autouse=True)
 def no_live_tmux(monkeypatch, request):
-    absorbed = types.SimpleNamespace(run=[], exec=[], osascript=[])
+    absorbed = types.SimpleNamespace(run=[], run_input=[], exec=[], osascript=[])
     is_real = request.node.get_closest_marker("real_tmux") is not None
     real_exec = asyncio.create_subprocess_exec
 
@@ -85,6 +87,7 @@ def no_live_tmux(monkeypatch, request):
                 _assert_throwaway_tmux(args)
                 return _REAL_SUBPROCESS_RUN(args, *pargs, **kwargs)
             absorbed.run.append([str(a) for a in args])
+            absorbed.run_input.append(kwargs.get("input"))
             out = "" if kwargs.get("text") else b""
             return subprocess.CompletedProcess(args, returncode=0, stdout=out, stderr=out)
         if (isinstance(args, (list, tuple)) and args
@@ -166,11 +169,31 @@ def no_live_subprocess_cli(_cli_shim_dir, monkeypatch):
     monkeypatch.setenv("PATH", f"{_cli_shim_dir}{os.pathsep}{os.environ['PATH']}")
 
 
+_DOCKWRIGHT_SHIM = (
+    "#!/bin/bash\n"
+    f'exec {shlex.quote(sys.executable)} -m dockwright "$@"\n'
+)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def in_tree_dockwright_on_path(tmp_path_factory):
+    d = tmp_path_factory.mktemp("dockwright-shim")
+    shim = d / "dockwright"
+    shim.write_text(_DOCKWRIGHT_SHIM)
+    shim.chmod(0o755)
+    before = os.environ["PATH"]
+    os.environ["PATH"] = f"{d}{os.pathsep}{before}"
+    yield d
+    os.environ["PATH"] = before
+
+
 @pytest.fixture(autouse=True)
 def _dockwright_config_hermetic(monkeypatch, tmp_path):
     monkeypatch.setenv("DOCKWRIGHT_CONFIG", str(tmp_path / "no-dockwright.toml"))
+    monkeypatch.setenv("DOCKWRIGHT_MANAGER_HOME", str(tmp_path / "mgr-home-default"))
     monkeypatch.delenv("DOCKWRIGHT_MANAGER_RC", raising=False)
     monkeypatch.delenv("DOCKWRIGHT_MANAGER_SKIP_PERMS", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -181,6 +204,57 @@ def _no_live_step_summary(monkeypatch):
 @pytest.fixture(autouse=True)
 def _no_live_presets(monkeypatch, tmp_path):
     monkeypatch.setattr(paths, "PRESETS", tmp_path / "no-presets")
+
+
+@pytest.fixture(autouse=True)
+def _no_live_permission_prompts(monkeypatch, tmp_path):
+    import dockwright.stale_monitor as _sm
+    prompts = tmp_path / "no-live-permission-prompts"
+    ledger = tmp_path / "no-live-permission-answers.jsonl"
+    monkeypatch.setattr(paths, "PERMISSION_PROMPTS", prompts, raising=False)
+    monkeypatch.setattr(paths, "PERMISSION_LEDGER", ledger, raising=False)
+    monkeypatch.setattr(_sm, "PERMISSION_PROMPTS", prompts, raising=False)
+    monkeypatch.setattr(_sm, "PERMISSION_LEDGER", ledger, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_exports(monkeypatch, tmp_path):
+    monkeypatch.setattr(paths, "EXPORTS", tmp_path / "exports")
+
+
+@pytest.fixture(autouse=True)
+def _no_live_worker_agent(monkeypatch, tmp_path):
+    monkeypatch.setattr(paths, "AGENTS_DIR", tmp_path / "no-agents")
+
+
+@pytest.fixture(autouse=True)
+def _no_live_roles(monkeypatch, tmp_path):
+    monkeypatch.setattr(paths, "ROLES_DIR", tmp_path / "no-roles")
+    monkeypatch.setattr(paths, "ROLE_SETTINGS", tmp_path / "role-settings")
+    monkeypatch.setattr(paths, "PROMPT_FILES", tmp_path / "prompt-files")
+    monkeypatch.setattr(config, "roles_dir", lambda: tmp_path / "no-roles")
+
+
+@pytest.fixture(autouse=True)
+def _no_live_daemon(monkeypatch, tmp_path):
+    monkeypatch.setattr(paths, "DAEMON", tmp_path / "no-live-daemon")
+    monkeypatch.setattr(paths, "DAEMON_STOP", tmp_path / "no-live-daemon-stop")
+    monkeypatch.setattr(paths, "PAUSE", tmp_path / "no-live-pause")
+    monkeypatch.setattr(paths, "PAUSE_MANIFEST", tmp_path / "no-live-pause" / "manifest.json")
+    monkeypatch.setattr(paths, "DAEMON_WAKE", tmp_path / "no-live-daemon" / "wake")
+    monkeypatch.setattr(paths, "LANE_HEALTH", tmp_path / "no-live-lane-health")
+    monkeypatch.setattr(paths, "LAUNCH_AGENTS", tmp_path / "no-live-launch-agents")
+
+
+@pytest.fixture(autouse=True)
+def _no_live_events(monkeypatch, tmp_path):
+    root = tmp_path / "no-live-events"
+    monkeypatch.setattr(paths, "EVENTS", root)
+    monkeypatch.setattr(paths, "EVENTS_LOG", root / "log")
+    monkeypatch.setattr(paths, "EVENTS_SEEN", root / "seen")
+    monkeypatch.setattr(paths, "EVENTS_SUBS", root / "subs")
+    monkeypatch.setattr(paths, "EVENTS_CURSORS", root / "cursors")
+    monkeypatch.setattr(paths, "EVENTS_QUEUES", root / "queues")
 
 
 @pytest.fixture(autouse=True)
@@ -196,7 +270,10 @@ def _no_live_account_state(monkeypatch, tmp_path, request):
     monkeypatch.setattr(paths, "ACCOUNT_USAGE", tmp_path / "no-live-usage")
     monkeypatch.setattr(paths, "ACCOUNT_ACTIVE", tmp_path / "no-live-account-active")
     monkeypatch.setattr(paths, "ACCOUNT_STATE", tmp_path / "no-live-account-state.json")
+    monkeypatch.setattr(paths, "ACCOUNT_LOCK", tmp_path / "no-live-account-lock")
+    monkeypatch.setattr(paths, "ACCOUNT_LEDGER", tmp_path / "no-live-account-flips.jsonl")
     monkeypatch.setattr(paths, "SPAWN_COUNTER", tmp_path / "no-live-spawn-counter.json")
+    monkeypatch.setattr(paths, "USAGE_CAPS", tmp_path / "no-live-usage-caps.toml")
     yield
 
 
@@ -238,6 +315,12 @@ def _fast_spawn_registration(monkeypatch):
 def _no_real_preflight_cleanup(monkeypatch):
     from dockwright import mcp_server
     monkeypatch.setattr(mcp_server, "_run_preflight_cleanup", lambda: "", raising=True)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_session_ancestry(monkeypatch):
+    from dockwright import mcp_server
+    monkeypatch.setattr(mcp_server, "resolve_cli_pid", lambda start=None: None, raising=True)
 
 
 @pytest.fixture
@@ -289,3 +372,45 @@ def no_leaked_test_sockets():
     if leaked:
         pytest.fail("tmux test sockets leaked (kill+unlink teardown missed): "
                     + ", ".join(str(p) for p in leaked), pytrace=False)
+
+
+def allow_codex(monkeypatch, tmp_path, *roots, extra_toml: str = "") -> Path:
+    selected = roots or ("/tmp", "/x")
+    quoted = ", ".join(f'"{r}"' for r in selected)
+    cfg = tmp_path / "codex-allowed.toml"
+    cfg.write_text(f"[codex]\nallowed_roots = [{quoted}]\n{extra_toml}")
+    monkeypatch.setenv("DOCKWRIGHT_CONFIG", str(cfg))
+    return cfg
+
+
+TEST_MODEL_PINS = '''[families]
+opus = "claude-opus-7-1"
+sonnet = "claude-sonnet-7"
+fable = "claude-fable-7-1"
+haiku = "claude-haiku-7"
+
+[defaults]
+worker_model = "@opus[1m]"
+manager_model = "@opus[1m]"
+distill_model = "claude-sonnet-4-6"
+scout_model = "@haiku"
+
+[context]
+no_native_1m = ["claude-sonnet-4-6"]
+'''
+
+
+@pytest.fixture
+def model_pins(tmp_path, monkeypatch):
+    from dockwright import models
+    path = tmp_path / "models.toml"
+    path.write_text(TEST_MODEL_PINS)
+    monkeypatch.setattr(models, "MODELS_FILE", path)
+
+    def move(old: str, new: str) -> None:
+        text = path.read_text()
+        assert old in text, f"{old!r} is not in the test pins"
+        path.write_text(text.replace(old, new))
+
+    move.path = path
+    return move

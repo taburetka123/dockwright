@@ -85,11 +85,31 @@ def test_doctor_compose_fresh_and_stale(tmp_path):
     assert not c.ok and "manager.md" in c.detail
 
 
-def test_doctor_main_runs_compose_check_only_with_flag(tmp_path, capsys):
-    orch_bin = tmp_path / "orch"
-    doctor.main(["--orch-bin", str(orch_bin),
+def _bare_doctor(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv(config.ENV_CONFIG_PATH, str(tmp_path / "no-config.toml"))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    doctor.main(["--orch-bin", str(tmp_path / "orch"),
                  "--claude-json", str(tmp_path / "claude.json"),
                  "--settings", str(tmp_path / "settings.json"),
                  "--codex-hooks", str(tmp_path / "codex-hooks.json"),
-                 "--codex-config", str(tmp_path / "codex-config.toml")])
-    assert "compose:fresh" not in capsys.readouterr().out
+                 "--codex-config", str(tmp_path / "codex-config.toml"),
+                 "--claude-dir", str(tmp_path / "claude"),
+                 "--codex-dir", str(tmp_path / "codex")])
+    return [ln for ln in capsys.readouterr().out.splitlines()
+            if "compose:fresh" in ln]
+
+
+def test_doctor_main_runs_compose_check_without_the_flag(tmp_path, capsys, monkeypatch):
+    lines = _bare_doctor(tmp_path, capsys, monkeypatch)
+    assert len(lines) == 1 and "nothing deployed" in lines[0], lines
+
+
+def test_doctor_main_compose_check_sees_the_default_agents_dir(tmp_path, capsys, monkeypatch):
+    agents = tmp_path / ".claude" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "manager.md").write_text("hand-edited, never composed\n")
+    lines = _bare_doctor(tmp_path, capsys, monkeypatch)
+    assert len(lines) == 1 and "[FAIL]" in lines[0], lines
+    assert "compose stamp" in lines[0]

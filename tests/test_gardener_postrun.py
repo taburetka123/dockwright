@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -94,6 +95,48 @@ def _ledger_events(postrun):
     if not postrun.LEDGER_PATH.is_file():
         return []
     return [json.loads(line) for line in postrun.LEDGER_PATH.read_text().splitlines() if line.strip()]
+
+
+MEMBERS = ["0eef8c47-2bc4-41d3-84df-c61e3ec2f9d1", "a2d9ddea-0320-417e-b556-d2a8a44420f2"]
+EXTRA_MEMBER = "5f1c2a33-9b8e-4c1d-8e7f-0a1b2c3d4e5f"
+
+
+def _write_variant(postrun, pid, *, members=MEMBERS, lane="digest", evidence_kind="findings",
+                   kind="rule-edit", supersedes=None, section=True, prose_diff=False):
+    text = PROPOSAL_TEMPLATE.format(
+        pid=pid, cluster="c",
+        target=str(postrun.ALLOWED_TARGET_ROOTS[0] / "rules" / "foo.md"))
+    text = text.replace(f"members: [{', '.join(MEMBERS)}]",
+                        f"members: [{', '.join(members)}]" if members else "")
+    text = text.replace("lane: digest", f"lane: {lane}")
+    text = text.replace("evidence_kind: findings", f"evidence_kind: {evidence_kind}")
+    text = text.replace("kind: rule-edit", f"kind: {kind}")
+    if supersedes:
+        text = text.replace("revert: ", f"supersedes: [{', '.join(supersedes)}]\nrevert: ", 1)
+        if section:
+            text += "\n## Supersedes\n" + "".join(f"- {sid}: redraft\n" for sid in supersedes)
+    if prose_diff:
+        text = re.sub(r"```diff\n.*?```\n",
+                      "no artifact change: accepting closes the superseded proposals\n",
+                      text, flags=re.S)
+    path = postrun.PENDING_DIR / f"{pid}.md"
+    path.write_text(text)
+    return path
+
+
+def _log_old(postrun, pid="old-1", **kw):
+    path = _write_variant(postrun, pid, **kw)
+    postrun.process_run_artifacts("r-old", known=postrun.known_from_ledger())
+    return path
+
+
+def _findings(postrun, *sids):
+    for sid in sids:
+        (postrun.FINDINGS_DIR / f"{sid}.md").write_text("finding\n")
+
+
+def _events(postrun, kind):
+    return [e for e in _ledger_events(postrun) if e["event"] == kind]
 
 
 class TestFrontmatterParse:
@@ -1044,6 +1087,15 @@ class TestComputeAlwaysOnDelta:
                 "+very long added skill line that would dominate if counted\n")
         assert postrun.compute_always_on_delta(_delta_body(diff), targets) == -5
 
+    def test_a_role_fragment_counts_toward_the_always_on_delta(self, postrun):
+        root = postrun.ALLOWED_TARGET_ROOTS[0]
+        targets = [str(root / "roles" / "Coder" / "fragments" / "foo.md")]
+        diff = ("--- a/roles/Coder/fragments/foo.md\n"
+                "+++ b/roles/Coder/fragments/foo.md\n"
+                "@@ -1,0 +1,1 @@\n"
+                "+added\n")
+        assert postrun.compute_always_on_delta(_delta_body(diff), targets) == len("added") + 1
+
     def test_multibyte_counts_utf8_bytes_not_chars(self, postrun):
         diff = ("--- a/rules/foo.md\n"
                 "+++ b/rules/foo.md\n"
@@ -1708,3 +1760,710 @@ class TestFlowCost:
                 "expectation": "e", "check_window_days": "14", "revert": "r"}
         violations = postrun.validate_proposal(meta, "## Evidence\n## Diff\nprose\n")
         assert any("flow_cost" in v for v in violations)
+
+
+class TestSupersedeAtBirth:
+    def test_supersede_moves_old_keeps_mtime_and_records_both_sides(self, postrun):
+        old = _log_old(postrun)
+        stamp = old.stat().st_mtime_ns - 3600 * 10**9
+        os.utime(old, ns=(stamp, stamp))
+        new = _write_variant(postrun, "new-1", supersedes=["old-1"])
+        summary = postrun.process_run_artifacts("r-new", known=postrun.known_from_ledger())
+        moved = postrun.superseded_dir() / "old-1.md"
+        assert new.exists() and not old.exists() and moved.exists()
+        meta, body = postrun.parse_frontmatter(moved.read_text())
+        assert meta["superseded_by"] == "new-1"
+        assert meta["superseded_run"] == "r-new"
+        assert "## Evidence" in body
+        assert moved.stat().st_mtime_ns == stamp
+        superseded = _events(postrun, "proposal_superseded")
+        assert [(e["proposal_id"], e["superseded_by"]) for e in superseded] == [("old-1", "new-1")]
+        born = [e for e in _events(postrun, "proposal") if e["proposal_id"] == "new-1"]
+        assert born[0]["supersedes"] == "old-1"
+        assert summary["superseded"] == 1 and summary["rejected"] == 0
+
+    def test_non_findings_proposal_cannot_supersede_one_with_members(self, postrun):
+        old = _log_old(postrun)
+        new = _write_variant(postrun, "new-1", members=None, evidence_kind="ops",
+                             supersedes=["old-1"])
+        summary = postrun.process_run_artifacts("r-new", known=postrun.known_from_ledger())
+        assert old.exists() and not new.exists()
+        assert summary["rejected"] == 1
+
+    def test_dropping_a_member_is_quarantined(self, postrun):
+        old = _log_old(postrun)
+        _write_variant(postrun, "new-1", members=MEMBERS[:1], supersedes=["old-1"])
+        summary = postrun.process_run_artifacts("r-new", known=postrun.known_from_ledger())
+        assert old.exists() and summary["rejected"] == 1
+
+    def test_legacy_prefix_member_is_covered_by_full_uuid(self, postrun):
+        old = _write_variant(postrun, "old-1")
+        old.write_text(old.read_text().replace(MEMBERS[0], MEMBERS[0][:8]))
+        postrun.ledger_append("proposal", proposal_id="old-1", path=str(old))
+        _write_variant(postrun, "new-1", supersedes=["old-1"])
+        summary = postrun.process_run_artifacts("r-new", known=postrun.known_from_ledger())
+        assert summary["superseded"] == 1 and summary["rejected"] == 0
+
+    def test_missing_supersedes_section_is_quarantined(self, postrun):
+        old = _log_old(postrun)
+        _write_variant(postrun, "new-1", supersedes=["old-1"], section=False)
+        summary = postrun.process_run_artifacts("r-new", known=postrun.known_from_ledger())
+        assert old.exists() and summary["rejected"] == 1
+
+    def test_unknown_id_is_quarantined(self, postrun):
+        _write_variant(postrun, "new-1", supersedes=["nope-1"])
+        summary = postrun.process_run_artifacts("r-new", known=set())
+        assert summary["rejected"] == 1
+
+    def test_other_lane_id_is_quarantined(self, postrun):
+        old = _log_old(postrun, lane="frontier", evidence_kind="external", members=None)
+        _write_variant(postrun, "new-1", supersedes=["old-1"])
+        summary = postrun.process_run_artifacts("r-new", known=postrun.known_from_ledger())
+        assert old.exists() and summary["rejected"] == 1
+
+    def test_id_born_in_the_same_postrun_is_quarantined(self, postrun):
+        old = _write_variant(postrun, "old-1")
+        _write_variant(postrun, "new-1", supersedes=["old-1"])
+        summary = postrun.process_run_artifacts("r-both", known=set())
+        assert old.exists()
+        assert summary["rejected"] == 1 and summary["superseded"] == 0
+
+    def test_open_apply_blocks_until_reverted(self, postrun):
+        old = _log_old(postrun)
+        postrun.ledger_append("proposal_apply_started", proposal_id="old-1")
+        _write_variant(postrun, "new-1", supersedes=["old-1"])
+        first = postrun.process_run_artifacts("r-1", known=postrun.known_from_ledger())
+        assert old.exists() and first["rejected"] == 1
+        postrun.ledger_append("proposal_reverted", proposal_id="old-1")
+        _write_variant(postrun, "new-2", supersedes=["old-1"])
+        second = postrun.process_run_artifacts("r-2", known=postrun.known_from_ledger())
+        assert not old.exists() and second["superseded"] == 1
+
+    def test_failure_before_start_does_not_close_an_open_apply(self, postrun):
+        postrun.ledger_append("proposal_apply_started", proposal_id="old-1")
+        postrun.ledger_append("proposal_apply_failed", proposal_id="old-1", after_start=False)
+        assert postrun.open_apply_ids() == {"old-1"}
+        postrun.ledger_append("proposal_apply_failed", proposal_id="old-1", after_start=True)
+        assert postrun.open_apply_ids() == set()
+
+    def test_apply_opened_between_check_and_move_blocks_the_move(self, postrun, monkeypatch):
+        old = _log_old(postrun)
+        answers = iter([set(), {"old-1"}])
+        monkeypatch.setattr(postrun, "open_apply_ids", lambda: next(answers))
+        new = _write_variant(postrun, "new-1", supersedes=["old-1"])
+        summary = postrun.process_run_artifacts("r-new", known=postrun.known_from_ledger())
+        assert old.exists() and not new.exists()
+        assert summary["rejected"] == 1 and summary["superseded"] == 0
+
+    def test_two_new_proposals_on_one_old_quarantine_the_second(self, postrun):
+        old = _log_old(postrun)
+        _write_variant(postrun, "new-a", supersedes=["old-1"])
+        _write_variant(postrun, "new-b", supersedes=["old-1"])
+        summary = postrun.process_run_artifacts("r-new", known=postrun.known_from_ledger())
+        assert not old.exists()
+        assert summary["superseded"] == 1 and summary["rejected"] == 1
+        assert (postrun.PENDING_DIR / "new-a.md").exists()
+
+    def test_proposal_retire_does_not_count_toward_backpressure(self, postrun):
+        _log_old(postrun)
+        _write_variant(postrun, "retire-1", kind="proposal-retire", supersedes=["old-1"],
+                       prose_diff=True)
+        summary = postrun.process_run_artifacts("r-new", known=postrun.known_from_ledger())
+        assert summary["proposals"] == 1 and summary["digest_proposals"] == 0
+
+    def test_redraft_with_supersedes_counts_toward_backpressure(self, postrun):
+        _log_old(postrun)
+        _write_variant(postrun, "new-1", supersedes=["old-1"])
+        summary = postrun.process_run_artifacts("r-new", known=postrun.known_from_ledger())
+        assert summary["proposals"] == 1 and summary["superseded"] == 1
+        assert summary["digest_proposals"] == 1 and summary["digest_negative"] == 0
+
+    def test_negative_redraft_with_supersedes_earns_backpressure_credit(self, postrun):
+        _log_old(postrun, members=None, evidence_kind="ops")
+        text = _negative_proposal_text(postrun, "new-1")
+        text = text.replace("revert: r\n", "supersedes: [old-1]\nrevert: r\n", 1)
+        text += "\n## Supersedes\n- old-1: redraft\n"
+        (postrun.PENDING_DIR / "new-1.md").write_text(text)
+        summary = postrun.process_run_artifacts("r-new", known=postrun.known_from_ledger())
+        assert summary["rejected"] == 0 and summary["superseded"] == 1
+        assert summary["digest_proposals"] == 1 and summary["digest_negative"] == 1
+
+    def test_proposal_retire_earns_no_backpressure_credit_either_way(self, postrun):
+        _log_old(postrun)
+        _write_variant(postrun, "retire-1", kind="proposal-retire", supersedes=["old-1"],
+                       prose_diff=True)
+        summary = postrun.process_run_artifacts("r-new", known=postrun.known_from_ledger())
+        assert summary["superseded"] == 1
+        assert summary["digest_proposals"] == 0 and summary["digest_negative"] == 0
+
+    def test_blank_supersedes_behaves_like_absent(self, postrun):
+        path = _write_variant(postrun, "new-1")
+        path.write_text(path.read_text().replace("revert: ", "supersedes:\nrevert: ", 1))
+        summary = postrun.process_run_artifacts("r-new", known=set())
+        assert path.exists() and summary["rejected"] == 0
+        assert summary["proposals"] == 1 and summary["digest_proposals"] == 1
+        assert _events(postrun, "proposal")[-1]["supersedes"] == ""
+        assert postrun.decide(str(path), "accept", "ok") == 0
+        assert _events(postrun, "decision")[-1]["supersedes"] == ""
+
+    def test_frontier_supersession_moves_the_old_file(self, postrun):
+        old = _log_old(postrun, lane="frontier", evidence_kind="external", members=None)
+        _write_variant(postrun, "new-1", lane="frontier", evidence_kind="external",
+                       members=None, supersedes=["old-1"])
+        summary = postrun.process_run_artifacts("r-new", known=postrun.known_from_ledger(),
+                                                lane="frontier")
+        assert not old.exists() and (postrun.superseded_dir() / "old-1.md").exists()
+        assert summary["superseded"] == 1 and summary["rejected"] == 0
+        assert _events(postrun, "proposal_superseded")[-1]["lane"] == "frontier"
+
+    def test_open_apply_on_one_of_two_ids_moves_neither(self, postrun):
+        old_1 = _log_old(postrun, "old-1")
+        old_2 = _log_old(postrun, "old-2")
+        postrun.ledger_append("proposal_apply_started", proposal_id="old-2")
+        new = _write_variant(postrun, "new-1", supersedes=["old-1", "old-2"])
+        summary = postrun.process_run_artifacts("r-new", known=postrun.known_from_ledger())
+        assert old_1.exists() and old_2.exists() and not new.exists()
+        assert summary["rejected"] == 1 and summary["superseded"] == 0
+        assert _events(postrun, "proposal_superseded") == []
+
+    def test_refused_successor_keeps_its_birth_event_before_the_rejection(self, postrun,
+                                                                          monkeypatch):
+        _log_old(postrun)
+        answers = iter([set(), {"old-1"}])
+        monkeypatch.setattr(postrun, "open_apply_ids", lambda: next(answers))
+        _write_variant(postrun, "new-1", supersedes=["old-1"])
+        postrun.process_run_artifacts("r-new", known=postrun.known_from_ledger())
+        trail = [(e["event"], e.get("proposal_id") or Path(e["path"]).name)
+                 for e in _ledger_events(postrun)
+                 if e["event"] in ("proposal", "proposal_rejected")]
+        assert trail[-2:] == [("proposal", "new-1"), ("proposal_rejected", "new-1.md")]
+
+    def test_failure_after_start_with_failed_rollback_keeps_the_apply_open(self, postrun):
+        postrun.ledger_append("proposal_apply_started", proposal_id="old-1")
+        postrun.ledger_append("proposal_apply_failed", proposal_id="old-1",
+                              after_start=True, rollback_failed=True)
+        assert postrun.open_apply_ids() == {"old-1"}
+        postrun.ledger_append("proposal_apply_failed", proposal_id="old-1",
+                              after_start=True, rollback_failed=False)
+        assert postrun.open_apply_ids() == set()
+
+    def test_edit_frontmatter_leaves_one_file_and_keeps_mtime(self, postrun):
+        path = _write_variant(postrun, "p-1")
+        stamp = path.stat().st_mtime_ns - 3600 * 10**9
+        os.utime(path, ns=(stamp, stamp))
+        postrun._edit_frontmatter(path, add={"superseded_by": "x"}, remove=("cluster",))
+        meta, body = postrun.parse_frontmatter(path.read_text())
+        assert meta["superseded_by"] == "x" and "cluster" not in meta and "## Evidence" in body
+        assert path.stat().st_mtime_ns == stamp
+        assert sorted(p.name for p in postrun.PENDING_DIR.iterdir()) == ["p-1.md"]
+
+
+class TestOpenAppliesCommand:
+    def test_prints_nothing_when_no_apply_is_open(self, postrun, capsys):
+        assert postrun.main(["open-applies"]) == 0
+        assert capsys.readouterr().out == ""
+
+    def test_prints_each_open_id_sorted(self, postrun, capsys):
+        postrun.ledger_append("proposal_apply_started", proposal_id="b-2")
+        postrun.ledger_append("proposal_apply_started", proposal_id="a-1")
+        postrun.ledger_append("proposal_apply_started", proposal_id="c-3")
+        postrun.ledger_append("proposal_reverted", proposal_id="c-3")
+        assert postrun.main(["open-applies"]) == 0
+        assert capsys.readouterr().out == "a-1\nb-2\n"
+
+
+class TestDecideSupersession:
+    def _supersede(self, postrun, new_pid="new-1", **kw):
+        old = _log_old(postrun)
+        stamp = old.stat().st_mtime_ns - 3600 * 10**9
+        os.utime(old, ns=(stamp, stamp))
+        new = _write_variant(postrun, new_pid, supersedes=["old-1"], **kw)
+        postrun.process_run_artifacts("r-new", known=postrun.known_from_ledger())
+        return old, new, stamp
+
+    def test_decline_proposal_retire_restores_and_marks_nothing(self, postrun):
+        _findings(postrun, *MEMBERS)
+        old, retire, stamp = self._supersede(postrun, "retire-1", kind="proposal-retire",
+                                             prose_diff=True)
+        assert postrun.decide(str(retire), "decline", "not stale") == 0
+        assert old.exists()
+        meta, _ = postrun.parse_frontmatter(old.read_text())
+        assert "superseded_by" not in meta and "superseded_run" not in meta
+        assert old.stat().st_mtime_ns == stamp
+        assert not any(postrun.FINDINGS_DIR.glob("*.reviewed"))
+        assert [e["proposal_id"] for e in _events(postrun, "proposal_restored")] == ["old-1"]
+        assert _events(postrun, "decision")[-1]["restored"] == "old-1"
+
+    def test_decline_with_restore_flag_marks_only_uncarried_members(self, postrun):
+        _findings(postrun, *MEMBERS, EXTRA_MEMBER)
+        old, new, _ = self._supersede(postrun, members=MEMBERS + [EXTRA_MEMBER])
+        assert postrun.decide(str(new), "decline", "wrong merge", restore_superseded=True) == 0
+        assert old.exists()
+        assert (postrun.FINDINGS_DIR / f"{EXTRA_MEMBER}.reviewed").exists()
+        assert not any((postrun.FINDINGS_DIR / f"{sid}.reviewed").exists() for sid in MEMBERS)
+
+    def test_decline_without_flag_keeps_superseded_and_marks_all(self, postrun):
+        _findings(postrun, *MEMBERS, EXTRA_MEMBER)
+        old, new, _ = self._supersede(postrun, members=MEMBERS + [EXTRA_MEMBER])
+        assert postrun.decide(str(new), "decline", "not worth it") == 0
+        assert not old.exists() and (postrun.superseded_dir() / "old-1.md").exists()
+        assert all((postrun.FINDINGS_DIR / f"{sid}.reviewed").exists()
+                   for sid in MEMBERS + [EXTRA_MEMBER])
+        assert _events(postrun, "decision")[-1]["supersedes"] == "old-1"
+
+    def test_accept_with_restore_flag_is_refused(self, postrun):
+        _old, new, _ = self._supersede(postrun)
+        assert postrun.decide(str(new), "accept", "ok", restore_superseded=True) == 2
+        assert new.exists()
+
+    def test_restore_name_collision_refuses_and_moves_nothing(self, postrun):
+        old, retire, _ = self._supersede(postrun, "retire-1", kind="proposal-retire",
+                                         prose_diff=True)
+        old.write_text("placeholder\n")
+        assert postrun.decide(str(retire), "decline", "not stale") == 2
+        assert retire.exists()
+        assert (postrun.superseded_dir() / "old-1.md").exists()
+
+    def test_decide_completes_an_unfinished_supersession(self, postrun):
+        old = _log_old(postrun)
+        new = _write_variant(postrun, "new-1", supersedes=["old-1"])
+        postrun.ledger_append("proposal", proposal_id="new-1", path=str(new), supersedes="old-1")
+        assert postrun.decide(str(new), "accept", "ok") == 0
+        moved = postrun.superseded_dir() / "old-1.md"
+        assert not old.exists() and moved.exists()
+        assert postrun.parse_frontmatter(moved.read_text())[0]["superseded_by"] == "new-1"
+
+    def test_completion_skips_an_id_with_supersession_history(self, postrun):
+        old = _log_old(postrun)
+        postrun.ledger_append("proposal_superseded", proposal_id="old-1", superseded_by="t-1")
+        postrun.ledger_append("proposal_restored", proposal_id="old-1", restored_by="t-1")
+        new = _write_variant(postrun, "new-1", supersedes=["old-1"])
+        postrun.ledger_append("proposal", proposal_id="new-1", path=str(new), supersedes="old-1")
+        assert postrun.decide(str(new), "accept", "ok") == 0
+        assert old.exists()
+
+    def test_restoring_decline_leaves_a_never_moved_id_in_place(self, postrun):
+        _findings(postrun, *MEMBERS)
+        old = _log_old(postrun)
+        new = _write_variant(postrun, "new-1", supersedes=["old-1"])
+        postrun.ledger_append("proposal", proposal_id="new-1", path=str(new), supersedes="old-1")
+        assert postrun.decide(str(new), "decline", "wrong", restore_superseded=True) == 0
+        assert old.exists()
+        assert _events(postrun, "decision")[-1]["restored"] == ""
+        assert not any(postrun.FINDINGS_DIR.glob("*.reviewed"))
+
+    def test_cli_restore_flag_reaches_decide(self, postrun):
+        old, new, _ = self._supersede(postrun)
+        rc = postrun.main(["decide", "--proposal", str(new), "--kind", "decline",
+                           "--reason", "x", "--restore-superseded"])
+        assert rc == 0 and old.exists()
+
+    def test_completion_refuses_a_successor_that_drops_a_member(self, postrun, capsys):
+        _findings(postrun, *MEMBERS)
+        old = _log_old(postrun)
+        new = _write_variant(postrun, "new-1", members=MEMBERS[:1], supersedes=["old-1"])
+        assert postrun.decide(str(new), "accept", "ok") == 2
+        assert old.exists() and new.exists()
+        assert not (postrun.superseded_dir() / "old-1.md").exists()
+        assert not any(postrun.FINDINGS_DIR.glob("*.reviewed"))
+        assert _events(postrun, "proposal_superseded") == []
+        assert _events(postrun, "decision") == []
+        assert "drops its members" in capsys.readouterr().err
+
+    def test_completion_refuses_a_cross_lane_successor(self, postrun, capsys):
+        old = _log_old(postrun, lane="frontier", evidence_kind="external", members=None)
+        new = _write_variant(postrun, "new-1", supersedes=["old-1"])
+        assert postrun.decide(str(new), "accept", "ok") == 2
+        assert old.exists() and new.exists()
+        assert not (postrun.superseded_dir() / "old-1.md").exists()
+        assert _events(postrun, "decision") == []
+        assert "another lane" in capsys.readouterr().err
+
+    def test_accept_marks_no_member_carried_by_an_id_completion_skipped(self, postrun):
+        _findings(postrun, *MEMBERS)
+        old = _log_old(postrun)
+        new = _write_variant(postrun, "new-1", supersedes=["old-1"])
+        postrun.ledger_append("proposal", proposal_id="new-1", path=str(new), supersedes="old-1")
+        postrun.ledger_append("proposal_apply_started", proposal_id="old-1")
+        assert postrun.decide(str(new), "accept", "ok") == 0
+        assert old.exists() and not new.exists()
+        assert not any(postrun.FINDINGS_DIR.glob("*.reviewed"))
+        assert _events(postrun, "decision")[-1]["members_marked"] == ""
+
+    def test_accept_proposal_retire_marks_members(self, postrun):
+        _findings(postrun, *MEMBERS)
+        old, retire, _ = self._supersede(postrun, "retire-1", kind="proposal-retire",
+                                         prose_diff=True)
+        assert postrun.decide(str(retire), "accept", "stale") == 0
+        assert all((postrun.FINDINGS_DIR / f"{sid}.reviewed").exists() for sid in MEMBERS)
+        assert not old.exists() and (postrun.superseded_dir() / "old-1.md").exists()
+        assert (postrun.ACCEPTED_DIR / "retire-1.md").exists()
+
+    def test_undecodable_pending_file_does_not_break_decide(self, postrun):
+        _findings(postrun, *MEMBERS)
+        old = _log_old(postrun)
+        new = _write_variant(postrun, "new-1", supersedes=["old-1"])
+        postrun.ledger_append("proposal", proposal_id="new-1", path=str(new), supersedes="old-1")
+        (postrun.PENDING_DIR / "garbage.md").write_bytes(b"\xff\xfe\x00garbage")
+        assert postrun.decide(str(new), "accept", "ok") == 0
+        assert not old.exists() and (postrun.superseded_dir() / "old-1.md").exists()
+
+    def _stranded_supersession(self, postrun, src: Path, sid="old-1"):
+        old = _log_old(postrun, sid)
+        retire = _write_variant(postrun, "retire-1", kind="proposal-retire", prose_diff=True,
+                                supersedes=[sid])
+        postrun.ledger_append("proposal", proposal_id="retire-1", path=str(retire),
+                              supersedes=sid)
+        src.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(old, src)
+        postrun._edit_frontmatter(src, add={"superseded_by": "retire-1",
+                                            "superseded_run": "r-x"})
+        postrun.ledger_append("proposal_superseded", proposal_id=sid, superseded_by="retire-1",
+                              run_id="r-x", path=str(src), from_path=str(old))
+        return old, retire
+
+    def test_restore_skips_a_ledger_path_outside_superseded(self, postrun, tmp_path, capsys):
+        stray = tmp_path / "elsewhere" / "old-1.md"
+        old, retire = self._stranded_supersession(postrun, stray)
+        assert postrun.decide(str(retire), "decline", "not stale") == 0
+        assert stray.exists() and not old.exists() and not retire.exists()
+        assert (postrun.DECLINED_DIR / "retire-1.md").exists()
+        assert _events(postrun, "proposal_restored") == []
+        assert _events(postrun, "decision")[-1]["not_restored"] == "old-1"
+        err = capsys.readouterr().err
+        assert "old-1" in err and "not restored" in err
+
+    def test_restore_skips_a_superseded_file_whose_id_differs(self, postrun, capsys):
+        src = postrun.superseded_dir() / "old-1.md"
+        old, retire = self._stranded_supersession(postrun, src)
+        src.write_text(src.read_text().replace("id: old-1", "id: other-1", 1))
+        assert postrun.decide(str(retire), "decline", "not stale") == 0
+        assert src.exists() and not old.exists() and not retire.exists()
+        assert "id: other-1" in src.read_text()
+        assert _events(postrun, "proposal_restored") == []
+        assert _events(postrun, "decision")[-1]["not_restored"] == "old-1"
+        err = capsys.readouterr().err
+        assert "old-1" in err and "not restored" in err
+
+    def test_restore_after_a_crash_before_the_stamp(self, postrun, monkeypatch):
+        _findings(postrun, *MEMBERS)
+        old = _log_old(postrun)
+        new = _write_variant(postrun, "new-1", supersedes=["old-1"])
+        real_edit = postrun._edit_frontmatter
+        interrupted = []
+
+        def interrupt_once(path, add=None, remove=()):
+            if not interrupted:
+                interrupted.append(path)
+                raise KeyboardInterrupt
+            return real_edit(path, add=add, remove=remove)
+
+        monkeypatch.setattr(postrun, "_edit_frontmatter", interrupt_once)
+        with pytest.raises(KeyboardInterrupt):
+            postrun.process_run_artifacts("r-new", known=postrun.known_from_ledger())
+        moved = postrun.superseded_dir() / "old-1.md"
+        assert moved.exists() and not old.exists()
+        assert "superseded_by" not in postrun.parse_frontmatter(moved.read_text())[0]
+        assert postrun.decide(str(new), "decline", "wrong merge", restore_superseded=True) == 0
+        assert old.exists() and not moved.exists()
+        assert "superseded_by" not in postrun.parse_frontmatter(old.read_text())[0]
+        assert not any(postrun.FINDINGS_DIR.glob("*.reviewed"))
+        assert [e["proposal_id"] for e in _events(postrun, "proposal_restored")] == ["old-1"]
+        assert _events(postrun, "decision")[-1]["restored"] == "old-1"
+
+    def test_restoring_decline_warns_and_marks_none_of_an_id_whose_file_is_missing(
+            self, postrun, capsys):
+        _findings(postrun, *MEMBERS, EXTRA_MEMBER)
+        old = _log_old(postrun)
+        new = _write_variant(postrun, "new-1", members=MEMBERS + [EXTRA_MEMBER],
+                             supersedes=["old-1"])
+        postrun.ledger_append("proposal", proposal_id="new-1", path=str(new), supersedes="old-1")
+        postrun.ledger_append("proposal_superseded", proposal_id="old-1", superseded_by="new-1",
+                              run_id="r-x", path=str(postrun.superseded_dir() / "old-1.md"),
+                              from_path=str(old), members=",".join(MEMBERS))
+        old.unlink()
+        assert postrun.decide(str(new), "decline", "wrong merge", restore_superseded=True) == 0
+        assert not new.exists() and (postrun.DECLINED_DIR / "new-1.md").exists()
+        assert {p.stem for p in postrun.FINDINGS_DIR.glob("*.reviewed")} == {EXTRA_MEMBER}
+        assert _events(postrun, "proposal_restored") == []
+        decision = _events(postrun, "decision")[-1]
+        assert decision["not_restored"] == "old-1" and decision["restored"] == ""
+        assert decision["members_kept"] == ",".join(MEMBERS)
+        assert decision["members_marked"] == EXTRA_MEMBER
+        captured = capsys.readouterr()
+        assert "old-1" in captured.err and "not restored" in captured.err
+        assert ("; kept unmarked (still carried by a pending proposal or by an id not "
+                "restored): 2") in captured.out
+
+    def test_accept_after_a_crash_before_the_move_marks_no_member_of_the_stranded_id(
+            self, postrun, monkeypatch):
+        _findings(postrun, *MEMBERS)
+        old = _log_old(postrun)
+        new = _write_variant(postrun, "new-1", supersedes=["old-1"])
+        real_move = postrun.shutil.move
+        crashed = []
+
+        def interrupt_once(src, dst):
+            if not crashed:
+                crashed.append(src)
+                raise KeyboardInterrupt
+            return real_move(src, dst)
+
+        monkeypatch.setattr(postrun.shutil, "move", interrupt_once)
+        with pytest.raises(KeyboardInterrupt):
+            postrun.process_run_artifacts("r-new", known=postrun.known_from_ledger())
+        assert old.exists()
+        assert [e["proposal_id"] for e in _events(postrun, "proposal_superseded")] == ["old-1"]
+        assert postrun.decide(str(new), "accept", "ok") == 0
+        assert old.exists() and not new.exists()
+        assert not any(postrun.FINDINGS_DIR.glob("*.reviewed"))
+        assert _events(postrun, "decision")[-1]["members_marked"] == ""
+
+    def test_decline_refusal_names_the_restore_flag(self, postrun, capsys):
+        _findings(postrun, *MEMBERS)
+        old = _log_old(postrun)
+        new = _write_variant(postrun, "new-1", members=MEMBERS[:1], supersedes=["old-1"])
+        assert postrun.decide(str(new), "decline", "wrong") == 2
+        assert old.exists() and new.exists()
+        assert not any(postrun.FINDINGS_DIR.glob("*.reviewed"))
+        assert "--restore-superseded" in capsys.readouterr().err
+
+    def _retire_stranded_before_the_move(self, postrun, monkeypatch):
+        _findings(postrun, *MEMBERS)
+        old = _log_old(postrun)
+        retire = _write_variant(postrun, "retire-1", kind="proposal-retire", prose_diff=True,
+                                supersedes=["old-1"])
+        real_move = postrun.shutil.move
+        failed = []
+
+        def fail_once(src, dst):
+            if not failed:
+                failed.append(src)
+                raise OSError("rename failed")
+            return real_move(src, dst)
+
+        monkeypatch.setattr(postrun.shutil, "move", fail_once)
+        with pytest.raises(OSError):
+            postrun.process_run_artifacts("r-retire", known=postrun.known_from_ledger())
+        assert old.exists() and retire.exists()
+        assert [e["superseded_by"] for e in _events(postrun, "proposal_superseded")] == ["retire-1"]
+        return old, retire
+
+    def test_restoring_decline_warns_when_the_superseded_id_was_decided_since(
+            self, postrun, monkeypatch, capsys):
+        old, retire = self._retire_stranded_before_the_move(postrun, monkeypatch)
+        assert postrun.decide(str(old), "accept", "ok") == 0
+        assert (postrun.ACCEPTED_DIR / "old-1.md").exists() and not old.exists()
+        assert postrun.decide(str(retire), "decline", "not stale") == 0
+        assert (postrun.DECLINED_DIR / "retire-1.md").exists() and not retire.exists()
+        assert not old.exists() and not (postrun.superseded_dir() / "old-1.md").exists()
+        assert _events(postrun, "proposal_restored") == []
+        decision = _events(postrun, "decision")[-1]
+        assert decision["proposal_id"] == "retire-1"
+        assert decision["not_restored"] == "old-1" and decision["restored"] == ""
+        err = capsys.readouterr().err
+        assert "old-1" in err and "not restored" in err
+
+    def test_restoring_decline_warns_when_a_later_redraft_superseded_the_id(
+            self, postrun, monkeypatch, capsys):
+        old, retire = self._retire_stranded_before_the_move(postrun, monkeypatch)
+        _write_variant(postrun, "new-2", supersedes=["old-1"])
+        postrun.process_run_artifacts("r-redraft", known=postrun.known_from_ledger())
+        moved = postrun.superseded_dir() / "old-1.md"
+        assert moved.exists() and not old.exists()
+        assert postrun.parse_frontmatter(moved.read_text())[0]["superseded_by"] == "new-2"
+        assert postrun.decide(str(retire), "decline", "not stale") == 0
+        assert moved.exists() and not old.exists()
+        assert postrun.parse_frontmatter(moved.read_text())[0]["superseded_by"] == "new-2"
+        assert (postrun.DECLINED_DIR / "retire-1.md").exists() and not retire.exists()
+        assert not any(postrun.FINDINGS_DIR.glob("*.reviewed"))
+        assert _events(postrun, "proposal_restored") == []
+        assert _events(postrun, "decision")[-1]["not_restored"] == "old-1"
+        err = capsys.readouterr().err
+        assert "old-1" in err and "not restored" in err
+
+
+class TestDecideProtectsSharedMembers:
+    @pytest.mark.parametrize("kind", ["accept", "decline"])
+    def test_plain_decide_leaves_a_member_another_pending_proposal_carries(self, postrun, kind):
+        _findings(postrun, *MEMBERS, EXTRA_MEMBER)
+        first = _write_variant(postrun, "a-1", members=[MEMBERS[0], MEMBERS[1]])
+        second = _write_variant(postrun, "b-1", members=[MEMBERS[0], EXTRA_MEMBER])
+        postrun.process_run_artifacts("r-1", known=set())
+        assert postrun.decide(str(first), kind, "reason") == 0
+        assert {p.stem for p in postrun.FINDINGS_DIR.glob("*.reviewed")} == {MEMBERS[1]}
+        assert _events(postrun, "decision")[-1]["members_marked"] == MEMBERS[1]
+        assert postrun.decide(str(second), "accept", "ok") == 0
+        assert {p.stem for p in postrun.FINDINGS_DIR.glob("*.reviewed")} == {
+            MEMBERS[0], MEMBERS[1], EXTRA_MEMBER}
+
+    def test_decide_reports_the_shared_member_as_kept(self, postrun, capsys):
+        _findings(postrun, *MEMBERS, EXTRA_MEMBER)
+        first = _write_variant(postrun, "a-1", members=[MEMBERS[0], MEMBERS[1]])
+        _write_variant(postrun, "b-1", members=[MEMBERS[0], EXTRA_MEMBER])
+        postrun.process_run_artifacts("r-1", known=set())
+        assert postrun.decide(str(first), "accept", "ok") == 0
+        assert _events(postrun, "decision")[-1]["members_kept"] == MEMBERS[0]
+        assert "; kept unmarked (still carried by a pending proposal): 1" in capsys.readouterr().out
+
+
+class TestValidateSubcommand:
+
+    def _fence_less(self, postrun, name="cr.md", declared="0", supersedes=None,
+                    with_section=True):
+        target = postrun.ALLOWED_TARGET_ROOTS[0] / "findings"
+        target.mkdir(parents=True, exist_ok=True)
+        sup = f"supersedes: [{supersedes}]\n" if supersedes else ""
+        section = "\n## Supersedes\nolder: retire — spent\n" if with_section else ""
+        text = (
+            "---\n"
+            "id: cr-1\nrun_id: r-test\ncluster: c\nlane: digest\n"
+            "kind: corpus-retire\nevidence_kind: findings\n"
+            "members: [0eef8c47-2bc4-41d3-84df-c61e3ec2f9d1, "
+            "a2d9ddea-0320-417e-b556-d2a8a44420f2]\n"
+            f"targets: [{target}]\n"
+            f"always_on_bytes: {declared}\nflow_cost: none\nbase_rev: abc1234\n"
+            + sup +
+            "expectation: the parked remainder shrinks by 1\n"
+            "check_window_days: 14\nrevert: delete the .reviewed markers\n"
+            "---\n\n## Evidence\none line per member.\n\n"
+            "## Diff\nNo artifact change: accepting retires the members.\n"
+            + section
+        )
+        path = postrun.PENDING_DIR / name
+        path.write_text(text)
+        return path
+
+    def test_missing_supersedes_section_is_reported(self, postrun):
+        path = self._fence_less(postrun, supersedes="older", with_section=False)
+        violations, _notes, _info = postrun.validate_artifact(str(path), False)
+        assert any("## Supersedes" in v for v in violations)
+
+    def test_declared_bytes_mismatch_reports_the_computed_delta(self, postrun):
+        path = _write_proposal(postrun, name="m.md",
+                               target=postrun.ALLOWED_TARGET_ROOTS[0] / "flows" / "f.md")
+        text = path.read_text()
+        text = text.replace("always_on_bytes: 9", "always_on_bytes: 593")
+        text = text.replace("+++ b/rules/foo.md", "+++ b/flows/f.md")
+        path.write_text(text)
+        violations, _notes, info = postrun.validate_artifact(str(path), False)
+        assert any("always_on_bytes mismatch" in v for v in violations)
+        assert "computed +0" in info
+        assert "declared 593" in info
+
+    def test_computed_delta_is_the_diff_not_the_declaration(self, postrun):
+        path = _write_proposal(postrun, name="c.md")
+        _violations, _notes, info = postrun.validate_artifact(str(path), False)
+        assert "declared 9" in info
+        assert "computed +9" in info
+
+    def test_valid_proposal_passes_and_prints_delta(self, postrun):
+        path = _write_proposal(postrun, name="ok.md")
+        violations, _notes, info = postrun.validate_artifact(str(path), False)
+        assert violations == []
+        assert "always_on_bytes" in info
+
+    def test_fence_less_proposal_passes_with_na(self, postrun):
+        path = self._fence_less(postrun, name="ok-cr.md")
+        violations, _notes, info = postrun.validate_artifact(str(path), False)
+        assert violations == []
+        assert "n/a (no diff fence)" in info
+
+    def test_check_artifact_validates(self, postrun):
+        good = postrun.CHECKS_DIR / "c1.md"
+        good.write_text("---\nid: c1\nrun_id: r\nexpectation: x\n"
+                        "check_window_days: 30\n---\n\nbody\n")
+        assert postrun.validate_artifact(str(good), True)[0] == []
+        bad = postrun.CHECKS_DIR / "c2.md"
+        bad.write_text("---\nid: c2\nrun_id: r\n---\n\nbody\n")
+        assert any("expectation" in v
+                   for v in postrun.validate_artifact(str(bad), True)[0])
+
+    def test_validate_agrees_with_the_gate_on_independent_proposals(self, postrun):
+        good = _write_proposal(postrun, name="a.md")
+        bad = _write_proposal(postrun, name="b.md", drop_field="revert")
+        pre = {p.name: postrun.validate_artifact(str(p), False)[0] == []
+               for p in (good, bad)}
+        postrun.process_run_artifacts("r-gate", set())
+        post = {"a.md": (postrun.PENDING_DIR / "a.md").is_file(),
+                "b.md": (postrun.PENDING_DIR / "b.md").is_file()}
+        assert pre == post
+
+    def test_known_divergence_two_proposals_one_supersedes_id(self, postrun):
+        older = _write_proposal(postrun, name="older.md")
+        postrun.ledger_append("proposal", proposal_id="older",
+                              path=str(older), lane="digest")
+        first = self._fence_less(postrun, name="s1.md", supersedes="older")
+        second = self._fence_less(postrun, name="s2.md", supersedes="older")
+        assert postrun.validate_artifact(str(first), False)[0] == []
+        assert postrun.validate_artifact(str(second), False)[0] == []
+        postrun.process_run_artifacts("r-div", {"older.md"})
+        survivors = sorted(p.name for p in postrun.PENDING_DIR.glob("s*.md"))
+        assert survivors == ["s1.md"]
+
+    def test_validate_mutates_nothing(self, postrun, tmp_path):
+        path = _write_proposal(postrun, name="ro.md")
+        postrun.LEDGER_PATH.write_text("")
+
+        def snapshot():
+            return sorted(
+                (str(p.relative_to(tmp_path)), p.stat().st_size, p.stat().st_mtime_ns)
+                for p in tmp_path.rglob("*") if p.is_file()
+            )
+
+        before = snapshot()
+        postrun.validate_artifact(str(path), False)
+        assert snapshot() == before
+
+    def test_non_integer_bytes_rejected_without_a_diff_fence(self, postrun):
+        path = self._fence_less(postrun, name="bad-bytes.md", declared="unknown")
+        violations, _notes, _info = postrun.validate_artifact(str(path), False)
+        assert any("not an integer" in v for v in violations)
+
+    def test_gate_quarantines_non_integer_bytes_without_a_fence(self, postrun):
+        self._fence_less(postrun, name="bad-bytes-gate.md", declared="unknown")
+        postrun.process_run_artifacts("r-int", set())
+        assert not (postrun.PENDING_DIR / "bad-bytes-gate.md").is_file()
+        assert (postrun.REJECTED_DIR / "bad-bytes-gate.md").is_file()
+
+    def test_backpressure_warning_names_the_streak_and_zero_negative(self, postrun, capsys):
+        for i in range(3):
+            postrun.record_backpressure(f"r{i}", 2, 0)
+        err = capsys.readouterr().err
+        assert "back-pressure violation" in err
+        assert "3 consecutive" in err
+        assert "zero negative-byte proposals" in err
+        assert "only grew" not in err
+
+    def test_non_utf8_artifact_exits_2_instead_of_raising(self, postrun):
+        path = postrun.PENDING_DIR / "binary.md"
+        path.write_bytes(b"\xff\xfe\x00binary")
+        assert postrun.main(["validate", "--proposal", str(path)]) == 2
+
+    def test_empty_proposal_target_reports_instead_of_raising(self, postrun):
+        assert postrun.main(["validate", "--proposal", ""]) == 2
+
+    def test_main_returns_0_on_a_clean_proposal(self, postrun):
+        path = _write_proposal(postrun, name="clean.md")
+        assert postrun.main(["validate", "--proposal", str(path)]) == 0
+
+    def test_main_returns_1_and_prints_violations_on_stdout(self, postrun, capsys):
+        path = _write_proposal(postrun, name="dirty.md", drop_field="revert")
+        assert postrun.main(["validate", "--proposal", str(path)]) == 1
+        out = capsys.readouterr().out
+        assert "missing required field: revert" in out
+
+    def test_main_check_flag_dispatches_to_the_check_path(self, postrun, capsys):
+        bad = postrun.CHECKS_DIR / "c3.md"
+        bad.write_text("---\nid: c3\nrun_id: r\n---\n\nbody\n")
+        assert postrun.main(["validate", "--check", str(bad)]) == 1
+        out = capsys.readouterr().out
+        assert "missing required field: expectation" in out
+
+    def test_skipped_env_apply_check_still_exits_0_with_a_note(self, postrun, monkeypatch, capsys):
+        path = _write_proposal(postrun, name="env.md")
+        monkeypatch.setattr(postrun, "_apply_check",
+                            lambda path_str, body: ("skipped-env", "boom"))
+        assert postrun.main(["validate", "--proposal", str(path)]) == 0
+        out = capsys.readouterr().out
+        assert "NOTE apply-check skipped (environment): boom" in out

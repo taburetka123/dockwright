@@ -64,13 +64,13 @@ def test_fix_command_plus_other_high_signal_reports_both(selffix):
     assert "edits:5" in line
 
 
-def test_fix_alias_still_escalates(selffix):
+def test_fix_alias_no_longer_escalates(selffix):
     transcript = _write_transcript(selffix["home"], "sid-c6", [
         _command_invocation("fix", "the retry double-fires on replay"),
     ])
     line = _invoke(selffix, "sid-c6", transcript)
-    assert _outcome(line) == "spawn", f"expected spawn, got: {line!r}"
-    assert "fix-command" in line
+    assert _outcome(line) != "spawn"
+    assert "fix-command" not in line
 
 
 def test_fix_alias_files_exist():

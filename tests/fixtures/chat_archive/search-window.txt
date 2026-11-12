@@ -1,0 +1,24 @@
+# Search Results for:
+
+## Messages (2 results)
+### Result 1 of 2
+Channel: #some-channel (ID: C01ABCDEF)
+From: Ada Example <ada@example.test> (ID: U01ABCDEF)
+Time: 2026-10-27 13:20:59 +00
+Message_ts: 1793107259.250289
+Permalink: [link](https://chat.example.test/archives/C01ABCDEF/p1793107259250289?thread_ts=1793106047.590119&cid=C01ABCDEF)
+Text:
+Lorem ipsum reply in a thread, <@U01ME00000> dolor.
+
+---
+
+### Result 2 of 2
+Channel: #some-channel (ID: C01ABCDEF)
+From: Bob Example <bob@example.test> (ID: U01BOBBOB)
+Time: 2026-10-27 13:21:00 +00
+Message_ts: 1793107260.000100
+Permalink: [link](https://chat.example.test/archives/C01ABCDEF/p1793107260000100)
+Text:
+Sed do eiusmod tempor, a top-level message in the same second.
+
+---

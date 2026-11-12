@@ -80,9 +80,9 @@ cat > "$PLIST_PATH" <<EOF
         <string>/usr/bin/python3</string>
         <string>$GATE_PATH</string>
     </array>
-    <!-- Hourly tick. The tick is LLM-free file arithmetic; the gate's own
-         K-threshold / weekly-floor / 3-per-week cap make the actual run
-         cadence conservative (PRD §5, §10).
+    <!-- Hourly tick. The tick is LLM-free file arithmetic; the gate spawns a
+         digest at most once per 7 days since the last ok digest, and its
+         3-per-week attempt cap only retries a failed run (PRD §5, §10).
          Disable: touch ~/.claude/dockwright/gardener-stop
          Uninstall: launchctl bootout gui/\$(id -u)/$PLIST_LABEL && rm $PLIST_PATH -->
     <key>StartInterval</key>

@@ -1,0 +1,44 @@
+{
+  "enableAllProjectMcpServers": true,
+  "remoteControlAtStartup": false,
+  "disableRemoteControl": true,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|NotebookEdit|MultiEdit",
+        "hooks": [
+          {"type": "command", "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"topic agent edits nothing - answer in a reply.* artifact\"}}'", "timeout": 10}
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {"type": "command", "command": "@@DOCKWRIGHT_BIN@@ reply-guard || echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"topic agent guard failed - denying\"}}'", "timeout": 10}
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "mcp__dockwright__artifact_get",
+      "mcp__dockwright__artifact_list",
+      "mcp__dockwright__artifact_put",
+      "mcp__dockwright__worker_done",
+      "mcp__dockwright__child_done",
+      "Bash(dockwright board:*)",
+      "Bash(printenv:*)"
+    ],
+    "deny": [
+      "Edit",
+      "NotebookEdit",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git rebase:*)",
+      "Bash(git reset:*)",
+      "Bash(git checkout:*)",
+      "Bash(gh pr merge:*)",
+      "Bash(gh pr edit:*)",
+      "Bash(rm:*)"
+    ]
+  }
+}

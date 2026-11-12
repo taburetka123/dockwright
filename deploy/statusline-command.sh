@@ -21,16 +21,33 @@ else
   todos=""
 fi
 
+pct_color() {
+  if [ "$1" -lt 60 ]; then echo 82
+  elif [ "$1" -le 85 ]; then echo 220
+  else echo 196; fi
+}
+
 rate_badge() {
   case "$2" in ''|*[!0-9]*) return 0;; esac
-  if [ "$2" -lt 60 ]; then color=82
-  elif [ "$2" -le 85 ]; then color=220
-  else color=196; fi
-  printf " \033[38;5;%sm· %s %s%%\033[0m" "$color" "$1" "$2"
+  printf " \033[38;5;%sm· %s %s%%%s\033[0m" "$(pct_color "$2")" "$1" "$2" "${3:-}"
 }
+
+ctx_badge() {
+  case "$1" in ''|*[!0-9]*) return 0;; esac
+  case "$2" in ''|*[!0-9]*) return 0;; esac
+  case "$3" in ''|0|*[!0-9]*) return 0;; esac
+  used_k=$(( ($2 + 500) / 1000 ))
+  if [ $(( $3 % 1000000 )) -eq 0 ]; then size_h="$(( $3 / 1000000 ))M"
+  elif [ $(( $3 % 1000 )) -eq 0 ]; then size_h="$(( $3 / 1000 ))k"
+  else size_h="$3"; fi
+  printf " \033[38;5;%sm· ctx %s%% %sk/%s\033[0m" "$(pct_color "$1")" "$1" "$used_k" "$size_h"
+}
+
 five_hour_pct=$(echo "$input" | jq -r '(.rate_limits.five_hour.used_percentage // empty) | round' 2>/dev/null)
 seven_day_pct=$(echo "$input" | jq -r '(.rate_limits.seven_day.used_percentage // empty) | round' 2>/dev/null)
-ratelimits="$(rate_badge 5h "$five_hour_pct")$(rate_badge 7d "$seven_day_pct")"
+ctx_pct=$(echo "$input" | jq -r '(.context_window.used_percentage // empty) | round' 2>/dev/null)
+ctx_used=$(echo "$input" | jq -r '(.context_window.total_input_tokens // empty) | round' 2>/dev/null)
+ctx_size=$(echo "$input" | jq -r '(.context_window.context_window_size // empty) | round' 2>/dev/null)
 
 ccd="${CLAUDE_CONFIG_DIR:-}"
 if [ -z "$ccd" ] || [ "$ccd" = "$HOME/.claude" ]; then
@@ -40,6 +57,50 @@ else
   cfg_label="${cfg_base#.claude-}"
 fi
 cfg_badge=$(printf " \033[38;5;245m· cfg:%s\033[0m" "$cfg_label")
+
+cfg_json="${ccd:-$HOME}/.claude.json"
+now=$(date +%s)
+scoped=$(jq -c -s '
+  (.[0] // {}) as $f
+  | ($f.cachedUsageUtilization // {}) as $c
+  | (($c.accountUuid | type) == "string" and $c.accountUuid == $f.oauthAccount.accountUuid
+     and ($c.utilization.limits | type) == "array") as $ok
+  | {at: (if $ok and (($c.fetchedAtMs | type) == "number") then ($c.fetchedAtMs / 1000 | floor) else null end),
+     rows: (if $ok then
+             [ $c.utilization.limits[]
+               | select(.kind == "weekly_scoped"
+                        and (.scope.model.display_name | type) == "string"
+                        and (.percent | type) == "number")
+               | {name: .scope.model.display_name,
+                  pct: (.percent | round),
+                  resets_at: (.resets_at
+                              | if type == "string"
+                                then (try (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdate) catch null)
+                                elif type == "number" then . else null end)} ]
+           else [] end)}' "$cfg_json" 2>/dev/null)
+if ! jq -n -e --argjson s "$scoped" '$s | type == "object" and (.rows | type) == "array"' >/dev/null 2>&1; then
+  scoped='{"at":null,"rows":[]}'
+fi
+scoped_at=$(printf '%s' "$scoped" | jq -r '.at // empty' 2>/dev/null)
+model_badges=$(printf '%s' "$scoped" \
+  | jq -r '.rows[] | [.name, .pct, (.resets_at // "")] | join("\u001f")' 2>/dev/null \
+  | while IFS=$(printf '\037') read -r name pct reset; do
+      case "$reset" in
+        (''|*[!0-9]*) ;;
+        (*) [ "$now" -ge "$reset" ] && continue ;;
+      esac
+      suffix=""
+      case "$scoped_at" in
+        (''|*[!0-9]*) ;;
+        (*)
+          age=$(( now - scoped_at ))
+          if [ "$age" -ge 86400 ]; then suffix=" ($(( age / 86400 ))d)"
+          elif [ "$age" -ge 3600 ]; then suffix=" ($(( age / 3600 ))h)"; fi
+          ;;
+      esac
+      rate_badge "$name" "$pct" "$suffix"
+    done)
+ratelimits="$(rate_badge 5h "$five_hour_pct")$(rate_badge 7d "$seven_day_pct")$model_badges$(ctx_badge "$ctx_pct" "$ctx_used" "$ctx_size")"
 
 if echo "$input" | jq -e '.rate_limits != null' >/dev/null 2>&1; then
   usage_acct="${CLAUDE_ORCH_ACCOUNT:-}"
@@ -53,12 +114,14 @@ if echo "$input" | jq -e '.rate_limits != null' >/dev/null 2>&1; then
       [ -d "$usage_dir" ] || { [ -d "$HOME/.claude/orchestrator/usage" ] && usage_dir="$HOME/.claude/orchestrator/usage"; }
       if mkdir -p "$usage_dir" 2>/dev/null; then
         usage_tmp="$usage_dir/.$usage_acct.json.tmp.$$"
-        if echo "$input" | jq -c --argjson ts "$(date +%s)" '{
+        if echo "$input" | jq -c --argjson ts "$now" --argjson scoped "$scoped" '{
               five_hour_pct: (.rate_limits.five_hour.used_percentage // null),
               seven_day_pct: (.rate_limits.seven_day.used_percentage // null),
               five_hour_resets_at: (.rate_limits.five_hour.resets_at // null),
               seven_day_resets_at: (.rate_limits.seven_day.resets_at // null),
-              ts: $ts
+              ts: $ts,
+              model_scoped: $scoped.rows,
+              model_scoped_at: $scoped.at
             }' > "$usage_tmp" 2>/dev/null; then
           mv -f "$usage_tmp" "$usage_dir/$usage_acct.json" 2>/dev/null || rm -f "$usage_tmp" 2>/dev/null
         else
@@ -68,6 +131,33 @@ if echo "$input" | jq -e '.rate_limits != null' >/dev/null 2>&1; then
       ;;
   esac
 fi
+
+case "$session_id" in
+  ""|.*|*/*) : ;;
+  *)
+    ctx_root="$HOME/.claude/dockwright/usage"
+    [ -d "$ctx_root" ] || { [ -d "$HOME/.claude/orchestrator/usage" ] && ctx_root="$HOME/.claude/orchestrator/usage"; }
+    ctx_dir="$ctx_root/context"
+    ctx_file="$ctx_dir/$session_id.json"
+    ctx_writable=1
+    case "$ctx_pct" in ''|*[!0-9]*) ctx_writable=0;; esac
+    case "$ctx_used" in ''|*[!0-9]*) ctx_writable=0;; esac
+    case "$ctx_size" in ''|*[!0-9]*) ctx_writable=0;; esac
+    if [ "$ctx_writable" -eq 1 ]; then
+      if mkdir -p "$ctx_dir" 2>/dev/null; then
+        ctx_tmp="$ctx_dir/.$session_id.json.tmp.$$"
+        if printf '{"used_tokens":%s,"context_window_size":%s,"used_percentage":%s,"ts":%s}\n' \
+             "$ctx_used" "$ctx_size" "$ctx_pct" "$(date +%s)" > "$ctx_tmp" 2>/dev/null; then
+          mv -f "$ctx_tmp" "$ctx_file" 2>/dev/null || rm -f "$ctx_tmp" 2>/dev/null
+        else
+          rm -f "$ctx_tmp" 2>/dev/null
+        fi
+      fi
+    else
+      rm -f "$ctx_file" 2>/dev/null
+    fi
+    ;;
+esac
 
 model_name=$(echo "$input" | jq -r '.model.display_name // .model.id // empty' 2>/dev/null)
 effort_level=$(echo "$input" | jq -r '.effort.level // empty' 2>/dev/null)
@@ -82,7 +172,6 @@ fi
 
 worker_label=""
 mgr_identity=""
-mgr_workers_row=""
 active_dir="$HOME/.claude/dockwright/active"
 [ -d "$active_dir" ] || active_dir="$HOME/.claude/orchestrator/active"
 record=""
@@ -106,29 +195,6 @@ if [ "$agent" = "manager" ]; then
       mgr_identity=$(printf "\033[38;5;117m%s\033[0m" "$manager_name")
     fi
   fi
-
-  idle=0
-  processing=0
-  if [ -d "$active_dir" ]; then
-    counts=$(jq -r --arg mgr "$manager_name" \
-      'select(.agent == "worker" and (.parent_manager_name == $mgr or .parent_manager_name == null) and .pid != null) | [.pid, .state, .claude_sid, (.transcript_path // "")] | @tsv' \
-      "$active_dir"/*.json 2>/dev/null \
-      | while IFS=$(printf '\t') read -r pid state sid tp; do
-          [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || continue
-          if [ "$state" = "idle" ] && [ -n "$tp" ] && [ -n "$sid" ]; then
-            subagents_dir="$(dirname "$tp")/$sid/subagents"
-            if [ -n "$(find "$subagents_dir" -name 'agent-*.jsonl' -newer "$tp" -mmin -15 2>/dev/null | head -n 1)" ]; then
-              state="processing"
-            fi
-          fi
-          echo "$state"
-        done \
-      | awk 'BEGIN{i=0;p=0} /^idle$/{i++} /^processing$/{p++} END{printf "%d %d", i, p}')
-    set -- $counts
-    idle=${1:-0}
-    processing=${2:-0}
-  fi
-  mgr_workers_row=$(printf "\033[38;5;208m🤖 %di / %dp\033[0m" "$idle" "$processing")
 elif [ "$agent" = "worker" ]; then
   funny_name=""
   task_name=""
@@ -136,7 +202,7 @@ elif [ "$agent" = "worker" ]; then
   if [ -n "$record" ]; then
     funny_name=$(jq -r '.funny_name // empty' "$record" 2>/dev/null)
     task_name=$(jq -r '.name // empty' "$record" 2>/dev/null)
-    parent_name=$(jq -r '.parent_manager_name // empty' "$record" 2>/dev/null)
+    parent_name=$(jq -r '.parent_name // .parent_manager_name // empty' "$record" 2>/dev/null)
   fi
   if [ -n "$funny_name" ]; then
     worker_label="$worker_label$(printf " \033[38;5;117m%s\033[0m" "$funny_name")"
@@ -155,12 +221,10 @@ if [ "$agent" = "manager" ]; then
   if [ -n "$mgr_identity" ]; then
     row1="$row1  $(printf '\033[38;5;213m🎯\033[0m') $mgr_identity"
   fi
-  [ -n "$mgr_workers_row" ] && row1="$row1  $mgr_workers_row"
+  row1="$row1$proposals$todos"
   row2="$ratelimits$cfg_badge$model_effort"
-  row3="$proposals$todos"
   printf '%s\n' "$row1"
-  printf '%s\n' "${row2# }"
-  printf '%s' "${row3# }"
+  printf '%s' "${row2# }"
 elif [ "$agent" = "worker" ]; then
   row1="$dir"
   [ -n "$branch" ] && row1="$row1  $branch"

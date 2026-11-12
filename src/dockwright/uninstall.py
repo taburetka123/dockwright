@@ -111,6 +111,23 @@ def strip_orchestrator_hooks(settings: dict, snippet: dict | None,
     return out
 
 
+PLUGIN_KEY = "dockwright@dockwright"
+PLUGIN_MARKETPLACE = "dockwright"
+
+
+def strip_plugin_registration(settings: dict) -> dict:
+    out = dict(settings)
+    enabled = dict(out.get("enabledPlugins") or {})
+    if PLUGIN_KEY in enabled:
+        enabled.pop(PLUGIN_KEY)
+        out["enabledPlugins"] = enabled
+    markets = dict(out.get("extraKnownMarketplaces") or {})
+    if PLUGIN_MARKETPLACE in markets:
+        markets.pop(PLUGIN_MARKETPLACE)
+        out["extraKnownMarketplaces"] = markets
+    return out
+
+
 def _count_hooks(settings: dict) -> int:
     return sum(len(block.get("hooks", []))
                for blocks in settings.get("hooks", {}).values() for block in blocks)
@@ -156,6 +173,10 @@ def build_plan(roots: Roots) -> Plan:
             plan.mcp.append(["claude", "mcp", "remove", "--scope", "user", server_name])
         if shutil.which("codex"):
             plan.mcp.append(["codex", "mcp", "remove", server_name])
+    if shutil.which("claude"):
+        plan.mcp.append(["claude", "plugin", "uninstall", PLUGIN_KEY, "--scope", "user"])
+        plan.mcp.append(["claude", "plugin", "marketplace", "remove", PLUGIN_MARKETPLACE,
+                         "--scope", "user"])
 
     snippet = _load_snippet(roots.repo_dir)
     extra_bins = [str(roots.repo_dir / ".venv" / "bin" / "dockwright"),
@@ -179,6 +200,8 @@ def build_plan(roots: Roots) -> Plan:
             continue
         data = json.loads(target.read_text())
         stripped = strip_orchestrator_hooks(data, snippet, extra_bins)
+        if mode == "claude":
+            stripped = strip_plugin_registration(stripped)
         removed = _count_hooks(data) - _count_hooks(stripped)
         if mode == "codex" and not stripped:
             plan.hook_edits.append(HookEdit(target, None, removed))
@@ -241,6 +264,7 @@ def build_plan(roots: Roots) -> Plan:
         roots.state_root,
         roots.manager_memory_root,
         roots.xdg_config_dir,
+        dockwright_home / "plugin",
         dockwright_home / "loops-registry.md",
         dockwright_home / "manager-memory",
         dockwright_home / "gardener",

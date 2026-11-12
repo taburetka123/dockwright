@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 from . import paths, state
+from .session_pid import _ppid_of
 from .terminal import get_driver
 
 MAX_HOPS = 8
@@ -31,22 +31,6 @@ def _resolve_via_pane_id(records: list[dict]) -> dict | None:
         print(f"identity: TMUX_PANE={wid!r} matches no manager record; "
               f"trying PPID-walk", file=sys.stderr)
     return None
-
-
-def _ppid_of(pid: int) -> int | None:
-    try:
-        result = subprocess.run(
-            ["ps", "-o", "ppid=", "-p", str(pid)],
-            capture_output=True, text=True, timeout=2, check=False,
-        )
-        if result.returncode != 0:
-            return None
-        token = result.stdout.strip()
-        if not token:
-            return None
-        return int(token)
-    except (subprocess.SubprocessError, ValueError):
-        return None
 
 
 def _resolve_via_ppid_walk(records: list[dict]) -> dict | None:

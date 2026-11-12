@@ -1,0 +1,11 @@
+{
+  "name": "dockwright",
+  "owner": {"name": "dockwright"},
+  "plugins": [
+    {
+      "name": "dockwright",
+      "source": "./plugins/dockwright",
+      "description": "Manager lane monitors for dockwright (armed by Skill(dockwright:arm-lanes))"
+    }
+  ]
+}

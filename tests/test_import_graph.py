@@ -60,7 +60,8 @@ def test_worker_hook_path_never_imports_fastmcp(tmp_path):
 
 def test_mcp_server_reexports_registry_helpers():
     from dockwright import mcp_server, registry
-    for name in ["_question_paths", "_drop_questions_for_worker",
+    for name in ["_question_paths", "_all_question_paths", "unique_question_paths",
+                 "manager_question_paths", "_drop_questions_for_worker",
                  "_prune_stale_active_records", "_resolve_unique_name"]:
         assert getattr(mcp_server, name) is getattr(registry, name), name
 

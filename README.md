@@ -31,6 +31,8 @@ The worker opens in its own tmux window and starts working. When it hits a decis
 
 > **Command namespace.** `setup.sh` installs slash commands into `~/.claude/commands` (and the Codex equivalents), claiming the names `/manager`, `/manager-*`, `/tab`, `/recreate-manager`, and `/dockwright-*`. If you already have user commands with those names, they get overwritten.
 
+> **Codex home.** When `codex` is on PATH, `setup.sh` also runs `dockwright translate-codex`: it rebuilds `~/.codex/AGENTS.md` from `~/.claude/rules`, mirrors `~/.claude/skills`, `~/.claude/commands` and `~/.claude/agents` into `~/.codex/skills` and `~/.codex/agents`, moves hand-written `~/.codex/rules/*.md` into `~/.codex/.dockwright-translate-backup/rules/` and removes that directory only when it is left empty, and moves any pre-existing file it does not own into `~/.codex/.dockwright-translate-backup/` before writing over it. Edit the Claude side; the Codex side is generated.
+
 ## Architecture
 
 ```
@@ -70,9 +72,12 @@ CLI:
 ```bash
 dockwright manager        # bring up the tmux server, open Claude, promote it to manager, attach
 dockwright doctor         # verify wiring (MCP registration, hooks, venv, compose freshness)
+dockwright pause          # quiet the whole fleet for a vacation: stop files, launchd jobs, workers archived, managers closed, tmux killed
+dockwright resume         # bring it back: managers on their own transcripts first, then the daemon
 dockwright init           # write a dockwright.toml with every default spelled out
 dockwright compose        # recompose agent files (cores + overlay + vars) standalone
 dockwright spend-report   # token spend per account, or money-first per-session detail (<worker-name|sid>)
+dockwright board          # board: inbox | topics | topic <KEY>; --serve for a localhost page with forms
 dockwright migrate-state  # move a legacy state tree into ~/.claude/dockwright/ (setup.sh runs this for you)
 dockwright uninstall      # provenance-driven removal; --dry-run to preview
 ```

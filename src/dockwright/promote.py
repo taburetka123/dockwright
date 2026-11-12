@@ -46,7 +46,10 @@ def _read_active_records() -> list[dict]:
 
 
 def _write_promoted_assignment(sid: str, name: str, manager_name: str,
-                               task_key: str | None = None) -> None:
+                               task_key: str | None = None,
+                               manager_sid: str | None = None,
+                               context_role: str | None = None,
+                               spawn_extra_args: list[str] | None = None) -> None:
     import time
 
     from . import paths, state
@@ -66,8 +69,12 @@ def _write_promoted_assignment(sid: str, name: str, manager_name: str,
             "branch": None,
             "manager_sid": None,
             "parent_manager_name": manager_name,
+            "parent_name": manager_name,
+            "parent_sid": manager_sid or None,
             "runtime": "claude",
             "ticket": task_key,
+            "context_role": context_role,
+            "spawn_extra_args": list(spawn_extra_args or []),
             "spawned_at": time.time(),
         })
     except Exception:
@@ -84,6 +91,9 @@ def assign_to_manager_cli() -> None:
     parser.add_argument("--task-key", default=None,
                         help="Grouping key for the assignment record (task_key: any stable slug); "
                              "joins this session into pipeline_status(task_key).")
+    from .models import EFFORTS
+    parser.add_argument("--model", required=True, help="The worker's --model token or id, e.g. '@opus[1m]'.")
+    parser.add_argument("--effort", required=True, choices=EFFORTS, help="The worker's --effort.")
     args = parser.parse_args(sys.argv[2:])
 
     if args.task_key is not None:
@@ -120,8 +130,18 @@ def assign_to_manager_cli() -> None:
             "picked the newest by started_at."
         )
 
-    extra_args = ["--settings", '{"remoteControlAtStartup": false, "disableRemoteControl": true}']
+    from . import roles
+    base_args = ["--settings", '{"remoteControlAtStartup": false, "disableRemoteControl": true}',
+                 "--model", args.model, "--effort", args.effort]
+    try:
+        extra_args = roles.default_role_args(base_args, "worker", cwd=os.getcwd())
+    except ValueError as exc:
+        print(f"ERROR: the worker cannot load its role: {exc}", file=sys.stderr)
+        sys.exit(1)
+    context_role = roles.DEFAULT_ROLE if extra_args != base_args else None
     env = {"CLAUDE_PARENT_MANAGER": manager_name}
+    if chosen.get("claude_sid"):
+        env["CLAUDE_PARENT_SID"] = chosen["claude_sid"]
 
     from .spawner import spawn_worker_tab
 
@@ -144,7 +164,9 @@ def assign_to_manager_cli() -> None:
         print(f"ERROR: could not launch the worker tab via tmux: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    _write_promoted_assignment(sid, name, manager_name, task_key=args.task_key)
+    _write_promoted_assignment(sid, name, manager_name, task_key=args.task_key,
+                               manager_sid=chosen.get("claude_sid"), context_role=context_role,
+                               spawn_extra_args=extra_args)
 
     print(
         f"Relaunched as worker '{name}' (assigned to '{manager_name}') in the "

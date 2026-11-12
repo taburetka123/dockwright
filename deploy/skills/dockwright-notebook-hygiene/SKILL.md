@@ -1,13 +1,13 @@
 ---
 name: dockwright-notebook-hygiene
-description: Actualize, prune and compress the manager notebook — verify every entry against a live source, delete what died, shrink what survived. Run it before ANY prepare_handoff or close_manager_self, including the mcp-refresh self-trigger that reaches prepare_handoff with no command, so the successor inherits a true agenda instead of a large one. Also use when the boot brief prints NOTEBOOK_WARN, or when the user asks to clean up the notebook.
+description: Actualize, prune and compress the manager notebook — verify every entry against a live source, delete what died, shrink what survived, then write the mark the handoff tools check. Run it before ANY prepare_handoff or close_manager_self, including the mcp-refresh self-trigger that reaches prepare_handoff with no command, so the successor inherits a true agenda instead of a large one. Also use when the boot brief prints NOTEBOOK_WARN or NOTEBOOK_NOT_ACTUALIZED, or when the user asks to clean up the notebook.
 ---
 
 # Notebook hygiene
 
 The manager notebook at `<state_root>/notebook/<domain>.md` is working state. A cold successor inherits it verbatim and acts on it, so a large notebook full of yesterday's truth is worse than a small one: the successor acts on the dead lines too.
 
-⛔ **The manager runs this pass itself and never spawns a worker for it.** The agent file's § Manager notebook owns that rule and states its reason; the pass reconciles the notebook against what THIS session learned.
+⛔ **The manager runs this pass itself and never spawns a worker for it.** The agent file's § Manager notebook owns that rule; the pass reconciles the notebook against what THIS session learned.
 
 Entry format, the `check:` contract, and archive-on-resolve mechanics belong to the `dockwright-orchestrator-guide` skill § Manager notebook. This skill owns the pass only.
 
@@ -15,6 +15,7 @@ Entry format, the `check:` contract, and archive-on-resolve mechanics belong to 
 
 - **Before ANY `prepare_handoff` or `close_manager_self`.** The agent file's § Manager notebook binds the pass to the tool call rather than to a list of commands — read the gate there.
 - When the boot brief prints `NOTEBOOK_WARN` — the notebook has grown past the boot warning threshold.
+- When the boot brief prints `NOTEBOOK_NOT_ACTUALIZED` — a past session handed off without the pass.
 - When the user asks.
 
 ## The pass
@@ -32,7 +33,7 @@ An entry that says "awaiting X" when X answered two days ago is a landmine: the 
 - **One command** → delete the line and keep the command as the entry's `check:`. State — which PR is where, what is deployed, what is pending — is re-derivable and rots fastest. It is the bulk of what makes a notebook large.
 - **Never know** → it is a decision, a measurement, an obligation to a named person, or a refutation. Those survive.
 
-⛔ **Do NOT relocate survivors into skills, rules, code comments or the tracker.** A decision worth keeping stays in the notebook. Relocation buys a second copy nobody re-reads.
+⛔ **A behaviour ruling's home is a rule.** A survivor that holds one leaves when a rule already holds it. Until one does, it is an uncodified-ruling entry (guide skill § Manager notebook). A ruling in a section whose heading holds the domain's `--decisions` marker stays in that section: nodes read it as the domain's rulings registry. Every other survivor stays: relocating it buys a second copy nobody re-reads.
 
 ### 3. What dies, in practice
 
@@ -43,7 +44,7 @@ An entry that says "awaiting X" when X answered two days ago is a landmine: the 
 
 ### 4. What survives
 
-Decisions with their reasons; measurements that cost real work to obtain; open questions to a named person; parked work with the verbatim instruction that parked it; and traps that would cost someone a round.
+Decisions with their reasons; measurements that cost real work to obtain; open questions to a named person; parked work with the verbatim instruction that parked it; uncodified rulings; and traps that would cost someone a round.
 
 **Every surviving entry carries a `check:`** — one cheap command or inspection that settles whether it is still live. An entry whose liveness cannot be checked in one call is why the file rotted. Give it one wherever a runnable check exists, and `check: none — <who or what settles it>` where none does.
 
@@ -52,6 +53,10 @@ Decisions with their reasons; measurements that cost real work to obtain; open q
 ### 5. Report
 
 Bytes before and after, entries before and after, how many died and the two or three reasons covering most of them, and anything you kept that you expected to kill.
+
+### 6. Mark
+
+End the pass with `dockwright notebook mark --sid <your sid>`; the agent file's § Manager notebook names the tools that check it. A pass you cannot run (context exhausted, a recreate that cannot wait): `dockwright notebook mark --sid <your sid> --not-actualized '<reason>'` instead; the next boot brief prints it as `NOTEBOOK_NOT_ACTUALIZED`.
 
 ## Anti-patterns
 

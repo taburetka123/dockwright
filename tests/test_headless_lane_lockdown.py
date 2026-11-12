@@ -5,6 +5,13 @@ import subprocess
 
 import pytest
 
+from tests.test_model_pin_inventory import (
+    EXPLICIT_RE as EXPLICIT_MODEL_RE,
+    HEADLESS_LIGHT_TOKEN,
+    RESOLVER_PROBE_ID,
+    _strip_1m,
+    resolver_stub,
+)
 from tests.lockdown_argv import (
     EXPECTED_HEADLESS_FLAGS,
     child_is_contained,
@@ -24,6 +31,8 @@ SCRIPTS = os.path.join(REPO, "deploy", "scripts")
 PRESETS = os.path.join(REPO, "deploy", "presets")
 
 EXPECTED_TOOLS = {"Bash", "Read", "Grep", "Glob"}
+
+_SENTINEL = object()
 
 EXPECTED_ALLOWED_TOOLS = {
     "selffix": {"Bash(jq:*)", "Bash(wc:*)", "Bash(head:*)", "Bash(tail:*)",
@@ -61,6 +70,17 @@ def _read_argv(argv_file):
     return parts
 
 
+def _lane_role(home):
+    role = home / ".claude" / "roles" / "GenericWorker"
+    role.mkdir(parents=True)
+    (role / "role.toml").write_text('core = "GenericWorker"\nlaunch = ["lane"]\n')
+    (role / "role.lane.md").write_text("<!-- dockwright-role: GenericWorker launch=lane -->\nBODY\n")
+    (role / "role.settings.json").write_text("{}")
+    (home / ".claude" / "roles" / "_agents").mkdir()
+    (home / ".claude" / "roles" / "_agents" / "none.json").write_text("{}")
+    return role / "role.lane.md"
+
+
 def _run_script(cmd, env, home):
     log = home / "script.log"
     with open(log, "wb") as fh:
@@ -73,6 +93,7 @@ def _run_script(cmd, env, home):
 @pytest.fixture(scope="module")
 def selffix_argv(tmp_path_factory):
     home = tmp_path_factory.mktemp("selffix") / "home"
+    _lane_role(home)
     scripts = home / ".claude" / "scripts"
     scripts.mkdir(parents=True)
     for name in ("selffix-run.sh", "runlock.sh", "selffix-retry-lib.sh",
@@ -125,6 +146,7 @@ def selffix_argv(tmp_path_factory):
 @pytest.fixture(scope="module")
 def gardener_argv(tmp_path_factory):
     home = tmp_path_factory.mktemp("gardener") / "home"
+    _lane_role(home)
     scripts = home / ".claude" / "scripts"
     scripts.mkdir(parents=True)
     for name in ("gardener-run.sh", "runlock.sh", "loop-label-prefix.sh"):
@@ -169,6 +191,53 @@ def gardener_argv(tmp_path_factory):
         "prompt": stdin_file.read_text() if stdin_file.exists() else "",
         "home": home,
     }
+
+
+@pytest.mark.parametrize("lane", ["selffix", "gardener"])
+def test_lane_carries_its_role_render_and_nothing_else_of_the_role(lane, selffix_argv, gardener_argv):
+    captured = selffix_argv if lane == "selffix" else gardener_argv
+    argv = captured["argv"]
+    occurrences = option_occurrences(argv, "--append-system-prompt-file")
+    assert len(occurrences) == 1 and occurrences[0] == [
+        str(captured["home"] / ".claude" / "roles" / "GenericWorker" / "role.lane.md")], argv
+    assert "--settings" not in argv and "--agents" not in argv and "--agents-file" not in argv
+
+
+def test_selffix_starts_without_a_render_when_role_args_refuses(tmp_path):
+    home = tmp_path / "home"
+    scripts = home / ".claude" / "scripts"
+    scripts.mkdir(parents=True)
+    for name in ("selffix-run.sh", "runlock.sh", "selffix-retry-lib.sh",
+                 "loop-label-prefix.sh", "transcript_signal.py"):
+        src = os.path.join(SCRIPTS, name)
+        if os.path.exists(src):
+            dst = scripts / name
+            shutil.copy(src, dst)
+            dst.chmod(0o755)
+    skill = home / ".claude" / "skills" / "dockwright-selffix"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# dockwright-selffix\n" + ("body " * 200))
+    transcript = home / "transcript.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "user", "message": {"content": "hello"}}) + "\n"
+        + json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "did the work"}]}}) + "\n")
+    bin_dir = home / "bin"
+    bin_dir.mkdir()
+    argv_file = home / "argv.nul"
+    _claude_stub(bin_dir / "claude", argv_file, 'echo "## Findings"\necho "Status: ok"')
+    stub = bin_dir / "dockwright"
+    stub.write_text("#!/usr/bin/env bash\n"
+                    '[ "$1" = model ] && echo claude-sonnet-5-5 && exit 0\n'
+                    'echo "role-args: unknown role" >&2; exit 2\n')
+    stub.chmod(0o755)
+    env = {**os.environ, "HOME": str(home), "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}", "SELFFIX_DEBUG": "1"}
+    proc, log = _run_script(["bash", str(scripts / "selffix-run.sh"), str(transcript), "sid-norole"], env, home)
+    assert proc.returncode == 0, log.read_text()
+    argv = _read_argv(argv_file)
+    assert "--append-system-prompt-file" not in argv
+    worker_log = (home / ".claude" / "dockwright" / "selffix" / "trigger.log").read_text()
+    assert "role-args refused" in worker_log, worker_log
 
 
 def test_selffix_child_cannot_reach_any_mcp_server(selffix_argv):
@@ -292,6 +361,21 @@ def test_gardener_headless_child_does_not_inherit_operator_settings(gardener_arg
 
 
 @pytest.mark.parametrize("lane", ["selffix", "gardener"])
+def test_lane_pins_exactly_one_concrete_non_fable_model(lane, selffix_argv, gardener_argv):
+    argv = (selffix_argv if lane == "selffix" else gardener_argv)["argv"]
+    occurrences = option_occurrences(argv, "--model")
+    assert len(occurrences) == 1, (
+        f"{lane} argv carries {len(occurrences)} --model options; a duplicate can shadow "
+        "the pin depending on which one the CLI honours")
+    values = occurrences[0]
+    assert len(values) == 1, f"{lane} --model carries {values}, expected one value"
+    model = values[0]
+    assert EXPLICIT_MODEL_RE.match(_strip_1m(model)), (
+        f"{lane} passes {model!r}; a bare alias tracks whatever the CLI calls latest")
+    assert "fable" not in model.lower(), f"{lane} runs headless on {model}"
+
+
+@pytest.mark.parametrize("lane", ["selffix", "gardener"])
 def test_no_permission_widening_flag_is_present(lane, selffix_argv, gardener_argv):
     captured = selffix_argv if lane == "selffix" else gardener_argv
     widened = permission_surface_widened(captured["argv"])
@@ -356,7 +440,7 @@ def test_prompt_travels_on_stdin_not_as_a_dash_p_argument(
     )
 
 
-def _run_selffix(tmp_path, events, extra_env=None):
+def _run_selffix(tmp_path, events, extra_env=None, resolver=_SENTINEL, expect_ok=True):
     home = tmp_path / "home"
     scripts = home / ".claude" / "scripts"
     scripts.mkdir(parents=True)
@@ -383,6 +467,8 @@ def _run_selffix(tmp_path, events, extra_env=None):
         'printf "%s\\n" "$(head -c 300 /dev/zero | tr "\\0" "x")"\n'
         'echo "Status: ok"',
     )
+    if resolver is not _SENTINEL:
+        resolver_stub(bin_dir, resolver, HEADLESS_LIGHT_TOKEN)
     env = {**os.environ, "HOME": str(home),
            "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
            **(extra_env or {})}
@@ -390,8 +476,56 @@ def _run_selffix(tmp_path, events, extra_env=None):
         ["bash", str(scripts / "selffix-run.sh"), str(transcript), "sid-gate"],
         env, home,
     )
-    assert proc.returncode == 0, log.read_text()
-    return {"spawned": argv_file.exists(), "home": home}
+    if expect_ok:
+        assert proc.returncode == 0, log.read_text()
+    return {"spawned": argv_file.exists(), "home": home,
+            "returncode": proc.returncode,
+            "argv": _read_argv(argv_file) if argv_file.exists() else []}
+
+
+def _run_gardener_headless(tmp_path, resolver=_SENTINEL, expect_ok=True):
+    home = tmp_path / "home"
+    scripts = home / ".claude" / "scripts"
+    scripts.mkdir(parents=True)
+    for name in ("gardener-run.sh", "runlock.sh", "loop-label-prefix.sh"):
+        src = os.path.join(SCRIPTS, name)
+        if os.path.exists(src):
+            dst = scripts / name
+            shutil.copy(src, dst)
+            dst.chmod(0o755)
+    presets = home / ".claude" / "dockwright" / "presets"
+    presets.mkdir(parents=True)
+    shutil.copy(os.path.join(PRESETS, "gardener-analyst-settings.json"),
+                presets / "gardener-analyst-settings.json")
+    skill = home / ".claude" / "skills" / "dockwright-gardener-digest"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# digest\n" + ("body " * 200))
+    bin_dir = home / "bin"
+    bin_dir.mkdir()
+    argv_file = home / "argv.nul"
+    _claude_stub(bin_dir / "claude", argv_file, 'echo "## Clusters"\necho "Status: ok"')
+    if resolver is not _SENTINEL:
+        resolver_stub(bin_dir, resolver, HEADLESS_LIGHT_TOKEN)
+    env = {**os.environ, "HOME": str(home),
+           "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+           "GARDENER_HEADLESS": "1", "GARDENER_CWD": str(home),
+           "GARDENER_TIMEOUT_SEC": "20",
+           "DOCKWRIGHT_TMUX_SOCKET": "lockdown-test-never-spawned"}
+    env.pop("DOCKWRIGHT_GARDENER_DIR", None)
+    proc, log = _run_script(
+        ["bash", str(scripts / "gardener-run.sh"), "--trigger", "force"], env, home)
+    if expect_ok:
+        assert proc.returncode == 0, log.read_text()
+    gdir = home / ".claude" / "dockwright" / "gardener"
+    return {"spawned": argv_file.exists(), "home": home,
+            "returncode": proc.returncode,
+            "argv": _read_argv(argv_file) if argv_file.exists() else [],
+            "run_log": (gdir / "run.log").read_text()
+                       if (gdir / "run.log").is_file() else ""}
+
+
+def _model_of(argv):
+    return argv[argv.index("--model") + 1]
 
 
 _REAL_TURN = {"type": "assistant", "message": {"content": [
@@ -402,6 +536,45 @@ _ZOMBIE_USER = {"type": "user", "message": {"content": (
 _LOGIN_BANNER = {"type": "assistant", "isApiErrorMessage": True,
                  "message": {"content": [
                      {"type": "text", "text": "Login expired · Please run /login"}]}}
+
+
+def test_selffix_takes_its_model_from_the_resolver(tmp_path):
+    result = _run_selffix(tmp_path, [_REAL_TURN], resolver=RESOLVER_PROBE_ID)
+    assert result["spawned"], "the child never launched, so nothing carried a model"
+    assert _model_of(result["argv"]) == RESOLVER_PROBE_ID, (
+        f"selffix launched on {_model_of(result['argv'])!r}, not what the resolver printed — "
+        f"a pin baked into the script does not move when the family map does")
+
+
+def test_gardener_headless_takes_its_model_from_the_resolver(tmp_path):
+    result = _run_gardener_headless(tmp_path, resolver=RESOLVER_PROBE_ID)
+    assert result["spawned"], "the child never launched, so nothing carried a model"
+    assert _model_of(result["argv"]) == RESOLVER_PROBE_ID, (
+        f"gardener launched on {_model_of(result['argv'])!r}, not what the resolver printed — "
+        f"a pin baked into the script does not move when the family map does")
+
+
+def test_selffix_refuses_to_launch_when_the_resolver_fails(tmp_path):
+    result = _run_selffix(tmp_path, [_REAL_TURN], resolver=None, expect_ok=False)
+    assert result["returncode"] != 0, "a failed resolve exited 0"
+    assert not result["spawned"], (
+        "selffix launched a child with no resolved model — it would run on whatever the "
+        "CLI calls default")
+    findings = (result["home"] / ".claude" / "dockwright" / "selffix" / "findings"
+                / "sid-gate.md")
+    assert "model-unresolved" in findings.read_text(), (
+        "the refusal left no line an operator can find; a silent exit reads as "
+        "'nothing happened'")
+
+
+def test_gardener_headless_refuses_to_launch_when_the_resolver_fails(tmp_path):
+    result = _run_gardener_headless(tmp_path, resolver=None, expect_ok=False)
+    assert result["returncode"] != 0, "a failed resolve exited 0"
+    assert not result["spawned"], (
+        "gardener launched a child with no resolved model — it would run on whatever the "
+        "CLI calls default")
+    assert "model-unresolved" in result["run_log"], (
+        f"the refusal left no line in run.log: {result['run_log']!r}")
 
 
 def test_instruction_only_transcript_never_reaches_the_child(tmp_path):
@@ -525,7 +698,7 @@ _FIX_FIXTURES = [
      "<command-args>the dedup window is too short</command-args>", True),
     ("deprecated /fix alias",
      "<command-message>fix</command-message>\n"
-     "<command-name>/fix</command-name>\n<command-args>x</command-args>", True),
+     "<command-name>/fix</command-name>\n<command-args>x</command-args>", False),
     ("LEADING WHITESPACE inside the tag",
      "<command-message>dockwright-fix</command-message>\n"
      "<command-name> /dockwright-fix </command-name>\n<command-args>x</command-args>", True),

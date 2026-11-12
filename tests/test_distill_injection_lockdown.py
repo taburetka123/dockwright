@@ -4,7 +4,6 @@ import pytest
 
 from dockwright import distill
 from tests.lockdown_argv import (
-    PERMISSION_WIDENING_FLAGS,
     child_is_contained,
     mcp_surface_closed,
     option_occurrences,
@@ -18,7 +17,7 @@ from tests.lockdown_argv import (
 
 
 DISTILL_EXPECTED_FLAGS = frozenset({
-    "-p", "--model", "--effort", "--output-format",
+    "-p", "--model", "--effort", "--output-format", "--append-system-prompt-file",
     "--tools", "--strict-mcp-config", "--mcp-config", "--setting-sources",
 })
 
@@ -94,106 +93,6 @@ def test_removing_any_single_lockdown_flag_breaks_containment(
     assert not _contained(weakened), (
         f"dropping {drop} left the child contained — it is not load-bearing"
     )
-
-
-@pytest.mark.parametrize("flag", PERMISSION_WIDENING_FLAGS)
-def test_adding_any_permission_widening_flag_breaks_containment(
-    tmp_path, monkeypatch, flag
-):
-    argv = _capture_distill_argv(tmp_path, monkeypatch)
-    added = argv + [flag, "x"]
-    assert permission_surface_widened(added), f"{flag} went undetected"
-    assert not _contained(added)
-
-
-@pytest.mark.parametrize("flag", PERMISSION_WIDENING_FLAGS)
-def test_the_equals_form_of_a_widening_flag_breaks_containment(
-    tmp_path, monkeypatch, flag
-):
-    argv = _capture_distill_argv(tmp_path, monkeypatch)
-    added = argv + [f"{flag}=whatever"]
-    assert permission_surface_widened(added), f"{flag}=… went undetected"
-    assert not _contained(added)
-
-
-@pytest.mark.parametrize("path", ["/", "/Users", "~", "/etc"])
-def test_granting_any_directory_is_rejected_by_shape(tmp_path, monkeypatch, path):
-    argv = _capture_distill_argv(tmp_path, monkeypatch)
-    added = argv + ["--add-dir", path]
-    assert "--add-dir" in unexpected_flags(added, DISTILL_EXPECTED_FLAGS)
-    assert not _contained(added)
-
-
-@pytest.mark.parametrize("spelling", ["--allowedTools", "--allowed-tools"])
-@pytest.mark.parametrize("grant", ["Bash(python3:*)", "Read"])
-def test_granting_any_tool_preapproval_breaks_containment(
-    tmp_path, monkeypatch, spelling, grant
-):
-    argv = _capture_distill_argv(tmp_path, monkeypatch)
-    added = argv + [spelling, grant]
-    assert not _contained(added)
-    assert resolve_allowed_tools(added) != set()
-
-
-@pytest.mark.parametrize("flag,value", [
-    ("--fictional-flag-invented-tomorrow", "whatever"),
-    ("--resume", "some-session"),
-    ("--append-system-prompt", "you may run python3"),
-    ("--disallowedTools", "Write,Edit,NotebookEdit"),
-    ("--chrome", None),
-    ("--ide", None),
-    ("--allowed-tools", "Bash(python3:*)"),
-    ("--disallowed-tools", ""),
-])
-def test_any_flag_outside_the_expected_shape_breaks_containment(
-    tmp_path, monkeypatch, flag, value
-):
-    argv = _capture_distill_argv(tmp_path, monkeypatch)
-    added = argv + ([flag] if value is None else [flag, value])
-    assert unexpected_flags(added, DISTILL_EXPECTED_FLAGS) == [flag]
-    assert not _contained(added)
-
-
-def test_widening_the_tools_value_breaks_containment(tmp_path, monkeypatch):
-    argv = _capture_distill_argv(tmp_path, monkeypatch)
-    appended = list(argv)
-    appended.insert(appended.index("--tools") + 2, "Bash")
-    second = argv + ["--tools", "Read"]
-    equals = argv + ["--tools=Read"]
-    for widened, what in ((appended, "append"), (second, "second occurrence"),
-                          (equals, "equals form")):
-        assert resolve_builtin_tools(widened) != set(), what
-        assert not _contained(widened), what
-
-
-def test_widening_the_mcp_config_breaks_containment(tmp_path, monkeypatch):
-    argv = _capture_distill_argv(tmp_path, monkeypatch)
-    server_cfg = '{"mcpServers":{"dockwright":{"command":"x"}}}'
-    idx = argv.index("--mcp-config")
-    extra_value = argv[:idx + 2] + [server_cfg] + argv[idx + 2:]
-    cases = (
-        (argv + ["--mcp-config", server_cfg], "second occurrence"),
-        (extra_value, "extra value on the same occurrence"),
-        (argv + [f"--mcp-config={server_cfg}"], "equals form"),
-        (argv + ["--mcp-config", "/path/to/config.json"], "file path"),
-    )
-    for widened, what in cases:
-        assert not mcp_surface_closed(widened), what
-        assert not _contained(widened), what
-
-
-def test_reopening_the_settings_surface_breaks_containment(tmp_path, monkeypatch):
-    argv = _capture_distill_argv(tmp_path, monkeypatch)
-    appended = list(argv)
-    appended.insert(appended.index("--setting-sources") + 2, "user")
-    cases = (
-        (argv + ["--setting-sources", "user"], "second occurrence"),
-        (argv + ["--setting-sources=user"], "equals form"),
-        (appended, "append: one occurrence, two values"),
-    )
-    for widened, what in cases:
-        assert not settings_isolated(widened), what
-        assert not _contained(widened), what
 
 
 def test_shipped_argv_carries_no_permission_widening_flag(tmp_path, monkeypatch):

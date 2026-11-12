@@ -27,6 +27,7 @@ def fresh_orchestrator_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "SLOTS", tmp_path / "slots")
     monkeypatch.setattr(paths, "MANAGER_MEMORY", tmp_path / "manager-memory")
     monkeypatch.setattr(paths, "ARCHITECT", tmp_path / "architect")
+    monkeypatch.setattr(paths, "PANE_SENDS", tmp_path / "pane-sends")
     monkeypatch.delenv("CLAUDE_SWEEP_MCP_IMAGES", raising=False)
     paths.ensure_dirs()
     yield tmp_path
@@ -214,7 +215,7 @@ def _fake_tmux_run(stdout=None, rc=0, stderr="", raise_exc=None):
 def test_terminal_ls_success(fresh_orchestrator_dir, monkeypatch):
     _reset_driver(monkeypatch)
     out = _panes_stdout(
-        ("claude-workers", "@1", "w-a", "%4", "/tmp/wt-a", "[w] fix-tests", "111"),
+        ("claude-workers", "@1", "w-a", "%4", "/tmp/wt-a", "[w] fix-tests", "111", "0", "cmd"),
     )
     monkeypatch.setattr(sweep.subprocess, "run", _fake_tmux_run(stdout=out))
     os_windows, err = sweep._terminal_ls()

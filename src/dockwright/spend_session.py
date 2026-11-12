@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 from . import pricing
@@ -13,7 +14,7 @@ def _iter_records(path: Path):
         raw = path.read_text(errors="replace")
     except OSError:
         return
-    for line in raw.splitlines():
+    for line in raw.split("\n"):
         line = line.strip()
         if not line:
             continue
@@ -43,13 +44,93 @@ def _tool_use_blocks(record: dict):
             yield block
 
 
-def _tool_result_ids(record: dict):
+def _tool_results(record: dict):
     content = (record.get("message") or {}).get("content")
     if not isinstance(content, list):
         return
     for block in content:
         if isinstance(block, dict) and block.get("type") == "tool_result":
-            yield block.get("tool_use_id")
+            yield block.get("tool_use_id"), block.get("content")
+
+
+def _content_chars(content) -> int:
+    if content is None:
+        return 0
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        return sum(_block_chars(block) for block in content)
+    return len(json.dumps(content, default=str))
+
+
+def _block_chars(block) -> int:
+    if isinstance(block, str):
+        return len(block)
+    if not isinstance(block, dict):
+        return 0
+    if isinstance(block.get("text"), str):
+        return len(block["text"])
+    if "content" in block:
+        return _content_chars(block["content"])
+    return 0
+
+
+_HEREDOC_OR_QUOTE = re.compile(
+    r"(?P<op>(?<!<)<<(?!<)-?[ \t]*\\?(?P<q>['\"]?)(?P<word>[A-Za-z0-9_.-]+)(?P=q))"
+    r"|'[^']*'"
+    r'|"(?:[^"\\]|\\.)*"')
+_REDIRECT = re.compile(r"(?<![-=<>])>>?(?!\()[ \t]*(?P<target>&?[^\s;&|<>()]*)")
+_TEE = re.compile(r"(?<![\w./-])tee(?![\w.-])")
+_SEGMENT_SPLIT = re.compile(r"\|\||&&|[|;&()]")
+_PYTHON = re.compile(r"python(?:3(?:\.\d+)?)?")
+
+
+def _heredoc_lines(command: str):
+    pending: list[str] = []
+    for line in command.splitlines():
+        if pending:
+            if line.strip() == pending[0]:
+                pending.pop(0)
+            continue
+        words = []
+        bare = []
+        last = 0
+        for match in _HEREDOC_OR_QUOTE.finditer(line):
+            bare.append(line[last:match.start()])
+            last = match.end()
+            if match.group("op"):
+                words.append(match.group("word"))
+                bare.append(" ")
+            else:
+                bare.append("_")
+        bare.append(line[last:])
+        pending.extend(words)
+        yield bool(words), "".join(bare)
+
+
+def _writes_a_file(bare: str) -> bool:
+    for match in _REDIRECT.finditer(bare):
+        target = match.group("target")
+        if target and target != "/dev/null" and not re.fullmatch(r"&(\d+|-)?", target):
+            return True
+    return _TEE.search(bare) is not None
+
+
+def _runs_python_on_stdin(bare: str) -> bool:
+    for segment in _SEGMENT_SPLIT.split(bare):
+        tokens = segment.split()
+        for i, token in enumerate(tokens):
+            if _PYTHON.fullmatch(token.rsplit("/", 1)[-1]) and "-" in tokens[i + 1:]:
+                return True
+    return False
+
+
+def heredoc_write(command: str) -> bool:
+    return any(opens and _writes_a_file(bare) for opens, bare in _heredoc_lines(command))
+
+
+def python_heredoc(command: str) -> bool:
+    return any(opens and _runs_python_on_stdin(bare) for opens, bare in _heredoc_lines(command))
 
 
 def _new_bucket() -> dict:
@@ -80,13 +161,38 @@ def _parse_file(path: Path, *, sidecar: bool, birth_ts, seen_ids: set,
                                           seen_ids, state)
         elif rtype == "user":
             _handle_user(record, ts, sidechain, open_turn, state)
+        elif not sidechain:
+            _shape_record(record, rtype, state["shape"])
         if (rtype in ("assistant", "user") and not sidechain
                 and ts is not None and state["episodes"]):
             state["episodes"][-1]["last_ts"] = ts
 
 
+def _shape_record(record: dict, rtype, shape: dict) -> None:
+    if rtype == "system" and record.get("subtype") == "compact_boundary":
+        shape["compactions"] += 1
+    elif rtype == "attachment":
+        attachment = record.get("attachment")
+        if isinstance(attachment, dict) and attachment.get("type") == "auto_mode":
+            shape["auto_mode"].append(attachment)
+
+
+def _shape_bash_use(block: dict, shape: dict) -> None:
+    command = (block.get("input") or {}).get("command")
+    if not isinstance(command, str):
+        return
+    if heredoc_write(command):
+        shape["heredoc_writes"] += 1
+        shape["heredoc_write_chars"] += len(command)
+    if python_heredoc(command):
+        shape["python_heredocs"] += 1
+
+
 def _handle_assistant(record: dict, ts, sidechain: bool, open_turn: bool,
                       seen_ids: set, state: dict) -> bool:
+    version = record.get("version")
+    if not sidechain and state["shape"]["version"] is None and isinstance(version, str) and version:
+        state["shape"]["version"] = version
     entry = usage_totals_of(record)
     if entry is not None:
         state["unknown_usage_fields"].update(entry["unknown_usage_keys"])
@@ -105,6 +211,8 @@ def _handle_assistant(record: dict, ts, sidechain: bool, open_turn: bool,
         state["open_tools"][tool_use_id] = {
             "tool": name, "ts": ts, "sidechain": sidechain}
         _tool_row(state, name, sidechain)["calls"] += 1
+        if name == "Bash" and not sidechain:
+            _shape_bash_use(block, state["shape"])
     stop = (record.get("message") or {}).get("stop_reason")
     if isinstance(stop, str) and not sidechain:
         open_turn = stop == "tool_use"
@@ -135,6 +243,10 @@ def _count_entry(record: dict, entry: dict, ts, sidechain: bool,
             (server, tool_label, entry["model"]), _new_bucket())
         mcp_bucket["api_calls"] += 1
         _add_tokens(mcp_bucket, entry)
+    if not sidechain:
+        state["shape"]["context_tokens"] += (
+            entry["in_tokens"] + entry["cache_read_tokens"]
+            + entry["cache_creation_5m_tokens"] + entry["cache_creation_1h_tokens"])
     server_tool_use = ((record.get("message") or {}).get("usage") or {}).get(
         "server_tool_use")
     if isinstance(server_tool_use, dict):
@@ -156,10 +268,12 @@ def _count_entry(record: dict, entry: dict, ts, sidechain: bool,
 
 def _handle_user(record: dict, ts, sidechain: bool, open_turn: bool,
                  state: dict) -> None:
-    for tool_use_id in _tool_result_ids(record):
+    for tool_use_id, content in _tool_results(record):
         started = state["open_tools"].pop(tool_use_id, None)
         if started is None:
             continue
+        if started["tool"] == "Bash" and not started["sidechain"]:
+            state["shape"]["bash_result_chars"] += _content_chars(content)
         row = _tool_row(state, started["tool"], started["sidechain"])
         if started["ts"] is not None and ts is not None:
             row["timed"] += 1
@@ -228,6 +342,9 @@ def build_report(main_log: Path, *, subagent_logs=None, started_at=None,
         "excluded_replayed": 0,
         "unknown_usage_fields": set(),
         "server_tool_use": {},
+        "shape": {"version": None, "context_tokens": 0, "bash_result_chars": 0,
+                  "compactions": 0, "auto_mode": [], "heredoc_writes": 0,
+                  "heredoc_write_chars": 0, "python_heredocs": 0},
     }
     seen_ids: set = set()
     _parse_file(main_log, sidecar=False, birth_ts=birth_ts,
@@ -285,6 +402,11 @@ def build_report(main_log: Path, *, subagent_logs=None, started_at=None,
         tools.append({**row, "avg_s": (row["total_s"] / row["timed"]
                                        if row["timed"] else None)})
     wall_first, wall_last = state["wall"]
+    shape = state["shape"]
+    main_calls = state["main"]["api_calls"]
+    first_auto = shape["auto_mode"][0] if shape["auto_mode"] else {}
+    bash_first = first_auto.get("bashFirst")
+    variant = first_auto.get("bashFirstSteer")
     return {
         "session": {"name": name, "sid": sid},
         "transcript": {"path": str(main_log),
@@ -294,6 +416,8 @@ def build_report(main_log: Path, *, subagent_logs=None, started_at=None,
             "multipliers": {"cache_read": pricing.CACHE_READ_MULT,
                             "cache_write_5m": pricing.CACHE_WRITE_5M_MULT,
                             "cache_write_1h": pricing.CACHE_WRITE_1H_MULT},
+            "cache_read_by_model": {row["model"]: pricing.cache_read_mult(row["model"])
+                                    for row in by_model_rows if row["priced"]},
             "source": ("built-in + dockwright.toml [pricing.rates] overrides"
                        if overridden else "built-in defaults"),
         },
@@ -329,6 +453,21 @@ def build_report(main_log: Path, *, subagent_logs=None, started_at=None,
         "server_tool_use": {key: total for key, total
                             in sorted(state["server_tool_use"].items())
                             if total},
+        "shape": {
+            "claude_code_version": shape["version"],
+            "main_api_calls": main_calls,
+            "mean_context_tokens": (shape["context_tokens"] / main_calls
+                                    if main_calls else None),
+            "cost_per_call": money["main"] / main_calls if main_calls else None,
+            "bash_result_chars": shape["bash_result_chars"],
+            "compactions": shape["compactions"],
+            "heredoc_writes": shape["heredoc_writes"],
+            "heredoc_write_chars": shape["heredoc_write_chars"],
+            "python_heredocs": shape["python_heredocs"],
+            "steer": {"attachments": len(shape["auto_mode"]),
+                      "bash_first": bash_first if isinstance(bash_first, bool) else None,
+                      "variant": variant if isinstance(variant, str) else None},
+        },
     }
 
 
@@ -351,6 +490,7 @@ def _candidate_sources():
                    "runtime": record.get("runtime") or "claude",
                    "started_at": record.get("started_at"),
                    "transcript_path": record.get("transcript_path"),
+                   "spend": record.get("spend"),
                    "date": _recency(float("inf"), record.get("started_at"))}
     for record in state.list_json_in(paths.CLOSED):
         if isinstance(record, dict) and record.get("claude_sid"):
@@ -358,6 +498,7 @@ def _candidate_sources():
                    "runtime": record.get("runtime") or "claude",
                    "started_at": record.get("started_at"),
                    "transcript_path": record.get("transcript_path"),
+                   "spend": record.get("spend"),
                    "date": _recency(_num(record.get("closed_at")),
                                     record.get("started_at"))}
     for event in read_events():
@@ -366,6 +507,7 @@ def _candidate_sources():
                    "runtime": event.get("runtime") or "claude",
                    "started_at": event.get("started_at"),
                    "transcript_path": None,
+                   "spend": event.get("spend"),
                    "date": _recency(_num(event.get("ts")),
                                     event.get("started_at"))}
 
@@ -440,6 +582,18 @@ def _rate_keys_used(report: dict) -> list:
     return used or sorted(rates)
 
 
+def _cache_read_note(report: dict) -> str:
+    prices = report["prices"]
+    by_model = prices.get("cache_read_by_model") or {}
+    distinct = set(by_model.values())
+    if len(distinct) == 1:
+        return f"{distinct.pop():g}x"
+    if not distinct:
+        return f"{prices['multipliers']['cache_read']:g}x"
+    return ", ".join(f"{model} {mult:g}x"
+                     for model, mult in sorted(by_model.items()))
+
+
 _TOOL_COL = 44
 
 
@@ -478,7 +632,7 @@ def _render_text(report: dict) -> str:
     lines.append("  prices: " + ", ".join(
         f"{key} in ${rates[key][0]:g}/M out ${rates[key][1]:g}/M"
         for key in _rate_keys_used(report)))
-    lines.append(f"          (cache rd {report['prices']['multipliers']['cache_read']}x, "
+    lines.append(f"          (cache rd {_cache_read_note(report)}, "
                  f"wr 5m {report['prices']['multipliers']['cache_write_5m']}x / "
                  f"1h {report['prices']['multipliers']['cache_write_1h']}x) — "
                  f"{report['prices']['source']}")
@@ -517,6 +671,24 @@ def _render_text(report: dict) -> str:
             lines.append(f"note: {unpaired} tool call(s) unpaired or "
                          "un-timestamped — counted in calls, excluded from "
                          "total-s/avg-s")
+    shape = report["shape"]
+    mean_context = shape["mean_context_tokens"]
+    per_call = shape["cost_per_call"]
+    lines.append(f"SHAPE         claude-code {shape['claude_code_version'] or '-'} · "
+                 f"mean context {_fmt_tok(round(mean_context)) if mean_context is not None else '-'} · "
+                 f"$/call {f'${per_call:.3f}' if per_call is not None else '-'} · "
+                 f"bash results {shape['bash_result_chars']:,} chars · "
+                 f"{shape['compactions']} compaction(s) · "
+                 f"{shape['heredoc_writes']} heredoc write(s) ({shape['heredoc_write_chars']:,} chars) · "
+                 f"{shape['python_heredocs']} python heredoc(s)")
+    steer = shape["steer"]
+    if not steer["attachments"]:
+        steer_state = "no auto_mode attachment"
+    elif steer["bash_first"] is False:
+        steer_state = "bash-first off"
+    else:
+        steer_state = f"bash-first {steer['variant'] or '-'}"
+    lines.append(f"STEER         {steer_state} · {steer['attachments']} attachment(s)")
     for title, rows, label_fn in (
             ("BY SKILL", report["attribution"]["by_skill"],
              lambda r: r["skill"]),
@@ -588,14 +760,23 @@ def run(argv=None) -> int:
                   file=_sys.stderr)
             return 2
     if (resolved.get("runtime") or "claude") == "codex":
-        note = "codex transcripts carry no usage data"
+        from . import spend_codex
+        name, sid = resolved.get("name"), resolved.get("sid")
+        log = resolved.get("log")
+        report = (spend_codex.build_codex_report(log, name=name, sid=sid)
+                  if log is not None else None)
+        if report is None:
+            report = spend_codex.report_from_spend(resolved.get("spend"),
+                                                   name=name, sid=sid)
+        if report is None:
+            report = spend_codex.no_usage_report(name=name, sid=sid)
+        if resolved.get("ambiguous_sids"):
+            report["resolution"] = {"picked_sid": sid,
+                                    "ambiguous_sids": resolved["ambiguous_sids"]}
         if args.as_json:
-            print(json.dumps({"session": {"name": resolved.get("name"),
-                                          "sid": resolved.get("sid")},
-                              "runtime": "codex", "note": note},
-                             indent=2, default=str))
+            print(json.dumps(report, indent=2, default=str))
         else:
-            print(f"{note} — no spend report is derivable for this session")
+            _sys.stdout.write(spend_codex.render_codex_text(report))
         return 0
     log = resolved.get("log")
     if log is None:

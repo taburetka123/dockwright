@@ -49,6 +49,12 @@ def dog(tmp_path, monkeypatch):
             mod._test_nudges.append((window_id, text))
 
     monkeypatch.setattr(mod, "_resolve_get_driver", lambda: (lambda: _FakeDriver()))
+    mod._test_busy_panes = set()
+    mod._test_stamps = []
+    monkeypatch.setattr(mod, "_resolve_pane_helpers", lambda: (
+        lambda wid: wid not in mod._test_busy_panes,
+        lambda sid, root=None: mod._test_stamps.append(sid),
+    ))
     return mod
 
 
@@ -149,6 +155,12 @@ class TestOrphanDetection:
         decision, _ = dog.run_tick(NOW)
         assert decision == "ok"
 
+    def test_worker_scoped_by_parent_name_only_is_orphaned_when_its_manager_is_gone(self, dog):
+        _write_worker(dog, "w1", None, parent_name="grumpy-yak")
+        decision, detail = dog.run_tick(NOW)
+        assert decision == "orphans"
+        assert detail["groups"] == {"grumpy-yak": 1}
+
     def test_legacy_worker_orphaned_only_when_no_managers_at_all(self, dog):
         _write_worker(dog, "w1", None)
         decision, detail = dog.run_tick(NOW)
@@ -182,6 +194,36 @@ class TestOrphanDetection:
         _write_worker(dog, "ghost", "grumpy-yak", nested=True)
         decision, _ = dog.run_tick(NOW)
         assert decision == "ok"
+
+    def test_live_subworker_of_a_live_node_is_not_orphaned(self, dog):
+        _write_manager(dog)
+        _write_worker(dog, "w1", "grumpy-yak", kind="worker")
+        _write_worker(dog, "s1", "task-w1", kind="subworker", parent_name="task-w1")
+        decision, _ = dog.run_tick(NOW)
+        assert decision == "ok"
+        assert dog._test_notifications == []
+
+    def test_real_orphan_counts_the_node_and_not_its_subworker(self, dog):
+        _write_worker(dog, "w1", "grumpy-yak", kind="worker")
+        _write_worker(dog, "s1", "task-w1", kind="subworker", parent_name="task-w1")
+        decision, detail = dog.run_tick(NOW)
+        assert decision == "orphans"
+        assert detail["groups"] == {"grumpy-yak": 1}
+        assert len(dog._test_notifications) == 1
+        assert "grumpy-yak" in dog._test_notifications[0]
+
+    def test_subworker_whose_node_died_posts_no_row(self, dog):
+        _write_manager(dog)
+        _write_worker(dog, "s1", "task-gone", kind="subworker", parent_name="task-gone")
+        decision, _ = dog.run_tick(NOW)
+        assert decision == "ok"
+        assert dog._test_notifications == []
+
+    def test_daemon_started_node_is_not_orphaned(self, dog):
+        _write_worker(dog, "w1", "daemon", kind="worker", parent_name="daemon")
+        decision, _ = dog.run_tick(NOW)
+        assert decision == "ok"
+        assert dog._test_notifications == []
 
     def test_corrupt_active_record_and_non_int_pid_skipped(self, dog):
         (dog.ACTIVE / "junk.json").write_text("{not json")
@@ -245,6 +287,18 @@ class TestResolution:
         assert not (dog.ORPHANS / "grumpy-yak.json").exists()
         assert "orphan_cleared" in [e["event"] for e in _ledger_events(dog)]
 
+    def test_stretch_opened_for_a_node_name_clears_on_the_next_tick(self, dog):
+        _write_worker(dog, "s1", "task-w1")
+        dog.run_tick(NOW)
+        assert "task-w1" in _state(dog)
+        _write_manager(dog)
+        _write_worker(dog, "w1", "grumpy-yak", kind="worker")
+        _write_worker(dog, "s1", "task-w1", kind="subworker", parent_name="task-w1")
+        decision, _ = dog.run_tick(NOW + 60)
+        assert decision == "ok"
+        assert "task-w1" not in _state(dog)
+        assert "orphan_cleared" in [e["event"] for e in _ledger_events(dog)]
+
     def test_stale_flag_without_state_entry_is_unlinked(self, dog):
         dog.ORPHANS.mkdir(parents=True)
         (dog.ORPHANS / "grumpy-yak.json").write_text(json.dumps({
@@ -275,6 +329,32 @@ class TestResolution:
 
 
 class TestAutonudge:
+    def test_a_pane_holding_his_text_is_skipped_and_retried_next_tick(self, dog, monkeypatch):
+        monkeypatch.setattr(dog, "AUTONUDGE", True)
+        _write_worker(dog, "w1", "grumpy-yak", window_id="w-1")
+        dog._test_busy_panes.add("w-1")
+        dog.run_tick(NOW)
+        assert dog._test_nudges == [], "his half-written line is never typed over"
+        assert dog._test_stamps == []
+        dog._test_busy_panes.clear()
+        dog.run_tick(NOW + 60)
+        assert [w for w, _ in dog._test_nudges] == ["w-1"], (
+            "a skipped worker must not be recorded as nudged, so the next tick retries")
+
+    def test_a_nudge_the_terminal_refused_leaves_no_stamp(self, dog, monkeypatch):
+        """A stamp with no submit behind it eats the engineer's next typed line."""
+        monkeypatch.setattr(dog, "AUTONUDGE", True)
+
+        class _RefusingDriver:
+            def send_text(self, window_id, text, submit=True):
+                return False
+
+        monkeypatch.setattr(dog, "_resolve_get_driver",
+                            lambda: (lambda: _RefusingDriver()))
+        _write_worker(dog, "w1", "grumpy-yak", window_id="w-1")
+        dog.run_tick(NOW)
+        assert dog._test_stamps == []
+
     def test_autonudge_off_by_default(self, dog):
         _write_worker(dog, "w1", "grumpy-yak")
         dog.run_tick(NOW)
@@ -290,6 +370,13 @@ class TestAutonudge:
         for _, text in dog._test_nudges:
             assert "worker_done" in text
             assert "resume your task" not in text
+
+    def test_autonudge_types_nothing_into_a_subworker(self, dog, monkeypatch):
+        monkeypatch.setattr(dog, "AUTONUDGE", True)
+        _write_worker(dog, "w1", "grumpy-yak", kind="worker", window_id="w-1")
+        _write_worker(dog, "s1", "task-w1", kind="subworker", parent_name="task-w1", window_id="w-2")
+        dog.run_tick(NOW)
+        assert [w for w, _ in dog._test_nudges] == ["w-1"]
 
     def test_autonudge_skips_pending_question_and_missing_window(self, dog, monkeypatch):
         monkeypatch.setattr(dog, "AUTONUDGE", True)

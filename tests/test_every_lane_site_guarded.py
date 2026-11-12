@@ -19,7 +19,8 @@ class _DeadStdout:
 def lane_state(tmp_path, monkeypatch):
     for attr, sub in (("ROOT", ""), ("ACTIVE", "active"), ("DONE", "done"),
                       ("QUESTIONS", "questions"), ("TURN_ENDS", "turn-ends"),
-                      ("LANE_HEALTH", "lane-health")):
+                      ("LANE_HEALTH", "lane-health"), ("ASSIGNMENTS", "assignments"),
+                      ("ARTIFACTS", "artifacts")):
         monkeypatch.setattr(paths, attr, tmp_path / sub if sub else tmp_path)
     monkeypatch.setattr(stale_monitor, "ROOT", tmp_path)
     monkeypatch.setattr(lane_io, "reader_is_dead", lambda fd=1: False)
@@ -61,8 +62,7 @@ def test_the_outbox_drain_does_not_unlink_what_it_could_not_deliver(
     outbox.mkdir(parents=True)
     entry = outbox / "1-1-0.json"
     entry.write_text(json.dumps(
-        {"line": "AUTOCLOSED w1 idle 120min", "kind": "autoclosed",
-         "buffered_at": 1.0}))
+        {"line": "gardener digest ready: run-w1", "kind": "gardener", "buffered_at": 1.0}))
 
     _kill_stdout(monkeypatch)
     with pytest.raises(lane_io.LaneDead):
@@ -77,10 +77,10 @@ def test_the_outbox_drain_does_unlink_what_it_did_deliver(lane_state, capsys):
     outbox = paths.notify_outbox_dir_for("mgr")
     outbox.mkdir(parents=True)
     entry = outbox / "1-1-0.json"
-    entry.write_text(json.dumps({"line": "AUTOCLOSED w1", "kind": "autoclosed"}))
+    entry.write_text(json.dumps({"line": "gardener digest ready: run-w1", "kind": "gardener"}))
 
     monitor._drain_notify_outbox("mgr")
-    assert "AUTOCLOSED w1" in capsys.readouterr().out
+    assert "gardener digest ready: run-w1" in capsys.readouterr().out
     assert not entry.exists(), "a delivered entry was left to replay forever"
 
 
@@ -124,7 +124,7 @@ def test_the_simple_lanes_commit_nothing_to_a_dead_reader(
         scan(dict(MGR))
 
     cursor = lane_state / f".seen-{lane}-mgr"
-    assert not cursor.exists() or name not in cursor.read_text()
+    assert not cursor.exists() or name.removesuffix(".json") not in cursor.read_text()
     assert not lane_io.heartbeat_path("mgr", lane).exists()
 
 
@@ -139,8 +139,9 @@ def test_every_lane_writes_a_heartbeat_on_a_healthy_scan(lane, lane_state, monke
     path = lane_io.heartbeat_path("mgr", lane)
     assert path.exists(), (
         f"the {lane} lane completed a healthy scan without writing a "
-        f"heartbeat, so `dockwright lanes` reports it NEVER-ARMED forever and "
-        f"the LANE_SILENT cross-check is blind to it")
+        f"heartbeat, so `dockwright lanes` never reads it as OK — it falls "
+        f"through to the marker verdicts (ARMED-UNRESOLVED, STALLED, HUNG) or "
+        f"to NEVER-ARMED — and the LANE_SILENT cross-check is blind to it")
     record = json.loads(path.read_text())
     assert record["lane"] == lane
     assert record["interval_hint"] == lane_io.LANES[lane]

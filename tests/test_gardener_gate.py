@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -21,7 +22,7 @@ def _load_gate():
 
 @pytest.fixture
 def gate(tmp_path, monkeypatch):
-    for var in ("GARDENER_K", "GARDENER_FLOOR_DAYS", "GARDENER_MAX_RUNS_PER_WEEK",
+    for var in ("GARDENER_FLOOR_DAYS", "GARDENER_MAX_RUNS_PER_WEEK",
                 "GARDENER_MIN_RUN_GAP", "GARDENER_FRONTIER_INTERVAL_DAYS",
                 "GARDENER_FRONTIER_RETRY_GAP"):
         monkeypatch.delenv(var, raising=False)
@@ -49,6 +50,7 @@ def gate(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "SELFFIX_RUN_SCRIPT", tmp_path / "selffix-run.sh")
     monkeypatch.setattr(mod, "SELFFIX_LOG_PATH", tmp_path / "selffix-trigger.log")
     monkeypatch.setattr(mod, "SELFFIX_DEBUG_PATHS", (tmp_path / "selffix-debug", tmp_path / "legacy-selffix-debug"))
+    monkeypatch.setattr(mod, "usage_capped", lambda: False)
     gardener_dir.mkdir(parents=True)
     findings_dir.mkdir(parents=True)
     closed_dir.mkdir(parents=True)
@@ -124,38 +126,40 @@ class TestStopFile:
         assert spawned == []
 
 
-class TestAccumulationGate:
-    def test_k_fresh_unreviewed_opens(self, gate):
+class TestWeeklyInterval:
+    def test_recent_marker_is_not_due_even_with_many_findings(self, gate):
+        _write_marker(gate, age_sec=3600)
         for i in range(8):
             _write_finding(gate, f"f{i}")
         decision, detail = gate.decide(NOW, force=False)
-        assert decision == "accum"
+        assert decision == "not_due"
         assert detail["new_unreviewed"] == 8
 
-    def test_below_k_stays_closed(self, gate):
-        for i in range(7):
-            _write_finding(gate, f"f{i}")
-        _write_marker(gate, age_sec=3600)
-        decision, _ = gate.decide(NOW, force=False)
-        assert decision == "no_material"
-
     def test_reviewed_findings_do_not_count(self, gate):
-        for i in range(8):
-            _write_finding(gate, f"f{i}", reviewed=(i < 4))
-        _write_marker(gate, age_sec=3600)
+        _write_marker(gate, age_sec=8 * 86400)
+        for i in range(4):
+            _write_finding(gate, f"f{i}", reviewed=True)
         decision, detail = gate.decide(NOW, force=False)
         assert decision == "no_material"
-        assert detail["new_unreviewed"] == 4
+        assert detail["new_unreviewed"] == 0
 
     def test_findings_older_than_marker_do_not_count(self, gate):
-        _write_marker(gate, age_sec=600)
+        _write_marker(gate, age_sec=8 * 86400)
         for i in range(8):
-            _write_finding(gate, f"old{i}", age_sec=1200)
+            _write_finding(gate, f"old{i}", age_sec=9 * 86400)
         for i in range(3):
             _write_finding(gate, f"new{i}", age_sec=60)
         decision, detail = gate.decide(NOW, force=False)
-        assert decision == "no_material"
+        assert decision == "floor"
         assert detail["new_unreviewed"] == 3
+
+    def test_failed_run_is_retried_after_cooldown(self, gate):
+        _write_marker(gate, age_sec=8 * 86400)
+        _write_finding(gate, "fresh", age_sec=60)
+        _write_ledger_runs(gate, [7 * 3600])
+        decision, detail = gate.decide(NOW, force=False)
+        assert decision == "floor"
+        assert detail["runs_in_week"] == 1
 
 
 class TestWeeklyFloor:
@@ -171,12 +175,12 @@ class TestWeeklyFloor:
         decision, _ = gate.decide(NOW, force=False)
         assert decision == "no_material"
 
-    def test_recent_marker_below_k_stays_closed(self, gate):
+    def test_recent_marker_is_not_due(self, gate):
         _write_marker(gate, age_sec=2 * 86400)
         for i in range(3):
             _write_finding(gate, f"f{i}", age_sec=60)
         decision, _ = gate.decide(NOW, force=False)
-        assert decision == "no_material"
+        assert decision == "not_due"
 
     def test_no_marker_with_some_material_opens_as_floor(self, gate):
         _write_finding(gate, "only-one", age_sec=60)
@@ -202,7 +206,7 @@ class TestRunRateCap:
             _write_finding(gate, f"f{i}")
         _write_ledger_runs(gate, [8 * 86400, 9 * 86400, 10 * 86400])
         decision, _ = gate.decide(NOW, force=False)
-        assert decision == "accum"
+        assert decision == "floor"
 
     def test_force_bypasses_cap(self, gate):
         _write_ledger_runs(gate, [3600, 7200, 10800])
@@ -217,7 +221,7 @@ class TestRunRateCap:
             extra_lines=["not json at all", '{"event": "run_end"}', '["a-list"]'],
         )
         decision, detail = gate.decide(NOW, force=False)
-        assert decision == "accum"
+        assert decision == "floor"
         assert detail["runs_in_week"] == 1
 
 
@@ -242,7 +246,7 @@ class TestCooldown:
             _write_finding(gate, f"f{i}")
         _write_ledger_runs(gate, [7 * 3600])
         decision, _ = gate.decide(NOW, force=False)
-        assert decision == "accum"
+        assert decision == "floor"
 
     def test_force_bypasses_cooldown(self, gate):
         _write_ledger_runs(gate, [60])
@@ -253,7 +257,7 @@ class TestCooldown:
         for i in range(8):
             _write_finding(gate, f"f{i}")
         decision, _ = gate.decide(NOW, force=False)
-        assert decision == "accum"
+        assert decision == "floor"
 
     def test_main_does_not_spawn_on_cooldown(self, gate, monkeypatch):
         for i in range(8):
@@ -274,14 +278,14 @@ class TestLaneIsolation:
             _write_finding(gate, f"f{i}")
         _write_ledger_runs(gate, [7 * 3600, 86400, 2 * 86400], lane="frontier")
         decision, detail = gate.decide(NOW, force=False)
-        assert decision == "accum"
+        assert decision == "floor"
         assert detail["runs_in_week"] == 0
 
     def test_frontier_run_does_not_arm_digest_cooldown(self, gate):
         for i in range(8):
             _write_finding(gate, f"f{i}")
         _write_ledger_runs(gate, [600], lane="frontier")
-        assert gate.decide(NOW, force=False)[0] == "accum"
+        assert gate.decide(NOW, force=False)[0] == "floor"
 
     def test_legacy_laneless_events_count_as_digest(self, gate):
         for i in range(8):
@@ -320,7 +324,7 @@ class TestRunMutex:
             _write_finding(gate, f"f{i}")
         _hold_lock(gate, 99999999)
         decision, _ = gate.decide(NOW, force=False)
-        assert decision == "accum"
+        assert decision == "floor"
 
     def test_lock_without_pid_file_reads_as_held(self, gate):
         gate.RUN_LOCK_DIR.mkdir(parents=True, exist_ok=True)
@@ -336,9 +340,9 @@ class TestMain:
         monkeypatch.setattr(gate, "spawn_run", lambda trigger: spawned.append(trigger))
         rc = gate.main([])
         assert rc == gate.EXIT_OK
-        assert spawned == ["accum"]
+        assert spawned == ["floor"]
         log = gate.GATE_LOG_PATH.read_text()
-        assert "accum" in log and "spawned=True" in log
+        assert "floor" in log and "spawned=True" in log
 
     def test_dry_run_never_spawns(self, gate, monkeypatch):
         for i in range(8):
@@ -544,6 +548,15 @@ class TestRetryQueue:
         assert gate.process_retry_queue(NOW) is False
         assert calls == [] and entry.exists(), "attempt must not burn into a live brick"
 
+    def test_deferred_while_a_usage_cap_pauses_the_fleet(self, gate, monkeypatch, tmp_path):
+        monkeypatch.setenv("SELFFIX_DEBUG", "1")
+        calls = self._capture_spawn(gate, monkeypatch)
+        monkeypatch.setattr(gate, "usage_capped", lambda: True)
+        entry = self._write_entry(gate, "sid-cap", self._transcript(tmp_path))
+        assert gate.process_retry_queue(NOW) is False
+        assert calls == [] and entry.exists()
+        assert "retry:deferred  sid-cap  reason=usage-cap" in gate.SELFFIX_LOG_PATH.read_text()
+
     def test_stale_brick_flag_does_not_defer(self, gate, monkeypatch, tmp_path):
         calls = self._capture_spawn(gate, monkeypatch)
         gate.ORCHESTRATOR_DIR.mkdir(parents=True, exist_ok=True)
@@ -553,6 +566,18 @@ class TestRetryQueue:
         self._write_entry(gate, "sid-r5", self._transcript(tmp_path))
         assert gate.process_retry_queue(NOW) is True
         assert len(calls) == 1
+
+    def test_spawn_value_error_drops_the_entry_and_the_tick_survives(self, gate, monkeypatch, tmp_path):
+        monkeypatch.setenv("SELFFIX_DEBUG", "1")
+
+        def spawn_raises(transcript, sid):
+            raise ValueError("embedded null byte")
+
+        monkeypatch.setattr(gate, "spawn_retry", spawn_raises)
+        entry = self._write_entry(gate, "sid-r11", self._transcript(tmp_path))
+        assert gate.process_retry_queue(NOW) is False
+        assert not entry.exists()
+        assert "retry:dropped  sid-r11  reason=spawn-failed" in gate.SELFFIX_LOG_PATH.read_text()
 
     def test_empty_queue_is_noop(self, gate, monkeypatch):
         calls = self._capture_spawn(gate, monkeypatch)
@@ -659,3 +684,217 @@ class TestHomeFallback:
         assert mod.FINDINGS_DIR == claude / "selffix-findings"
         assert mod.RETRY_DIR == claude / "selffix-retry"
         assert mod.CLOSED_DIR == claude / "orchestrator" / "closed"
+
+
+RETRY_ENV_TOML = (
+    '[gardener]\n'
+    'retry_env = ["DOCKWRIGHT_CLAUDE_BIN=/opt/wrapper/claude-wrapper", "EXAMPLE_RETRY_VAR=example-value"]\n'
+)
+
+
+@pytest.fixture(params=["tomllib", "scanner"])
+def reader(request, monkeypatch):
+    if request.param == "scanner":
+        monkeypatch.setitem(sys.modules, "tomllib", None)
+    return request.param
+
+
+def _config(tmp_path, monkeypatch, body: str) -> None:
+    cfg = tmp_path / "dockwright.toml"
+    cfg.write_text(body)
+    monkeypatch.setenv("DOCKWRIGHT_CONFIG", str(cfg))
+
+
+def _capture_popen(gate, monkeypatch) -> list:
+    calls = []
+    monkeypatch.setattr(gate.subprocess, "Popen", lambda *a, **kw: calls.append(kw))
+    return calls
+
+
+def _gate_warnings(gate) -> str:
+    return gate.GATE_LOG_PATH.read_text() if gate.GATE_LOG_PATH.is_file() else ""
+
+
+def test_retry_spawn_gets_retry_env(gate, tmp_path, monkeypatch, reader):
+    _config(tmp_path, monkeypatch, RETRY_ENV_TOML)
+    calls = _capture_popen(gate, monkeypatch)
+    gate.spawn_retry("/t.jsonl", "sid-1")
+    env = calls[0]["env"]
+    assert env["DOCKWRIGHT_CLAUDE_BIN"] == "/opt/wrapper/claude-wrapper"
+    assert env["EXAMPLE_RETRY_VAR"] == "example-value"
+    assert env["SELFFIX_RETRY_ATTEMPT"] == "1"
+    assert "WARN" not in _gate_warnings(gate)
+
+
+def test_digest_spawn_never_gets_retry_env(gate, tmp_path, monkeypatch, reader):
+    _config(tmp_path, monkeypatch, RETRY_ENV_TOML)
+    monkeypatch.delenv("DOCKWRIGHT_CLAUDE_BIN", raising=False)
+    monkeypatch.delenv("EXAMPLE_RETRY_VAR", raising=False)
+    calls = _capture_popen(gate, monkeypatch)
+    gate.spawn_run("accum")
+    env = calls[0].get("env") or dict(os.environ)
+    assert "DOCKWRIGHT_CLAUDE_BIN" not in env
+    assert "EXAMPLE_RETRY_VAR" not in env
+
+
+def test_absent_retry_env_spawns_plainly(gate, tmp_path, monkeypatch, reader):
+    _config(tmp_path, monkeypatch, '[gardener]\nhigh_skills = []\n')
+    monkeypatch.delenv("DOCKWRIGHT_CLAUDE_BIN", raising=False)
+    calls = _capture_popen(gate, monkeypatch)
+    gate.spawn_retry("/t.jsonl", "sid-2")
+    assert "DOCKWRIGHT_CLAUDE_BIN" not in calls[0]["env"]
+    assert "WARN" not in _gate_warnings(gate)
+
+
+@pytest.mark.parametrize("entry", ["SELFFIX_RETRY_ATTEMPT=0", "HOME=/tmp/x", "PATH=/tmp/x"])
+def test_reserved_key_is_refused_with_a_warning(gate, tmp_path, monkeypatch, reader, entry):
+    _config(tmp_path, monkeypatch, f'[gardener]\nretry_env = ["DOCKWRIGHT_CLAUDE_BIN=/opt/wrapper/claude-wrapper", "{entry}"]\n')
+    monkeypatch.delenv("DOCKWRIGHT_CLAUDE_BIN", raising=False)
+    calls = _capture_popen(gate, monkeypatch)
+    gate.spawn_retry("/t.jsonl", "sid-3")
+    env = calls[0]["env"]
+    assert env["SELFFIX_RETRY_ATTEMPT"] == "1"
+    assert "DOCKWRIGHT_CLAUDE_BIN" not in env
+    assert "WARN" in _gate_warnings(gate)
+
+
+def test_entry_without_equals_is_refused_with_a_warning(gate, tmp_path, monkeypatch, reader):
+    _config(tmp_path, monkeypatch, '[gardener]\nretry_env = ["DOCKWRIGHT_CLAUDE_BIN"]\n')
+    monkeypatch.delenv("DOCKWRIGHT_CLAUDE_BIN", raising=False)
+    calls = _capture_popen(gate, monkeypatch)
+    gate.spawn_retry("/t.jsonl", "sid-4")
+    assert "DOCKWRIGHT_CLAUDE_BIN" not in calls[0]["env"]
+    assert "WARN" in _gate_warnings(gate)
+
+
+def test_multiline_retry_env(gate, tmp_path, monkeypatch, reader):
+    _config(tmp_path, monkeypatch, '[gardener]\nretry_env = [\n  "DOCKWRIGHT_CLAUDE_BIN=/opt/wrapper/claude-wrapper",\n]\n')
+    monkeypatch.delenv("DOCKWRIGHT_CLAUDE_BIN", raising=False)
+    calls = _capture_popen(gate, monkeypatch)
+    gate.spawn_retry("/t.jsonl", "sid-5")
+    env = calls[0]["env"]
+    if reader == "tomllib":
+        assert env["DOCKWRIGHT_CLAUDE_BIN"] == "/opt/wrapper/claude-wrapper"
+    else:
+        assert "DOCKWRIGHT_CLAUDE_BIN" not in env
+        assert "WARN" in _gate_warnings(gate)
+
+
+def test_non_table_gardener_value_spawns_plainly_with_a_warning(gate, tmp_path, monkeypatch):
+    _config(tmp_path, monkeypatch, 'gardener = 5\n')
+    monkeypatch.delenv("DOCKWRIGHT_CLAUDE_BIN", raising=False)
+    monkeypatch.delenv("EXAMPLE_RETRY_VAR", raising=False)
+    calls = _capture_popen(gate, monkeypatch)
+    gate.spawn_retry("/t.jsonl", "sid-6")
+    env = calls[0]["env"]
+    assert "DOCKWRIGHT_CLAUDE_BIN" not in env
+    assert "EXAMPLE_RETRY_VAR" not in env
+    assert env["SELFFIX_RETRY_ATTEMPT"] == "1"
+    assert "WARN  [gardener] retry_env unreadable:" in _gate_warnings(gate)
+
+
+WRAPPER = "/opt/wrapper/claude-wrapper"
+
+
+def unparsed(where):
+    return ({}, [f"[gardener] retry_env present in a shape this reader cannot parse, on {where}"])
+
+
+@pytest.mark.parametrize("body, expected", [
+    (f'[gardener]  # retro settings\nretry_env = ["DOCKWRIGHT_CLAUDE_BIN={WRAPPER}"]\n',
+     ({"DOCKWRIGHT_CLAUDE_BIN": WRAPPER}, [])),
+    (f'gardener.retry_env = ["DOCKWRIGHT_CLAUDE_BIN={WRAPPER}"]\n', unparsed("line 1")),
+    (f'[gardener]\n"retry_env" = ["DOCKWRIGHT_CLAUDE_BIN={WRAPPER}"]\n', unparsed("line 2")),
+    (f'gardener = {{ retry_env = ["DOCKWRIGHT_CLAUDE_BIN={WRAPPER}"] }}\n', unparsed("line 1")),
+    (f'[gardener.retry_env]\nDOCKWRIGHT_CLAUDE_BIN = "{WRAPPER}"\n', unparsed("line 1")),
+    (f'[[gardener]]\nretry_env = ["DOCKWRIGHT_CLAUDE_BIN={WRAPPER}"]\n', unparsed("line 2")),
+    ('[gardener]\nretry_env = ["EXAMPLE_RETRY_VAR=/x/w"]  # was ["EXAMPLE_RETRY_VAR=/old"]\n',
+     ({"EXAMPLE_RETRY_VAR": "/x/w"}, [])),
+], ids=["header-comment", "dotted-key", "quoted-key", "inline-table", "sub-table",
+        "array-of-tables", "trailing-comment"])
+def test_scanner_parses_or_refuses_each_retry_env_shape(gate, tmp_path, monkeypatch, body, expected):
+    monkeypatch.setitem(sys.modules, "tomllib", None)
+    _config(tmp_path, monkeypatch, body)
+    assert gate.retry_env() == expected
+
+
+@pytest.mark.parametrize("body", [
+    "[gardener]\nnote = '''\nretry_env = [\"EXAMPLE_RETRY_VAR=from-a-string\"]\n'''\n",
+    '[gardener]\nnote = """a \\"""\nretry_env = ["EXAMPLE_RETRY_VAR=from-a-string"]\n"""\n',
+    "[other]\nx = [\n  ['''\n[gardener]\nretry_env = [\"EXAMPLE_RETRY_VAR=from-a-string\"]\n'''],\n]\n",
+    '[gardener]\n"retry\\u005fenv" = ["EXAMPLE_RETRY_VAR=x"]\n',
+    '["gardener"]\nretry_env = ["EXAMPLE_RETRY_VAR=x"]\n',
+    '[gardener]\nretry_env.sub = "x"\n',
+    '[gardener.retry_env.sub]\nx = 1\n',
+    '[gardener]\nretry_env = ["EXAMPLE_RETRY_VAR=1"]\n[gardener]\nretry_env = ["EXAMPLE_RETRY_VAR=2"]\n',
+], ids=["inside-literal-string", "inside-basic-string", "inside-nested-array-string",
+        "escaped-key", "quoted-header", "dotted-sub-key", "nested-sub-table", "second-appearance"])
+def test_scanner_agrees_with_tomllib_or_warns(gate, tmp_path, monkeypatch, body):
+    _config(tmp_path, monkeypatch, body)
+    full = gate.retry_env()
+    monkeypatch.setitem(sys.modules, "tomllib", None)
+    scanned = gate.retry_env()
+    assert scanned == full or (scanned[0] == {} and scanned[1]), (full, scanned)
+
+
+def test_a_second_mention_refuses_the_key_and_names_every_mention(gate, tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "tomllib", None)
+    _config(tmp_path, monkeypatch,
+            '[gardener]\nretry_env = ["EXAMPLE_RETRY_VAR=/x/w"]\n\n[agent_vars]\n'
+            'note = "the retry reads [gardener] retry_env."\n')
+    assert gate.retry_env() == ({}, [
+        "[gardener] retry_env refused: this reader needs its own line to be the only one "
+        "that mentions retry_env outside whole-line comments; mentioned on lines 2, 5"])
+
+
+def test_comma_inside_a_quoted_value(gate, tmp_path, monkeypatch, reader):
+    _config(tmp_path, monkeypatch,
+            '[gardener]\nretry_env = ["EXAMPLE_RETRY_VAR=a,b", \'OTHER_RETRY_VAR=c, d\']\n')
+    assert gate.retry_env() == ({"EXAMPLE_RETRY_VAR": "a,b", "OTHER_RETRY_VAR": "c, d"}, [])
+
+
+def test_starter_template_with_commented_out_retry_env_is_silent(gate, tmp_path, monkeypatch, reader):
+    from dockwright.config import DEFAULT_TOML
+    assert "# retry_env = [" in DEFAULT_TOML
+    _config(tmp_path, monkeypatch, DEFAULT_TOML)
+    assert gate.retry_env() == ({}, [])
+
+
+def test_nul_in_retry_env_entry_spawns_plainly_with_a_warning(gate, tmp_path, monkeypatch):
+    _config(tmp_path, monkeypatch, '[gardener]\nretry_env = ["DOCKWRIGHT_CLAUDE_BIN=/opt/wrapper\\u0000/claude"]\n')
+    monkeypatch.delenv("DOCKWRIGHT_CLAUDE_BIN", raising=False)
+    gate.SELFFIX_RUN_SCRIPT.write_text("exit 0\n")
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"type":"user","message":{"content":"hi"}}\n')
+    gate.RETRY_DIR.mkdir(parents=True)
+    (gate.RETRY_DIR / "sid-nul.json").write_text(json.dumps(
+        {"sid": "sid-nul", "transcript_path": str(transcript), "attempts": 0}))
+    real_popen = subprocess.Popen
+    spawned = []
+
+    def popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append((kwargs, proc))
+        return proc
+
+    monkeypatch.setattr(gate.subprocess, "Popen", popen)
+    assert gate.main([]) == 0
+    for _, proc in spawned:
+        proc.wait(timeout=10)
+    assert len(spawned) == 1
+    assert "DOCKWRIGHT_CLAUDE_BIN" not in spawned[0][0]["env"]
+    assert "WARN  [gardener] retry_env" in _gate_warnings(gate)
+
+
+@pytest.mark.parametrize("body, expected", [("exit 0", True), ("exit 1", False), ("exit 2", False)])
+def test_usage_capped_asks_the_usage_cap_command(tmp_path, monkeypatch, body, expected):
+    stub = tmp_path / "dockwright"
+    stub.write_text(f'#!/usr/bin/env bash\n[ "$*" = "usage-cap --paused" ] || exit 9\n{body}\n')
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ.get('PATH', '')}")
+    assert _load_gate().usage_capped() is expected
+
+
+def test_usage_capped_without_the_command_does_not_hold_the_queue(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert _load_gate().usage_capped() is False

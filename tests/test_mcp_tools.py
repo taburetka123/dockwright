@@ -1,14 +1,20 @@
 import inspect
 import os
+import shlex
 import subprocess
 import time
 import json as _json
 import time as _time
+from datetime import datetime, timezone
 from pathlib import Path
 import pytest
-from dockwright import paths, state
+from dockwright import artifact_export, models, notebook_mark, paths, state, waiting_on
 from dockwright import config as _config
 from dockwright.mcp_server import register_self_impl, list_workers_impl
+from tests.conftest import allow_codex
+
+FLAGS = ["--model", "@opus", "--effort", "xhigh"]
+
 
 @pytest.fixture
 def fresh_orchestrator_dir(tmp_path, monkeypatch):
@@ -17,6 +23,7 @@ def fresh_orchestrator_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "QUESTIONS", tmp_path / "questions")
     monkeypatch.setattr(paths, "ANSWERS", tmp_path / "answers")
     monkeypatch.setattr(paths, "DONE", tmp_path / "done")
+    monkeypatch.setattr(paths, "TURN_ENDS", tmp_path / "turn-ends")
     monkeypatch.setattr(paths, "CLOSED", tmp_path / "closed")
     monkeypatch.setattr(paths, "HANDOFFS", tmp_path / "handoffs")
     monkeypatch.setattr(paths, "PRESETS", tmp_path / "presets")
@@ -26,7 +33,16 @@ def fresh_orchestrator_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "ARTIFACTS", tmp_path / "artifacts")
     monkeypatch.setattr(paths, "ASSIGNMENTS", tmp_path / "assignments")
     monkeypatch.setattr(paths, "ASSIGNMENTS_PENDING", tmp_path / "assignments" / ".pending")
+    monkeypatch.setattr(paths, "PANE_SENDS", tmp_path / "pane-sends")
     monkeypatch.setattr(paths, "SPEND_LEDGER", tmp_path / "spend-ledger.jsonl")
+    monkeypatch.setattr(paths, "CHAT", tmp_path / "chat")
+    monkeypatch.setattr(paths, "CHAT_DB", tmp_path / "chat" / "archive.db")
+    monkeypatch.setattr(paths, "CHAT_RAW", tmp_path / "chat" / "raw")
+    monkeypatch.setattr(paths, "CHAT_TRIGGERS", tmp_path / "chat" / "triggers")
+    monkeypatch.setattr(paths, "CHAT_LEDGER", tmp_path / "chat" / "ledger.jsonl")
+    monkeypatch.setattr(paths, "CHAT_STARTED", tmp_path / "chat" / "started")
+    monkeypatch.setattr(paths, "CHAT_LOCK", tmp_path / "chat" / "pass.lock")
+    monkeypatch.setattr(paths, "CHAT_STOP", tmp_path / "chat-archive-stop")
     paths.ensure_dirs()
     yield tmp_path
 
@@ -54,6 +70,35 @@ def test_register_self_writes_active(fresh_orchestrator_dir):
     assert record["window_id"] == "iterm-9"
     assert isinstance(record["pid"], int)
     assert "started_at" in record
+
+def test_register_self_default_pid_goes_through_the_cli_pid_funnel(
+        fresh_orchestrator_dir, monkeypatch):
+    from dockwright import mcp_server
+
+    seen = []
+
+    def _resolve(start):
+        seen.append(start)
+        return 987654
+
+    monkeypatch.setattr(mcp_server, "resolve_cli_pid", _resolve)
+    register_self_impl(claude_sid="sid-funnel", agent="worker", name="funnel-bot",
+                       cwd="/x", iterm_sid="i1")
+    assert seen == [os.getppid()], (
+        "the default pid bypassed the cli-pid funnel, so a session whose MCP "
+        "server is not a direct child of the CLI records the wrong pid")
+    assert state.read_json(paths.ACTIVE / "sid-funnel.json")["pid"] == 987654
+
+
+def test_register_self_default_pid_falls_back_when_the_funnel_finds_nothing(
+        fresh_orchestrator_dir, monkeypatch):
+    from dockwright import mcp_server
+
+    monkeypatch.setattr(mcp_server, "resolve_cli_pid", lambda start: None)
+    register_self_impl(claude_sid="sid-fallback", agent="worker", name="fallback-bot",
+                       cwd="/x", iterm_sid="i1")
+    assert state.read_json(paths.ACTIVE / "sid-fallback.json")["pid"] == os.getppid()
+
 
 def test_register_self_duplicate_name_rejected(fresh_orchestrator_dir):
     register_self_impl(claude_sid="sid-1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1")
@@ -238,7 +283,7 @@ def test_send_manager_to_worker_types_content(fresh_orchestrator_dir, monkeypatc
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="42")
     typed = []
     monkeypatch.setattr(
-        "dockwright.mcp_server._send_text",
+        "dockwright.mcp_server._type_unguarded",
         lambda wid, text: typed.append((wid, text)),
     )
     result = send_manager_to_worker_impl(worker="alpha", text="also check Y")
@@ -249,7 +294,7 @@ def test_send_manager_to_worker_marker_prepends_once_multiline(fresh_orchestrato
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="42")
     typed = []
     monkeypatch.setattr(
-        "dockwright.mcp_server._send_text",
+        "dockwright.mcp_server._type_unguarded",
         lambda wid, text: typed.append(text),
     )
     send_manager_to_worker_impl(worker="alpha", text="line one\nline two")
@@ -270,7 +315,7 @@ def test_send_manager_to_worker_resolves_via_terminal_ls_when_id_empty(fresh_orc
             {"id": 555, "cwd": "/tmp/wt",
              "foreground_processes": [{"cmdline": ["node", "/x/claude", "--resume"]}]}]}]}])
     sent = {}
-    monkeypatch.setattr(srv, "_send_text", lambda wid, txt: sent.update(wid=wid, txt=txt))
+    monkeypatch.setattr(srv, "_type_unguarded", lambda wid, txt: sent.update(wid=wid, txt=txt))
     monkeypatch.setattr(srv, "_WINDOW_RESOLVE_RETRY_SLEEP", 0)
     result = srv.send_manager_to_worker_impl("alpha", "hi")
     assert result["status"] == "delivered" and sent["wid"] == "555"
@@ -285,7 +330,7 @@ def test_send_manager_to_worker_persisted_id_confirmed_live(fresh_orchestrator_d
         {"tabs": [{"windows": [
             {"id": 555, "cwd": "/somewhere/else", "foreground_processes": []}]}]}])
     sent = {}
-    monkeypatch.setattr(srv, "_send_text", lambda wid, txt: sent.update(wid=wid))
+    monkeypatch.setattr(srv, "_type_unguarded", lambda wid, txt: sent.update(wid=wid))
     result = srv.send_manager_to_worker_impl("alpha", "hi")
     assert result["status"] == "delivered" and sent["wid"] == "555"
 
@@ -938,6 +983,29 @@ def test_list_workers_reports_delegating_idle_worker_as_processing(fresh_orchest
     assert state.read_json(paths.ACTIVE / "w-del.json")["state"] == "idle"
 
 
+def test_list_workers_reports_a_worker_with_a_live_child_as_delegating(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1", pid=os.getpid())
+    _stamp_delegating_tree(tmp_path, "w1", agent_age_sec=5000, log_age_sec=10)
+    state.write_json_atomic(paths.ACTIVE / "c1.json", {
+        "claude_sid": "c1", "agent": "worker", "kind": "subworker", "name": "alpha-review",
+        "parent_name": "alpha", "pid": os.getpid(), "runtime": "codex", "state": "processing"})
+    worker = next(w for w in list_workers_impl() if w["name"] == "alpha")
+    assert worker["state"] == "processing" and worker["delegating"] is True
+
+
+def test_list_workers_reports_a_live_child_parent_with_no_transcript_as_delegating(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1", pid=os.getpid())
+    state.write_json_atomic(paths.ACTIVE / "c1.json", {
+        "claude_sid": "c1", "agent": "worker", "kind": "subworker", "name": "alpha-review",
+        "parent_name": "alpha", "pid": os.getpid(), "runtime": "codex", "state": "processing"})
+    from dockwright.transcript import find_session_log
+    assert find_session_log("w1") is None
+    worker = next(w for w in list_workers_impl() if w["name"] == "alpha")
+    assert worker["state"] == "processing" and worker["delegating"] is True
+
+
 def test_list_workers_keeps_true_idle_as_idle(fresh_orchestrator_dir, tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     register_self_impl(claude_sid="w-idle", agent="worker", name="resting",
@@ -945,6 +1013,30 @@ def test_list_workers_keeps_true_idle_as_idle(fresh_orchestrator_dir, tmp_path, 
     worker = next(w for w in list_workers_impl() if w["name"] == "resting")
     assert worker["state"] == "idle"
     assert "delegating" not in worker
+
+
+def test_list_workers_reads_an_unknown_pid_as_alive(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    state.write_json_atomic(paths.ACTIVE / "c1.json", {
+        "claude_sid": "c1", "agent": "worker", "kind": "subworker", "name": "alpha-review",
+        "parent_name": "alpha", "runtime": "codex", "pid": None})
+    state.write_json_atomic(paths.ACTIVE / "c2.json", {
+        "claude_sid": "c2", "agent": "worker", "kind": "subworker", "name": "bravo-review",
+        "parent_name": "bravo", "runtime": "codex"})
+    workers = {w["name"]: w for w in list_workers_impl()}
+    assert workers["alpha-review"]["alive"] is True
+    assert workers["bravo-review"]["alive"] is True
+
+
+def test_list_workers_reads_a_dead_pid_as_not_alive(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    from dockwright import registry
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(registry, "_live_pane_ids", lambda: {"%20"})
+    state.write_json_atomic(paths.ACTIVE / "c1.json", {
+        "claude_sid": "c1", "agent": "worker", "kind": "subworker", "name": "alpha-review",
+        "parent_name": "alpha", "runtime": "codex", "window_id": "%20", "pid": 2 ** 22 + 7})
+    worker = next(w for w in list_workers_impl() if w["name"] == "alpha-review")
+    assert worker["alive"] is False
 
 
 def test_list_workers_skips_delegation_check_for_processing_worker(fresh_orchestrator_dir, tmp_path, monkeypatch):
@@ -981,6 +1073,7 @@ def test_get_worker_summary_returns_full_text(fresh_orchestrator_dir, tmp_path, 
     result = get_worker_summary_impl(worker="alpha")
     assert result["name"] == "alpha"
     assert result["summary"] == long_text
+    assert result["source"] == "transcript"
     assert result["last_turn_at"] == "2026-05-18T10:00:00Z"
     assert result["alive"] is True
 
@@ -989,12 +1082,156 @@ def test_get_worker_summary_missing_log(fresh_orchestrator_dir, tmp_path, monkey
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1", pid=os.getpid())
     result = get_worker_summary_impl(worker="alpha")
     assert result["error"] == "transcript not found"
+    assert result["source"] == "transcript"
     assert result["summary"] is None
     assert result["last_turn_at"] is None
 
 def test_get_worker_summary_unknown_worker(fresh_orchestrator_dir):
     with pytest.raises(ValueError, match="no worker named 'ghost'"):
         get_worker_summary_impl(worker="ghost")
+
+def test_get_worker_summary_reads_an_unknown_pid_as_alive(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    state.write_json_atomic(paths.ACTIVE / "c1.json", {
+        "claude_sid": "c1", "agent": "worker", "kind": "subworker", "name": "alpha-review",
+        "parent_name": "alpha", "runtime": "codex", "pid": None})
+    state.write_json_atomic(paths.ACTIVE / "c2.json", {
+        "claude_sid": "c2", "agent": "worker", "kind": "subworker", "name": "bravo-review",
+        "parent_name": "bravo", "runtime": "codex"})
+    assert get_worker_summary_impl(worker="alpha-review")["alive"] is True
+    assert get_worker_summary_impl(worker="bravo-review")["alive"] is True
+
+def test_get_worker_summary_reads_a_dead_pid_as_not_alive(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    state.write_json_atomic(paths.ACTIVE / "c1.json", {
+        "claude_sid": "c1", "agent": "worker", "kind": "subworker", "name": "alpha-review",
+        "parent_name": "alpha", "runtime": "codex", "pid": 2 ** 22 + 7})
+    assert get_worker_summary_impl(worker="alpha-review")["alive"] is False
+
+_INTERIM_LINE = "Card 3: one comment. Next, cards 5 and 6."
+_INTERIM_TS = "2026-11-02T16:42:20Z"
+
+def _register_alpha_with_an_interim_line(tmp_path, monkeypatch):
+    _write_fake_transcript(tmp_path, monkeypatch, "w1", [
+        {"type": "assistant",
+         "message": {"content": [{"type": "text", "text": _INTERIM_LINE}]},
+         "timestamp": _INTERIM_TS},
+    ])
+    register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1", pid=os.getpid())
+
+def _write_done(sid, event_id, summary, completed_at, bucket="alpha"):
+    done_dir = paths.done_dir_for(bucket)
+    done_dir.mkdir(parents=True, exist_ok=True)
+    event = {"event_id": event_id, "claude_sid": sid, "worker_name": "alpha", "summary": summary}
+    if completed_at is not None:
+        event["completed_at"] = completed_at
+    state.write_json_atomic(done_dir / f"{sid}-{event_id}.json", event)
+
+def test_get_worker_summary_returns_the_worker_done_report_over_an_interim_line(
+        fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _register_alpha_with_an_interim_line(tmp_path, monkeypatch)
+    report = "Report: " + "y" * 1500
+    eid = worker_done_impl(claude_sid="w1", summary=report)["event_id"]
+    result = get_worker_summary_impl(worker="alpha")
+    assert result["summary"] == report
+    assert result["source"] == "worker_done"
+    assert result["event_id"] == eid
+    assert isinstance(result["completed_at"], float)
+    assert result["alive"] is True
+    assert "last_turn_at" not in result
+
+@pytest.mark.parametrize("field", ["tasked_at", "processing_since"])
+def test_get_worker_summary_reads_the_transcript_when_the_done_predates_the_episode(
+        fresh_orchestrator_dir, tmp_path, monkeypatch, field):
+    _register_alpha_with_an_interim_line(tmp_path, monkeypatch)
+    _write_done("w1", "e1", "old report", 1000.0)
+    _set_active_stamps("w1", **{field: 1100.0})
+    result = get_worker_summary_impl(worker="alpha")
+    assert result["summary"] == _INTERIM_LINE
+    assert result["source"] == "transcript"
+    assert result["last_turn_at"] == _INTERIM_TS
+    assert "event_id" not in result
+
+def test_get_worker_summary_counts_a_done_inside_the_retask_grace(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _register_alpha_with_an_interim_line(tmp_path, monkeypatch)
+    _write_done("w1", "e1", "report", 1099.0)
+    _set_active_stamps("w1", tasked_at=1100.0)
+    result = get_worker_summary_impl(worker="alpha")
+    assert result["source"] == "worker_done"
+    assert result["summary"] == "report"
+
+@pytest.mark.parametrize("older_id, newer_id", [("e1", "e2"), ("e2", "e1")])
+def test_get_worker_summary_takes_the_newest_done_of_the_episode(
+        fresh_orchestrator_dir, tmp_path, monkeypatch, older_id, newer_id):
+    _register_alpha_with_an_interim_line(tmp_path, monkeypatch)
+    _set_active_stamps("w1", tasked_at=1000.0)
+    _write_done("w1", older_id, "first", 1100.0)
+    _write_done("w1", newer_id, "second", 1200.0)
+    result = get_worker_summary_impl(worker="alpha")
+    assert result["summary"] == "second"
+    assert result["event_id"] == newer_id
+
+def _write_turn_end(sid, completed_at, bucket="alpha"):
+    turn_ends_dir = paths.turn_ends_dir_for(bucket)
+    turn_ends_dir.mkdir(parents=True, exist_ok=True)
+    state.write_json_atomic(turn_ends_dir / f"{sid}-{int(completed_at * 1000)}.json", {
+        "sid": sid, "agent": "worker", "name": "alpha", "completed_at": completed_at})
+
+@pytest.mark.parametrize("stamps", [
+    {"processing_since": 1000.0},
+    {"processing_since": 1000.0, "tasked_at": 1050.0},
+])
+def test_get_worker_summary_reads_the_transcript_when_the_turn_ended_past_the_done_lookback(
+        fresh_orchestrator_dir, tmp_path, monkeypatch, stamps):
+    _register_alpha_with_an_interim_line(tmp_path, monkeypatch)
+    _set_active_stamps("w1", **stamps)
+    _write_done("w1", "e1", "report", 1060.0)
+    _write_turn_end("w1", 1661.0)
+    result = get_worker_summary_impl(worker="alpha")
+    assert result["source"] == "transcript"
+    assert result["summary"] == _INTERIM_LINE
+
+@pytest.mark.parametrize("turn_end, source", [(1660.0, "worker_done"), (1661.0, "transcript")])
+def test_get_worker_summary_takes_the_record_turn_end_when_no_turn_ends_file_is_left(
+        fresh_orchestrator_dir, tmp_path, monkeypatch, turn_end, source):
+    _register_alpha_with_an_interim_line(tmp_path, monkeypatch)
+    last_turn_at = datetime.fromtimestamp(turn_end, timezone.utc).isoformat().replace("+00:00", "Z")
+    _set_active_stamps("w1", processing_since=1000.0, last_turn_at=last_turn_at)
+    _write_done("w1", "e1", "report", 1060.0)
+    result = get_worker_summary_impl(worker="alpha")
+    assert result["source"] == source
+
+@pytest.mark.parametrize("turn_end", [1070.0, 1660.0])
+def test_get_worker_summary_keeps_the_done_when_the_turn_ended_inside_the_done_lookback(
+        fresh_orchestrator_dir, tmp_path, monkeypatch, turn_end):
+    _register_alpha_with_an_interim_line(tmp_path, monkeypatch)
+    _set_active_stamps("w1", processing_since=1000.0)
+    _write_done("w1", "e1", "report", 1060.0)
+    _write_turn_end("w1", turn_end)
+    result = get_worker_summary_impl(worker="alpha")
+    assert result["source"] == "worker_done"
+    assert result["summary"] == "report"
+
+def test_get_worker_summary_returns_the_done_when_the_transcript_is_missing(
+        fresh_orchestrator_dir, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1", pid=os.getpid())
+    _write_done("w1", "e1", "report", 1100.0)
+    result = get_worker_summary_impl(worker="alpha")
+    assert result["summary"] == "report"
+    assert result["source"] == "worker_done"
+    assert "error" not in result
+
+def test_get_worker_summary_skips_an_unreadable_done_file(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _register_alpha_with_an_interim_line(tmp_path, monkeypatch)
+    _set_active_stamps("w1", tasked_at=time.time() - 60)
+    done_dir = paths.done_dir_for("alpha")
+    done_dir.mkdir(parents=True, exist_ok=True)
+    (done_dir / "w1-bad.json").write_text("{")
+    _write_done("w1", "e2", "report", None)
+    result = get_worker_summary_impl(worker="alpha")
+    assert result["summary"] == "report"
+    assert result["source"] == "worker_done"
 
 def test_get_worker_tail_returns_last_n_lines(fresh_orchestrator_dir, tmp_path, monkeypatch):
     lines = []
@@ -1086,6 +1323,39 @@ def test_worker_done_writes_event_file(fresh_orchestrator_dir):
     assert isinstance(record["completed_at"], (int, float))
     assert done_files[0].name == f"w1-{result['event_id']}.json"
     assert done_files[0].parent.name == paths.UNSCOPED_BUCKET
+
+def _set_active_stamps(sid, **stamps):
+    path = paths.ACTIVE / f"{sid}.json"
+    record = state.read_json(path)
+    record.update(stamps)
+    state.write_json_atomic(path, record)
+
+def _the_done_record():
+    done_files = list(paths.DONE.rglob("*.json"))
+    assert len(done_files) == 1
+    return state.read_json(done_files[0])
+
+def test_worker_done_stamps_the_engineer_input_when_his_line_is_the_latest_input(fresh_orchestrator_dir):
+    register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1", pid=os.getpid())
+    _set_active_stamps("w1", input_at=1234.5, human_attached_at=1234.5, tasked_at=1000.0)
+    worker_done_impl(claude_sid="w1", summary="PARKED — x\nanswered him")
+    record = _the_done_record()
+    assert record["engineer_input_at"] == 1234.5
+    assert record["tasked_at"] == 1000.0
+
+@pytest.mark.parametrize("stamps", [
+    {"input_at": 2000.0, "human_attached_at": 1000.0},
+    {"human_attached_at": 1000.0},
+    {},
+    {"input_at": 1, "human_attached_at": True},
+])
+def test_worker_done_stamps_no_engineer_input_after_a_relay_or_a_manual_attach(fresh_orchestrator_dir, stamps):
+    register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1", pid=os.getpid())
+    _set_active_stamps("w1", **stamps)
+    worker_done_impl(claude_sid="w1", summary="PARKED — x\nanswered the manager")
+    record = _the_done_record()
+    assert "engineer_input_at" not in record
+    assert "tasked_at" not in record
 
 def test_worker_done_unknown_sid_rejected(fresh_orchestrator_dir):
     with pytest.raises(ValueError, match="session ghost-sid not registered"):
@@ -1221,7 +1491,6 @@ def test_wait_for_worker_harvests_self_healed_done_event(fresh_orchestrator_dir)
     assert result["summary"] == "ghost finished"
 
 
-import signal
 from dockwright.mcp_server import (
     prepare_handoff_impl, become_manager_with_takeover_impl,
     prepare_recovery_handoff_impl,
@@ -1264,6 +1533,29 @@ def test_prepare_handoff_rejects_unknown_sid(fresh_orchestrator_dir):
         prepare_handoff_impl(claude_sid="ghost", narrative_summary="...", trigger_reason="manual")
 
 
+def _open_notebook(domain="general"):
+    path = notebook_mark.notebook_file(domain)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# N\n\n## open entry\ncheck: x\n")
+
+
+def test_prepare_handoff_refuses_without_notebook_mark(fresh_orchestrator_dir):
+    become_manager_impl(claude_sid="mgr-old", iterm_sid="i0")
+    _open_notebook()
+    with pytest.raises(ValueError, match="dockwright notebook mark --sid mgr-old --domain general"):
+        prepare_handoff_impl("mgr-old", "n", "manual")
+    assert list(paths.HANDOFFS.glob("*.json")) == []
+
+
+def test_prepare_handoff_passes_with_this_sessions_mark(fresh_orchestrator_dir):
+    become_manager_impl(claude_sid="mgr-old", iterm_sid="i0")
+    _open_notebook()
+    notebook_mark.write("mgr-old", "general")
+    result = prepare_handoff_impl("mgr-old", "n", "manual")
+    assert "handoff_id" in result
+    assert Path(result["path"]).exists()
+
+
 def test_become_manager_with_takeover_releases_and_acquires(fresh_orchestrator_dir, monkeypatch):
     old_result = become_manager_impl(claude_sid="mgr-old", iterm_sid="i0")
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
@@ -1290,6 +1582,41 @@ def test_become_manager_with_takeover_releases_and_acquires(fresh_orchestrator_d
     handoff_after = state.read_json(paths.HANDOFFS / f"{handoff['handoff_id']}.json")
     assert handoff_after["consumed_at"] is not None
     assert handoff_after["to_sid"] == "mgr-new"
+
+
+def test_become_manager_with_takeover_refuses_work_root_before_touching_predecessor(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    become_manager_impl(claude_sid="mgr-old", iterm_sid="i0")
+    handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
+    closed = []
+    monkeypatch.setattr("dockwright.mcp_server._close_window", lambda window_id: closed.append(window_id))
+    monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: True)
+    monkeypatch.setattr("dockwright.registry._pid_alive", lambda pid: True)
+    work_root = tmp_path / "work"
+    (work_root / "manager").mkdir(parents=True)
+    monkeypatch.setenv("DOCKWRIGHT_MANAGER_HOME", str(work_root / "manager"))
+    monkeypatch.chdir(work_root)
+    with pytest.raises(ValueError, match="refusing to start a manager"):
+        become_manager_with_takeover_impl(
+            claude_sid="mgr-new", takeover_from="mgr-old",
+            handoff_id=handoff["handoff_id"], iterm_sid="i1",
+        )
+    assert closed == []
+    assert (paths.ACTIVE / "mgr-old.json").exists()
+    assert not (paths.ACTIVE / "mgr-new.json").exists()
+    assert state.read_json(paths.HANDOFFS / f"{handoff['handoff_id']}.json")["consumed_at"] is None
+
+
+def test_spawn_replacement_manager_refuses_when_manager_home_cannot_be_created(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    parent_file = tmp_path / "afile"
+    parent_file.write_text("x")
+    monkeypatch.setenv("DOCKWRIGHT_MANAGER_HOME", str(parent_file / "manager"))
+    become_manager_impl(claude_sid="mgr-old", iterm_sid="42")
+    handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    _patch_window_id_exists(monkeypatch, True)
+    with pytest.raises(ValueError, match="could not be created"):
+        _asyncio.run(spawn_replacement_manager_impl(handoff["handoff_id"]))
+    assert captured == {}
 
 
 def test_become_manager_with_takeover_reports_pane_closed_and_reuses_preflight(fresh_orchestrator_dir, monkeypatch):
@@ -1726,6 +2053,8 @@ def test_takeover_raises_and_unregisters_when_registration_races_and_returns_suf
         })
         legacy = state.read_json(paths.ACTIVE / "legacy-worker.json")
         legacy["parent_manager_name"] = raced_name
+        legacy["parent_name"] = raced_name
+        legacy["parent_sid"] = claude_sid
         state.write_json_atomic(paths.ACTIVE / "legacy-worker.json", legacy)
         return {"ok": True, "name": raced_name, "domain": domain, "runtime": "claude", "preflight": ""}
 
@@ -1751,6 +2080,8 @@ def test_takeover_raises_and_unregisters_when_registration_races_and_returns_suf
     handoff_after = state.read_json(paths.HANDOFFS / f"{handoff['handoff_id']}.json")
     assert handoff_after["consumed_at"] is None
     assert handoff_after["to_sid"] is None
+    assert legacy_after["parent_name"] is None
+    assert legacy_after["parent_sid"] is None
 
 
 def test_bootstrap_recreate_seam_end_to_end(tmp_path, fresh_orchestrator_dir, monkeypatch):
@@ -1865,6 +2196,38 @@ def test_prepare_recovery_handoff_allows_bricked_target(fresh_orchestrator_dir):
     assert "handoff_id" in out
 
 
+def test_prepare_recovery_handoff_marks_not_actualized(fresh_orchestrator_dir):
+    become_manager_impl(claude_sid="mgr-bricked", iterm_sid="i0")
+    _brick_manager_record("mgr-bricked")
+    _open_notebook()
+    prepare_recovery_handoff_impl("mgr-bricked")
+    mark = notebook_mark.read("general")
+    assert mark["sid"] == "mgr-bricked"
+    assert mark["actualized"] is False
+    assert mark["reason"] == "recovery handoff (account-flip-recovery)"
+
+
+def test_prepare_recovery_handoff_keeps_a_fresh_actualized_mark(fresh_orchestrator_dir):
+    become_manager_impl(claude_sid="mgr-bricked", iterm_sid="i0")
+    _brick_manager_record("mgr-bricked")
+    _open_notebook()
+    notebook_mark.write("mgr-peer", "general")
+    prepare_recovery_handoff_impl("mgr-bricked")
+    mark = notebook_mark.read("general")
+    assert mark["sid"] == "mgr-peer"
+    assert mark["actualized"] is True
+
+
+def test_prepare_recovery_handoff_survives_an_unwritable_mark(fresh_orchestrator_dir):
+    become_manager_impl(claude_sid="mgr-bricked", iterm_sid="i0")
+    _brick_manager_record("mgr-bricked")
+    _open_notebook()
+    (paths.ROOT / "notebook" / "marks").write_text("not a directory")
+    out = prepare_recovery_handoff_impl("mgr-bricked")
+    assert "handoff_id" in out
+    assert Path(out["path"]).exists()
+
+
 def test_prepare_recovery_handoff_allows_dead_pid(fresh_orchestrator_dir, monkeypatch):
     become_manager_impl(claude_sid="mgr-dead", iterm_sid="i0")
     monkeypatch.setattr("dockwright.mcp_server._pid_alive", lambda pid: False)
@@ -1881,6 +2244,27 @@ def test_prepare_recovery_handoff_allows_pidless_record(fresh_orchestrator_dir):
     })
     out = prepare_recovery_handoff_impl("mgr-legacy")
     assert "handoff_id" in out
+
+
+def test_recovery_takeover_of_a_pidless_predecessor_closes_no_window(fresh_orchestrator_dir, monkeypatch):
+    from dockwright import mcp_server
+    state.write_json_atomic(paths.ACTIVE / "mgr-legacy.json", {
+        "claude_sid": "mgr-legacy", "agent": "manager", "name": "old-timer",
+        "cwd": "/x", "window_id": "i0", "pid": None, "started_at": 1.0,
+        "state": "idle", "last_turn_at": None, "last_summary": None,
+        "domain": "general", "parent_manager_name": None,
+    })
+    handoff = prepare_recovery_handoff_impl("mgr-legacy")
+    closed = []
+    monkeypatch.setattr(mcp_server, "_close_window", lambda window_id: closed.append(window_id))
+    monkeypatch.setattr(mcp_server, "_paint_manager_tab", lambda name, domain: None)
+
+    result = become_manager_with_takeover_impl(
+        claude_sid="mgr-new", takeover_from="mgr-legacy",
+        handoff_id=handoff["handoff_id"], iterm_sid="i1",
+    )
+    assert result["ok"] is True
+    assert closed == [], "a predecessor whose pid is unknown must not have its window killed"
 
 
 def test_prepare_recovery_handoff_refuses_live_manager_mid_long_turn(fresh_orchestrator_dir, tmp_path, monkeypatch):
@@ -2235,19 +2619,80 @@ def test_spawn_worker_forwards_extra_args(monkeypatch):
         cwd="/tmp/x",
         initial_prompt="hello",
         name="alpha",
-        extra_args=["--dangerously-skip-permissions"],
+        extra_args=[*FLAGS, "--dangerously-skip-permissions"],
     ))
     inner_cmd = captured["args"][-1]
     assert "--dangerously-skip-permissions" in inner_cmd
-    assert inner_cmd.index("--dangerously-skip-permissions") < inner_cmd.index("hello")
-    claude_pos = inner_cmd.rindex("claude ")
-    assert claude_pos < inner_cmd.index("--dangerously-skip-permissions")
+    assert inner_cmd.index("--dangerously-skip-permissions") < inner_cmd.index('"$(cat ')
+    launch_pos = inner_cmd.rindex(" launch ")
+    assert launch_pos < inner_cmd.index("--dangerously-skip-permissions")
+
+
+def _spawn_fable(monkeypatch, fable_left, extra_args, force=False, pick=None):
+    captured = _patch_exec(monkeypatch)
+    picks = []
+    monkeypatch.setattr(spawner, "_fable_left", fable_left)
+    monkeypatch.setattr(spawner, "_pick_account",
+                        lambda force=False, fable=False: picks.append(fable) or pick)
+    _asyncio.run(spawner.spawn_worker_tab(
+        extra_args=extra_args, cwd="/tmp/x", initial_prompt="hi", name="alpha", force=force))
+    return captured["args"][-1], picks
+
+
+FABLE_FLAGS = ["--model", "@fable[1m]", "--effort", "medium"]
+
+
+def test_spawn_fable_with_no_fable_left_launches_opus_at_xhigh(monkeypatch):
+    seen = []
+    inner_cmd, picks = _spawn_fable(
+        monkeypatch, lambda now, force=False: seen.append(force) or False, FABLE_FLAGS, force=True)
+    assert models.resolve_model("@opus[1m]") in inner_cmd
+    assert models.families()["fable"] not in inner_cmd
+    assert "--effort xhigh" in inner_cmd and "--effort medium" not in inner_cmd
+    assert seen == [True]
+    assert picks == [False]
+
+
+def test_spawn_fable_with_fable_left_keeps_fable_and_picks_a_fable_account(monkeypatch):
+    inner_cmd, picks = _spawn_fable(monkeypatch, lambda now, force=False: True, FABLE_FLAGS)
+    assert models.resolve_model("@fable[1m]") in inner_cmd
+    assert "--effort medium" in inner_cmd
+    assert picks == [True]
+
+
+def test_spawn_fable_whose_launch_account_has_spent_fable_launches_opus(monkeypatch):
+    monkeypatch.setattr(spawner, "_resolve_account", lambda letter: ("a", None))
+    monkeypatch.setattr(spawner, "_fable_spent", lambda letter, now: letter == "a")
+    inner_cmd, picks = _spawn_fable(monkeypatch, lambda now, force=False: True, FABLE_FLAGS, pick="b")
+    assert "CLAUDE_ORCH_ACCOUNT=a" in inner_cmd
+    assert models.resolve_model("@opus[1m]") in inner_cmd
+    assert models.families()["fable"] not in inner_cmd
+    assert "--effort xhigh" in inner_cmd
+    assert picks == [True]
+
+
+def test_spawn_fable_with_no_pool_pick_checks_the_default_account(monkeypatch):
+    default = _config.default_account()
+    monkeypatch.setattr(spawner, "_fable_spent", lambda letter, now: letter == default)
+    inner_cmd, picks = _spawn_fable(monkeypatch, lambda now, force=False: True, FABLE_FLAGS)
+    assert models.resolve_model("@opus[1m]") in inner_cmd
+    assert models.families()["fable"] not in inner_cmd
+    assert picks == [True]
+
+
+def test_spawn_opus_never_reads_fable_usage(monkeypatch):
+    def _no_read(now, force=False):
+        raise AssertionError("a non-Fable spawn must not read the Fable windows")
+
+    inner_cmd, picks = _spawn_fable(monkeypatch, _no_read, FLAGS)
+    assert models.resolve_model("@opus") in inner_cmd
+    assert picks == [False]
 
 
 def test_spawn_worker_forwards_env(monkeypatch):
     captured = _patch_exec(monkeypatch)
     _asyncio.run(spawner.spawn_worker_tab(
-        cwd="/tmp/x",
+        extra_args=FLAGS, cwd="/tmp/x",
         initial_prompt="hi",
         name="alpha",
         env={"MY_VAR": "1"},
@@ -2262,7 +2707,7 @@ def test_spawn_worker_forwards_env(monkeypatch):
 def test_spawn_worker_caller_cannot_override_orchestrator_env(monkeypatch):
     captured = _patch_exec(monkeypatch)
     _asyncio.run(spawner.spawn_worker_tab(
-        cwd="/tmp/x",
+        extra_args=FLAGS, cwd="/tmp/x",
         initial_prompt="hi",
         name="alpha",
         env={
@@ -2283,15 +2728,22 @@ def test_spawn_worker_caller_cannot_override_orchestrator_env(monkeypatch):
 def test_spawn_worker_defaults_unchanged_when_new_params_omitted(monkeypatch):
     captured = _patch_exec(monkeypatch)
     _asyncio.run(spawner.spawn_worker_tab(
-        cwd="/tmp/x",
+        extra_args=FLAGS, cwd="/tmp/x",
         initial_prompt="hi",
         name="alpha",
     ))
     inner_cmd = captured["args"][-1]
-    assert inner_cmd.rstrip().endswith("claude --model 'claude-opus-5[1m]' hi")
+    prompt_file = next(paths.PROMPT_FILES.glob("*.txt"))
+    assert inner_cmd.rstrip().endswith(
+        f"{shlex.quote(str(paths.dockwright_bin()))} launch "
+        "--model " + models.families()["opus"] + " --effort xhigh "
+        "--disallowedTools=Artifact,SendFeedback,Workflow,AskUserQuestion,ReportFindings,ScheduleWakeup "
+        + f'"$(cat {shlex.quote(str(prompt_file))})"')
+    assert prompt_file.read_text() == "hi"
 
 
-def test_spawn_worker_codex_runtime_builds_codex_command(monkeypatch):
+def test_spawn_worker_codex_runtime_builds_codex_command(monkeypatch, tmp_path):
+    allow_codex(monkeypatch, tmp_path)
     captured = _patch_exec(monkeypatch)
     _asyncio.run(spawner.spawn_worker_tab(
         cwd="/tmp/x",
@@ -2321,11 +2773,14 @@ def test_spawn_manager_builds_claude_command_without_runtime_env(monkeypatch):
     assert "CLAUDE_AGENT=manager" in inner_cmd
     assert "CLAUDE_MANAGER_RUNTIME" not in inner_cmd
     assert "CLAUDE_WORKER_RUNTIME" not in inner_cmd
-    assert "/manager-resume h1" in inner_cmd
+    prompt_file = next(paths.PROMPT_FILES.glob("*.txt"))
+    assert prompt_file.read_text() == "/manager-resume h1"
+    assert f'"$(cat {shlex.quote(str(prompt_file))})"' in inner_cmd
     assert "You are an orchestrator worker running in a separate tmux window" not in inner_cmd
 
 
-def test_spawn_worker_codex_rejects_claude_only_extra_args(monkeypatch):
+def test_spawn_worker_codex_rejects_claude_only_extra_args(monkeypatch, tmp_path):
+    allow_codex(monkeypatch, tmp_path)
     _patch_exec(monkeypatch)
     with pytest.raises(ValueError, match="runtime='codex'.*Claude-only"):
         _asyncio.run(spawner.spawn_worker_tab(
@@ -2337,7 +2792,8 @@ def test_spawn_worker_codex_rejects_claude_only_extra_args(monkeypatch):
         ))
 
 
-def test_spawn_worker_codex_rejects_default_overrides(monkeypatch):
+def test_spawn_worker_codex_rejects_default_overrides(monkeypatch, tmp_path):
+    allow_codex(monkeypatch, tmp_path)
     _patch_exec(monkeypatch)
     with pytest.raises(ValueError, match="cannot override orchestrator Codex defaults"):
         _asyncio.run(spawner.spawn_worker_tab(
@@ -2350,7 +2806,8 @@ def test_spawn_worker_codex_rejects_default_overrides(monkeypatch):
 
 
 @pytest.mark.parametrize("extra_arg", ["-sworkspace-write", "-aon-request"])
-def test_spawn_worker_codex_rejects_compact_default_overrides(monkeypatch, extra_arg):
+def test_spawn_worker_codex_rejects_compact_default_overrides(monkeypatch, tmp_path, extra_arg):
+    allow_codex(monkeypatch, tmp_path)
     _patch_exec(monkeypatch)
     with pytest.raises(ValueError, match="cannot override orchestrator Codex defaults"):
         _asyncio.run(spawner.spawn_worker_tab(
@@ -2377,7 +2834,7 @@ def test_spawn_worker_target_window_match_adds_match_flag(monkeypatch):
     terminal._DRIVER = None
     captured = _patch_exec(monkeypatch)
     _asyncio.run(spawner.spawn_worker_tab(
-        cwd="/tmp/x",
+        extra_args=FLAGS, cwd="/tmp/x",
         initial_prompt="hi",
         name="alpha",
         target_window_match="window_id:42",
@@ -2391,7 +2848,7 @@ def test_spawn_worker_no_match_flag_when_target_window_match_unset(monkeypatch):
     terminal._DRIVER = None
     captured = _patch_exec(monkeypatch)
     _asyncio.run(spawner.spawn_worker_tab(
-        cwd="/tmp/x",
+        extra_args=FLAGS, cwd="/tmp/x",
         initial_prompt="hi",
         name="alpha",
     ))
@@ -2409,7 +2866,7 @@ def test_spawn_worker_route_to_workers_window_ignores_target_window_match(monkey
 
     monkeypatch.setattr(terminal.TmuxDriver, "find_group_pane", fake_find)
     _asyncio.run(spawner.spawn_worker_tab(
-        cwd="/tmp/x",
+        extra_args=FLAGS, cwd="/tmp/x",
         initial_prompt="hi",
         name="alpha",
         route_to_workers_window=True,
@@ -2437,7 +2894,7 @@ def test_spawn_worker_tab_manager_routes_to_mgr_session(monkeypatch):
     monkeypatch.setattr(_spawner, "get_driver", lambda: FakeDrv())
 
     _asyncio2.run(_spawner.spawn_worker_tab(
-        cwd="/tmp/x",
+        extra_args=FLAGS, cwd="/tmp/x",
         initial_prompt="/manager-resume x",
         name="m",
         agent="manager",
@@ -2448,7 +2905,7 @@ def test_spawn_worker_tab_manager_routes_to_mgr_session(monkeypatch):
 
     captured_spawn_kwargs.clear()
     _asyncio2.run(_spawner.spawn_worker_tab(
-        cwd="/tmp/x",
+        extra_args=FLAGS, cwd="/tmp/x",
         initial_prompt="do work",
         name="w",
         agent="worker",
@@ -2488,7 +2945,7 @@ def test_spawn_worker_account_a_default(monkeypatch, tmp_path):
     captured = _patch_exec(monkeypatch)
     _enable_pool(monkeypatch, tmp_path, letter="a")
     _asyncio.run(spawner.spawn_worker_tab(
-        cwd="/tmp/x",
+        extra_args=FLAGS, cwd="/tmp/x",
         initial_prompt="hi",
         name="alpha",
     ))
@@ -2501,9 +2958,9 @@ def test_spawn_worker_account_a_default(monkeypatch, tmp_path):
 def test_spawn_worker_account_b_config_dir(monkeypatch, tmp_path):
     captured = _patch_exec(monkeypatch)
     _enable_pool(monkeypatch, tmp_path, letter="b")
-    monkeypatch.setattr(spawner, "_pick_account", lambda force=False: "b")
+    monkeypatch.setattr(spawner, "_pick_account", lambda force=False, fable=False: "b")
     _asyncio.run(spawner.spawn_worker_tab(
-        cwd="/tmp/x",
+        extra_args=FLAGS, cwd="/tmp/x",
         initial_prompt="hi",
         name="alpha",
     ))
@@ -2548,7 +3005,7 @@ def test_spawn_manager_rides_pointer_b(monkeypatch, tmp_path):
 def test_spawn_omits_prefix_without_pointer(monkeypatch):
     captured = _patch_exec(monkeypatch)
     _asyncio.run(spawner.spawn_worker_tab(
-        cwd="/tmp/x",
+        extra_args=FLAGS, cwd="/tmp/x",
         initial_prompt="hi",
         name="alpha",
     ))
@@ -2560,7 +3017,7 @@ def test_spawn_omits_prefix_without_pointer(monkeypatch):
 def test_spawn_omits_prefix_on_invalid_pointer(monkeypatch, tmp_path):
     captured = _patch_exec(monkeypatch)
     _enable_pool(monkeypatch, tmp_path, letter="z")
-    _asyncio.run(spawner.spawn_worker_tab(cwd="/tmp/x", initial_prompt="hi", name="alpha"))
+    _asyncio.run(spawner.spawn_worker_tab(extra_args=FLAGS, cwd="/tmp/x", initial_prompt="hi", name="alpha"))
     inner_cmd_z = captured["args"][-1]
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in inner_cmd_z
     assert "CLAUDE_ORCH_ACCOUNT" not in inner_cmd_z
@@ -2570,7 +3027,7 @@ def test_caller_token_disables_pool_injection(monkeypatch, tmp_path):
     captured = _patch_exec(monkeypatch)
     _enable_pool(monkeypatch, tmp_path, letter="a")
     _asyncio.run(spawner.spawn_worker_tab(
-        cwd="/tmp/x",
+        extra_args=FLAGS, cwd="/tmp/x",
         initial_prompt="hi",
         name="alpha",
         env={
@@ -2587,9 +3044,9 @@ def test_caller_token_disables_pool_injection(monkeypatch, tmp_path):
 def test_caller_config_dir_dropped_picker_wins(monkeypatch, tmp_path):
     captured = _patch_exec(monkeypatch)
     _enable_pool(monkeypatch, tmp_path, letter="b")
-    monkeypatch.setattr(spawner, "_pick_account", lambda force=False: "b")
+    monkeypatch.setattr(spawner, "_pick_account", lambda force=False, fable=False: "b")
     _asyncio.run(spawner.spawn_worker_tab(
-        cwd="/tmp/x",
+        extra_args=FLAGS, cwd="/tmp/x",
         initial_prompt="hi",
         name="alpha",
         env={"CLAUDE_CONFIG_DIR": "/tmp/evil"},
@@ -2685,6 +3142,7 @@ def test_spawn_worker_impl_reports_registered(fresh_orchestrator_dir, monkeypatc
     assert result["status"] == "registered"
     assert result["claude_sid"] == "spawned-reg-worker"
     assert result["window_id"] == "999"
+    assert state.read_json(paths.pending_assignment_path(result["assignment_id"]))["name"] == "reg-worker"
 
 
 def test_spawn_worker_impl_reports_no_register(fresh_orchestrator_dir, monkeypatch):
@@ -2721,42 +3179,58 @@ def test_spawn_replacement_manager_targets_old_manager_window(fresh_orchestrator
     assert result["runtime"] == "claude"
 
 
-def test_spawn_replacement_manager_pins_opus_model(fresh_orchestrator_dir, monkeypatch):
+def test_spawn_replacement_manager_pins_cwd_to_manager_home(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    mgr_home = tmp_path / "mgr-home"
+    monkeypatch.setenv("DOCKWRIGHT_MANAGER_HOME", str(mgr_home))
     become_manager_impl(claude_sid="mgr-old", iterm_sid="42")
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
     captured = _patch_spawn_worker_tab(monkeypatch)
     _patch_window_id_exists(monkeypatch, True)
     _asyncio.run(spawn_replacement_manager_impl(handoff["handoff_id"]))
-    assert captured["extra_args"] == ["--remote-control", "--model", "claude-opus-5[1m]"]
+    assert captured["cwd"] == str(mgr_home)
+    assert mgr_home.is_dir()
 
 
-def test_spawn_replacement_manager_carries_settings_and_rc(fresh_orchestrator_dir, monkeypatch, tmp_path):
-    presets = tmp_path / "presets"; presets.mkdir(exist_ok=True)
-    settings = presets / "manager-settings.json"
-    settings.write_text("{}")
-    monkeypatch.setattr(mcp_server.paths, "PRESETS", presets)
+def test_become_manager_refuses_parent_of_manager_home(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    work_root = tmp_path / "work"
+    (work_root / "manager").mkdir(parents=True)
+    monkeypatch.setenv("DOCKWRIGHT_MANAGER_HOME", str(work_root / "manager"))
+    monkeypatch.chdir(work_root)
+    with pytest.raises(ValueError, match="refusing to start a manager"):
+        become_manager_impl(claude_sid="mgr-root", iterm_sid="i1")
+    assert not (paths.ACTIVE / "mgr-root.json").exists()
+
+
+def test_become_manager_records_manager_home_cwd(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    work_root = tmp_path / "work"
+    (work_root / "manager").mkdir(parents=True)
+    monkeypatch.setenv("DOCKWRIGHT_MANAGER_HOME", str(work_root / "manager"))
+    monkeypatch.chdir(work_root / "manager")
+    become_manager_impl(claude_sid="mgr-home", iterm_sid="i1")
+    assert state.read_json(paths.ACTIVE / "mgr-home.json")["cwd"] == str(work_root / "manager")
+
+
+def test_spawn_replacement_manager_pins_manager_model(fresh_orchestrator_dir, monkeypatch):
     become_manager_impl(claude_sid="mgr-old", iterm_sid="42")
     handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
     captured = _patch_spawn_worker_tab(monkeypatch)
     _patch_window_id_exists(monkeypatch, True)
     _asyncio.run(spawn_replacement_manager_impl(handoff["handoff_id"]))
-    assert captured["extra_args"] == [
-        "--remote-control", "--settings", str(settings), "--model", "claude-opus-5[1m]"]
-    _rc = captured["extra_args"].index("--remote-control")
-    assert _rc + 1 < len(captured["extra_args"]) and \
-        captured["extra_args"][_rc + 1].startswith("-"), captured["extra_args"]
+    assert captured["extra_args"] == ["--model", models.families()["fable"] + "[1m]"]
 
 
-def test_spawn_replacement_manager_carries_skip_perms_opt_in(fresh_orchestrator_dir, monkeypatch):
-    monkeypatch.setenv("DOCKWRIGHT_MANAGER_SKIP_PERMS", "1")
+def test_spawn_replacement_manager_reads_a_pin_moved_after_the_server_started(
+        fresh_orchestrator_dir, monkeypatch, model_pins):
     become_manager_impl(claude_sid="mgr-old", iterm_sid="42")
-    handoff = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
     captured = _patch_spawn_worker_tab(monkeypatch)
     _patch_window_id_exists(monkeypatch, True)
-    _asyncio.run(spawn_replacement_manager_impl(handoff["handoff_id"]))
-    assert captured["extra_args"] == [
-        "--remote-control", "--dangerously-skip-permissions",
-        "--model", "claude-opus-5[1m]"]
+    first = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
+    _asyncio.run(spawn_replacement_manager_impl(first["handoff_id"]))
+    assert captured["extra_args"][-2:] == ["--model", "claude-opus-7-1[1m]"]
+    model_pins('opus = "claude-opus-7-1"', 'opus = "claude-opus-9-9"')
+    second = prepare_handoff_impl(claude_sid="mgr-old", narrative_summary="state", trigger_reason="manual")
+    _asyncio.run(spawn_replacement_manager_impl(second["handoff_id"]))
+    assert captured["extra_args"][-2:] == ["--model", "claude-opus-9-9[1m]"]
 
 
 def test_spawn_replacement_manager_inherits_predecessor_funny_name(fresh_orchestrator_dir, monkeypatch):
@@ -2886,7 +3360,9 @@ def test_spawn_worker_disables_remote_appends_caller_extra_args(fresh_orchestrat
     assert captured["extra_args"] == REMOTE_OFF_FLAGS + ["--dangerously-skip-permissions"]
 
 
-def test_spawn_worker_impl_codex_runtime_skips_claude_remote_flags(fresh_orchestrator_dir, monkeypatch):
+def test_spawn_worker_impl_codex_runtime_skips_claude_remote_flags(fresh_orchestrator_dir, monkeypatch,
+                                                                   tmp_path):
+    allow_codex(monkeypatch, tmp_path)
     captured = _patch_spawn_worker_tab(monkeypatch)
     result = _asyncio.run(spawn_worker_impl(
         initial_prompt="task",
@@ -3091,8 +3567,8 @@ def test_resume_replays_verifier_spawn_extra_args(fresh_orchestrator_dir, monkey
 
     _asyncio.run(_spawn_and_confirm_resume(
         fake_spawn, paths.CLOSED / "vsid.json", state.read_json(paths.CLOSED / "vsid.json"),
-        "verifier", "vsid", "/x", 5.0, 0.05))
-    assert captured["extra_args"] == ["--settings", "/deployed/verifier-settings.json"]
+        "verifier", "vsid", "/x", 5.0, 0.05, model="@opus", effort="xhigh"))
+    assert captured["extra_args"] == ["--settings", "/deployed/verifier-settings.json", *FLAGS]
     assert not any("worker-headless-settings.json" in a for a in captured["extra_args"])
 
 
@@ -3114,8 +3590,8 @@ def test_resume_replays_headless_preset_spawn_args(fresh_orchestrator_dir, monke
 
     _asyncio.run(_spawn_and_confirm_resume(
         fake_spawn, paths.CLOSED / "hsid.json", state.read_json(paths.CLOSED / "hsid.json"),
-        "w-bare", "hsid", "/x", 5.0, 0.05))
-    assert captured["extra_args"] == ["--settings", "/deployed/worker-headless-settings.json"]
+        "w-bare", "hsid", "/x", 5.0, 0.05, model="@opus", effort="xhigh"))
+    assert captured["extra_args"] == ["--settings", "/deployed/worker-headless-settings.json", *FLAGS]
 
 
 def test_resume_legacy_record_falls_back_to_manual_inline(fresh_orchestrator_dir, monkeypatch):
@@ -3132,9 +3608,9 @@ def test_resume_legacy_record_falls_back_to_manual_inline(fresh_orchestrator_dir
 
     _asyncio.run(_spawn_and_confirm_resume(
         fake_spawn, paths.CLOSED / "lsid.json", state.read_json(paths.CLOSED / "lsid.json"),
-        "legacy", "lsid", "/x", 5.0, 0.05))
-    assert captured["extra_args"] == _legacy_inline_settings_args()
-    assert captured["extra_args"] == REMOTE_OFF_FLAGS
+        "legacy", "lsid", "/x", 5.0, 0.05, model="@opus", effort="xhigh"))
+    assert captured["extra_args"] == [*_legacy_inline_settings_args(), *FLAGS]
+    assert captured["extra_args"][:2] == REMOTE_OFF_FLAGS
     assert "permissions" not in captured["extra_args"][1]
     assert not any("worker-headless-settings.json" in a for a in captured["extra_args"])
 
@@ -3178,7 +3654,7 @@ def test_manager_spawn_unaffected_by_worker_rc_flag(fresh_orchestrator_dir, monk
     _patch_window_id_exists(monkeypatch, True)
     _asyncio.run(spawn_replacement_manager_impl(handoff["handoff_id"]))
     extra = captured.get("extra_args") or []
-    assert extra == ["--remote-control", "--model", "claude-opus-5[1m]"]
+    assert extra == ["--model", models.families()["fable"] + "[1m]"]
     assert "--settings" not in extra
     assert all("remoteControlAtStartup" not in str(a) for a in extra)
 
@@ -3198,6 +3674,17 @@ def test_spawn_worker_impl_pauses_when_both_hot(fresh_orchestrator_dir, monkeypa
     _write_usage_mcp(tmp_path, "b", 97.0)
     result = _asyncio.run(spawn_worker_impl("hi", name="paused-one"))
     assert result["status"] == "paused"
+    assert captured == {}
+    assert not list(paths.ASSIGNMENTS_PENDING.glob("*.json"))
+
+
+def test_spawn_worker_returns_the_held_gate(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    _enable_pool(monkeypatch, tmp_path, letter="a")
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    monkeypatch.setattr(spawner, "usage_spawn_gate",
+                        lambda force=False: {"status": "held", "account": "a"})
+    result = _asyncio.run(spawn_worker_impl("hi", name="held-one"))
+    assert result == {"status": "held", "account": "a"}
     assert captured == {}
     assert not list(paths.ASSIGNMENTS_PENDING.glob("*.json"))
 
@@ -3504,7 +3991,7 @@ def test_wait_for_worker_unrelated_record_stamps_never_gate_closed_worker(fresh_
 
 def test_send_manager_to_worker_stamps_tasked_at(fresh_orchestrator_dir, monkeypatch):
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="42")
-    monkeypatch.setattr("dockwright.mcp_server._send_text", lambda wid, text: None)
+    monkeypatch.setattr("dockwright.mcp_server._type_unguarded", lambda wid, text: None)
     before = time.time()
     send_manager_to_worker_impl(worker="alpha", text="new task")
     record = state.read_json(paths.ACTIVE / "w1.json")
@@ -3863,6 +4350,20 @@ def test_list_closed_workers_default_is_unlimited_newest_first(fresh_orchestrato
     assert [r["name"] for r in _lcw()] == ["new", "mid", "old"]
 
 
+def test_list_closed_workers_exposes_moved(fresh_orchestrator_dir):
+    paths.CLOSED.mkdir(parents=True, exist_ok=True)
+    state.write_json_atomic(paths.CLOSED / "c-moved.json", {
+        "claude_sid": "c-moved", "name": "moved", "cwd": "/x", "closed_at": 1.0,
+        "closed_reason": "session_end", "moved": "fable", "parent_manager_name": "manager-a",
+    })
+    state.write_json_atomic(paths.CLOSED / "c-plain.json", {
+        "claude_sid": "c-plain", "name": "plain", "cwd": "/x", "closed_at": 2.0,
+        "parent_manager_name": "manager-a",
+    })
+    rows = {r["name"]: r for r in _lcw()}
+    assert rows["moved"]["moved"] == "fable" and rows["plain"]["moved"] is None
+
+
 def test_list_closed_workers_limit_returns_newest_records(fresh_orchestrator_dir):
     paths.CLOSED.mkdir(parents=True, exist_ok=True)
     for name, closed_at in (("old", 1.0), ("newest", 3.0), ("middle", 2.0)):
@@ -3948,6 +4449,19 @@ def test_close_manager_self_rejects_non_manager(fresh_orchestrator_dir):
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1", pid=os.getpid())
     with pytest.raises(ValueError, match="not a manager"):
         close_manager_self_impl("w1")
+
+
+def test_close_manager_self_refuses_without_notebook_mark(fresh_orchestrator_dir, monkeypatch):
+    become_manager_impl(claude_sid="mgr-c", iterm_sid="i0", domain="general")
+    _open_notebook()
+    closed, distilled = [], []
+    monkeypatch.setattr("dockwright.mcp_server._close_window", lambda *a, **k: closed.append(a))
+    monkeypatch.setattr("dockwright.mcp_server.distill_and_write_memory", lambda *a, **k: distilled.append(a))
+    with pytest.raises(ValueError, match="dockwright notebook mark"):
+        close_manager_self_impl("mgr-c")
+    assert (paths.ACTIVE / "mgr-c.json").exists()
+    assert closed == []
+    assert distilled == []
 
 
 from dockwright.mcp_server import _migrate_flat_manager_memory
@@ -4131,6 +4645,7 @@ def test_parent_manager_preserved_across_close_and_resume(fresh_orchestrator_dir
     mgr_name = state.read_json(paths.ACTIVE / "mgr-a.json")["name"]
     captured_spawn = _patch_spawn_worker_tab(monkeypatch)
     _asyncio.run(spawn_worker_impl(
+        extra_args=FLAGS,
         initial_prompt="task",
         name="worker-fc",
         cwd="/tmp/fc",
@@ -4157,7 +4672,8 @@ def test_parent_manager_preserved_across_close_and_resume(fresh_orchestrator_dir
     )
 
     captured_resume = _patch_spawn_registers_active(monkeypatch)
-    _asyncio.run(_resume_worker_mcp(name="worker-fc", _registration_timeout_sec=2.0, _poll_interval=0.01))
+    _asyncio.run(_resume_worker_mcp(name="worker-fc", model="@opus", effort="xhigh", _registration_timeout_sec=2.0,
+                                    _poll_interval=0.01))
     resumed_env = captured_resume.get("env") or {}
     assert resumed_env.get("CLAUDE_PARENT_MANAGER") == mgr_name, (
         f"resume_worker MUST pass CLAUDE_PARENT_MANAGER={mgr_name!r} from the closed "
@@ -4227,7 +4743,7 @@ def test_resume_reclaims_autoclosed_spend_to_ledger(fresh_orchestrator_dir, tmp_
         "spend": {"turns": 3, "out_tokens": 100, "in_tokens": 50, "cache_read_tokens": 10},
     })
     _patch_spawn_registers_active(monkeypatch)
-    result = _asyncio.run(_resume_worker_mcp(name="idle-worker", _registration_timeout_sec=2.0, _poll_interval=0.01))
+    result = _asyncio.run(_resume_worker_mcp(model="@opus", effort="xhigh", name="idle-worker", _registration_timeout_sec=2.0, _poll_interval=0.01))
     assert result["ok"] is True
     assert not (paths.CLOSED / "idle-sid.json").exists()
     ledger_path = fresh_orchestrator_dir / "spend-ledger.jsonl"
@@ -4249,7 +4765,7 @@ def test_resume_does_not_reledger_session_end_closures(fresh_orchestrator_dir, t
         "spend": {"turns": 2, "out_tokens": 80, "in_tokens": 40, "cache_read_tokens": 5},
     })
     _patch_spawn_registers_active(monkeypatch)
-    result = _asyncio.run(_resume_worker_mcp(name="ended-worker", _registration_timeout_sec=2.0, _poll_interval=0.01))
+    result = _asyncio.run(_resume_worker_mcp(model="@opus", effort="xhigh", name="ended-worker", _registration_timeout_sec=2.0, _poll_interval=0.01))
     assert result["ok"] is True
     assert not (paths.CLOSED / "ended-sid.json").exists()
     ledger_path = fresh_orchestrator_dir / "spend-ledger.jsonl"
@@ -4265,7 +4781,7 @@ def test_resume_worker_with_null_parent_omits_env(fresh_orchestrator_dir, tmp_pa
         "iterm_sid": "il", "closed_at": 1.0,
     })
     captured = _patch_spawn_registers_active(monkeypatch)
-    _asyncio.run(_resume_worker_mcp(name="legacy-worker", _registration_timeout_sec=2.0, _poll_interval=0.01))
+    _asyncio.run(_resume_worker_mcp(model="@opus", effort="xhigh", name="legacy-worker", _registration_timeout_sec=2.0, _poll_interval=0.01))
     env = captured.get("env")
     assert env is None or "CLAUDE_PARENT_MANAGER" not in env
 
@@ -4367,7 +4883,7 @@ def test_resume_worker_keeps_closed_record_when_registration_times_out(fresh_orc
     state.write_json_atomic(paths.CLOSED / "stuck-sid.json", {
         "claude_sid": "stuck-sid", "name": "stuck", "cwd": "/tmp/s", "closed_at": 1.0})
     _patch_spawn_worker_tab(monkeypatch)
-    result = _asyncio.run(_resume_worker_mcp(
+    result = _asyncio.run(_resume_worker_mcp(model="@opus", effort="xhigh", 
         name="stuck", _registration_timeout_sec=0.05, _poll_interval=0.01))
     assert result["ok"] is False
     assert "did not register" in result["reason"]
@@ -4379,7 +4895,7 @@ def test_resume_worker_unlinks_closed_record_after_registration_confirmed(fresh_
     state.write_json_atomic(paths.CLOSED / "good-sid.json", {
         "claude_sid": "good-sid", "name": "good", "cwd": "/tmp/g", "closed_at": 1.0})
     _patch_spawn_registers_active(monkeypatch)
-    result = _asyncio.run(_resume_worker_mcp(
+    result = _asyncio.run(_resume_worker_mcp(model="@opus", effort="xhigh", 
         name="good", _registration_timeout_sec=2.0, _poll_interval=0.01))
     assert result["ok"] is True
     assert result["sid"] == "good-sid"
@@ -4392,7 +4908,7 @@ def test_resume_worker_claude_applies_remote_off_settings(fresh_orchestrator_dir
     state.write_json_atomic(paths.CLOSED / "rc-sid.json", {
         "claude_sid": "rc-sid", "name": "rc-worker", "cwd": "/tmp/rc", "closed_at": 1.0})
     captured = _patch_spawn_registers_active(monkeypatch)
-    result = _asyncio.run(_resume_worker_mcp(
+    result = _asyncio.run(_resume_worker_mcp(model="@opus", effort="xhigh", 
         name="rc-worker", _registration_timeout_sec=2.0, _poll_interval=0.01))
     assert result["ok"] is True
     assert (captured.get("extra_args") or [])[:2] == REMOTE_OFF_FLAGS
@@ -4405,10 +4921,10 @@ def test_resume_worker_claude_honors_remote_control_opt_in(fresh_orchestrator_di
     state.write_json_atomic(paths.CLOSED / "rc-on-sid.json", {
         "claude_sid": "rc-on-sid", "name": "rc-on-worker", "cwd": "/tmp/rc", "closed_at": 1.0})
     captured = _patch_spawn_registers_active(monkeypatch)
-    result = _asyncio.run(_resume_worker_mcp(
+    result = _asyncio.run(_resume_worker_mcp(model="@opus", effort="xhigh", 
         name="rc-on-worker", _registration_timeout_sec=2.0, _poll_interval=0.01))
     assert result["ok"] is True
-    assert captured.get("extra_args") == RC_ON_FLAGS
+    assert captured.get("extra_args") == [*RC_ON_FLAGS, *FLAGS]
     assert "--remote-control" in (captured.get("extra_args") or [])
 
 
@@ -4470,7 +4986,7 @@ def test_resume_worker_ignores_foreign_name_claim_mid_window(fresh_orchestrator_
         return ("999", kwargs.get("name", ""))
 
     monkeypatch.setattr(spawner, "spawn_worker_tab", fake_spawn)
-    result = _asyncio.run(_resume_worker_mcp(
+    result = _asyncio.run(_resume_worker_mcp(model="@opus", effort="xhigh", 
         name="tkt-1234", _registration_timeout_sec=0.1, _poll_interval=0.01))
     assert result["ok"] is False, (
         "a foreign session claiming the name mid-window must not confirm the resume"
@@ -4493,7 +5009,7 @@ def test_resume_worker_confirms_via_resumed_sid_and_returns_registered_name(fres
         return ("999", kwargs.get("name", ""))
 
     monkeypatch.setattr(spawner, "spawn_worker_tab", fake_spawn)
-    result = _asyncio.run(_resume_worker_mcp(
+    result = _asyncio.run(_resume_worker_mcp(model="@opus", effort="xhigh", 
         name="tkt-1234", _registration_timeout_sec=2.0, _poll_interval=0.01))
     assert result["ok"] is True
     assert result["sid"] == "old-sid"
@@ -4555,11 +5071,11 @@ def test_resume_worker_concurrent_second_call_refused(fresh_orchestrator_dir, tm
     _patch_spawn_worker_tab(monkeypatch)
 
     async def scenario():
-        first = _asyncio.create_task(_resume_worker_mcp(
+        first = _asyncio.create_task(_resume_worker_mcp(model="@opus", effort="xhigh", 
             name="dup-task", _registration_timeout_sec=0.5, _poll_interval=0.01))
         await _asyncio.sleep(0.05)
         with pytest.raises(ValueError, match="already in progress"):
-            await _resume_worker_mcp(
+            await _resume_worker_mcp(model="@opus", effort="xhigh", 
                 name="dup-task", _registration_timeout_sec=0.5, _poll_interval=0.01)
         return await first
 
@@ -4655,7 +5171,7 @@ def test_become_manager_empty_iterm_sid_and_no_env_stays_empty(fresh_orchestrato
     assert record["window_id"] == ""
 
 
-from dockwright.mcp_server import _input_is_idle
+from dockwright.mcp_server import _input_is_idle, _input_state
 
 
 def test_input_is_idle_empty_bordered_box():
@@ -4705,6 +5221,61 @@ def test_input_is_idle_bare_reset_ends_faint_so_later_text_is_busy():
     assert _input_is_idle("\x1b[39m❯ \x1b[2mghost\x1b[mREAL") is False
 
 
+@pytest.mark.parametrize("screen, state", [
+    (None, "no capture"), ("", "no capture"),
+    ("no caret here at all", "no prompt"),
+    ("│ ❯                      │\n  ⏶ Press up to edit queued messages", "queued"),
+    ("│ ❯ do the migration first │", "draft"),
+    ("\x1b[39m❯ \x1b[2mghost\x1b[mREAL", "draft"),
+    ("❯ ", "idle"),
+    ("\x1b[38;5;246m❯\xa0\x1b[39m", "idle"),
+    ("\x1b[39m❯ \x1b[2mSpawn a worker to investigate the codebase\x1b[0m", "idle"),
+])
+def test_input_state_names_why_a_line_is_not_idle(screen, state):
+    assert _input_state(screen) == state
+
+
+PERMISSION_DIALOG = "Bash command\n  rm -rf build\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n"
+IDLE_LINE = "│ ❯                      │"
+QUEUED_LINE = "│ ❯                      │\n  ⏶ Press up to edit queued messages"
+DRAFT_LINE = "│ ❯ do the migration first │"
+
+
+def test_the_permission_dialog_snapshot_is_not_an_idle_line():
+    assert _input_state(PERMISSION_DIALOG) != "idle"
+
+
+@pytest.mark.parametrize("screen,state", [
+    (DRAFT_LINE + "\n  ⏶ Press up to edit queued messages", "draft"),
+    (PERMISSION_DIALOG + "  ⏶ Press up to edit queued messages\n", "draft"),
+    ("Press up to edit queued messages\n" + DRAFT_LINE, "draft"),
+    ("Press up to edit queued messages\nno caret here", "no prompt"),
+    (QUEUED_LINE, "queued"),
+])
+def test_a_non_empty_caret_line_is_a_draft_whatever_the_queued_hint_says(screen, state):
+    assert _input_state(screen) == state
+
+
+@pytest.mark.parametrize("screen,attached,refused", [
+    (IDLE_LINE, False, False), (QUEUED_LINE, False, False), (DRAFT_LINE, False, True),
+    ("no caret here", False, True), (None, False, True), (PERMISSION_DIALOG, False, True),
+    (IDLE_LINE, True, False), (QUEUED_LINE, True, True),
+    (DRAFT_LINE + "\n  ⏶ Press up to edit queued messages", False, True),
+    (PERMISSION_DIALOG + "  ⏶ Press up to edit queued messages\n", False, True),
+    ("Press up to edit queued messages\nno caret here", False, True)])
+def test_reply_policy_lets_only_a_free_or_queued_line_through(monkeypatch, screen, attached, refused):
+    import dockwright.mcp_server as srv
+    monkeypatch.setattr(srv, "_capture_text", lambda window_id: screen)
+    monkeypatch.setattr(srv, "is_human_attached", lambda record, now=None: attached)
+    monkeypatch.setattr(srv, "_attached_until", lambda record: None)
+    monkeypatch.setattr(srv, "_attached_refusal", lambda record: "attached")
+    out = srv.reply_policy({"name": "w"}, "w1")
+    if refused:
+        assert out is not None and out["delivered"] is False and "line" in out
+    else:
+        assert out is None
+
+
 def test_capture_text_uses_ansi_capture(monkeypatch):
     import dockwright.mcp_server as srv
 
@@ -4727,7 +5298,7 @@ def test_send_manager_to_manager_idle_delivers(fresh_orchestrator_dir, monkeypat
     state.write_json_atomic(paths.ACTIVE / "m2.json", {
         "claude_sid": "m2", "agent": "manager", "name": "peer", "window_id": "9"})
     monkeypatch.setattr(srv, "_capture_text", lambda wid: "❯ ")
-    monkeypatch.setattr(srv, "_send_text", lambda wid, txt: None)
+    monkeypatch.setattr(srv, "_type_unguarded", lambda wid, txt: None)
     assert srv.send_manager_to_manager_impl("peer", "hi")["status"] == "delivered_live"
 
 
@@ -4737,7 +5308,7 @@ def test_send_manager_to_manager_busy_returns_peer_busy_no_inbox(fresh_orchestra
         "claude_sid": "m2", "agent": "manager", "name": "peer", "window_id": "9"})
     monkeypatch.setattr(srv, "_capture_text", lambda wid: "❯ writing a reply...")
     typed = []
-    monkeypatch.setattr(srv, "_send_text", lambda wid, txt: typed.append(txt))
+    monkeypatch.setattr(srv, "_type_unguarded", lambda wid, txt: typed.append(txt))
     r = srv.send_manager_to_manager_impl("peer", "hi")
     assert r["status"] == "peer_busy" and r["delivered"] is False and typed == []
 
@@ -4767,7 +5338,7 @@ def test_send_manager_to_manager_resolves_and_stamps_back(fresh_orchestrator_dir
     monkeypatch.setattr(srv, "_resolve_manager_window", lambda *a, **k: "77")
     monkeypatch.setattr(srv, "_capture_text", lambda wid: "❯ ")
     sent = {}
-    monkeypatch.setattr(srv, "_send_text", lambda wid, txt: sent.update(wid=wid))
+    monkeypatch.setattr(srv, "_type_unguarded", lambda wid, txt: sent.update(wid=wid))
     r = srv.send_manager_to_manager_impl("peer", "hi")
     assert r["status"] == "delivered_live" and sent["wid"] == "77"
     assert state.read_json(paths.ACTIVE / "m2.json")["window_id"] == "77"
@@ -4792,7 +5363,7 @@ def test_send_manager_to_manager_dim_placeholder_delivers(fresh_orchestrator_dir
                         lambda wid: "\x1b[39m❯ \x1b[2mSpawn a worker to investigate\x1b[0m")
     monkeypatch.setattr(srv, "_resolve_sender_manager", lambda: None)
     typed = []
-    monkeypatch.setattr(srv, "_send_text", lambda wid, txt: typed.append(txt))
+    monkeypatch.setattr(srv, "_type_unguarded", lambda wid, txt: typed.append(txt))
     r = srv.send_manager_to_manager_impl("peer", "hi")
     assert r["status"] == "delivered_live" and typed == ["[MANAGER] hi"]
 
@@ -4804,7 +5375,7 @@ def test_send_manager_to_manager_ansi_typed_input_is_busy(fresh_orchestrator_dir
     monkeypatch.setattr(srv, "_capture_text",
                         lambda wid: "\x1b[39m❯ \x1b[39mhalf a thought\x1b[0m")
     typed = []
-    monkeypatch.setattr(srv, "_send_text", lambda wid, txt: typed.append(txt))
+    monkeypatch.setattr(srv, "_type_unguarded", lambda wid, txt: typed.append(txt))
     r = srv.send_manager_to_manager_impl("peer", "hi")
     assert r["status"] == "peer_busy" and r["delivered"] is False and typed == []
 
@@ -4816,7 +5387,7 @@ def _peer_and_sender(monkeypatch, sender):
     monkeypatch.setattr(srv, "_capture_text", lambda wid: "❯ ")
     monkeypatch.setattr(srv, "_resolve_sender_manager", lambda: sender)
     typed = []
-    monkeypatch.setattr(srv, "_send_text", lambda wid, txt: typed.append(txt))
+    monkeypatch.setattr(srv, "_type_unguarded", lambda wid, txt: typed.append(txt))
     return srv, typed
 
 
@@ -4869,7 +5440,7 @@ def test_send_manager_to_manager_peer_busy_stamps_nothing(fresh_orchestrator_dir
     monkeypatch.setattr(srv, "_resolve_sender_manager",
                         lambda: {"name": "sender-mgr", "domain": "infra"})
     typed = []
-    monkeypatch.setattr(srv, "_send_text", lambda wid, txt: typed.append(txt))
+    monkeypatch.setattr(srv, "_type_unguarded", lambda wid, txt: typed.append(txt))
     r = srv.send_manager_to_manager_impl("peer", "hi")
     assert r["status"] == "peer_busy" and typed == []
     assert "sender" not in r
@@ -4886,7 +5457,7 @@ def test_send_manager_to_manager_stamps_from_active_record_without_patching_the_
     monkeypatch.setenv("TMUX_PANE", "%7")
     monkeypatch.setattr(srv, "_capture_text", lambda wid: "❯ ")
     typed = []
-    monkeypatch.setattr(srv, "_send_text", lambda wid, txt: typed.append(txt))
+    monkeypatch.setattr(srv, "_type_unguarded", lambda wid, txt: typed.append(txt))
     r = srv.send_manager_to_manager_impl("peer", "hi")
     assert typed == ["[MANAGER sender-mgr · infra] hi"]
     assert r["sender"] == "sender-mgr"
@@ -4904,7 +5475,7 @@ def test_send_manager_to_manager_delivers_when_sender_resolution_raises(fresh_or
     monkeypatch.setattr(identity, "resolve_manager_record", boom)
     monkeypatch.setattr(srv, "_capture_text", lambda wid: "❯ ")
     typed = []
-    monkeypatch.setattr(srv, "_send_text", lambda wid, txt: typed.append(txt))
+    monkeypatch.setattr(srv, "_type_unguarded", lambda wid, txt: typed.append(txt))
     r = srv.send_manager_to_manager_impl("peer", "hi")
     assert r["status"] == "delivered_live" and typed == ["[MANAGER] hi"]
 
@@ -4928,7 +5499,7 @@ def test_send_manager_to_worker_does_not_match_manager(fresh_orchestrator_dir, m
     register_self_impl(claude_sid="m1", agent="manager", name="happy-yak", cwd="/x", iterm_sid="42")
     typed = []
     monkeypatch.setattr(
-        "dockwright.mcp_server._send_text",
+        "dockwright.mcp_server._type_unguarded",
         lambda wid, text: typed.append((wid, text)),
     )
     with pytest.raises(ValueError, match="active manager") as exc:
@@ -4945,7 +5516,7 @@ def test_worker_finder_names_manager_holder_by_sid_too(fresh_orchestrator_dir):
         kill_worker_impl(worker="ghost", dry_run=True)
 
 
-from dockwright.mcp_server import _send_text
+from dockwright.mcp_server import _type_unguarded
 
 
 def test_send_text_uses_bracketed_paste_then_single_enter(fresh_orchestrator_dir, monkeypatch):
@@ -4953,9 +5524,10 @@ def test_send_text_uses_bracketed_paste_then_single_enter(fresh_orchestrator_dir
     calls = []
     monkeypatch.setattr(
         "dockwright.mcp_server.subprocess.run",
-        lambda args, **kw: calls.append((list(args), kw)),
+        lambda args, **kw: (calls.append((list(args), kw)),
+                            subprocess.CompletedProcess(args, 0, b"", b""))[1],
     )
-    _send_text("42", "do the migration first")
+    _type_unguarded("42", "do the migration first")
     assert len(calls) == 4
     load = next(a for a, _ in calls if "load-buffer" in a)
     paste = next(a for a, _ in calls if "paste-buffer" in a)
@@ -4973,10 +5545,11 @@ def test_send_text_multiline_arrives_whole(fresh_orchestrator_dir, monkeypatch):
     calls = []
     monkeypatch.setattr(
         "dockwright.mcp_server.subprocess.run",
-        lambda args, **kw: calls.append((list(args), kw)),
+        lambda args, **kw: (calls.append((list(args), kw)),
+                            subprocess.CompletedProcess(args, 0, b"", b""))[1],
     )
     multiline = "line one\nline two\n\nline four with trailing"
-    _send_text("7", multiline)
+    _type_unguarded("7", multiline)
     load_kw = next(kw for a, kw in calls if "load-buffer" in a)
     assert load_kw["input"] == multiline.encode("utf-8")
     paste = next(a for a, _ in calls if "paste-buffer" in a)
@@ -4991,7 +5564,7 @@ def test_send_text_swallows_failure(fresh_orchestrator_dir, monkeypatch):
         raise FileNotFoundError("tmux not installed")
 
     monkeypatch.setattr("dockwright.mcp_server.subprocess.run", boom)
-    _send_text("42", "hi")
+    _type_unguarded("42", "hi")
 
 
 def test_become_manager_with_takeover_skips_close_when_no_window_resolves(fresh_orchestrator_dir, monkeypatch):
@@ -5285,33 +5858,158 @@ from dockwright.mcp_server import (
 
 
 def test_artifact_put_accepts_task_key_and_ticket_alias(fresh_orchestrator_dir):
-    _tool_artifact_put(task_key="K-1", phase="spec", name="srs", content="a",
+    _tool_artifact_put(task_key="K-1", phase="spec", name="srs",
+                       content_path=_source(fresh_orchestrator_dir, "a", "a.md"),
                        status="complete", writer_sid="s1")
     assert artifact_get_impl("K-1", "spec", "srs")["content"] == "a"
-    _tool_artifact_put(ticket="K-2", phase="spec", name="srs", content="b",
+    _tool_artifact_put(ticket="K-2", phase="spec", name="srs",
+                       content_path=_source(fresh_orchestrator_dir, "b", "b.md"),
                        status="complete", writer_sid="s1")
     assert artifact_get_impl("K-2", "spec", "srs")["content"] == "b"
     _tool_artifact_put(task_key="K-3", ticket="K-2", phase="spec", name="srs",
-                       content="c", status="complete", writer_sid="s1")
+                       content_path=_source(fresh_orchestrator_dir, "c", "c.md"), status="complete",
+                       writer_sid="s1")
     assert artifact_get_impl("K-3", "spec", "srs")["content"] == "c"
     with pytest.raises(ValueError):
-        _tool_artifact_put(phase="spec", name="srs", content="d",
+        _tool_artifact_put(phase="spec", name="srs", content_path=_source(fresh_orchestrator_dir, "d", "d.md"),
                            status="complete", writer_sid="s1")
 
 
 def test_artifact_read_tools_accept_task_key_and_ticket_alias(fresh_orchestrator_dir):
     artifact_put_impl("K-1", "spec", "srs", "body", "complete", "s1")
-    assert _tool_artifact_get(task_key="K-1", phase="spec", name="srs")["content"] == "body"
-    assert _tool_artifact_get(ticket="K-1", phase="spec", name="srs")["content"] == "body"
+    assert Path(_tool_artifact_get(task_key="K-1", phase="spec", name="srs")["content_path"]).read_text(
+        encoding="utf-8") == "body"
+    assert Path(_tool_artifact_get(ticket="K-1", phase="spec", name="srs")["content_path"]).read_text(
+        encoding="utf-8") == "body"
     assert _tool_artifact_list(task_key="K-1")[0]["name"] == "srs"
     assert _tool_artifact_list(ticket="K-1")[0]["name"] == "srs"
-    assert "K-1" in _tool_artifact_view(task_key="K-1")
+    assert "K-1" in Path(_tool_artifact_view(task_key="K-1")["content_path"]).read_text(encoding="utf-8")
     assert "K-1" in _tool_pipeline_status(ticket="K-1")
     for tool in (_tool_artifact_get, _tool_artifact_list, _tool_artifact_view,
                  _tool_pipeline_status):
         with pytest.raises(ValueError):
             tool() if tool in (_tool_artifact_list, _tool_artifact_view,
                                _tool_pipeline_status) else tool(phase="spec", name="srs")
+
+
+def _source(tmp_path, text, name="source.md"):
+    path = tmp_path / name
+    path.write_bytes(text.encode("utf-8"))
+    return str(path)
+
+
+def test_artifact_put_copies_the_file_byte_for_byte_and_outlives_it(fresh_orchestrator_dir):
+    text = "título\n\ncuerpo — 1\n"
+    source = _source(fresh_orchestrator_dir, text)
+    _tool_artifact_put("K", phase="spec", name="a", content_path=source, status="complete", writer_sid="w")
+    os.unlink(source)
+    assert artifact_get_impl("K", "spec", "a")["content"] == text
+
+
+@pytest.mark.parametrize("make, reason", [
+    (lambda root: "relative.md", "absolute"),
+    (lambda root: str(root), "not a regular file"),
+    (lambda root: str(root / "missing.md"), "does not exist"),
+    (lambda root: _source(root, "x" * (artifact_export.STORE_FILE_MAX + 1), "big.md"), "over the"),
+    (lambda root: (root / "bad.md").write_bytes(b"\xff\xfe") and str(root / "bad.md"), "not UTF-8"),
+])
+def test_artifact_put_refuses_a_path_it_cannot_copy(fresh_orchestrator_dir, make, reason):
+    with pytest.raises(ValueError, match=reason):
+        _tool_artifact_put("K", phase="spec", name="a", content_path=make(fresh_orchestrator_dir),
+                           status="complete", writer_sid="w")
+    assert not paths.artifact_path("K", "spec", "a").exists()
+
+
+def test_artifact_put_refuses_a_file_inside_the_store(fresh_orchestrator_dir):
+    artifact_put_impl("K", "spec", "a", "body", "complete", "w")
+    with pytest.raises(ValueError, match="inside the store"):
+        _tool_artifact_put("K", phase="spec", name="b", content_path=str(paths.artifact_path("K", "spec", "a")),
+                           status="complete", writer_sid="w")
+
+
+@pytest.mark.parametrize("body", ["one line", "x" * 20 * 1024])
+def test_artifact_get_returns_a_copy_of_the_body_and_no_text(fresh_orchestrator_dir, body):
+    artifact_put_impl("K", "spec", "a", body, "complete", "w")
+    got = _tool_artifact_get("K", phase="spec", name="a", reader_sid="r")
+    assert "content" not in got
+    copy = Path(got["content_path"])
+    assert copy.read_bytes() == body.encode("utf-8")
+    assert copy.is_relative_to(paths.EXPORTS)
+    assert got["path"] == str(paths.artifact_path("K", "spec", "a"))
+
+
+def test_a_second_read_reuses_the_copy_and_refreshes_its_mtime(fresh_orchestrator_dir):
+    artifact_put_impl("K", "spec", "a", "body", "complete", "w")
+    first = Path(_tool_artifact_get("K", phase="spec", name="a")["content_path"])
+    hour_ago = time.time() - 3600
+    os.utime(first, (hour_ago, hour_ago))
+    inode = first.stat().st_ino
+    second = Path(_tool_artifact_get("K", phase="spec", name="a")["content_path"])
+    assert second == first
+    assert second.stat().st_ino == inode
+    assert second.stat().st_mtime > hour_ago + 1800
+
+
+def test_one_read_records_one_artifact_read_event(fresh_orchestrator_dir):
+    artifact_put_impl("K", "spec", "a", "body", "complete", "w")
+    _tool_artifact_get("K", phase="spec", name="a", reader_sid="r")
+    lines = paths.artifact_events_path("K").read_text().splitlines()
+    assert sum('"artifact_read"' in line for line in lines) == 1
+
+
+def test_a_copy_older_than_a_day_is_removed_on_the_next_export(fresh_orchestrator_dir):
+    artifact_put_impl("K", "spec", "a", "old", "complete", "w")
+    artifact_put_impl("K", "spec", "b", "new", "complete", "w")
+    old = Path(_tool_artifact_get("K", phase="spec", name="a")["content_path"])
+    day_ago = time.time() - artifact_export.EXPORT_MAX_AGE_SEC - 60
+    os.utime(old, (day_ago, day_ago))
+    _tool_artifact_get("K", phase="spec", name="b")
+    assert not old.exists()
+
+
+@pytest.mark.parametrize("read", [
+    lambda: _tool_artifact_get("K", phase="spec", name="a")["content_path"],
+    lambda: _tool_artifact_view("K")["content_path"],
+])
+def test_a_copy_edited_in_place_is_rewritten_from_the_store_on_the_next_read(fresh_orchestrator_dir, read):
+    artifact_put_impl("K", "spec", "a", "stored", "complete", "w")
+    first = Path(read())
+    expected = first.read_bytes()
+    first.write_text("edited, never stored", encoding="utf-8")
+    again = Path(read())
+    assert again == first
+    assert again.read_bytes() == expected
+
+
+def test_the_export_folder_is_private_to_its_user(fresh_orchestrator_dir):
+    artifact_put_impl("K", "spec", "a", "body", "complete", "w")
+    _tool_artifact_get("K", phase="spec", name="a")
+    assert paths.EXPORTS.stat().st_mode & 0o777 == 0o700
+
+
+def test_an_export_folder_left_open_is_closed_before_use(fresh_orchestrator_dir):
+    paths.EXPORTS.mkdir()
+    os.chmod(paths.EXPORTS, 0o777)
+    artifact_put_impl("K", "spec", "a", "body", "complete", "w")
+    _tool_artifact_get("K", phase="spec", name="a")
+    assert paths.EXPORTS.stat().st_mode & 0o777 == 0o700
+
+
+def test_an_export_folder_that_is_a_symlink_is_refused(fresh_orchestrator_dir):
+    elsewhere = fresh_orchestrator_dir / "elsewhere"
+    elsewhere.mkdir()
+    paths.EXPORTS.symlink_to(elsewhere)
+    artifact_put_impl("K", "spec", "a", "body", "complete", "w")
+    with pytest.raises(ValueError, match="not a folder this user owns"):
+        _tool_artifact_get("K", phase="spec", name="a")
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_artifact_view_writes_the_fold_to_a_file(fresh_orchestrator_dir):
+    artifact_put_impl("K", "spec", "a", "the body", "complete", "w")
+    got = _tool_artifact_view("K")
+    assert set(got) == {"content_path"}
+    assert "the body" in Path(got["content_path"]).read_text(encoding="utf-8")
 
 
 def test_pipeline_event_accepts_task_key_and_ticket_alias(fresh_orchestrator_dir):
@@ -5501,12 +6199,14 @@ def test_artifact_put_eexist_reguard_refuses_unknown_verdict(fresh_orchestrator_
 
 
 def test_artifact_put_tool_threads_overwrite(fresh_orchestrator_dir):
-    _tool_artifact_put(task_key="TKT-SANDBOX-9", phase="spec", name="srs", content="a",
+    _tool_artifact_put(task_key="TKT-SANDBOX-9", phase="spec", name="srs",
+                       content_path=_source(fresh_orchestrator_dir, "a", "a.md"),
                        status="complete", writer_sid="w1")
-    _tool_artifact_put(task_key="TKT-SANDBOX-9", phase="spec", name="srs", content="b",
+    _tool_artifact_put(task_key="TKT-SANDBOX-9", phase="spec", name="srs",
+                       content_path=_source(fresh_orchestrator_dir, "b", "b.md"),
                        status="complete", writer_sid="w2", overwrite=True)
-    assert _tool_artifact_get(task_key="TKT-SANDBOX-9", phase="spec",
-                              name="srs")["content"] == "b"
+    assert Path(_tool_artifact_get(task_key="TKT-SANDBOX-9", phase="spec",
+                                   name="srs")["content_path"]).read_text(encoding="utf-8") == "b"
 
 
 def test_partial_then_complete_same_writer_overwrites(fresh_orchestrator_dir):
@@ -5866,10 +6566,10 @@ def test_artifact_put_guard_matrix(fresh_orchestrator_dir, occupant,
 def test_artifact_put_signature_pin():
     assert list(inspect.signature(artifact_put_impl).parameters) == [
         "task_key", "phase", "name", "content", "status", "writer_sid",
-        "contract_hash", "read_set", "overwrite"]
+        "contract_hash", "read_set", "overwrite", "scope", "decided_by"]
     assert list(inspect.signature(_tool_artifact_put).parameters) == [
-        "task_key", "phase", "name", "content", "status", "writer_sid",
-        "contract_hash", "read_set", "overwrite", "ticket"]
+        "task_key", "phase", "name", "content_path", "status", "writer_sid",
+        "contract_hash", "read_set", "overwrite", "scope", "decided_by", "ticket"]
 
 
 from dockwright.mcp_server import (
@@ -5877,8 +6577,9 @@ from dockwright.mcp_server import (
 )
 
 
-def test_pipeline_status_joins_liveness(fresh_orchestrator_dir):
-    register_self_impl(claude_sid="sid-live", agent="worker", name="w-live", cwd="/x", iterm_sid="i1")
+def test_pipeline_status_joins_liveness(fresh_orchestrator_dir, monkeypatch):
+    _probes(monkeypatch)
+    register_self_impl(claude_sid="sid-live", agent="worker", name="w-live", cwd="/x", iterm_sid="i1", pid=_LIVE)
     artifact_put_impl("TKT-SANDBOX-1", "spec", "a", "x", "complete", "sid-live")
     done_dir = paths.done_dir_for("mgr-name")
     done_dir.mkdir(parents=True, exist_ok=True)
@@ -6033,7 +6734,7 @@ def test_spawn_env_absent_by_default(fresh_orchestrator_dir, monkeypatch, no_orc
 def test_spawn_env_absent_by_default_codex_unaffected(fresh_orchestrator_dir, monkeypatch,
                                                       tmp_path):
     cfg = tmp_path / "dockwright.toml"
-    cfg.write_text('[spawn.env]\nFOO = "bar"\n')
+    cfg.write_text('[spawn.env]\nFOO = "bar"\n[codex]\nallowed_roots = ["/tmp"]\n')
     monkeypatch.setenv(_config.ENV_CONFIG_PATH, str(cfg))
     captured = _patch_spawn_worker_tab(monkeypatch)
     _asyncio.run(spawn_worker_impl(initial_prompt="task", name="cx", cwd="/tmp", runtime="codex"))
@@ -6096,10 +6797,10 @@ def test_spawn_footer_injected_with_explicit_task_key(fresh_orchestrator_dir, mo
     captured = _patch_spawn_worker_tab(monkeypatch)
     _asyncio.run(spawn_worker_impl(
         initial_prompt="build the scraper", name="yt-scraper", cwd="/tmp",
-        task_key="yt-bot-public"))
+        task_key="demo-task"))
     text = captured["initial_prompt"]
-    assert "[orchestrator] Artifact discipline — task_key: `yt-bot-public`" in text
-    assert 'artifact_put(task_key="yt-bot-public"' in text
+    assert "[orchestrator] Artifact discipline — task_key: `demo-task`" in text
+    assert 'artifact_put(task_key="demo-task"' in text
     assert text.startswith("build the scraper")
 
 
@@ -6145,12 +6846,53 @@ def test_spawn_footer_not_in_assignment_record(fresh_orchestrator_dir, monkeypat
     assert record["ticket"] == "TKT-SANDBOX-2"
 
 
-def test_spawn_footer_present_for_codex_runtime(fresh_orchestrator_dir, monkeypatch):
+def test_spawn_footer_present_for_codex_runtime(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    allow_codex(monkeypatch, tmp_path)
     captured = _patch_spawn_worker_tab(monkeypatch)
     _asyncio.run(spawn_worker_impl(
         initial_prompt="port the bot", name="cx-bot", cwd="/tmp",
-        task_key="yt-bot-public", runtime="codex"))
+        task_key="demo-task", runtime="codex"))
     assert "[orchestrator] Artifact discipline" in captured["initial_prompt"]
+    assert "Store/publish failures are non-blocking" in captured["initial_prompt"]
+
+
+def _install_worker_agent(tmp_path, monkeypatch):
+    agents = tmp_path / "agents"
+    agents.mkdir(exist_ok=True)
+    (agents / "worker.md").write_text("---\nname: worker\n---\n\n# Worker Agent\n\nbody\n")
+    monkeypatch.setattr(paths, "AGENTS_DIR", agents)
+
+
+def test_spawn_footer_short_when_the_worker_agent_is_in_context(
+        fresh_orchestrator_dir, monkeypatch, tmp_path):
+    _install_worker_agent(tmp_path, monkeypatch)
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    _asyncio.run(spawn_worker_impl(
+        initial_prompt="build the scraper", name="yt-scraper", cwd="/tmp",
+        task_key="demo-task"))
+    text = captured["initial_prompt"]
+    assert "[orchestrator] Artifact discipline — task_key: `demo-task`" in text
+    assert 'artifact_put(task_key="demo-task"' in text
+    assert "Persist pipeline artifacts" in text
+    assert "Store/publish failures are non-blocking" not in text
+
+
+def test_spawn_footer_long_when_no_worker_agent_file(fresh_orchestrator_dir, monkeypatch):
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    _asyncio.run(spawn_worker_impl(
+        initial_prompt="build the scraper", name="yt-scraper", cwd="/tmp",
+        task_key="demo-task"))
+    assert "Store/publish failures are non-blocking" in captured["initial_prompt"]
+
+
+def test_spawn_footer_long_when_caller_owns_the_system_prompt(
+        fresh_orchestrator_dir, monkeypatch, tmp_path):
+    _install_worker_agent(tmp_path, monkeypatch)
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    _asyncio.run(spawn_worker_impl(
+        initial_prompt="build the scraper", name="yt-scraper", cwd="/tmp",
+        task_key="demo-task", extra_args=["--append-system-prompt", "mine"]))
+    assert "Store/publish failures are non-blocking" in captured["initial_prompt"]
 
 
 def test_repo_sync_footer_injected_without_task_key(fresh_orchestrator_dir, monkeypatch):
@@ -6168,7 +6910,8 @@ def test_repo_sync_footer_absent_on_blank_prompt(fresh_orchestrator_dir, monkeyp
     assert captured["initial_prompt"] == ""
 
 
-def test_repo_sync_footer_present_for_codex_runtime(fresh_orchestrator_dir, monkeypatch):
+def test_repo_sync_footer_present_for_codex_runtime(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    allow_codex(monkeypatch, tmp_path)
     captured = _patch_spawn_worker_tab(monkeypatch)
     _asyncio.run(spawn_worker_impl(
         initial_prompt="port the bot", name="cx-scout", cwd="/tmp", runtime="codex"))
@@ -6186,7 +6929,7 @@ def test_repo_sync_footer_lands_after_artifact_footer(fresh_orchestrator_dir, mo
     captured = _patch_spawn_worker_tab(monkeypatch)
     _asyncio.run(spawn_worker_impl(
         initial_prompt="build the scraper", name="w1", cwd="/tmp",
-        task_key="yt-bot-public"))
+        task_key="demo-task"))
     text = captured["initial_prompt"]
     assert text.index("[orchestrator] Artifact discipline") \
         < text.index("[orchestrator] Repo freshness")
@@ -6206,6 +6949,301 @@ def test_repo_sync_footer_is_headless_approvable():
     assert "git -C" not in footer
     assert "&&" not in footer
     assert "cd <repo>" in footer
+
+
+from dockwright import config
+
+
+def _install_role(tmp_path, monkeypatch, name="GenericWorker", launch=("worker",)):
+    roles_dir = tmp_path / "roles"
+    role_dir = roles_dir / name
+    role_dir.mkdir(parents=True, exist_ok=True)
+    launches = ", ".join(f'"{kind}"' for kind in launch)
+    (role_dir / "role.toml").write_text(f'core = "{name}"\nlaunch = [{launches}]\n')
+    for kind in launch:
+        (role_dir / f"role.{kind}.md").write_text(f"<!-- dockwright-role: {name} launch={kind} -->\nBODY\n")
+    (role_dir / "role.settings.json").write_text(json.dumps({"skillOverrides": {"skill-x": "name-only"}}))
+    monkeypatch.setattr(paths, "ROLES_DIR", roles_dir)
+    return role_dir
+
+
+def _install_profiles(tmp_path, monkeypatch, repos=None, agents=()):
+    settings = {"sets": {"none": [], "common": ["acme"], "back": ["acme", "acme-be"]},
+                "repos": repos or {}, "work_roots": [str(tmp_path / "work")], "work_default": "back"}
+    monkeypatch.setattr(config, "profiles", lambda: settings)
+    for profile in agents:
+        (paths.ROLES_DIR / "_agents").mkdir(parents=True, exist_ok=True)
+        (paths.ROLES_DIR / "_agents" / f"{profile}.json").write_text("{}")
+    return settings
+
+
+def _profile_render(role_dir, launch, profile):
+    name = role_dir.name
+    path = role_dir / f"role.{launch}.{profile}.md"
+    path.write_text(f"<!-- dockwright-role: {name} launch={launch} -->\n<!-- dockwright-profile: {profile} -->\nBODY\n")
+    return path
+
+
+def _git_repo(path):
+    path.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    return path
+
+
+def test_spawn_worker_takes_the_profile_of_its_cwd_and_its_agents_file(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    _install_worker_agent(tmp_path, monkeypatch)
+    role_dir = _install_role(tmp_path, monkeypatch)
+    render = _profile_render(role_dir, "worker", "back")
+    _install_profiles(tmp_path, monkeypatch, repos={"acme-api": "back"}, agents=("back",))
+    repo = _git_repo(tmp_path / "work" / "acme-api")
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    _asyncio.run(spawn_worker_impl(initial_prompt="task", name="w", cwd=str(repo), extra_args=FLAGS))
+    args = captured["extra_args"]
+    assert args[:2] == ["--append-system-prompt-file", str(render)]
+    assert args.count("--settings") == 1
+    assert args[-2:] == ["--agents-file", str(paths.ROLES_DIR / "_agents" / "back.json")]
+    command = spawner._runtime_command("claude", "task", args)
+    assert command.startswith(f"{shlex.quote(str(paths.dockwright_bin()))} launch ")
+    assert "--agents-file" in command and "--agents " not in command
+
+
+def test_spawn_worker_without_an_agents_file_carries_no_agents_flag(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    _install_worker_agent(tmp_path, monkeypatch)
+    role_dir = _install_role(tmp_path, monkeypatch)
+    _profile_render(role_dir, "worker", "back")
+    _install_profiles(tmp_path, monkeypatch, repos={"acme-api": "back"})
+    repo = _git_repo(tmp_path / "work" / "acme-api")
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    _asyncio.run(spawn_worker_impl(initial_prompt="task", name="w", cwd=str(repo)))
+    assert "--agents-file" not in captured["extra_args"]
+
+
+def test_spawn_worker_without_cwd_takes_the_worker_homes_profile(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    _install_worker_agent(tmp_path, monkeypatch)
+    role_dir = _install_role(tmp_path, monkeypatch)
+    render = _profile_render(role_dir, "worker", "back")
+    _install_profiles(tmp_path, monkeypatch, repos={"worker": "back"})
+    home = tmp_path / "work" / "worker"
+    home.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_ORCH_WORKER_HOME", str(home))
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    _asyncio.run(spawn_worker_impl(initial_prompt="task", name="w"))
+    assert captured["extra_args"][:2] == ["--append-system-prompt-file", str(render)]
+
+
+def test_the_tmux_command_stays_short_with_a_large_agents_file(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    _install_worker_agent(tmp_path, monkeypatch)
+    _install_role(tmp_path, monkeypatch)
+    _install_profiles(tmp_path, monkeypatch, agents=("none",))
+    (paths.ROLES_DIR / "_agents" / "none.json").write_text(json.dumps({"general-purpose": {"prompt": "x" * 200_000}}))
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    _asyncio.run(spawn_worker_impl(initial_prompt="task", name="w", cwd="/tmp", extra_args=FLAGS))
+    args = captured["extra_args"]
+    assert args[-2:] == ["--agents-file", str(paths.ROLES_DIR / "_agents" / "none.json")]
+    assert len(spawner._runtime_command("claude", "task", args)) < 4096
+
+
+def test_spawn_worker_without_manifests_keeps_todays_command(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    _install_worker_agent(tmp_path, monkeypatch)
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    _asyncio.run(spawn_worker_impl(initial_prompt="task", name="w", cwd="/tmp", extra_args=FLAGS))
+    assert "--append-system-prompt-file" not in captured["extra_args"]
+    assert str(paths.AGENTS_DIR / "worker.md") in spawner._runtime_command("claude", "task", captured["extra_args"])
+    assert list(state.list_json_in(paths.ASSIGNMENTS_PENDING))[0]["context_role"] is None
+
+
+def test_spawn_worker_loads_the_generic_worker_role(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    _install_worker_agent(tmp_path, monkeypatch)
+    role_dir = _install_role(tmp_path, monkeypatch)
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    result = _asyncio.run(spawn_worker_impl(initial_prompt="task", name="w", cwd="/tmp", task_key="k-1", extra_args=FLAGS))
+    args = captured["extra_args"]
+    assert args[:2] == ["--append-system-prompt-file", str(role_dir / "role.worker.md")]
+    assert args.count("--settings") == 1
+    settings = json.loads(Path(args[args.index("--settings") + 1]).read_text())
+    assert settings["skillOverrides"] == {"skill-x": "name-only"}
+    assert settings["enableAllProjectMcpServers"] is True
+    assert str(paths.AGENTS_DIR / "worker.md") not in spawner._runtime_command("claude", "task", args)
+    pending = list(state.list_json_in(paths.ASSIGNMENTS_PENDING))[0]
+    assert pending["context_role"] == "GenericWorker" and result["context_role"] == "GenericWorker"
+    assert "Store/publish failures are non-blocking" not in captured["initial_prompt"]
+
+
+def test_spawn_worker_names_its_role(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    _install_role(tmp_path, monkeypatch)
+    coder = _install_role(tmp_path, monkeypatch, name="Coder")
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    _asyncio.run(spawn_worker_impl(initial_prompt="task", name="w", cwd="/tmp", context_role="Coder"))
+    assert captured["extra_args"][:2] == ["--append-system-prompt-file", str(coder / "role.worker.md")]
+    assert list(state.list_json_in(paths.ASSIGNMENTS_PENDING))[0]["context_role"] == "Coder"
+
+
+def test_spawn_worker_refuses_an_unknown_role_once_manifests_exist(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    _install_role(tmp_path, monkeypatch)
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    with pytest.raises(ValueError, match="unknown role 'Nope'"):
+        _asyncio.run(spawn_worker_impl(initial_prompt="task", name="w", cwd="/tmp", context_role="Nope"))
+    assert captured == {} and list(paths.ASSIGNMENTS_PENDING.glob("*")) == []
+
+
+def test_spawn_worker_refuses_a_role_beside_its_own_system_prompt(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    _install_role(tmp_path, monkeypatch)
+    _patch_spawn_worker_tab(monkeypatch)
+    with pytest.raises(ValueError, match="exclusive"):
+        _asyncio.run(spawn_worker_impl(initial_prompt="task", name="w", cwd="/tmp", context_role="GenericWorker",
+                                       extra_args=["--append-system-prompt", "mine"]))
+
+
+def test_spawn_worker_with_its_own_system_prompt_loads_no_role(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    _install_role(tmp_path, monkeypatch)
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    _asyncio.run(spawn_worker_impl(initial_prompt="task", name="w", cwd="/tmp",
+                                   extra_args=["--append-system-prompt", "mine"]))
+    assert "--append-system-prompt-file" not in captured["extra_args"]
+    assert list(state.list_json_in(paths.ASSIGNMENTS_PENDING))[0]["context_role"] is None
+
+
+@pytest.mark.parametrize("env,launch", [(None, "worker"), ({"CLAUDE_WORKER_KIND": "subworker"}, "child")])
+def test_every_claude_worker_launch_loads_the_generic_worker_role_once_manifests_exist(
+        monkeypatch, tmp_path, env, launch):
+    _install_worker_agent(tmp_path, monkeypatch)
+    role_dir = _install_role(tmp_path, monkeypatch, launch=("worker", "child"))
+    captured = _patch_exec(monkeypatch)
+    _asyncio.run(spawner.spawn_worker_tab(cwd="/tmp/x", initial_prompt="", name="alpha", resume_sid="s1",
+                                          extra_args=[*FLAGS, "--settings", '{"enableAllProjectMcpServers": true}'], env=env))
+    words = shlex.split(captured["args"][-1].split(" launch ", 1)[1])
+    assert words[words.index("--append-system-prompt-file") + 1] == str(role_dir / f"role.{launch}.md")
+    assert str(paths.AGENTS_DIR / "worker.md") not in words and words.count("--settings") == 1
+    settings = json.loads(Path(words[words.index("--settings") + 1]).read_text())
+    assert settings == {"enableAllProjectMcpServers": True, "skillOverrides": {"skill-x": "name-only"}}
+
+
+def test_a_role_layer_never_loosens_a_skill_the_spawn_settings_restrict(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    role_dir = _install_role(tmp_path, monkeypatch)
+    (role_dir / "role.settings.json").write_text(json.dumps(
+        {"skillOverrides": {"skill-x": "name-only", "skill-y": "name-only", "skill-z": "name-only"}}))
+    captured = _patch_spawn_worker_tab(monkeypatch)
+    base = {"skillOverrides": {"skill-x": "off", "skill-y": "user-invocable-only", "skill-z": "on"}}
+    _asyncio.run(spawn_worker_impl(initial_prompt="task", name="w", cwd="/tmp",
+                                   extra_args=["--settings", json.dumps(base)]))
+    args = captured["extra_args"]
+    settings = json.loads(Path(args[args.index("--settings") + 1]).read_text())
+    assert settings["skillOverrides"] == {"skill-x": "off", "skill-y": "user-invocable-only", "skill-z": "name-only"}
+
+
+def _closed_worker(tmp_path, monkeypatch, sid, spawn_extra_args, kind=None):
+    _make_transcript(tmp_path, monkeypatch, sid)
+    if kind == "subworker":
+        state.write_json_atomic(paths.ACTIVE / "parent1.json", {
+            "claude_sid": "parent1", "agent": "worker", "name": "alpha", "cwd": "/tmp", "iterm_sid": "ip",
+            "pid": os.getpid(), "started_at": 0})
+    state.write_json_atomic(paths.CLOSED / f"{sid}.json", {
+        "claude_sid": sid, "name": f"w-{sid}", "cwd": "/tmp", "closed_at": 1.0, "runtime": "claude",
+        **({"kind": kind, "parent_name": "alpha", "parent_sid": "parent1"} if kind else {})})
+    state.write_json_atomic(paths.assignment_path(sid), {
+        "claude_sid": sid, "name": f"w-{sid}", "cwd": "/tmp", "runtime": "claude",
+        "spawn_extra_args": spawn_extra_args})
+
+
+@pytest.mark.parametrize("kind,launch", [(None, "worker"), ("subworker", "child")])
+def test_a_worker_spawned_before_roles_resumes_in_the_generic_worker_role(
+        fresh_orchestrator_dir, monkeypatch, tmp_path, kind, launch):
+    _install_worker_agent(tmp_path, monkeypatch)
+    role_dir = _install_role(tmp_path, monkeypatch, launch=("worker", "child"))
+    preset = tmp_path / "preset.json"
+    preset.write_text(json.dumps({"enableAllProjectMcpServers": True}))
+    _closed_worker(tmp_path, monkeypatch, "old1", ["--model", "m", "--settings", str(preset)], kind)
+    captured = _patch_spawn_registers_active(monkeypatch)
+    _asyncio.run(_resume_worker_mcp(effort="xhigh", name="w-old1", _registration_timeout_sec=2.0, _poll_interval=0.01))
+    args = captured["extra_args"]
+    assert args[:2] == ["--append-system-prompt-file", str(role_dir / f"role.{launch}.md")]
+    assert args[args.index("--model") + 1] == "m" and args.count("--settings") == 1
+    settings = json.loads(Path(args[args.index("--settings") + 1]).read_text())
+    assert settings == {"enableAllProjectMcpServers": True, "skillOverrides": {"skill-x": "name-only"}}
+    assert str(paths.AGENTS_DIR / "worker.md") not in spawner._runtime_command("claude", "", args, resume_sid="old1")
+    assert state.read_json(paths.assignment_path("old1"))["context_role"] == "GenericWorker"
+
+
+def test_a_pre_roles_resume_carries_the_agents_file_of_its_cwd(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    _install_worker_agent(tmp_path, monkeypatch)
+    _install_role(tmp_path, monkeypatch)
+    _install_profiles(tmp_path, monkeypatch, agents=("none",))
+    _closed_worker(tmp_path, monkeypatch, "old4", ["--settings", "{}"])
+    captured = _patch_spawn_registers_active(monkeypatch)
+    _asyncio.run(_resume_worker_mcp(name="w-old4", model="@opus", effort="high", _registration_timeout_sec=2.0, _poll_interval=0.01))
+    args = captured["extra_args"]
+    assert args[args.index("--agents-file") + 1] == str(paths.ROLES_DIR / "_agents" / "none.json")
+    assert args[args.index("--effort") + 1] == "high"
+
+
+@pytest.mark.parametrize("manifests,spawn_extra_args", [
+    (False, ["--settings", "{}"]),
+    (True, ["--append-system-prompt", "mine", "--settings", "{}"]),
+    (True, ["--append-system-prompt-file", "/r/role.worker.md", "--settings", "/s.json"]),
+])
+def test_a_resume_replays_spawn_args_that_name_a_prompt_or_predate_no_roles(
+        fresh_orchestrator_dir, monkeypatch, tmp_path, manifests, spawn_extra_args):
+    if manifests:
+        _install_role(tmp_path, monkeypatch)
+    else:
+        monkeypatch.setattr(paths, "ROLES_DIR", tmp_path / "no-roles")
+    _closed_worker(tmp_path, monkeypatch, "old2", spawn_extra_args)
+    captured = _patch_spawn_registers_active(monkeypatch)
+    _asyncio.run(_resume_worker_mcp(model="@opus", effort="xhigh", name="w-old2", _registration_timeout_sec=2.0, _poll_interval=0.01))
+    assert captured["extra_args"] == [*spawn_extra_args, *FLAGS]
+
+
+def test_a_pre_roles_resume_is_refused_when_the_generic_worker_render_is_missing(
+        fresh_orchestrator_dir, monkeypatch, tmp_path):
+    role_dir = _install_role(tmp_path, monkeypatch)
+    (role_dir / "role.worker.md").unlink()
+    _closed_worker(tmp_path, monkeypatch, "old3", ["--settings", "{}"])
+    captured = _patch_spawn_registers_active(monkeypatch)
+    with pytest.raises(ValueError, match="resume_worker: .*run `dockwright compose`"):
+        _asyncio.run(_resume_worker_mcp(name="w-old3", _registration_timeout_sec=2.0, _poll_interval=0.01))
+    assert captured == {}
+
+
+def test_spawn_worker_tier_is_refused_with_the_roster_gone(fresh_orchestrator_dir):
+    with pytest.raises(ValueError, match="tier is gone: pass --model and --effort in extra_args"):
+        _asyncio.run(mcp_server.spawn_worker("do it", tier="REVIEW_TIER2",
+                                             extra_args=["--model", "@opus", "--effort", "xhigh"]))
+
+
+def test_spawn_worker_tool_passes_the_context_role_only(fresh_orchestrator_dir, monkeypatch):
+    seen = {}
+
+    async def fake_impl(*args, **kwargs):
+        seen.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(mcp_server, "spawn_worker_impl", fake_impl)
+    _asyncio.run(mcp_server.spawn_worker(initial_prompt="x", role="Coder"))
+    assert seen["context_role"] == "Coder" and "role" not in seen
+
+
+def _closed_worker_for_resume(tmp_path, monkeypatch, spawn_extra_args):
+    _install_worker_agent(tmp_path, monkeypatch)
+    _closed_worker(tmp_path, monkeypatch, "w1", spawn_extra_args)
+    return _patch_spawn_registers_active(monkeypatch)
+
+
+def test_resume_takes_a_missing_model_or_effort_from_the_call_and_refuses_to_override_the_record(
+        fresh_orchestrator_dir, monkeypatch, tmp_path):
+    captured = _closed_worker_for_resume(tmp_path, monkeypatch, ["--model", "@opus"])
+    with pytest.raises(ValueError, match="resume_worker: the record carries no --effort; pass effort="):
+        _asyncio.run(mcp_server.resume_worker("w-w1"))
+    with pytest.raises(ValueError, match="the record carries its own --model"):
+        _asyncio.run(mcp_server.resume_worker("w-w1", model="@sonnet", effort="xhigh"))
+    _asyncio.run(_resume_worker_mcp(name="w-w1", effort="xhigh", _registration_timeout_sec=2.0, _poll_interval=0.01))
+    args = captured["extra_args"]
+    assert args[args.index("--model") + 1] == "@opus" and args[args.index("--effort") + 1] == "xhigh"
+
+
+def test_an_auto_resume_from_send_manager_to_worker_reports_the_missing_flag(fresh_orchestrator_dir, monkeypatch, tmp_path):
+    _closed_worker_for_resume(tmp_path, monkeypatch, ["--model", "@opus"])
+    with pytest.raises(ValueError, match="the record carries no --effort"):
+        _asyncio.run(mcp_server.send_manager_to_worker("w-w1", "go on", auto_resume=True))
 
 
 from dockwright.mcp_server import list_closed_workers_impl as _lcw_impl
@@ -6262,6 +7300,41 @@ def test_pipeline_status_lists_assignment_with_no_artifacts(fresh_orchestrator_d
     assert "unrelated" not in out
 
 
+def test_list_workers_and_pipeline_status_carry_both_roles(fresh_orchestrator_dir):
+    register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1")
+    state.write_json_atomic(paths.ASSIGNMENTS / "w1.json", {
+        "claude_sid": "w1", "name": "alpha", "ticket": "K-1", "initial_prompt": "do",
+        "role": "IMPL_HARD", "context_role": "Coder"})
+    (w,) = list_workers_impl()
+    assert (w["role"], w["context_role"]) == ("IMPL_HARD", "Coder")
+    assert "role=Coder/IMPL_HARD" in pipeline_status_impl("K-1")
+    (row,) = _json.loads(pipeline_status_impl("K-1", "json"))["assignments"]
+    assert (row["role"], row["context_role"]) == ("IMPL_HARD", "Coder")
+
+
+def test_pipeline_status_prints_dashes_for_an_assignment_with_no_roles(fresh_orchestrator_dir):
+    state.write_json_atomic(paths.ASSIGNMENTS / "w1.json", {
+        "claude_sid": "w1", "name": "alpha", "ticket": "K-1", "initial_prompt": "do"})
+    assert "role=-/-" in pipeline_status_impl("K-1")
+
+
+def test_pipeline_status_shows_each_sessions_model(fresh_orchestrator_dir):
+    for sid, name, extra in (
+            ("w1", "alpha", {"spawn_extra_args": ["--append-system-prompt-file", "/r.md", "--model", "@fable",
+                                                  "--effort", "medium"]}),
+            ("w2", "beta", {"model": "claude-opus-5-5", "spawn_extra_args": []}),
+            ("w3", "gamma", {"spawn_extra_args": ["--model=@sonnet"]}),
+            ("w4", "delta", {})):
+        state.write_json_atomic(paths.ASSIGNMENTS / f"{sid}.json", {
+            "claude_sid": sid, "name": name, "ticket": "K-1", "initial_prompt": "do", **extra})
+    board = pipeline_status_impl("K-1").split("## assignments")[1].split("## events")[0]
+    rows = {line.split()[1]: line for line in board.splitlines() if line.startswith("- ")}
+    assert "  model=@fable  " in rows["alpha"] and "  model=claude-opus-5-5  " in rows["beta"]
+    assert "  model=@sonnet  " in rows["gamma"] and "  model=-  " in rows["delta"]
+    models = {a["name"]: a["model"] for a in _json.loads(pipeline_status_impl("K-1", "json"))["assignments"]}
+    assert models == {"alpha": "@fable", "beta": "claude-opus-5-5", "gamma": "@sonnet", "delta": None}
+
+
 from dockwright.mcp_server import _spawn_and_confirm_resume
 
 
@@ -6297,7 +7370,7 @@ def test_resume_spawn_passes_no_assignment_env(fresh_orchestrator_dir):
 
     _asyncio.run(_spawn_and_confirm_resume(
         fake_spawn, paths.CLOSED / "old-sid.json", state.read_json(paths.CLOSED / "old-sid.json"),
-        "w-res", "old-sid", "/x", 5.0, 0.05))
+        "w-res", "old-sid", "/x", 5.0, 0.05, model="@opus", effort="xhigh"))
     assert "CLAUDE_ASSIGNMENT_ID" not in (captured.get("env") or {})
 
 
@@ -6332,6 +7405,18 @@ def test_prune_pending_sweeps_orphans(fresh_orchestrator_dir):
     stale.write_text("{}")
     fresh_p.write_text("{}")
     _age(stale, 2)
+    _prune_stale_assignments()
+    assert not stale.exists() and fresh_p.exists()
+
+
+def test_prune_sweeps_prompt_files_past_the_assignment_retention(fresh_orchestrator_dir):
+    paths.PROMPT_FILES.mkdir(parents=True, exist_ok=True)
+    stale = paths.PROMPT_FILES / "old.txt"
+    fresh_p = paths.PROMPT_FILES / "new.txt"
+    stale.write_text("task")
+    fresh_p.write_text("task")
+    _age(stale, paths.ASSIGNMENT_RETENTION_DAYS + 1)
+    _age(fresh_p, paths.ASSIGNMENT_RETENTION_DAYS - 1)
     _prune_stale_assignments()
     assert not stale.exists() and fresh_p.exists()
 
@@ -6383,6 +7468,535 @@ def test_prune_artifacts_tolerates_vanishing_entries(fresh_orchestrator_dir):
     assert paths.artifact_ticket_dir("TKT-SANDBOX-1").exists()
 
 
+from dockwright import pipeline
+from dockwright.mcp_server import _write_question, _open_token_task_keys
+
+_EXAMPLE_SCHEMA = """
+schema = "code-ticket"
+version = 1
+
+[nodes.design]
+role = "SCOUT_DESIGN"
+gate = true
+brief = "briefs/design.md"
+inputs = []
+outputs = ["context.ask", "design.hld", "plan.tasks"]
+checkpoints = ["design.explainer"]
+extra_args = []
+
+[nodes.task]
+role = "IMPL_HARD"
+repeat = "plan.tasks"
+brief = "briefs/task.md"
+inputs = ["plan.tasks", "design.hld"]
+outputs = ["review.task-{i}"]
+
+[nodes.pr]
+role = "IMPL_HARD"
+gate = true
+brief = "briefs/pr.md"
+inputs = ["plan.tasks"]
+outputs = ["implement.repo"]
+
+[nodes.post-merge]
+role = "SCOUT"
+brief = "briefs/post-merge.md"
+inputs = ["implement.repo"]
+outputs = ["summary.post-merge"]
+
+[[edges]]
+from = "design"
+to = "task"
+exit_checks = [{ type = "artifact", name = "plan.tasks" }]
+[[edges]]
+from = "task"
+to = "task"
+[[edges]]
+from = "task"
+to = "pr"
+when = "last"
+[[edges]]
+from = "pr"
+to = "post-merge"
+trigger = "merge"
+"""
+
+
+def _write_example_schema(tmp_path, schema_text=_EXAMPLE_SCHEMA):
+    d = tmp_path / "schemas"
+    (d / "briefs").mkdir(parents=True, exist_ok=True)
+    (d / "code-ticket.toml").write_text(schema_text)
+    for n in ("design", "task", "pr", "post-merge"):
+        (d / "briefs" / f"{n}.md").write_text(f"# {n} brief for {{task_key}} at {{cwd}} inputs {{inputs}}\n")
+    return d / "code-ticket.toml"
+
+
+def _seed_snapshot(task_key, tmp_path, holder="a-design", schema_text=_EXAMPLE_SCHEMA):
+    text = pipeline.snapshot(pipeline.load_schema(_write_example_schema(tmp_path, schema_text)))
+    d = paths.artifact_ticket_dir(task_key); d.mkdir(parents=True, exist_ok=True)
+    (d / "schema.toml").write_text(text)
+    state.append_event(paths.artifact_events_path(task_key),
+                       {"type": "pipeline_started", "token_id": "t1", "node": "design", "index": 1, "holder": holder,
+                        "cwd": "/w", "manager": "mgr", "ts": time.time() - PAST_GRACE})
+
+
+PAST_GRACE = 2 * waiting_on.STALL_GRACE_SEC
+
+
+def _commit(task_key, node, index, holder, ts=None):
+    state.append_event(paths.artifact_events_path(task_key),
+                       {"type": "advance_committed", "request_id": f"r-{node}-{index}", "token_id": "t1",
+                        "node": node, "index": index, "holder": holder, "ts": ts or time.time() - PAST_GRACE})
+
+
+def _append_malformed_commit(task_key):
+    state.append_event(paths.artifact_events_path(task_key),
+                       {"type": "advance_committed", "request_id": "r-bad", "token_id": "t1",
+                        "node": "task", "holder": "a-task"})
+
+
+def test_artifact_put_scope_default_internal_and_validated(fresh_orchestrator_dir):
+    artifact_put_impl("K1", "spec", "x", "b", "complete", "w1")
+    assert artifact_get_impl("K1", "spec", "x")["scope"] == "internal"
+    artifact_put_impl("K1", "design", "hld", "b", "complete", "w1", scope="output")
+    assert artifact_get_impl("K1", "design", "hld")["scope"] == "output"
+    with pytest.raises(ValueError):
+        artifact_put_impl("K1", "spec", "y", "b", "complete", "w1", scope="public")
+
+
+def test_artifact_get_with_reader_sid_appends_a_read_event(fresh_orchestrator_dir):
+    artifact_put_impl("K2", "design", "hld", "b", "complete", "w1", scope="output")
+    artifact_get_impl("K2", "design", "hld", reader_sid="r1")
+    events = _read_events(paths.artifact_events_path("K2"))
+    assert [e for e in events if e["type"] == "artifact_read"][0]["actor_sid"] == "r1"
+    artifact_get_impl("K2", "design", "hld")
+    assert len([e for e in _read_events(paths.artifact_events_path("K2")) if e["type"] == "artifact_read"]) == 1
+
+
+def test_pipeline_event_refuses_reserved_types(fresh_orchestrator_dir):
+    with pytest.raises(ValueError):
+        pipeline_event_impl("K3", "advance_committed", reason="forged")
+    assert pipeline_event_impl("K3", "note", reason="fine")["ok"]
+    assert [e["type"] for e in _read_events(paths.artifact_events_path("K3"))] == ["note"]
+
+
+def test_pipeline_event_refuses_a_caller_written_lane_event(fresh_orchestrator_dir):
+    with pytest.raises(ValueError, match="reserved"):
+        pipeline_event_impl("K3", "lane_event", reason="forged")
+    assert _read_events(paths.artifact_events_path("K3")) == []
+
+
+def test_artifact_tools_pass_scope_and_reader_sid_and_refuse_reserved_events(fresh_orchestrator_dir):
+    _tool_artifact_put(task_key="K-T", phase="design", name="hld",
+                       content_path=_source(fresh_orchestrator_dir, "b", "hld.md"),
+                       status="complete", writer_sid="w1", scope="output")
+    got = _tool_artifact_get(task_key="K-T", phase="design", name="hld", reader_sid="r9")
+    assert got["scope"] == "output"
+    reads = [e for e in _read_events(paths.artifact_events_path("K-T")) if e["type"] == "artifact_read"]
+    assert [(e["phase"], e["name"], e["actor_sid"]) for e in reads] == [("design", "hld", "r9")]
+    with pytest.raises(ValueError, match="reserved"):
+        _tool_pipeline_event(task_key="K-T", type="artifact_read", phase="design", name="hld")
+
+
+def test_answer_question_writes_a_decision_artifact_for_keyed_workers(fresh_orchestrator_dir):
+    state.write_json_atomic(paths.assignment_path("sid-w"), {"assignment_id": "a1", "claude_sid": "sid-w", "ticket": "K4", "name": "w"})
+    qid = _write_question("sid-w", "w", "Which colour?", parent_manager_name="mgr")
+    answer_question_impl(qid, "blue")
+    d = artifact_get_impl("K4", "decision", f"q-{qid[:8]}")
+    assert d["scope"] == "output" and d["status"] == "complete" and d["writer_sid"] == f"answer:{qid}"
+    assert "Which colour?" in d["content"] and "blue" in d["content"]
+
+
+def test_answer_question_without_ticket_writes_no_decision(fresh_orchestrator_dir):
+    state.write_json_atomic(paths.assignment_path("sid-u"), {"assignment_id": "a2", "claude_sid": "sid-u", "name": "u"})
+    qid = _write_question("sid-u", "u", "q?", parent_manager_name="mgr")
+    assert answer_question_impl(qid, "a")["ok"]
+    assert not list(paths.ARTIFACTS.glob("*/decision.*"))
+
+
+def test_decision_artifact_names_the_node_the_asker_holds(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("K4N", tmp_path)
+    state.write_json_atomic(paths.assignment_path("sid-d"), {"assignment_id": "a-design", "claude_sid": "sid-d", "ticket": "K4N", "name": "d"})
+    state.write_json_atomic(paths.assignment_path("sid-x"), {"assignment_id": "a-x", "claude_sid": "sid-x", "ticket": "K4X", "name": "x"})
+    q_held = _write_question("sid-d", "d", "Scope?", parent_manager_name="mgr")
+    q_free = _write_question("sid-x", "x", "Name?", parent_manager_name="mgr")
+    answer_question_impl(q_held, "narrow")
+    answer_question_impl(q_free, "short")
+    held = artifact_get_impl("K4N", "decision", f"q-{q_held[:8]}")["content"].splitlines()
+    free = artifact_get_impl("K4X", "decision", f"q-{q_free[:8]}")["content"].splitlines()
+    assert "node: design" in held
+    assert "node: -" in free
+
+
+def test_answer_question_records_the_manager_as_decider_by_default(fresh_orchestrator_dir):
+    state.write_json_atomic(paths.assignment_path("sid-m"), {"assignment_id": "a-m", "claude_sid": "sid-m", "ticket": "KDM", "name": "m"})
+    qid = _write_question("sid-m", "m", "Ship?", parent_manager_name="mgr")
+    answer_question_impl(qid, "yes")
+    d = artifact_get_impl("KDM", "decision", f"q-{qid[:8]}")
+    assert d["decided_by"] == "manager"
+    assert d["content"].splitlines()[-1] == "decided_by: manager"
+
+
+def test_answer_question_records_the_engineer_when_told(fresh_orchestrator_dir):
+    state.write_json_atomic(paths.assignment_path("sid-e"), {"assignment_id": "a-e", "claude_sid": "sid-e", "ticket": "KDE", "name": "e"})
+    qid = _write_question("sid-e", "e", "Ship?", parent_manager_name="mgr")
+    answer_question_impl(qid, "yes", decided_by="engineer")
+    d = artifact_get_impl("KDE", "decision", f"q-{qid[:8]}")
+    assert d["decided_by"] == "engineer"
+    assert d["content"].splitlines()[-1] == "decided_by: engineer"
+
+
+def test_answer_question_refuses_an_unknown_decider_before_touching_anything(fresh_orchestrator_dir):
+    from dockwright.mcp_server import _find_question_path
+    state.write_json_atomic(paths.assignment_path("sid-b"), {"assignment_id": "a-b", "claude_sid": "sid-b", "ticket": "KDB", "name": "b"})
+    qid = _write_question("sid-b", "b", "Ship?", parent_manager_name="mgr")
+    with pytest.raises(ValueError, match="decided_by"):
+        answer_question_impl(qid, "yes", decided_by="boss")
+    q_path = _find_question_path(qid)
+    assert q_path is not None and q_path.exists()
+    assert not (paths.ANSWERS / f"{qid}.json").exists()
+    assert not list(paths.ARTIFACTS.glob("*/decision.*"))
+
+
+def test_artifact_put_tool_stamps_decided_by_only_when_passed(fresh_orchestrator_dir):
+    _tool_artifact_put(task_key="KDP", phase="decision", name="pane-20260929T120000",
+                       content_path=_source(fresh_orchestrator_dir, "from: engineer\n", "p1.md"),
+                       status="complete", writer_sid="sid-n", scope="output", decided_by="engineer")
+    assert artifact_get_impl("KDP", "decision", "pane-20260929T120000")["decided_by"] == "engineer"
+    _tool_artifact_put(task_key="KDP", phase="decision", name="pane-20260929T130000",
+                       content_path=_source(fresh_orchestrator_dir, "from: engineer\n", "p2.md"),
+                       status="complete", writer_sid="sid-n", scope="output")
+    assert "decided_by" not in artifact_get_impl("KDP", "decision", "pane-20260929T130000")
+    assert "decided_by" not in paths.artifact_path("KDP", "decision", "pane-20260929T130000").read_text()
+
+
+def test_artifact_put_refuses_an_unknown_decider_and_a_decider_off_a_decision_record(fresh_orchestrator_dir):
+    with pytest.raises(ValueError, match="decided_by"):
+        _tool_artifact_put(task_key="KDR", phase="decision", name="pane-x",
+                           content_path=_source(fresh_orchestrator_dir, "b", "x.md"),
+                           status="complete", writer_sid="sid-n", scope="output", decided_by="boss")
+    with pytest.raises(ValueError, match="decided_by"):
+        artifact_put_impl("KDR", "design", "hld", "b", "complete", "sid-n", scope="output", decided_by="manager")
+    assert not paths.artifact_path("KDR", "decision", "pane-x").exists()
+    assert not paths.artifact_path("KDR", "design", "hld").exists()
+    assert _read_events(paths.artifact_events_path("KDR")) == []
+
+
+def test_pipeline_status_prints_who_decided_on_decision_rows_only(fresh_orchestrator_dir):
+    artifact_put_impl("KDS", "context", "ask", "b", "complete", "sid-m", scope="output")
+    artifact_put_impl("KDS", "decision", "pane-a", "b", "complete", "sid-n", scope="output", decided_by="engineer")
+    artifact_put_impl("KDS", "decision", "q-old", "b", "complete", "answer:1", scope="output")
+
+    def rows():
+        lines = pipeline_status_impl("KDS").splitlines()
+        return {full: next(line for line in lines if line.startswith(f"- {full} "))
+                for full in ("context.ask", "decision.pane-a", "decision.q-old")}
+
+    now = rows()
+    assert now["decision.pane-a"].endswith(" input(s)  decided_by=engineer")
+    assert now["decision.q-old"].endswith(" input(s)  decided_by=?")
+    assert now["context.ask"].endswith(" input(s)")
+    state.append_event(paths.artifact_events_path("KDS"), {"type": "round_started", "ts": 10 ** 12})
+    carried = rows()
+    assert carried["decision.pane-a"].endswith(" input(s)  decided_by=engineer  carried")
+    assert carried["context.ask"].endswith(" input(s)  carried")
+
+
+def test_scope_warnings_reach_any_writer_of_a_declared_output(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("KW0", tmp_path)
+    state.append_event(paths.artifact_events_path("KW0"),
+                       {"type": "token_override", "token_id": "t1", "to": "design", "index": 1})
+    res = artifact_put_impl("KW0", "design", "hld", "b", "complete", "sid-none", scope="internal")
+    assert res["ok"] and len(res["warnings"]) == 1 and "design.hld" in res["warnings"][0]
+    assert "warnings" not in artifact_put_impl("KW0", "design", "notes", "b", "complete", "sid-none", scope="internal")
+
+
+def test_scope_warnings_name_the_holders_declared_output_put_with_a_non_output_scope(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("KW1", tmp_path)
+    _commit("KW1", "task", 2, "a-task")
+    state.write_json_atomic(paths.assignment_path("sid-t"), {"assignment_id": "a-task", "claude_sid": "sid-t", "ticket": "KW1", "name": "t"})
+    state.write_json_atomic(paths.assignment_path("sid-o"), {"assignment_id": "a-other", "claude_sid": "sid-o", "ticket": "KW1", "name": "o"})
+    res = artifact_put_impl("KW1", "review", "task-2", "b", "complete", "sid-t", scope="internal")
+    assert len(res["warnings"]) == 1 and "review.task-2" in res["warnings"][0]
+    assert "warnings" not in artifact_put_impl("KW1", "review", "task-2", "b", "complete", "sid-t", scope="output")
+    assert "warnings" not in artifact_put_impl("KW1", "review", "task-1", "b", "complete", "sid-t", scope="internal")
+    assert "warnings" not in artifact_put_impl("KW1", "review", "task-2x", "b", "complete", "sid-o", scope="checkpoint")
+    res = artifact_put_impl("KW1", "review", "task-2", "b", "complete", "sid-o", scope="internal", overwrite=True)
+    assert len(res["warnings"]) == 1 and "review.task-2" in res["warnings"][0]
+
+
+def test_artifact_put_survives_a_malformed_fold(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("KM1", tmp_path)
+    _append_malformed_commit("KM1")
+    state.write_json_atomic(paths.assignment_path("sid-d"), {"assignment_id": "a-design", "claude_sid": "sid-d", "ticket": "KM1", "name": "d"})
+    res = artifact_put_impl("KM1", "design", "hld", "b", "complete", "sid-d", scope="internal")
+    assert res["ok"] and "warnings" not in res
+    assert artifact_get_impl("KM1", "design", "hld")["content"] == "b"
+
+
+def test_prune_treats_a_work_whose_fold_fails_as_open(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("KM2", tmp_path)
+    _append_malformed_commit("KM2")
+    old = time.time() - 40 * 86400
+    for p in paths.artifact_ticket_dir("KM2").rglob("*"):
+        os.utime(p, (old, old))
+    state.write_json_atomic(paths.assignment_path("sid-m"), {"assignment_id": "a-task", "claude_sid": "sid-m", "ticket": "KM2", "name": "n"})
+    os.utime(paths.assignment_path("sid-m"), (old, old))
+    _prune_stale_artifacts(); _prune_stale_assignments()
+    assert paths.artifact_ticket_dir("KM2").is_dir() and paths.assignment_path("sid-m").exists()
+
+
+def test_pipeline_status_reports_a_failed_fold_and_renders_the_rest(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("KM3", tmp_path)
+    _append_malformed_commit("KM3")
+    state.write_json_atomic(paths.assignment_path("sid-d"), {"assignment_id": "a-design", "claude_sid": "sid-d", "ticket": "KM3", "name": "KM3-design", "spawned_at": 1.0})
+    artifact_put_impl("KM3", "summary", "other", "b", "complete", "someone", scope="output")
+    artifact_get_impl("KM3", "summary", "other", reader_sid="sid-d")
+    out = pipeline_status_impl("KM3")
+    token = out.split("## token", 1)[1].split("## reads", 1)[0]
+    assert "- fold failed:" in token and "node=" not in token
+    assert "- KM3-design (design) read summary.other  OUTSIDE INPUTS" in out
+    assert "## events" in out and "artifact_read" in out
+
+
+def test_pipeline_status_flags_reads_outside_inputs(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("K5", tmp_path)
+    state.write_json_atomic(paths.assignment_path("sid-d"), {"assignment_id": "a-design", "claude_sid": "sid-d", "ticket": "K5", "name": "K5-design", "spawned_at": 1.0})
+    artifact_put_impl("K5", "summary", "other", "b", "complete", "someone", scope="output")
+    artifact_get_impl("K5", "summary", "other", reader_sid="sid-d")
+    out = pipeline_status_impl("K5")
+    assert "## token" in out and "node=design" in out and "holder=a-design" in out
+    assert "summary.other  OUTSIDE INPUTS" in out
+
+
+def test_pipeline_status_reads_cover_read_sets_foreign_keys_strangers_and_unattributed(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("K7", tmp_path)
+    _commit("K7", "task", 1, "a-task")
+    state.write_json_atomic(paths.assignment_path("sid-t"), {"assignment_id": "a-task", "claude_sid": "sid-t", "ticket": "K7", "name": "K7-task", "spawned_at": 1.0})
+    for name in ("hld", "other"):
+        artifact_put_impl("K7", "design", name, "b", "complete", "w-design", scope="output")
+    artifact_put_impl("K7", "decision", "q-1", "b", "complete", "answer:1", scope="output")
+    artifact_put_impl("K7", "review", "task-1", "b", "complete", "sid-t", scope="output",
+                      read_set=["junk", {"name": "plan.tasks"}, {"name": "design.hld", "task_key": "OTHER"},
+                                {"name": "design.hld", "task_key": "K7"}])
+    artifact_get_impl("K7", "decision", "q-1", reader_sid="sid-t")
+    artifact_get_impl("K7", "design", "other", reader_sid="sid-t")
+    artifact_get_impl("K7", "design", "hld", reader_sid="stranger-sid")
+    artifact_get_impl("K7", "decision", "q-1", reader_sid="stranger-sid")
+    state.append_event(paths.artifact_events_path("K7"), {"type": "artifact_read", "phase": "design", "name": "hld"})
+    out = pipeline_status_impl("K7")
+    reads = out.split("## reads\n", 1)[1].split("\n\n", 1)[0].splitlines()
+    assert reads == [
+        "- K7-task (task) read OTHER:design.hld  OUTSIDE INPUTS",
+        "- K7-task (task) read decision.q-1",
+        "- K7-task (task) read design.hld",
+        "- K7-task (task) read design.other  OUTSIDE INPUTS",
+        "- K7-task (task) read plan.tasks",
+        "- sid=stranger (?) read decision.q-1",
+        "- sid=stranger (?) read design.hld  OUTSIDE INPUTS",
+        "- unattributed read design.hld",
+    ]
+
+
+def test_prune_skips_works_with_an_open_token(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("K6", tmp_path)
+    old = time.time() - 40 * 86400
+    for p in paths.artifact_ticket_dir("K6").rglob("*"):
+        os.utime(p, (old, old))
+    state.write_json_atomic(paths.assignment_path("sid-old"), {"assignment_id": "a-design", "claude_sid": "sid-old", "ticket": "K6", "name": "n"})
+    os.utime(paths.assignment_path("sid-old"), (old, old))
+    _prune_stale_artifacts(); _prune_stale_assignments()
+    assert paths.artifact_ticket_dir("K6").is_dir() and paths.assignment_path("sid-old").exists()
+
+
+def test_prune_removes_works_whose_token_sits_on_a_terminal_node(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("K8", tmp_path)
+    _commit("K8", "post-merge", 1, "a-pm")
+    old = time.time() - 40 * 86400
+    for p in paths.artifact_ticket_dir("K8").rglob("*"):
+        os.utime(p, (old, old))
+    state.write_json_atomic(paths.assignment_path("sid-pm"), {"assignment_id": "a-pm", "claude_sid": "sid-pm", "ticket": "K8", "name": "n"})
+    os.utime(paths.assignment_path("sid-pm"), (old, old))
+    _prune_stale_artifacts(); _prune_stale_assignments()
+    assert not paths.artifact_ticket_dir("K8").exists() and not paths.assignment_path("sid-pm").exists()
+
+
+def test_prune_removes_a_closed_work(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("K9", tmp_path)
+    ms._append_task_event("K9", {"type": "work_closed", "token_id": "t1", "node": "design", "reason": "never",
+                                 "actor_sid": "m1"})
+    old = time.time() - 40 * 86400
+    for p in paths.artifact_ticket_dir("K9").rglob("*"):
+        os.utime(p, (old, old))
+    state.write_json_atomic(paths.assignment_path("sid-cl"), {"assignment_id": "a-design", "claude_sid": "sid-cl", "ticket": "K9", "name": "n"})
+    os.utime(paths.assignment_path("sid-cl"), (old, old))
+    _prune_stale_artifacts(); _prune_stale_assignments()
+    assert not paths.artifact_ticket_dir("K9").exists() and not paths.assignment_path("sid-cl").exists()
+
+
+def test_open_token_task_keys_lists_works_whose_token_can_still_move(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("KO-open", tmp_path)
+    _seed_snapshot("KO-done", tmp_path)
+    _commit("KO-done", "post-merge", 1, "a-pm")
+    _seed_snapshot("KO-bad", tmp_path)
+    _append_malformed_commit("KO-bad")
+    artifact_put_impl("KO-plain", "spec", "a", "x", "complete", "s1")
+    assert _open_token_task_keys() == {"KO-open", "KO-bad"}
+
+
+def test_non_object_journal_lines_break_no_reader(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("KJ", tmp_path)
+    with open(paths.artifact_events_path("KJ"), "a") as f:
+        f.write("[1]\nnull\n")
+    state.write_json_atomic(paths.assignment_path("sid-d"), {"assignment_id": "a-design", "claude_sid": "sid-d", "ticket": "KJ", "name": "KJ-design", "spawned_at": 1.0})
+    res = artifact_put_impl("KJ", "design", "hld", "b", "complete", "sid-d", scope="internal")
+    assert res["ok"] and len(res["warnings"]) == 1 and "design.hld" in res["warnings"][0]
+    qid = _write_question("sid-d", "KJ-design", "Which?", parent_manager_name="mgr")
+    assert answer_question_impl(qid, "this")["ok"]
+    assert "node: design" in artifact_get_impl("KJ", "decision", f"q-{qid[:8]}")["content"].splitlines()
+    old = time.time() - 40 * 86400
+    for p in paths.artifact_ticket_dir("KJ").rglob("*"):
+        os.utime(p, (old, old))
+    os.utime(paths.assignment_path("sid-d"), (old, old))
+    assert artifact_list_impl("OTHER") == []
+    _prune_stale_assignments()
+    assert paths.artifact_ticket_dir("KJ").is_dir() and paths.assignment_path("sid-d").exists()
+    out = pipeline_status_impl("KJ")
+    assert "- t1: node=design index=1 holder=a-design" in out and "## reads" in out and "decision.q-" in out
+
+
+def _reads_section(out):
+    return out.split("## reads\n", 1)[1].split("\n\n", 1)[0].splitlines()
+
+
+def test_handed_names_split_into_events_that_fit_the_journal_line():
+    names = [f"decision.q-{i:08d}" for i in range(300)]
+    events = ms._handed_events("a1", names)
+    assert len(events) > 1
+    assert [n for e in events for n in e["names"]] == names
+    assert all(e["assignment_id"] == "a1" and e["type"] == "inputs_handed" for e in events)
+    assert all(len(state.event_line(ms._fit_task_event(e))) <= state.EVENT_LINE_MAX for e in events)
+    assert ms._handed_events("a1", ["context.ask"]) == [
+        {"type": "inputs_handed", "assignment_id": "a1", "names": ["context.ask"]}]
+
+
+def test_reads_attribute_handed_inputs_to_the_holder_by_assignment(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("KH", tmp_path)
+    _commit("KH", "design", 1, "a-design")
+    state.write_json_atomic(paths.assignment_path("sid-d"), {"assignment_id": "a-design", "claude_sid": "sid-d",
+                                                             "ticket": "KH", "name": "KH-design", "spawned_at": 1.0})
+    state.append_event(paths.artifact_events_path("KH"),
+                       {"type": "inputs_handed", "assignment_id": "a-design", "names": ["context.ask"]})
+    assert _reads_section(pipeline_status_impl("KH")) == ["- KH-design (design) read context.ask"]
+
+
+def test_handed_inputs_of_a_session_that_never_held_the_token_print_no_read(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("KH", tmp_path)
+    _commit("KH", "design", 1, "a-design")
+    state.write_json_atomic(paths.assignment_path("sid-x"), {"assignment_id": "a-superseded", "claude_sid": "sid-x",
+                                                             "ticket": "KH", "name": "KH-task-1", "spawned_at": 2.0})
+    state.append_event(paths.artifact_events_path("KH"),
+                       {"type": "inputs_handed", "assignment_id": "a-superseded", "names": ["design.hld"]})
+    assert not any("design.hld" in line for line in _reads_section(pipeline_status_impl("KH")))
+
+
+def test_handed_inputs_of_an_unknown_assignment_print_no_read(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("KH", tmp_path)
+    _commit("KH", "design", 1, "a-design")
+    state.write_json_atomic(paths.assignment_path("sid-d"), {"assignment_id": "a-design", "claude_sid": "sid-d",
+                                                             "ticket": "KH", "name": "KH-design", "spawned_at": 1.0})
+    state.append_event(paths.artifact_events_path("KH"),
+                       {"type": "inputs_handed", "assignment_id": "a-never", "names": ["context.ask"]})
+    assert not any("context.ask" in line for line in _reads_section(pipeline_status_impl("KH")))
+
+
+def test_reads_allow_a_restarted_holders_own_checkpoint(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("KR", tmp_path)
+    _commit("KR", "design", 1, "a-design-r1")
+    state.write_json_atomic(paths.assignment_path("sid-r"), {"assignment_id": "a-design-r1", "claude_sid": "sid-r", "ticket": "KR", "name": "KR-design-r1", "spawned_at": 2.0})
+    artifact_put_impl("KR", "design", "explainer", "b", "partial", "sid-dead", scope="checkpoint")
+    artifact_get_impl("KR", "design", "explainer", reader_sid="sid-r")
+    assert _reads_section(pipeline_status_impl("KR")) == ["- KR-design-r1 (design) read design.explainer"]
+
+
+def test_reads_allow_a_nodes_own_output_at_its_index_and_flag_other_nodes_outputs(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("KI", tmp_path)
+    _commit("KI", "task", 2, "a-task")
+    state.write_json_atomic(paths.assignment_path("sid-t"), {"assignment_id": "a-task", "claude_sid": "sid-t", "ticket": "KI", "name": "KI-task-2", "spawned_at": 1.0})
+    artifact_put_impl("KI", "review", "task-2", "b", "complete", "sid-t", scope="output")
+    artifact_put_impl("KI", "context", "ask", "b", "complete", "mgr", scope="output")
+    artifact_get_impl("KI", "review", "task-2", reader_sid="sid-t")
+    artifact_get_impl("KI", "context", "ask", reader_sid="sid-t")
+    assert _reads_section(pipeline_status_impl("KI")) == [
+        "- KI-task-2 (task) read context.ask  OUTSIDE INPUTS",
+        "- KI-task-2 (task) read review.task-2",
+    ]
+
+
+def test_reads_never_flag_the_works_running_summary(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("KS", tmp_path)
+    _commit("KS", "task", 2, "a-task")
+    state.write_json_atomic(paths.assignment_path("sid-t"), {"assignment_id": "a-task", "claude_sid": "sid-t", "ticket": "KS", "name": "KS-task-2", "spawned_at": 1.0})
+    artifact_put_impl("KS", "summary", "thread", "s", "complete", "sid-prev", scope="output")
+    artifact_get_impl("KS", "summary", "thread", reader_sid="sid-t")
+    assert _reads_section(pipeline_status_impl("KS")) == ["- KS-task-2 (task) read summary.thread"]
+
+
+def test_reads_judge_a_child_by_its_parents_node(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("KC", tmp_path)
+    _commit("KC", "task", 1, "a-task")
+    family = (("sid-t", "a-task", "KC-task-1", "mgr-sid"), ("sid-c", "a-c", "KC-task-1-review", "sid-t"),
+              ("sid-g", "a-g", "KC-task-1-review-probe", "sid-c"), ("sid-x", "a-x", "KC-loop-x", "sid-y"),
+              ("sid-y", "a-y", "KC-loop-y", "sid-x"))
+    for n, (sid, aid, name, parent) in enumerate(family, 1):
+        state.write_json_atomic(paths.assignment_path(sid), {"assignment_id": aid, "claude_sid": sid, "ticket": "KC",
+                                                              "name": name, "parent_sid": parent, "spawned_at": float(n)})
+    artifact_put_impl("KC", "design", "hld", "b", "complete", "w-design", scope="output")
+    for sid in ("sid-c", "sid-g", "sid-x"):
+        artifact_get_impl("KC", "design", "hld", reader_sid=sid)
+    assert _reads_section(pipeline_status_impl("KC")) == [
+        "- KC-task-1-review (task) read design.hld",
+        "- KC-task-1-review-probe (task) read design.hld",
+        "- KC-loop-x (?) read design.hld  OUTSIDE INPUTS",
+    ]
+
+
+def test_answer_question_skips_the_decision_for_a_subworker_asker(fresh_orchestrator_dir):
+    for sid, kind in (("sid-sub", "subworker"), ("sid-wk", "worker")):
+        state.write_json_atomic(paths.ACTIVE / f"{sid}.json", {"claude_sid": sid, "name": sid, "agent": "worker", "kind": kind})
+        state.write_json_atomic(paths.assignment_path(sid), {"assignment_id": f"a-{sid}", "claude_sid": sid, "ticket": "KS", "name": sid})
+    q_sub = _write_question("sid-sub", "sid-sub", "Child?", parent_manager_name="mgr")
+    q_wk = _write_question("sid-wk", "sid-wk", "Worker?", parent_manager_name="mgr")
+    assert answer_question_impl(q_sub, "a")["ok"] and answer_question_impl(q_wk, "b")["ok"]
+    assert state.read_json(paths.ANSWERS / f"{q_sub}.json")["answer"] == "a"
+    assert sorted(p.name for p in paths.artifact_ticket_dir("KS").glob("decision.*")) == [f"decision.q-{q_wk[:8]}.md"]
+
+
+def test_prune_deletes_a_stale_assignment_with_a_blank_ticket(fresh_orchestrator_dir):
+    state.write_json_atomic(paths.assignment_path("sid-blank"), {"assignment_id": "a-b", "claude_sid": "sid-blank", "ticket": " ", "name": "b"})
+    _age(paths.assignment_path("sid-blank"), 31)
+    _prune_stale_assignments()
+    assert not paths.assignment_path("sid-blank").exists()
+
+
+def test_answer_question_survives_a_non_string_holder_in_the_journal(fresh_orchestrator_dir, tmp_path):
+    _seed_snapshot("KH", tmp_path)
+    state.append_event(paths.artifact_events_path("KH"), {"type": "advance_committed", "request_id": "r-h", "token_id": "t1",
+                                                           "node": "task", "index": 1, "holder": ["x"]})
+    state.write_json_atomic(paths.assignment_path("sid-d"), {"assignment_id": "a-design", "claude_sid": "sid-d", "ticket": "KH", "name": "d"})
+    qid = _write_question("sid-d", "d", "Q?", parent_manager_name="mgr")
+    assert answer_question_impl(qid, "a")["ok"]
+    assert "node: design" in artifact_get_impl("KH", "decision", f"q-{qid[:8]}")["content"].splitlines()
+
+
+def test_legacy_artifact_without_scope_reads_as_internal(fresh_orchestrator_dir):
+    p = paths.artifact_path("KL", "spec", "old")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text('---\nphase: "spec"\nname: "old"\nstatus: "complete"\nwriter_sid: "w"\n---\nlegacy body')
+    assert artifact_get_impl("KL", "spec", "old")["scope"] == "internal"
+    assert [s["scope"] for s in artifact_list_impl("KL")] == ["internal"]
+
+
 def test_spawn_value_error_unlinks_pending(fresh_orchestrator_dir, monkeypatch):
     async def raise_value_error(**kwargs):
         raise ValueError("disallowed extra args")
@@ -6397,10 +8011,10 @@ def test_spawn_worker_explicit_task_key_wins_over_derivation(fresh_orchestrator_
     captured = _patch_spawn_worker_tab(monkeypatch)
     _asyncio.run(spawn_worker_impl(
         initial_prompt="build the bot; related cleanup tracked in TKT-999",
-        name="yt-bot-scraper", cwd="/tmp", task_key="yt-bot-public"))
+        name="demo-worker", cwd="/tmp", task_key="demo-task"))
     (pending,) = list(paths.ASSIGNMENTS_PENDING.glob("*.json"))
     record = state.read_json(pending)
-    assert record["ticket"] == "yt-bot-public"
+    assert record["ticket"] == "demo-task"
 
 
 def test_spawn_never_derives_key_from_prompt_prose(fresh_orchestrator_dir, monkeypatch,
@@ -6431,10 +8045,10 @@ def test_spawn_hint_absent_with_explicit_task_key(fresh_orchestrator_dir, monkey
     _patch_spawn_worker_tab(monkeypatch)
     result = _asyncio.run(spawn_worker_impl(
         initial_prompt="build the bot; cleanup tracked in TKT-999",
-        name="yt-bot-scraper", cwd="/tmp", task_key="yt-bot-public"))
+        name="demo-worker", cwd="/tmp", task_key="demo-task"))
     assert "task_key_hint" not in result
     (pending,) = list(paths.ASSIGNMENTS_PENDING.glob("*.json"))
-    assert state.read_json(pending)["ticket"] == "yt-bot-public"
+    assert state.read_json(pending)["ticket"] == "demo-task"
 
 
 def test_spawn_hint_absent_without_any_mention(fresh_orchestrator_dir, monkeypatch,
@@ -6468,17 +8082,17 @@ def test_spawn_worker_without_task_key_stays_unkeyed(fresh_orchestrator_dir, mon
 
 
 def test_slug_key_round_trips_store_and_joins_assignments(fresh_orchestrator_dir):
-    artifact_put_impl("yt-bot-public", "spec", "scraper", "# bot spec", "complete", "sid-bot")
-    (entry,) = artifact_list_impl("yt-bot-public")
+    artifact_put_impl("demo-task", "spec", "scraper", "# bot spec", "complete", "sid-bot")
+    (entry,) = artifact_list_impl("demo-task")
     assert entry["phase"] == "spec" and entry["name"] == "scraper"
-    assert Path(entry["path"]).parent == paths.ARTIFACTS / "yt-bot-public"
+    assert Path(entry["path"]).parent == paths.ARTIFACTS / "demo-task"
     state.write_json_atomic(paths.ASSIGNMENTS / "sid-bot.json", {
-        "claude_sid": "sid-bot", "name": "yt-bot-scraper", "ticket": "yt-bot-public",
+        "claude_sid": "sid-bot", "name": "demo-worker", "ticket": "demo-task",
         "initial_prompt": "build the scraper half",
     })
-    out = pipeline_status_impl("yt-bot-public")
+    out = pipeline_status_impl("demo-task")
     assert "spec.scraper" in out
-    assert "yt-bot-scraper" in out and "build the scraper half" in out
+    assert "demo-worker" in out and "build the scraper half" in out
 
 
 def test_spawn_worker_blank_task_key_rejected(fresh_orchestrator_dir, monkeypatch):
@@ -6656,7 +8270,7 @@ def test_spawn_worker_default_title_is_plain_name(monkeypatch):
     terminal._DRIVER = None
     captured = _patch_exec(monkeypatch)
     _asyncio.run(spawner.spawn_worker_tab(
-        cwd="/tmp/x", initial_prompt="hi", name="alpha"))
+        extra_args=FLAGS, cwd="/tmp/x", initial_prompt="hi", name="alpha"))
     argv = list(captured["args"])
     assert "-n" in argv and argv[argv.index("-n") + 1] == "alpha"
     assert not any("[w]" in str(a) for a in argv)
@@ -6695,7 +8309,7 @@ def test_mcp_send_and_close_emit_tmux_argv(fresh_orchestrator_dir, monkeypatch):
 
     monkeypatch.setattr(_sp, "run", _fake_run)
 
-    srv._send_text("%5", "hello worker")
+    srv._type_unguarded("%5", "hello worker")
     srv._close_window("%5")
 
     assert any(
@@ -6757,13 +8371,15 @@ def _write_closed(name, sid, cwd="/tmp/wt", runtime="claude", closed_at=1.0):
         "claude_sid": sid, "name": name, "cwd": cwd,
         "runtime": runtime, "closed_at": closed_at,
     })
+    state.write_json_atomic(paths.assignment_path(sid), {"claude_sid": sid, "name": name, "cwd": cwd,
+                                                        "runtime": runtime, "spawn_extra_args": list(FLAGS)})
 
 
 def test_auto_send_live_worker_delivers_without_resume(fresh_orchestrator_dir, monkeypatch):
     import dockwright.mcp_server as srv
     register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="42")
     typed = []
-    monkeypatch.setattr(srv, "_send_text", lambda wid, text: typed.append(text))
+    monkeypatch.setattr(srv, "_type_unguarded", lambda wid, text: typed.append(text))
 
     async def no_resume(*a, **k):
         raise AssertionError("resume must not fire for a live worker")
@@ -6780,7 +8396,7 @@ def test_auto_send_resumes_closed_worker_and_delivers(fresh_orchestrator_dir, tm
     _write_closed("alpha", "gone-sid")
     _patch_spawn_registers_active(monkeypatch)
     typed = []
-    monkeypatch.setattr(srv, "_send_text", lambda wid, text: typed.append((wid, text)))
+    monkeypatch.setattr(srv, "_type_unguarded", lambda wid, text: typed.append((wid, text)))
     monkeypatch.setattr(srv, "_terminal_ls", lambda: [
         {"tabs": [{"windows": [
             {"id": "999", "cwd": "/tmp/wt",
@@ -6845,7 +8461,7 @@ def test_auto_send_codex_lane(fresh_orchestrator_dir, tmp_path, monkeypatch):
     _write_closed("cx", "cx-sid", cwd="/tmp/cx", runtime="codex")
     _patch_spawn_registers_active(monkeypatch)
     typed = []
-    monkeypatch.setattr(srv, "_send_text", lambda wid, text: typed.append(text))
+    monkeypatch.setattr(srv, "_type_unguarded", lambda wid, text: typed.append(text))
     monkeypatch.setattr(srv, "_terminal_ls", lambda: [
         {"tabs": [{"windows": [
             {"id": "999", "cwd": "/tmp/cx",
@@ -6949,3 +8565,981 @@ def test_list_managers_flags_never_took_a_turn(fresh_orchestrator_dir):
         "quiet-scribe": False,
         "ancient-one": True,
     }
+
+
+def _alpha():
+    register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="42")
+
+
+def test_ask_manager_with_a_keepalive_beats_and_returns_the_answer(fresh_orchestrator_dir):
+    _alpha()
+    beats = []
+
+    async def keepalive(n):
+        beats.append(n)
+
+    async def scenario():
+        task = _asyncio.create_task(mcp_server.ask_manager_impl(
+            claude_sid="w1", question="q?", poll_interval=0.01,
+            keepalive=keepalive, keepalive_sec=0.02))
+        await _asyncio.sleep(0.15)
+        qid = mcp_server.list_pending_questions_impl()[0]["question_id"]
+        mcp_server.answer_question_impl(qid, "yes")
+        return await _asyncio.wait_for(task, timeout=2.0)
+
+    assert _asyncio.run(scenario()) == "yes"
+    assert len(beats) >= 3 and beats == sorted(beats)
+
+
+def _spy_timeout(monkeypatch):
+    seen = {}
+    real_sentinel = mcp_server._reask_sentinel
+
+    def spy(qid, timeout_sec, *a, **k):
+        seen["timeout"] = timeout_sec
+        return real_sentinel(qid, timeout_sec, *a, **k)
+
+    monkeypatch.setattr(mcp_server, "_reask_sentinel", spy)
+    return seen
+
+
+def test_the_long_wait_needs_a_keepalive(fresh_orchestrator_dir, monkeypatch):
+    _alpha()
+    seen = _spy_timeout(monkeypatch)
+    monkeypatch.setattr(mcp_server, "ASK_MANAGER_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(mcp_server, "ASK_MANAGER_LONG_WAIT_SEC", 99)
+    result = _asyncio.run(mcp_server.ask_manager_impl(
+        claude_sid="w1", question="q?", poll_interval=0.01))
+    assert result.startswith("NO_ANSWER_YET:")
+    assert seen["timeout"] == 0.05
+
+
+def test_a_keepalive_uses_the_long_wait(fresh_orchestrator_dir, monkeypatch):
+    _alpha()
+    seen = _spy_timeout(monkeypatch)
+
+    async def keepalive(n):
+        return None
+
+    monkeypatch.setattr(mcp_server, "ASK_MANAGER_LONG_WAIT_SEC", 0.05)
+    result = _asyncio.run(mcp_server.ask_manager_impl(
+        claude_sid="w1", question="q?", poll_interval=0.01, keepalive=keepalive,
+        keepalive_sec=0.01))
+    assert result.startswith("NO_ANSWER_YET:")
+    assert seen["timeout"] == 0.05
+
+
+def test_a_failing_keepalive_ends_the_wait_without_eating_the_answer(fresh_orchestrator_dir):
+    _alpha()
+
+    async def broken(n):
+        raise OSError("transport closed")
+
+    result = _asyncio.run(_asyncio.wait_for(mcp_server.ask_manager_impl(
+        claude_sid="w1", question="q?", poll_interval=0.01, keepalive=broken,
+        keepalive_sec=0.01), timeout=5.0))
+    assert result.startswith("NO_ANSWER_YET:")
+    qid = mcp_server.list_pending_questions_impl()[0]["question_id"]
+    mcp_server.answer_question_impl(qid, "later")
+    assert (paths.ANSWERS / f"{qid}.json").exists()
+
+
+def test_codex_tui_keeps_the_old_wait_and_codex_exec_its_own():
+    from dockwright import config
+    assert config.ask_parent_wait_sec("codex-tui") == 1500
+    assert config.ask_parent_wait_sec("codex-exec") == 240
+    assert config.ask_parent_wait_sec("claude-tui") is None
+
+
+def test_the_provider_bound_clamps_the_long_wait(fresh_orchestrator_dir, monkeypatch):
+    from dockwright import config
+    register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x",
+                       iterm_sid="42", provider="codex-tui")
+    monkeypatch.setattr(mcp_server, "ASK_MANAGER_LONG_WAIT_SEC", 10_000)
+    monkeypatch.setattr(config, "DEFAULT_ASK_PARENT_WAIT_SEC", {"codex-tui": 0.05})
+    seen = []
+    real_sentinel = mcp_server._reask_sentinel
+
+    def spy(qid, timeout_sec, *args):
+        seen.append(timeout_sec)
+        return real_sentinel(qid, timeout_sec, *args)
+
+    monkeypatch.setattr(mcp_server, "_reask_sentinel", spy)
+
+    async def keepalive(n):
+        pass
+
+    result = _asyncio.run(_asyncio.wait_for(mcp_server.ask_manager_impl(
+        claude_sid="w1", question="q?", poll_interval=0.01, keepalive=keepalive,
+        keepalive_sec=0.01), timeout=5.0))
+    assert result.startswith("NO_ANSWER_YET:")
+    assert seen == [0.05]
+
+
+def test_the_mcp_app_keeps_ask_manager_alive_with_progress_and_returns_the_answer(
+        fresh_orchestrator_dir, monkeypatch):
+    from mcp.shared.memory import create_connected_server_and_client_session
+    _alpha()
+    monkeypatch.setattr(mcp_server, "ASK_KEEPALIVE_SEC", 0.05)
+    progress = []
+
+    async def on_progress(value, total, message):
+        progress.append(value)
+
+    async def answer_after_two_beats():
+        while len(progress) < 2 or not mcp_server.list_pending_questions_impl():
+            await _asyncio.sleep(0.02)
+        qid = mcp_server.list_pending_questions_impl()[0]["question_id"]
+        mcp_server.answer_question_impl(qid, "yes")
+
+    async def scenario():
+        async with create_connected_server_and_client_session(mcp_server.mcp) as client:
+            tools = {t.name: t for t in (await client.list_tools()).tools}
+            answerer = _asyncio.create_task(answer_after_two_beats())
+            result = await client.call_tool(
+                "ask_manager", {"claude_sid": "w1", "question": "q?"},
+                progress_callback=on_progress)
+            await answerer
+            return tools, result
+
+    tools, result = _asyncio.run(_asyncio.wait_for(scenario(), timeout=10.0))
+    assert not result.isError
+    assert result.content[0].text == "yes"
+    assert len(progress) >= 2
+    for name in ("ask_manager", "ask_parent"):
+        assert "ctx" not in tools[name].inputSchema.get("properties", {})
+        assert "ctx" not in tools[name].inputSchema.get("required", [])
+
+
+def test_progress_keepalive_needs_a_progress_token():
+    class Meta:
+        progressToken = None
+
+    class Req:
+        meta = Meta()
+
+    class Ctx:
+        request_context = Req()
+
+    assert mcp_server._progress_keepalive(None) is None
+    assert mcp_server._progress_keepalive(Ctx()) is None
+    Meta.progressToken = 7
+    assert mcp_server._progress_keepalive(Ctx()) is not None
+
+
+def test_a_relay_into_a_blocked_worker_names_its_question(fresh_orchestrator_dir, monkeypatch):
+    _alpha()
+    monkeypatch.setattr("dockwright.mcp_server._type_unguarded", lambda wid, text: None)
+    qid = mcp_server._write_question("w1", "alpha", "q?", None)
+    result = send_manager_to_worker_impl(worker="alpha", text="do Z instead")
+    assert result["status"] == "delivered"
+    assert result["blocked_on"] == qid
+
+
+def test_a_relay_into_an_unblocked_worker_carries_no_blocked_on(fresh_orchestrator_dir, monkeypatch):
+    _alpha()
+    monkeypatch.setattr("dockwright.mcp_server._type_unguarded", lambda wid, text: None)
+    result = send_manager_to_worker_impl(worker="alpha", text="hi")
+    assert "blocked_on" not in result
+
+
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import dockwright.mcp_server as ms
+from dockwright import waiting_on
+
+_LIVE = 424242
+_CLAUDE = "claude --settings /w/worker.json"
+
+
+def _probes(monkeypatch, *, commands=None, parents=None, screen=None, banner=None, ps=True, log=True,
+            log_file=None):
+    commands = {_LIVE: _CLAUDE} if commands is None else commands
+    index = {"command_by_pid": commands, "child_commands": {}, "parent_by_pid": parents or {}}
+    monkeypatch.setattr(ms, "_pid_alive", lambda pid: pid in commands)
+    monkeypatch.setattr(ms, "_process_index", lambda: index if ps else None)
+    monkeypatch.setattr(ms, "_capture_plain", lambda window_id: screen)
+    session_log = log_file if log_file is not None else Path("/w/session.jsonl")
+    monkeypatch.setattr(ms, "find_session_log",
+                        lambda sid, runtime="claude", root=None: session_log if log else None)
+    if log_file is None:
+        monkeypatch.setattr(ms, "_limit_banner_text", lambda log_path, strict=False: banner)
+
+
+def _transcript(tmp_path, text, *, quiet_sec=0):
+    log = tmp_path / "transcripts" / "session.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}) + "\n")
+    stamp = time.time() - quiet_sec
+    os.utime(log, (stamp, stamp))
+    return log
+
+
+def _holder(task_key, sid, assignment_id, *, pid=_LIVE, state_="idle", tasked_at=100.0, input_at=None,
+            window_id="%9"):
+    state.write_json_atomic(paths.assignment_path(sid), {
+        "assignment_id": assignment_id, "claude_sid": sid, "ticket": task_key,
+        "name": f"{task_key}-{assignment_id}", "spawned_at": 1.0})
+    record = {"claude_sid": sid, "agent": "worker", "name": f"{task_key}-{assignment_id}", "pid": pid,
+              "state": state_, "runtime": "claude", "window_id": window_id, "parent_manager_name": "mgr",
+              "tasked_at": tasked_at}
+    if input_at is not None:
+        record["input_at"] = input_at
+    state.write_json_atomic(paths.ACTIVE / f"{sid}.json", record)
+
+
+def _reported(sid, completed_at=200.0):
+    done = paths.done_dir_for("mgr")
+    done.mkdir(parents=True, exist_ok=True)
+    state.write_json_atomic(done / f"{sid}-e1.json", {"claude_sid": sid, "completed_at": completed_at})
+
+
+def _ask(sid, qid="q1"):
+    qdir = paths.question_dir_for("mgr")
+    qdir.mkdir(parents=True, exist_ok=True)
+    state.write_json_atomic(qdir / f"{qid}.json", {"question_id": qid, "worker_sid": sid, "question": "?",
+                                                   "asked_at": 150.0})
+
+
+def _status(task_key):
+    return json.loads(ms.pipeline_status_impl(task_key, "json"))
+
+
+def _at_pr_with_a_pr_url(task_key, tmp_path, sid="sid-p"):
+    _seed_snapshot(task_key, tmp_path)
+    _commit(task_key, "pr", 1, "a-pr")
+    _holder(task_key, sid, "a-pr")
+    artifact_put_impl(task_key, "implement", "repo", "https://github.com/o/r/pull/7", "complete", sid,
+                      scope="output")
+
+
+_WAITING = "waiting 2026-10-08T12:00:00Z — waiting for approval on o/c#8\nmerged https://github.com/o/r/pull/7 abc1234 by node\n"
+
+
+def _at_post_merge_for_status(task_key, tmp_path, monkeypatch, merge_state=_WAITING):
+    from tests.test_pipeline_core import APPROVE
+    _seed_snapshot(task_key, tmp_path, schema_text=APPROVE)
+    _commit(task_key, "post-merge", 1, "a-pm")
+    _holder(task_key, "sid-pm", "a-pm")
+    artifact_put_impl(task_key, "implement", "repo", "https://github.com/o/r/pull/7\nhttps://github.com/o/c/pull/8\n",
+                      "complete", "sid-p", scope="output")
+    if merge_state is not None:
+        artifact_put_impl(task_key, "merge", "state", merge_state, "partial", "sid-pm", scope="checkpoint")
+
+
+def test_waiting_on_is_the_holders_open_question(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _probes(monkeypatch)
+    _seed_snapshot("W1", tmp_path)
+    _holder("W1", "sid-d", "a-design")
+    _ask("sid-d")
+    out = _status("W1")
+    assert out["waiting_on"] == "human:question" and out["tokens"][0]["waiting_on"] == "human:question"
+    assert out["questions"] == [{"question_id": "q1", "worker_sid": "sid-d", "asked_at": 150.0}]
+
+
+def test_a_dead_holder_pid_reads_stalled_never_worker(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _probes(monkeypatch)
+    _seed_snapshot("W2", tmp_path)
+    _holder("W2", "sid-d", "a-design", pid=_LIVE + 1)
+    out = _status("W2")
+    assert out["waiting_on"] == "stalled:design" and out["tokens"][0]["holder_alive"] is False
+
+
+def test_a_live_pid_that_ps_shows_as_another_program_reads_stalled(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _probes(monkeypatch, commands={_LIVE: "/usr/bin/python3 -m http.server"})
+    _seed_snapshot("W3", tmp_path)
+    _holder("W3", "sid-d", "a-design")
+    assert _status("W3")["waiting_on"] == "stalled:design"
+
+
+def test_a_live_unreported_holder_reads_worker_at_its_node(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _probes(monkeypatch)
+    _seed_snapshot("W4", tmp_path)
+    _holder("W4", "sid-d", "a-design")
+    out = _status("W4")
+    assert out["waiting_on"] == "worker:design"
+    assert out["tokens"][0]["holder_sid"] == "sid-d" and out["tokens"][0]["holder_reported"] is False
+
+
+def test_a_reported_pr_holder_with_a_pr_url_waits_on_the_merge(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _probes(monkeypatch)
+    _at_pr_with_a_pr_url("W5", tmp_path)
+    _reported("sid-p")
+    out = _status("W5")
+    assert out["waiting_on"] == "external:merge" and out["tokens"][0]["holder_reported"] is True
+    assert "\nwaiting_on: external:merge\n" in ms.pipeline_status_impl("W5")
+
+
+def test_a_waiting_post_merge_holder_waits_on_the_merge(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _probes(monkeypatch)
+    _at_post_merge_for_status("W6", tmp_path, monkeypatch)
+    _reported("sid-pm")
+    assert _status("W6")["waiting_on"] == "external:merge"
+
+
+def test_a_waiting_word_older_than_the_holder_does_not_read_as_a_merge_wait(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _probes(monkeypatch)
+    from tests.test_pipeline_core import APPROVE
+    _seed_snapshot("W8", tmp_path, schema_text=APPROVE)
+    artifact_put_impl("W8", "implement", "repo", "https://github.com/o/r/pull/7\n", "complete", "sid-p", scope="output")
+    artifact_put_impl("W8", "merge", "state", _WAITING, "partial", "sid-old", scope="checkpoint")
+    merge_state = paths.artifact_path("W8", "merge", "state")
+    stamp = state.parse_artifact(merge_state.read_text())[0]["written_at"]
+    merge_state.write_text(merge_state.read_text().replace(f"written_at: {stamp}", f"written_at: {stamp - 3 * PAST_GRACE}"))
+    _commit("W8", "post-merge", 1, "a-pm")
+    _holder("W8", "sid-pm", "a-pm")
+    _reported("sid-pm")
+    assert _status("W8")["waiting_on"] == "stalled:post-merge"
+
+
+def test_status_holds_between_the_approve_firing_and_the_first_merge_state_put(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _probes(monkeypatch)
+    _at_post_merge_for_status("W7", tmp_path, monkeypatch, merge_state=None)
+    _reported("sid-pm")
+    assert _status("W7")["waiting_on"] == "stalled:post-merge"
+
+
+def test_new_input_after_the_done_brings_worker_back(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _probes(monkeypatch)
+    _at_pr_with_a_pr_url("W6", tmp_path)
+    _holder("W6", "sid-p", "a-pr", input_at=300.0)
+    _reported("sid-p")
+    assert _status("W6")["waiting_on"] == "worker:pr"
+
+
+def test_a_rate_limit_banner_reads_time_with_its_reset(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    hour = (datetime.fromtimestamp(time.time(), ZoneInfo("Etc/UTC")).hour + 2) % 24
+    label = f"{hour % 12 or 12}{'am' if hour < 12 else 'pm'}"
+    _probes(monkeypatch, banner=f"You've hit your session limit · resets {label} (Etc/UTC)")
+    _seed_snapshot("W7", tmp_path)
+    _holder("W7", "sid-d", "a-design")
+    before = time.time()
+    out = _status("W7")
+    assert out["waiting_on"] == "external:time"
+    reset_at = out["tokens"][0]["reset_at"]
+    assert isinstance(reset_at, int) and before < reset_at <= before + 3 * 3600
+
+
+def test_an_overload_banner_is_not_a_limit(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _probes(monkeypatch, banner="API Error: 529 overloaded")
+    _seed_snapshot("W8", tmp_path)
+    _holder("W8", "sid-d", "a-design")
+    assert _status("W8")["waiting_on"] == "worker:design"
+
+
+def test_a_paused_request_reads_time_and_a_failed_spawn_reads_stalled(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _probes(monkeypatch)
+    for key, reason, expected in (("W9", "paused", "external:time"), ("W10", "spawn-error", "stalled:task")):
+        _seed_snapshot(key, tmp_path)
+        _holder(key, f"sid-{key}", "a-design")
+        _reported(f"sid-{key}")
+        events = paths.artifact_events_path(key)
+        state.append_event(events, {"type": "advance_requested", "token_id": "t1", "request_id": "r1",
+                                    "edge": {"from": "design", "to": "task"}, "index_to": 1, "kind": "advance",
+                                    "ts": time.time() - PAST_GRACE})
+        state.append_event(events, {"type": "advance_pending", "token_id": "t1", "request_id": "r1",
+                                    "reason": reason, "assignment_id": None})
+        out = _status(key)
+        assert out["waiting_on"] == expected and out["tokens"][0]["waiting_on"] is None
+        assert out["open_requests"][0]["waiting_on"] == expected
+        assert out["open_requests"][0]["pending_reason"] == reason
+        line = next(ln for ln in ms.pipeline_status_impl(key).splitlines() if ln.startswith("- open request r1 "))
+        assert line.endswith(f" waiting_on={expected}")
+
+
+def test_a_forked_work_reads_its_most_urgent_row(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _probes(monkeypatch)
+    _seed_snapshot("W11", tmp_path)
+    _holder("W11", "sid-a", "a-row-a")
+    events = paths.artifact_events_path("W11")
+    state.append_event(events, {"type": "token_forked", "token_id": "t1", "node": "task",
+                                "rows": [{"row": "a", "stage": 1, "token_id": "t1/a"},
+                                         {"row": "b", "stage": 1, "token_id": "t1/b"}]})
+    for row in ("a", "b"):
+        state.append_event(events, {"type": "advance_requested", "token_id": f"t1/{row}", "request_id": f"r{row}",
+                                    "edge": {"from": "design", "to": "task"}, "index_to": 1, "kind": "fork",
+                                    "row": row})
+    state.append_event(events, {"type": "advance_committed", "token_id": "t1/a", "request_id": "ra",
+                                "node": "task", "index": 1, "holder": "a-row-a"})
+    state.append_event(events, {"type": "advance_pending", "token_id": "t1/b", "request_id": "rb",
+                                "reason": "paused", "assignment_id": None})
+    out = _status("W11")
+    assert out["waiting_on"] == "worker:task"
+    assert {t["token_id"]: t["waiting_on"] for t in out["tokens"]} == {"t1": None, "t1/a": "worker:task"}
+    assert [r["waiting_on"] for r in out["open_requests"]] == ["external:time"]
+    lines = ms.pipeline_status_impl("W11").splitlines()
+    assert any(ln.startswith("- t1: ") and " waiting_on=- " in ln and ln.endswith(" forked") for ln in lines)
+    assert any(ln.startswith("- t1/a: ") and ln.endswith(" waiting_on=worker:task row=a") for ln in lines)
+
+
+def test_a_gate_launched_under_the_holder_reads_human_gate(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    shell = "/bin/zsh -c source /u/.claude/shell-snapshots/s.sh && eval 'bash /u/.claude/scripts/plannotator-gate /r/'"
+    gate = "bash /u/.claude/scripts/plannotator-gate /r/ --gate --json"
+    commands = {_LIVE: _CLAUDE, 500: shell, 501: gate}
+    _probes(monkeypatch, commands=commands, parents={500: _LIVE, 501: 500})
+    _seed_snapshot("W12", tmp_path)
+    _holder("W12", "sid-d", "a-design")
+    assert _status("W12")["waiting_on"] == "human:gate"
+    _probes(monkeypatch, commands=commands, parents={500: 1, 501: 500})
+    assert _status("W12")["waiting_on"] == "worker:design"
+
+
+def test_an_approval_dialog_on_a_processing_holder_reads_human(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _probes(monkeypatch, screen="Bash command\n  rm -rf build\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n")
+    _seed_snapshot("W13", tmp_path)
+    _holder("W13", "sid-d", "a-design", state_="processing")
+    assert _status("W13")["waiting_on"] == "human:approval-dialog"
+
+
+def test_a_tracker_watcher_on_the_works_key_reads_its_external_value(fresh_orchestrator_dir, tmp_path,
+                                                                     monkeypatch):
+    watcher = (f"/opt/py/Python.app/Contents/MacOS/Python /u/.claude/scripts/{waiting_on.TRACKER_WATCH_SCRIPT} "
+               "W14 --poll 300")
+    _probes(monkeypatch, commands={_LIVE: _CLAUDE, 600: watcher})
+    _seed_snapshot("W14", tmp_path)
+    _holder("W14", "sid-d", "a-design")
+    _reported("sid-d")
+    assert _status("W14")["waiting_on"] == waiting_on.EXTERNAL_TRACKER
+    _probes(monkeypatch, commands={_LIVE: _CLAUDE, 600: watcher.replace("W14", "OTHER-1")})
+    assert _status("W14")["waiting_on"] == "stalled:design"
+
+
+def test_a_finished_terminal_node_reads_none(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _probes(monkeypatch)
+    _seed_snapshot("W15", tmp_path)
+    _commit("W15", "post-merge", 1, "a-pm")
+    _holder("W15", "sid-pm", "a-pm")
+    _reported("sid-pm")
+    artifact_put_impl("W15", "summary", "post-merge", "done", "complete", "sid-pm", scope="output")
+    assert _status("W15")["waiting_on"] == "none"
+
+
+def test_failed_probes_are_named_and_never_raise(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _probes(monkeypatch, ps=False, log=False)
+    _seed_snapshot("W16", tmp_path)
+    _holder("W16", "sid-d-123456789", "a-design")
+    out = _status("W16")
+    assert out["probe_errors"] == ["ps", "transcript:sid-d-12"] and out["waiting_on"] == "worker:design"
+    assert "\nwaiting_on: worker:design (probe failed: ps, transcript:sid-d-12)\n" in ms.pipeline_status_impl("W16")
+
+
+def test_a_work_without_a_snapshot_reads_its_open_question_or_none(fresh_orchestrator_dir, monkeypatch):
+    _probes(monkeypatch)
+    artifact_put_impl("W17", "spec", "a", "x", "complete", "sid-q")
+    assert _status("W17")["waiting_on"] == "none"
+    state.write_json_atomic(paths.assignment_path("sid-q"), {"assignment_id": "a-q", "claude_sid": "sid-q",
+                                                             "ticket": "W17", "spawned_at": 1.0})
+    _ask("sid-q")
+    assert _status("W17")["waiting_on"] == "human:question"
+
+
+def test_a_failed_fold_is_a_probe_error(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _probes(monkeypatch)
+    _seed_snapshot("W18", tmp_path)
+    _append_malformed_commit("W18")
+    out = _status("W18")
+    assert out["waiting_on"] == "none" and out["probe_errors"] == ["fold"] and out["tokens"] == []
+
+
+def test_the_json_status_is_one_versioned_object(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _probes(monkeypatch)
+    _seed_snapshot("W19", tmp_path)
+    _holder("W19", "sid-d", "a-design")
+    artifact_put_impl("W19", "decision", "q-1", "x", "complete", "sid-d", decided_by="manager")
+    raw = ms.pipeline_status_impl("W19", "json")
+    assert "\n" not in raw
+    out = json.loads(raw)
+    assert list(out) == ["version", "task_key", "waiting_on", "topic", "gate", "probe_errors", "round", "closed",
+                         "carried_prs", "tokens", "open_requests", "questions", "artifacts", "assignments", "events"]
+    assert out["version"] == 1 and out["task_key"] == "W19" and out["round"] == 1
+    assert out["closed"] is None
+    assert set(out["tokens"][0]) == {"token_id", "node", "index", "holder", "holder_sid", "holder_alive",
+                                     "holder_reported", "row", "forked", "held", "waiting_on", "reset_at"}
+    decision = next(a for a in out["artifacts"] if a["phase"] == "decision")
+    assert decision["decided_by"] == "manager" and decision["writer_liveness"] == "active"
+    assert set(decision) == {"phase", "name", "status", "scope", "writer_sid", "writer_liveness", "written_at",
+                             "decided_by", "read_count", "carried"}
+    assert out["assignments"][0] == {"name": "W19-a-design", "assignment_id": "a-design", "claude_sid": "sid-d",
+                                     "liveness": "active", "model_requests": None, "branch": None, "role": None,
+                                     "context_role": None, "model": None}
+    assert [e["type"] for e in out["events"]][0] == "pipeline_started"
+
+
+def test_pipeline_status_shows_each_sessions_model_request_count(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _probes(monkeypatch)
+    _seed_snapshot("W19", tmp_path)
+    _holder("W19", "sid-d", "a-design")
+    live = state.read_json(paths.ACTIVE / "sid-d.json")
+    state.write_json_atomic(paths.ACTIVE / "sid-d.json",
+                            {**live, "spend": {"turns": 3, "out_tokens": 9, "model_requests": 122}})
+    for sid, assignment_id, spawned_at, spend in (
+            ("sid-p", "a-plan", 2.0, {"turns": 2, "out_tokens": 5, "model_requests": 71}),
+            ("sid-o", "a-old", 3.0, {"turns": 2, "out_tokens": 5})):
+        name = f"W19-{assignment_id}"
+        state.write_json_atomic(paths.assignment_path(sid), {
+            "assignment_id": assignment_id, "claude_sid": sid, "ticket": "W19", "name": name,
+            "spawned_at": spawned_at})
+        state.write_json_atomic(paths.CLOSED / f"{sid}.json", {"claude_sid": sid, "name": name, "spend": spend})
+    board = ms.pipeline_status_impl("W19").split("## assignments")[1].split("## events")[0]
+    rows = {line.split()[1]: line for line in board.splitlines() if line.startswith("- ")}
+    assert "  model_requests=122  " in rows["W19-a-design"]
+    assert "  model_requests=71  " in rows["W19-a-plan"]
+    assert "  model_requests=?  " in rows["W19-a-old"]
+    assert {a["name"]: a["model_requests"] for a in _status("W19")["assignments"]} == {
+        "W19-a-design": 122, "W19-a-plan": 71, "W19-a-old": None}
+
+
+def test_an_unknown_status_format_is_refused(fresh_orchestrator_dir):
+    with pytest.raises(ValueError, match="unknown format 'yaml'"):
+        ms.pipeline_status_impl("W20", "yaml")
+
+
+def test_the_pipeline_status_tool_passes_its_format(fresh_orchestrator_dir, monkeypatch):
+    _probes(monkeypatch)
+    assert json.loads(ms.pipeline_status(task_key="W21", format="json"))["task_key"] == "W21"
+    assert ms.pipeline_status(ticket="W21").startswith("# pipeline_status(W21)\nwaiting_on: none\n")
+
+
+def test_the_cli_prints_the_status_as_json_or_text(fresh_orchestrator_dir, tmp_path, monkeypatch, capsys):
+    _probes(monkeypatch)
+    _seed_snapshot("W22", tmp_path)
+    _holder("W22", "sid-d", "a-design")
+    assert pipeline.main(["status", "W22", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["waiting_on"] == "worker:design"
+    assert pipeline.main(["status", "W22"]) == 0
+    assert "waiting_on: worker:design" in capsys.readouterr().out
+    assert pipeline.main(["status", "  "]) == 2
+
+
+def test_the_cli_status_leaves_stale_assignments_and_the_tool_prunes_them(fresh_orchestrator_dir, tmp_path, monkeypatch, capsys):
+    _probes(monkeypatch)
+    _seed_snapshot("W23", tmp_path)
+    paths.ASSIGNMENTS_PENDING.mkdir(parents=True, exist_ok=True)
+    stale = paths.ASSIGNMENTS_PENDING / "old.json"
+    stale.write_text("{}")
+    old = time.time() - paths.PENDING_ASSIGNMENT_TTL_SEC - 60
+    os.utime(stale, (old, old))
+    assert pipeline.main(["status", "W23", "--json"]) == 0
+    capsys.readouterr()
+    assert stale.exists()
+    ms.pipeline_status(task_key="W23")
+    assert not stale.exists()
+
+
+def test_the_cli_status_leaves_stale_works_and_the_tool_prunes_them(fresh_orchestrator_dir, tmp_path, monkeypatch,
+                                                                     capsys):
+    _probes(monkeypatch)
+    _seed_snapshot("W24", tmp_path)
+    _holder("W24", "sid-d", "a-design")
+    old = time.time() - paths.ARTIFACT_RETENTION_DAYS * 86400 - 60
+    for key in ("OLD-1", "OLD-2"):
+        artifact_put_impl(key, "spec", "a", "x", "complete", "sid-o")
+        for p in paths.artifact_ticket_dir(key).rglob("*"):
+            os.utime(p, (old, old))
+    assert pipeline.main(["status", "W24", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["waiting_on"] == "worker:design"
+    assert pipeline.main(["status", "OLD-2", "--json"]) == 0
+    assert [a["name"] for a in json.loads(capsys.readouterr().out)["artifacts"]] == ["a"]
+    assert paths.artifact_ticket_dir("OLD-1").is_dir() and paths.artifact_ticket_dir("OLD-2").is_dir()
+    ms.pipeline_status(task_key="W24")
+    assert not paths.artifact_ticket_dir("OLD-1").exists() and not paths.artifact_ticket_dir("OLD-2").exists()
+
+
+def test_a_processing_holder_quiet_on_a_limit_banner_reads_time(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    log = _transcript(tmp_path, "You've hit your session limit · resets 3am (Etc/UTC)",
+                      quiet_sec=ms.RATE_LIMIT_NUDGE_SEC + 60)
+    _probes(monkeypatch, screen="", log_file=log)
+    _seed_snapshot("W25", tmp_path)
+    _holder("W25", "sid-d", "a-design", state_="processing")
+    out = _status("W25")
+    assert out["waiting_on"] == "external:time" and out["probe_errors"] == []
+    os.utime(log, None)
+    assert _status("W25")["waiting_on"] == "worker:design"
+
+
+def test_a_message_quoting_the_limit_signature_is_no_banner(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    log = _transcript(tmp_path, "Checked the stale lane: a worker that says it hit your session limit stays busy.")
+    _probes(monkeypatch, log_file=log)
+    _seed_snapshot("W26", tmp_path)
+    _holder("W26", "sid-d", "a-design")
+    assert _status("W26")["waiting_on"] == "worker:design"
+    _transcript(tmp_path, "You've hit your session limit · resets 3am (Etc/UTC)")
+    assert _status("W26")["waiting_on"] == "external:time"
+
+
+def test_a_session_whose_process_died_reads_dead_in_text_and_json(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _probes(monkeypatch, commands={_LIVE: _CLAUDE, _LIVE + 2: "/usr/bin/python3 -m http.server"})
+    _seed_snapshot("W27", tmp_path)
+    _holder("W27", "sid-dead", "a-design", pid=_LIVE + 1)
+    _holder("W28", "sid-othr", "a-w28", pid=_LIVE + 2)
+    _holder("W29", "sid-live", "a-w29")
+    for key, sid in (("W27", "sid-dead"), ("W28", "sid-othr"), ("W29", "sid-live")):
+        artifact_put_impl(key, "spec", "a", "x", "complete", sid)
+    out = _status("W27")
+    assert out["assignments"][0]["liveness"] == "dead" and out["artifacts"][0]["writer_liveness"] == "dead"
+    text = ms.pipeline_status_impl("W27")
+    assert "writer=sid-dead(dead)" in text and "sid=sid-dead(dead)" in text and "(active)" not in text
+    assert _status("W28")["artifacts"][0]["writer_liveness"] == "dead"
+    assert _status("W29")["artifacts"][0]["writer_liveness"] == "active"
+
+
+def test_waiting_on_status_probes_ps_once_unless_given_an_index(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _probes(monkeypatch)
+    probe = ms._process_index
+    calls = []
+    monkeypatch.setattr(ms, "_process_index", lambda: calls.append(1) or probe())
+    _seed_snapshot("W40", tmp_path)
+    _holder("W40", "sid-d", "a-design")
+    snap, events = ms._load_snapshot_for("W40"), ms._read_events(paths.artifact_events_path("W40"))
+    assert ms._waiting_on_status("W40", snap, events, {}, time.time())["waiting_on"] == "worker:design"
+    assert calls == [1]
+    given = ms._waiting_on_status("W40", snap, events, {}, time.time(), index=probe())
+    assert calls == [1] and given["waiting_on"] == "worker:design"
+    failed = ms._waiting_on_status("W40", snap, events, {}, time.time(), index=None)
+    assert calls == [1] and failed["probe_errors"] == ["ps"]
+
+
+def test_spawn_worker_tab_keeps_a_prompt_far_past_the_tmux_limit_out_of_the_tmux_command(monkeypatch):
+    terminal._DRIVER = None
+    captured = _patch_exec(monkeypatch)
+    prompt = "P" * 100_000
+    _asyncio.run(spawner.spawn_worker_tab(extra_args=FLAGS, cwd="/tmp/x", initial_prompt=prompt, name="alpha"))
+    tmux_command = list(captured["args"])
+    assert sum(len(a.encode()) + 1 for a in tmux_command) < 8_000
+    prompt_file = next(paths.PROMPT_FILES.glob("*.txt"))
+    assert prompt_file.read_text() == prompt
+    assert f'"$(cat {shlex.quote(str(prompt_file))})"' in tmux_command[-1]
+
+
+from dockwright.mcp_server import get_worker_pane_impl, answer_permission_prompt_impl, set_human_attached_impl
+
+PANE_TALL_DIALOG = """\
+⏺ Bash(cp a b)
+╭──────────────────────────────────────────────────────────────╮
+│ Bash command                                                 │
+│                                                              │
+│ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
+│ cp a b                                                       │
+│ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌ Jump to bottom (click) ↓ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
+
+
+"""
+
+CREATE_FILE_DIALOG = """\
+⏺ Write(/r/x.md)
+╭──────────────────────────────────────────────────────────────╮
+│ Create file                                                  │
+│ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
+│ /r/x.md                                                      │
+│ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌ Jump to bottom (click) ↓ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
+"""
+
+SELF_EDIT_DIALOG = CREATE_FILE_DIALOG + "│   2. Yes, and allow Claude to edit files in its ~/.claude folder for this session\n"
+
+PANE_PROCEED_DIALOG = """\
+⏺ Bash(git commit -m x)
+╭──────────────────────────────────────────────────────────────╮
+│ Bash command                                                 │
+│   git commit -m x                                            │
+│ Do you want to proceed?                                      │
+│ ❯ 1. Yes                                                     │
+│   3. No, and tell Claude what to do differently (esc)        │
+╰──────────────────────────────────────────────────────────────╯"""
+
+
+class PromptPane:
+    def __init__(self, screen, after_key, on_key=None):
+        self.screen = screen
+        self.after_key = after_key
+        self.on_key = on_key
+        self.calls = []
+
+    def capture_screen(self, pane):
+        return self.screen
+
+    def capture_screen_ansi(self, pane):
+        return self.screen
+
+    def send_key(self, pane, key):
+        self.calls.append(("key", pane, key))
+        self.screen = self.after_key
+        if self.on_key is not None:
+            self.on_key()
+        return True
+
+
+def _pane_iso(ts):
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _prompt_worker(tmp_path, monkeypatch, pane, *, marker=True, tool_name="Bash", summary="cp a b", at=None,
+                   window="%7"):
+    register_self_impl(claude_sid="w1", agent="worker", name="alpha", cwd="/x", iterm_sid="i1", pid=os.getpid())
+    monkeypatch.setattr(ms, "get_driver", lambda: pane)
+    monkeypatch.setattr(ms, "_resolve_live_worker_window", lambda r: window)
+    monkeypatch.setattr(ms, "SAFEGUARD_SETTLE_STEP_SEC", 0)
+    at = time.time() - 30 if at is None else at
+    if not marker:
+        return at
+    log = tmp_path / "w1-transcript.jsonl"
+    log.write_text(json.dumps({"type": "assistant", "timestamp": _pane_iso(at), "message": {"content": [
+        {"type": "tool_use", "id": "toolu_1", "name": tool_name,
+         "input": {"command": summary} if tool_name == "Bash" else {"file_path": summary}}]}}) + "\n")
+    _write_prompt_marker(at, tool_name, summary, str(log))
+    return at
+
+
+def _write_prompt_marker(at, tool_name="Bash", summary="cp a b", transcript_path=None, tool_use_id="toolu_1"):
+    paths.PERMISSION_PROMPTS.mkdir(parents=True, exist_ok=True)
+    (paths.PERMISSION_PROMPTS / "w1.json").write_text(json.dumps({
+        "at": at, "sid": "w1", "name": "alpha", "tool_name": tool_name, "summary": summary,
+        "transcript_path": transcript_path, "cwd": "/x", "decided": None, "attempts": [],
+        "tool_use_id": tool_use_id, "closed_at": None}))
+
+
+def _prompt_marker():
+    return json.loads((paths.PERMISSION_PROMPTS / "w1.json").read_text())
+
+
+def _last_ledger_line():
+    return json.loads(paths.PERMISSION_LEDGER.read_text().splitlines()[-1])
+
+
+def test_get_worker_pane_returns_the_text_the_signs_and_the_open_marker(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    at = _prompt_worker(tmp_path, monkeypatch, PromptPane(PANE_TALL_DIALOG, ""))
+    out = get_worker_pane_impl("alpha")
+    assert out == {"worker": "alpha", "pane": "%7", "text": PANE_TALL_DIALOG.rstrip(), "classic_dialog": False,
+                   "dialog_sign": True, "prompt_at": at,
+                   "prompt": {"tool_name": "Bash", "summary": "cp a b", "at": at, "state": "open",
+                              "tool_use_id": "toolu_1", "attempts": [], "decided": None},
+                   "human_attached": False}
+
+
+def test_get_worker_pane_without_a_marker_reads_prompt_null(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _prompt_worker(tmp_path, monkeypatch, PromptPane("⏺ done\n", ""), marker=False)
+    out = get_worker_pane_impl("alpha")
+    assert out["prompt"] is None and out["prompt_at"] is None
+    assert out["dialog_sign"] is False and out["classic_dialog"] is False
+
+
+def test_get_worker_pane_finds_a_pending_spawn_by_name(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    pane = PromptPane(PANE_PROCEED_DIALOG, "")
+    monkeypatch.setattr(ms, "get_driver", lambda: pane)
+    paths.ASSIGNMENTS_PENDING.mkdir(parents=True, exist_ok=True)
+    (paths.ASSIGNMENTS_PENDING / "aaff01.window").write_text("%9")
+    (paths.ASSIGNMENTS_PENDING / "aaff01.json").write_text(json.dumps({"name": "boot-x", "parent_manager_name": "mgr"}))
+    out = get_worker_pane_impl("boot-x")
+    assert out["worker"] == "boot-x" and out["pane"] == "%9" and out["classic_dialog"] is True
+    assert out["prompt"] is None and out["human_attached"] is False
+
+
+def test_get_worker_pane_raises_for_an_unknown_name(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    monkeypatch.setattr(ms, "get_driver", lambda: PromptPane("", ""))
+    with pytest.raises(ValueError, match="no worker named 'ghost'"):
+        get_worker_pane_impl("ghost")
+
+
+def test_get_worker_pane_raises_when_no_live_window_resolves(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    pane = PromptPane(PANE_TALL_DIALOG, "")
+    _prompt_worker(tmp_path, monkeypatch, pane, window="")
+    monkeypatch.setattr(ms, "_WINDOW_RESOLVE_RETRY_SLEEP", 0)
+    with pytest.raises(ValueError, match="no live window"):
+        get_worker_pane_impl("alpha")
+    with pytest.raises(ValueError, match="no live window"):
+        answer_permission_prompt_impl("alpha", "approve")
+    assert pane.calls == []
+
+
+def test_get_worker_pane_skips_a_pending_spawn_with_an_empty_window_sidecar(fresh_orchestrator_dir, tmp_path,
+                                                                            monkeypatch):
+    monkeypatch.setattr(ms, "get_driver", lambda: PromptPane("", ""))
+    paths.ASSIGNMENTS_PENDING.mkdir(parents=True, exist_ok=True)
+    (paths.ASSIGNMENTS_PENDING / "aaff01.window").write_text("")
+    (paths.ASSIGNMENTS_PENDING / "aaff01.json").write_text(json.dumps({"name": "boot-x"}))
+    with pytest.raises(ValueError):
+        get_worker_pane_impl("boot-x")
+
+
+def test_get_worker_pane_trims_to_the_requested_lines(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    _prompt_worker(tmp_path, monkeypatch, PromptPane(PANE_TALL_DIALOG, ""))
+    out = get_worker_pane_impl("alpha", lines=3)
+    assert out["text"] == "\n".join(PANE_TALL_DIALOG.rstrip().splitlines()[-3:])
+
+
+def test_answer_approve_presses_1_when_the_dialog_sign_is_on_screen(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    pane = PromptPane(CREATE_FILE_DIALOG, "⏺ Write(/r/x.md)\n")
+    at = _prompt_worker(tmp_path, monkeypatch, pane, tool_name="Write", summary="/r/x.md")
+    out = answer_permission_prompt_impl("alpha", "approve", prompt_at=at, manager_sid="m1")
+    assert pane.calls == [("key", "%7", "1")]
+    assert out == {"status": "answered", "worker": "alpha", "tool_name": "Write", "summary": "/r/x.md"}
+    marker = _prompt_marker()
+    assert marker["decided"]["by"] == "manager" and marker["decided"]["answer"] == "approve"
+    assert marker["decided"]["manager_sid"] == "m1"
+    line = _last_ledger_line()
+    assert line["answer"] == "approve" and line["by"] == "manager" and line["worker"] == "alpha"
+    assert line["sid"] == "w1" and line["manager_sid"] == "m1" and "outcome" not in line
+
+
+def test_answer_refuse_presses_escape(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    pane = PromptPane(CREATE_FILE_DIALOG, "")
+    at = _prompt_worker(tmp_path, monkeypatch, pane, tool_name="Write", summary="/r/x.md")
+    out = answer_permission_prompt_impl("alpha", "refuse", prompt_at=at)
+    assert pane.calls == [("key", "%7", "Escape")] and out["status"] == "answered"
+    assert _prompt_marker()["decided"]["answer"] == "refuse"
+
+
+def test_answer_rejects_an_unknown_answer(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    pane = PromptPane(CREATE_FILE_DIALOG, "")
+    _prompt_worker(tmp_path, monkeypatch, pane)
+    with pytest.raises(ValueError):
+        answer_permission_prompt_impl("alpha", "yes")
+    assert pane.calls == []
+
+
+def test_answer_without_a_marker_or_a_classic_block_presses_nothing(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    pane = PromptPane("⏺ done\n", "")
+    _prompt_worker(tmp_path, monkeypatch, pane, marker=False)
+    out = answer_permission_prompt_impl("alpha", "approve")
+    assert out == {"status": "no_dialog", "worker": "alpha", "tool_name": None, "summary": None, "prompt": None}
+    assert pane.calls == []
+
+
+def test_answer_with_an_open_marker_but_no_sign_on_screen_presses_nothing(fresh_orchestrator_dir, tmp_path,
+                                                                           monkeypatch):
+    pane = PromptPane("\n" * 20, "")
+    at = _prompt_worker(tmp_path, monkeypatch, pane)
+    out = answer_permission_prompt_impl("alpha", "approve", prompt_at=at)
+    assert out["status"] == "no_dialog" and out["tool_name"] == "Bash" and out["prompt"]["state"] == "open"
+    assert pane.calls == []
+
+
+def test_answer_refuses_while_a_human_is_attached(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    pane = PromptPane(CREATE_FILE_DIALOG, "")
+    at = _prompt_worker(tmp_path, monkeypatch, pane)
+    set_human_attached_impl("alpha", True)
+    out = answer_permission_prompt_impl("alpha", "approve", prompt_at=at)
+    assert out["status"] == "human_attached" and pane.calls == []
+
+
+def test_answer_approve_session_needs_the_self_edit_option_text(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    pane = PromptPane(CREATE_FILE_DIALOG, "")
+    at = _prompt_worker(tmp_path, monkeypatch, pane, tool_name="Write", summary="/r/x.md")
+    out = answer_permission_prompt_impl("alpha", "approve_session", prompt_at=at)
+    assert out["status"] == "wrong_dialog" and pane.calls == []
+    pane.screen = SELF_EDIT_DIALOG
+    out = answer_permission_prompt_impl("alpha", "approve_session", prompt_at=at)
+    assert out["status"] == "answered" and pane.calls == [("key", "%7", "2")]
+
+
+def test_answer_unsettled_when_the_sign_stays_leaves_decided_empty_and_records_the_attempt(fresh_orchestrator_dir,
+                                                                                           tmp_path, monkeypatch):
+    pane = PromptPane(CREATE_FILE_DIALOG, CREATE_FILE_DIALOG)
+    at = _prompt_worker(tmp_path, monkeypatch, pane, tool_name="Write", summary="/r/x.md")
+    out = answer_permission_prompt_impl("alpha", "approve", prompt_at=at)
+    assert out["status"] == "unsettled" and pane.calls == [("key", "%7", "1")]
+    marker = _prompt_marker()
+    assert marker["decided"] is None and marker["attempts"][0]["answer"] == "approve"
+    assert _last_ledger_line()["outcome"] == "unsettled"
+
+
+def test_answer_does_not_overwrite_a_newer_marker_written_during_the_settle(fresh_orchestrator_dir, tmp_path,
+                                                                             monkeypatch):
+    pane = PromptPane(CREATE_FILE_DIALOG, CREATE_FILE_DIALOG)
+    at = _prompt_worker(tmp_path, monkeypatch, pane, tool_name="Write", summary="/r/x.md")
+    pane.on_key = lambda: _write_prompt_marker(at + 1, "Write", "/r/y.md", str(tmp_path / "w1-transcript.jsonl"))
+    out = answer_permission_prompt_impl("alpha", "approve", prompt_at=at)
+    assert out["status"] == "answered" and out["summary"] == "/r/x.md"
+    marker = _prompt_marker()
+    assert marker["at"] == at + 1 and marker["decided"] is None and marker["attempts"] == []
+    assert _last_ledger_line()["outcome"] == "superseded"
+
+
+def test_answer_a_classic_dialog_of_a_pending_spawn_presses_1(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    pane = PromptPane(PANE_PROCEED_DIALOG, "")
+    monkeypatch.setattr(ms, "get_driver", lambda: pane)
+    monkeypatch.setattr(ms, "SAFEGUARD_SETTLE_STEP_SEC", 0)
+    paths.ASSIGNMENTS_PENDING.mkdir(parents=True, exist_ok=True)
+    (paths.ASSIGNMENTS_PENDING / "aaff01.window").write_text("%9")
+    (paths.ASSIGNMENTS_PENDING / "aaff01.json").write_text(json.dumps({"name": "boot-x"}))
+    out = answer_permission_prompt_impl("boot-x", "approve")
+    assert out == {"status": "answered", "worker": "boot-x", "tool_name": None, "summary": None}
+    assert pane.calls == [("key", "%9", "1")]
+    assert _last_ledger_line()["sid"] is None and _last_ledger_line()["worker"] == "boot-x"
+
+
+def test_an_open_marker_on_a_processing_holder_reads_human_approval_dialog(fresh_orchestrator_dir, tmp_path,
+                                                                           monkeypatch):
+    _probes(monkeypatch, screen=PANE_TALL_DIALOG)
+    _seed_snapshot("W13b", tmp_path)
+    _holder("W13b", "sid-d", "a-design", state_="processing")
+    at = time.time() - 30
+    log = tmp_path / "sid-d.jsonl"
+    log.write_text(json.dumps({"type": "assistant", "timestamp": _pane_iso(at), "message": {"content": [
+        {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "cp a b"}}]}}) + "\n")
+    paths.PERMISSION_PROMPTS.mkdir(parents=True, exist_ok=True)
+    (paths.PERMISSION_PROMPTS / "sid-d.json").write_text(json.dumps({
+        "at": at, "sid": "sid-d", "name": "W13b-a-design", "tool_name": "Bash", "summary": "cp a b",
+        "transcript_path": str(log), "cwd": "/x", "decided": None, "attempts": [], "tool_use_id": "toolu_1",
+        "closed_at": None}))
+    assert _status("W13b")["waiting_on"] == "human:approval-dialog"
+    _probes(monkeypatch, screen="\n" * 20)
+    assert _status("W13b")["waiting_on"] == "worker:design"
+    _probes(monkeypatch, screen=None)
+    assert _status("W13b")["waiting_on"] == "worker:design"
+
+
+def test_answer_refuses_a_prompt_at_that_is_not_the_open_markers(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    pane = PromptPane(CREATE_FILE_DIALOG, "")
+    at = _prompt_worker(tmp_path, monkeypatch, pane, tool_name="Write", summary="/r/x.md")
+    out = answer_permission_prompt_impl("alpha", "approve", prompt_at=at - 1)
+    assert out["status"] == "changed" and out["prompt_at"] == at and out["prompt"]["at"] == at and pane.calls == []
+    out = answer_permission_prompt_impl("alpha", "approve")
+    assert out["status"] == "changed" and pane.calls == []
+
+
+def test_answer_refuses_a_prompt_at_when_no_marker_is_open(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    pane = PromptPane(PANE_PROCEED_DIALOG, "")
+    _prompt_worker(tmp_path, monkeypatch, pane, marker=False)
+    out = answer_permission_prompt_impl("alpha", "approve", prompt_at=123.0)
+    assert out["status"] == "changed" and out["prompt_at"] is None and pane.calls == []
+
+
+def test_answer_a_classic_dialog_that_stays_reads_unsettled(fresh_orchestrator_dir, tmp_path, monkeypatch):
+    pane = PromptPane(PANE_PROCEED_DIALOG, PANE_PROCEED_DIALOG)
+    monkeypatch.setattr(ms, "get_driver", lambda: pane)
+    monkeypatch.setattr(ms, "SAFEGUARD_SETTLE_STEP_SEC", 0)
+    paths.ASSIGNMENTS_PENDING.mkdir(parents=True, exist_ok=True)
+    (paths.ASSIGNMENTS_PENDING / "aaff01.window").write_text("%9")
+    (paths.ASSIGNMENTS_PENDING / "aaff01.json").write_text(json.dumps({"name": "boot-x"}))
+    out = answer_permission_prompt_impl("boot-x", "approve")
+    assert out["status"] == "unsettled" and pane.calls == [("key", "%9", "1")]
+    assert _last_ledger_line()["outcome"] == "unsettled"
+
+
+def test_answer_on_a_classic_dialog_beside_a_closed_marker_records_no_stale_command(fresh_orchestrator_dir, tmp_path,
+                                                                                    monkeypatch):
+    pane = PromptPane(PANE_PROCEED_DIALOG, "")
+    at = _prompt_worker(tmp_path, monkeypatch, pane, tool_name="Write", summary="/r/old.md")
+    marker = _prompt_marker(); marker["closed_at"] = at + 1
+    (paths.PERMISSION_PROMPTS / "w1.json").write_text(json.dumps(marker))
+    pane_view = get_worker_pane_impl("alpha")
+    assert pane_view["prompt"]["state"] == "closed" and pane_view["prompt_at"] is None
+    out = answer_permission_prompt_impl("alpha", "approve", prompt_at=pane_view["prompt_at"])
+    assert out == {"status": "answered", "worker": "alpha", "tool_name": None, "summary": None}
+    line = _last_ledger_line()
+    assert line["tool_name"] is None and line["summary"] is None
+
+
+def test_answer_writes_a_pressed_line_before_the_keypress_and_the_outcome_after(fresh_orchestrator_dir, tmp_path,
+                                                                                 monkeypatch):
+    pane = PromptPane(CREATE_FILE_DIALOG, "")
+    seen = []
+    pane.on_key = lambda: seen.append(paths.PERMISSION_LEDGER.read_text().splitlines())
+    at = _prompt_worker(tmp_path, monkeypatch, pane, tool_name="Write", summary="/r/x.md")
+    answer_permission_prompt_impl("alpha", "approve", prompt_at=at, manager_sid="m1")
+    assert len(seen[0]) == 1 and json.loads(seen[0][0])["outcome"] == "pressed"
+    lines = [json.loads(l) for l in paths.PERMISSION_LEDGER.read_text().splitlines()]
+    assert [l.get("outcome") for l in lines] == ["pressed", None]
+    assert lines[0]["summary"] == "/r/x.md" and lines[0]["answer"] == "approve" and lines[1]["answer"] == "approve"

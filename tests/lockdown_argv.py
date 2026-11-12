@@ -36,6 +36,7 @@ EXPECTED_HEADLESS_FLAGS = frozenset({
     "--setting-sources",
     "--no-session-persistence",
     "--disallowedTools",
+    "--append-system-prompt-file",
 })
 
 

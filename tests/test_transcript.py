@@ -31,6 +31,35 @@ def test_find_session_log_finds_codex_rollout(tmp_path, monkeypatch):
     log.write_text("{}")
     assert find_session_log("the-sid", runtime="codex") == log
 
+def test_find_codex_rollout_honours_codex_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    codex_home = tmp_path / "elsewhere" / "codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    sessions = codex_home / "sessions" / "2026" / "09" / "07"
+    sessions.mkdir(parents=True)
+    log = sessions / "rollout-2026-09-07T10-00-00-the-sid.jsonl"
+    log.write_text("{}")
+    assert find_session_log("the-sid", runtime="codex") == log
+    monkeypatch.delenv("CODEX_HOME")
+    assert find_session_log("the-sid", runtime="codex") is None
+
+
+def test_find_session_log_searches_the_root_it_is_given_on_both_runtimes(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
+    projects = tmp_path / "pool" / "projects" / "-Users-x"
+    projects.mkdir(parents=True)
+    claude_log = projects / "the-sid.jsonl"
+    claude_log.write_text("")
+    sessions = tmp_path / "pool" / "sessions" / "2026" / "09"
+    sessions.mkdir(parents=True)
+    codex_log = sessions / "rollout-2026-09-08T10-00-00-the-sid.jsonl"
+    codex_log.write_text("{}")
+    assert find_session_log("the-sid") is None
+    assert find_session_log("the-sid", "claude", tmp_path / "pool" / "projects") == claude_log
+    assert find_session_log("the-sid", "codex", tmp_path / "pool" / "sessions") == codex_log
+
 def test_last_assistant_summary_extracts_codex_output_text(tmp_path):
     log = tmp_path / "codex.jsonl"
     log.write_text("\n".join([
@@ -266,3 +295,63 @@ def test_is_delegating_freshness_moves_with_the_episode_grace_env(tmp_path, monk
     assert is_delegating(record, now) is True
     monkeypatch.setenv("CLAUDE_ORCH_EPISODE_GRACE_SEC", "300")
     assert is_delegating(record, now) is False
+
+
+def test_is_delegating_true_for_a_worker_with_a_live_child(tmp_path, monkeypatch):
+    from dockwright import paths, state
+    monkeypatch.setattr(paths, "ACTIVE", tmp_path / "active")
+    (tmp_path / "active").mkdir()
+    state.write_json_atomic(paths.ACTIVE / "c1.json", {
+        "claude_sid": "c1", "agent": "worker", "kind": "subworker", "name": "alpha-review",
+        "parent_name": "alpha", "pid": os.getpid()})
+    assert is_delegating({"claude_sid": "w1", "name": "alpha", "runtime": "codex"}, time.time()) is True
+    assert is_delegating({"claude_sid": "w2", "name": "bravo", "runtime": "claude"}, time.time()) is False
+
+
+TURN_A = ('{"type":"turn.completed","usage":{"input_tokens":212735,"cached_input_tokens":153088,'
+          '"cache_write_input_tokens":0,"output_tokens":255,"reasoning_output_tokens":101}}')
+TURN_B = ('{"type":"turn.completed","usage":{"input_tokens":70690,"cached_input_tokens":0,'
+          '"cache_write_input_tokens":12,"output_tokens":9,"reasoning_output_tokens":0}}')
+
+
+def test_codex_usage_of_maps_turn_completed_onto_the_spend_scheme():
+    from dockwright.transcript import codex_usage_of
+    assert codex_usage_of(json.loads(TURN_A)) == {
+        "out_tokens": 255, "in_tokens": 59647, "cache_read_tokens": 153088,
+        "cache_creation_tokens": 0, "reasoning_tokens": 101}
+    assert codex_usage_of({"type": "turn.started"}) is None
+    assert codex_usage_of({"type": "turn.completed", "usage": "x"}) is None
+    assert codex_usage_of({"type": "turn.completed",
+                           "usage": {"input_tokens": 5, "cached_input_tokens": 9}})["in_tokens"] == 0
+
+
+def test_recount_codex_spend_sums_one_round_log_and_is_idempotent(tmp_path):
+    from dockwright.transcript import recount_codex_spend
+    log = tmp_path / "r1.log"
+    log.write_text("hook: SessionStart\n" + TURN_A + "\nReading additional input from stdin…\n" + TURN_B + "\n")
+    first = recount_codex_spend(log, None)
+    assert first == {"turns": 2, "out_tokens": 264, "in_tokens": 130337, "cache_read_tokens": 153088,
+                     "cache_creation_tokens": 12, "reasoning_tokens": 101, "last_turn_out": 9,
+                     "by_model": {}}
+    assert recount_codex_spend(log, first) == first
+
+
+def test_recount_codex_spend_keeps_prior_without_events_and_ignores_sibling_rounds(tmp_path):
+    from dockwright.transcript import recount_codex_spend
+    (tmp_path / "r1.log").write_text(TURN_A + "\n")
+    r2 = tmp_path / "r2.log"
+    r2.write_text('{"type":"thread.started","thread_id":"t"}\n')
+    prior = {"turns": 1, "out_tokens": 1}
+    assert recount_codex_spend(r2, prior) == prior
+    assert recount_codex_spend(tmp_path / "missing.log", prior) == prior
+
+
+def test_is_delegating_reads_live_children_from_the_records_it_is_given(tmp_path, monkeypatch):
+    from dockwright import paths
+    monkeypatch.setattr(paths, "ACTIVE", tmp_path / "active")
+    (tmp_path / "active").mkdir()
+    parent = {"claude_sid": "p1", "name": "alpha", "runtime": "codex"}
+    child = {"claude_sid": "c1", "kind": "subworker", "parent_name": "alpha",
+             "pid": os.getpid()}
+    assert is_delegating(parent, time.time(), records=[child]) is True
+    assert is_delegating(parent, time.time(), records=[]) is False

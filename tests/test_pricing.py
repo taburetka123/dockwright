@@ -1,3 +1,5 @@
+import pytest
+
 from dockwright import pricing
 
 
@@ -91,3 +93,136 @@ def test_unknown_model_still_unpriced_with_default_rates():
     from dockwright import pricing
     b = pricing.cost_breakdown("claude-newfamily-7", output_tokens=5)
     assert b["priced"] is False and b["total"] == 0.0
+
+
+def _cache_read_per_mtok(model, **kw):
+    return pricing.cost_breakdown(model, cache_read_tokens=1_000_000, **kw)["cache_read"]
+
+
+def test_cache_read_priced_at_published_per_model_rate():
+    assert _cache_read_per_mtok("claude-fable-5-1") == pytest.approx(0.25)
+    assert _cache_read_per_mtok("claude-mythos-5-1") == pytest.approx(0.25)
+    assert _cache_read_per_mtok("claude-fable-5") == pytest.approx(1.00)
+    assert _cache_read_per_mtok("claude-mythos-5") == pytest.approx(1.00)
+    assert _cache_read_per_mtok("claude-opus-5") == pytest.approx(0.50)
+    assert _cache_read_per_mtok("claude-opus-4-8") == pytest.approx(0.50)
+    assert _cache_read_per_mtok("claude-sonnet-5") == pytest.approx(0.20)
+    assert _cache_read_per_mtok("claude-sonnet-4-6") == pytest.approx(0.30)
+    assert _cache_read_per_mtok("claude-haiku-4-5") == pytest.approx(0.10)
+    assert _cache_read_per_mtok("claude-opus-5-5") == pytest.approx(0.20)
+    assert _cache_read_per_mtok("claude-sonnet-5-5") == pytest.approx(0.10)
+
+
+def test_opus_5_5_priced_at_its_own_rate_not_the_opus_family_rate():
+    newer = pricing.cost_breakdown("claude-opus-5-5",
+                                   input_tokens=1_000_000, output_tokens=1_000_000)
+    older = pricing.cost_breakdown("claude-opus-5",
+                                   input_tokens=1_000_000, output_tokens=1_000_000)
+    assert (newer["input"], newer["output"]) == pytest.approx((4.0, 20.0))
+    assert (older["input"], older["output"]) == pytest.approx((5.0, 25.0))
+
+
+def test_sonnet_5_5_priced_at_its_own_rate_not_the_sonnet_family_rate():
+    newer = pricing.cost_breakdown("claude-sonnet-5-5",
+                                   input_tokens=1_000_000, output_tokens=1_000_000)
+    older = pricing.cost_breakdown("claude-sonnet-4-6",
+                                   input_tokens=1_000_000, output_tokens=1_000_000)
+    assert (newer["input"], newer["output"]) == pytest.approx((2.0, 10.0))
+    assert (older["input"], older["output"]) == pytest.approx((3.0, 15.0))
+
+
+def test_sonnet_5_priced_at_its_own_rate_not_the_sonnet_family_rate():
+    newer = pricing.cost_breakdown("claude-sonnet-5[1m]",
+                                   input_tokens=1_000_000, output_tokens=1_000_000)
+    older = pricing.cost_breakdown("claude-sonnet-4-6",
+                                   input_tokens=1_000_000, output_tokens=1_000_000)
+    assert (newer["input"], newer["output"]) == pytest.approx((2.0, 10.0))
+    assert (older["input"], older["output"]) == pytest.approx((3.0, 15.0))
+
+
+def test_fable_5_1_cache_read_is_a_quarter_of_fable_5():
+    newer = pricing.cost_breakdown("claude-fable-5-1[1m]", cache_read_tokens=100_000_000)
+    older = pricing.cost_breakdown("claude-fable-5", cache_read_tokens=100_000_000)
+    assert newer["cache_read"] == pytest.approx(25.0)
+    assert newer["total"] == pytest.approx(25.0)
+    assert older["cache_read"] == pytest.approx(100.0)
+
+
+def test_cache_read_override_survives_context_and_date_suffixes():
+    assert _cache_read_per_mtok("claude-fable-5-1[1m]") == pytest.approx(0.25)
+    assert _cache_read_per_mtok("claude-fable-5-1-20260401") == pytest.approx(0.25)
+    assert _cache_read_per_mtok("CLAUDE-FABLE-5-1") == pytest.approx(0.25)
+    assert _cache_read_per_mtok("claude-mythos-5-1[1m]") == pytest.approx(0.25)
+    assert _cache_read_per_mtok("claude-opus-5-5[1m]") == pytest.approx(0.20)
+    assert _cache_read_per_mtok("claude-opus-5-5-20261001") == pytest.approx(0.20)
+
+
+def test_opus_5_5_rates_survive_context_and_date_suffixes():
+    for model in ("claude-opus-5-5[1m]", "claude-opus-5-5-20261001"):
+        b = pricing.cost_breakdown(model, input_tokens=1_000_000, output_tokens=1_000_000)
+        assert (b["input"], b["output"]) == pytest.approx((4.0, 20.0))
+
+
+def test_sibling_models_keep_the_standard_multiplier():
+    assert _cache_read_per_mtok("claude-fable-5") == pytest.approx(1.00)
+    assert _cache_read_per_mtok("claude-fable-5-15") == pytest.approx(1.00)
+    assert _cache_read_per_mtok("claude-opus-5-1") == pytest.approx(0.50)
+
+
+def test_cache_read_override_leaves_input_output_and_cache_write_alone():
+    b = pricing.cost_breakdown("claude-fable-5-1",
+                               input_tokens=1_000_000, output_tokens=1_000_000,
+                               cache_creation_5m_tokens=1_000_000,
+                               cache_creation_1h_tokens=1_000_000)
+    assert b["input"] == pytest.approx(10.0)
+    assert b["output"] == pytest.approx(50.0)
+    assert b["cache_write"] == pytest.approx(32.5)
+
+
+def test_cache_read_override_applies_to_the_overridden_base_rate():
+    rates = dict(pricing.MODEL_RATES)
+    rates["fable"] = (20.0, 100.0)
+    assert _cache_read_per_mtok("claude-fable-5-1", rates=rates) == pytest.approx(0.5)
+    assert _cache_read_per_mtok("claude-fable-5", rates=rates) == pytest.approx(2.0)
+
+
+def test_unpriced_model_stays_zero_under_the_override_lookup():
+    b = pricing.cost_breakdown("claude-mythos-5-1", cache_read_tokens=1_000_000,
+                               rates={"opus": (5.0, 25.0)})
+    assert b["priced"] is False
+    assert b["total"] == 0.0
+
+
+def test_fable_5_2_priced_at_its_own_rate_not_the_fable_family_rate():
+    newer = pricing.cost_breakdown("claude-fable-5-2",
+                                   input_tokens=1_000_000, output_tokens=1_000_000)
+    older = pricing.cost_breakdown("claude-fable-5-1",
+                                   input_tokens=1_000_000, output_tokens=1_000_000)
+    assert (newer["input"], newer["output"]) == pytest.approx((8.0, 40.0))
+    assert (older["input"], older["output"]) == pytest.approx((10.0, 50.0))
+
+
+def test_fable_5_2_cache_read_at_its_published_rate():
+    assert _cache_read_per_mtok("claude-fable-5-2") == pytest.approx(0.20)
+    assert _cache_read_per_mtok("claude-fable-5-2[1m]") == pytest.approx(0.20)
+    assert _cache_read_per_mtok("claude-fable-5-2-20261101") == pytest.approx(0.20)
+
+
+def test_haiku_5_5_priced_at_its_own_rate_not_the_haiku_family_rate():
+    for model in ("claude-haiku-5-5", "claude-haiku-5-5[1m]"):
+        b = pricing.cost_breakdown(model, input_tokens=1_000_000, output_tokens=1_000_000)
+        assert (b["input"], b["output"]) == pytest.approx((0.10, 0.50))
+    older = pricing.cost_breakdown("claude-haiku-4-5",
+                                   input_tokens=1_000_000, output_tokens=1_000_000)
+    assert (older["input"], older["output"]) == pytest.approx((1.0, 5.0))
+
+
+def test_haiku_5_5_cache_read_is_a_tenth_of_its_input_rate():
+    assert _cache_read_per_mtok("claude-haiku-5-5") == pytest.approx(0.01)
+    assert _cache_read_per_mtok("claude-haiku-5-5[1m]") == pytest.approx(0.01)
+
+
+def test_sonnet_5_5_cache_read_survives_context_and_date_suffixes():
+    assert _cache_read_per_mtok("claude-sonnet-5-5[1m]") == pytest.approx(0.10)
+    assert _cache_read_per_mtok("claude-sonnet-5-5-20261001") == pytest.approx(0.10)
+    assert _cache_read_per_mtok("claude-sonnet-5") == pytest.approx(0.20)

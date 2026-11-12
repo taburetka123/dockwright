@@ -19,10 +19,11 @@ import gardener_postrun
 
 class ApplyError(Exception):
 
-    def __init__(self, message: str, code: int = 1, klass=None):
+    def __init__(self, message: str, code: int = 1, klass=None, rollback_failed=False):
         super().__init__(message)
         self.code = code
         self.klass = klass
+        self.rollback_failed = rollback_failed
 
 
 _FENCE_OPEN = re.compile(r"^```diff\s*$")
@@ -647,7 +648,7 @@ class ProposalCurrency:
         self.note = note
 
 
-_CREATING_KINDS = ("new-asset", "build-brief")
+_CREATING_KINDS = ("new-asset", "build-brief", "proposal-retire")
 _VERDICT_ORDER = ("STALE", "unknown", "fresh", "n/a")
 
 
@@ -993,7 +994,8 @@ def _execute_plan(plan, snapshot):
                         "modified, inspect git status")
         code = exc.code if isinstance(exc, ApplyError) else 1
         raise ApplyError(message, code=code,
-                         klass=getattr(exc, "klass", None))
+                         klass=getattr(exc, "klass", None),
+                         rollback_failed=bool(failures))
     return records
 
 
@@ -1085,6 +1087,57 @@ def _canon_gate(plan, pre_validator):
     return summaries
 
 
+def _gate_or_restore(plan, pre_validator, snapshot):
+    try:
+        return _canon_gate(plan, pre_validator)
+    except _SuiteRed as red:
+        failures = _restore(snapshot)
+        try:
+            rerun = _run_repo_suite(red.root)
+        except ApplyError as exc2:
+            raise ApplyError(f"(canon-gate) {exc2}", code=1, klass="canon-gate",
+                             rollback_failed=bool(failures))
+        tail = "\n".join(
+            ((red.proc.stdout or "") + (red.proc.stderr or ""))
+            .strip().splitlines()[-15:])
+        if rerun.returncode != 0:
+            message = (
+                f"canon gate: pre-existing failures in {red.root} "
+                "— the repo was red BEFORE this apply; fix the repo first "
+                f"(all touched files restored):\n{tail}")
+        else:
+            message = (
+                f"canon gate: the apply broke the suite in {red.root} "
+                f"(all touched files restored):\n{tail}")
+        for path in failures:
+            message += (f"\nROLLBACK OF {path} FAILED — tree left "
+                        "modified, inspect git status")
+        raise ApplyError(f"(canon-gate) {message}", code=1,
+                         klass="canon-gate", rollback_failed=bool(failures))
+    except ApplyError as exc:
+        failures = _restore(snapshot)
+        message = f"{exc} (all touched files restored)"
+        for path in failures:
+            message += (f"\nROLLBACK OF {path} FAILED — tree left "
+                        "modified, inspect git status")
+        raise ApplyError(f"(canon-gate) {message}", code=1,
+                         klass="canon-gate", rollback_failed=bool(failures))
+
+
+def _close_interrupted_apply(meta, snapshot, exc):
+    failures = _restore(snapshot) if snapshot is not None else []
+    reason = type(exc).__name__ + (f": {exc}" if str(exc) else "")
+    message = f"gardener-apply: interrupted after start ({reason}); all touched files restored"
+    for path in failures:
+        message += (f"\nROLLBACK OF {path} FAILED — tree left "
+                    "modified, inspect git status")
+    print(message, file=sys.stderr)
+    gardener_postrun.ledger_append(
+        "proposal_apply_failed", proposal_id=str(meta.get("id")),
+        reasons=message, lane=str(meta.get("lane") or "digest"),
+        after_start=True, rollback_failed=bool(failures))
+
+
 def cmd_apply(args) -> int:
     try:
         meta, plan = resolve_plan(args.proposal)
@@ -1093,6 +1146,7 @@ def cmd_apply(args) -> int:
             raise ApplyError(f"({exc.klass}) {exc}", code=exc.code,
                              klass=exc.klass)
         raise
+    args.apply_meta = meta
     for root in plan:
         ensure_git_root(root)
     for root, rp in plan.items():
@@ -1113,43 +1167,24 @@ def cmd_apply(args) -> int:
     except ApplyError as exc:
         raise ApplyError(f"(canon-gate) {exc}", code=exc.code,
                          klass="canon-gate")
-    snapshot = _snapshot(plan)
-    records = _execute_plan(plan, snapshot)
+    with gardener_postrun.move_lock():
+        gardener_postrun.ledger_append(
+            "proposal_apply_started", proposal_id=str(meta.get("id")),
+            lane=str(meta.get("lane") or "digest"))
+        args.apply_started = True
+        if not os.path.isfile(args.proposal):
+            raise ApplyError(
+                "proposal file left proposals/pending/ while this apply was starting "
+                f"(superseded or decided): {args.proposal} — nothing was written", code=2)
+    snapshot = None
     try:
-        gate_summaries = _canon_gate(plan, pre_validator)
-    except _SuiteRed as red:
-        failures = _restore(snapshot)
-        try:
-            rerun = _run_repo_suite(red.root)
-        except ApplyError as exc2:
-            raise ApplyError(f"(canon-gate) {exc2}", code=1, klass="canon-gate")
-        tail = "\n".join(
-            ((red.proc.stdout or "") + (red.proc.stderr or ""))
-            .strip().splitlines()[-15:])
-        if rerun.returncode != 0:
-            message = (
-                f"canon gate: pre-existing failures in {red.root} "
-                "— the repo was red BEFORE this apply; fix the repo first "
-                f"(all touched files restored):\n{tail}")
-        else:
-            message = (
-                f"canon gate: the apply broke the suite in {red.root} "
-                f"(all touched files restored):\n{tail}")
-        for path in failures:
-            message += (f"\nROLLBACK OF {path} FAILED — tree left "
-                        "modified, inspect git status")
-        raise ApplyError(f"(canon-gate) {message}", code=1,
-                         klass="canon-gate")
-    except ApplyError as exc:
-        failures = _restore(snapshot)
-        message = f"{exc} (all touched files restored)"
-        for path in failures:
-            message += (f"\nROLLBACK OF {path} FAILED — tree left "
-                        "modified, inspect git status")
-        raise ApplyError(f"(canon-gate) {message}", code=1,
-                         klass="canon-gate")
-    except BaseException:
-        _restore(snapshot)
+        snapshot = _snapshot(plan)
+        records = _execute_plan(plan, snapshot)
+        gate_summaries = _gate_or_restore(plan, pre_validator, snapshot)
+    except ApplyError:
+        raise
+    except BaseException as exc:
+        _close_interrupted_apply(meta, snapshot, exc)
         raise
     for rec in records:
         if rec.strip():
@@ -1306,15 +1341,20 @@ def main(argv=None) -> int:
     except ApplyError as exc:
         print(f"gardener-apply: {exc}", file=sys.stderr)
         if args.cmd == "apply":
-            try:
-                meta, _body = load_proposal(args.proposal)
+            meta = getattr(args, "apply_meta", None)
+            if meta is None:
+                try:
+                    meta, _body = load_proposal(args.proposal)
+                    pid = str(meta.get("id"))
+                except ApplyError:
+                    meta, pid = {}, "unknown"
+            else:
                 pid = str(meta.get("id"))
-                lane = str(meta.get("lane") or "digest")
-            except ApplyError:
-                pid, lane = "unknown", "digest"
             gardener_postrun.ledger_append(
                 "proposal_apply_failed", proposal_id=pid, reasons=str(exc),
-                lane=lane)
+                lane=str(meta.get("lane") or "digest"),
+                after_start=bool(getattr(args, "apply_started", False)),
+                rollback_failed=bool(exc.rollback_failed))
         return exc.code
 
 

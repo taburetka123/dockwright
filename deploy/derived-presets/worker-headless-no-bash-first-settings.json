@@ -1,0 +1,6 @@
+{
+  "extends": "worker-headless-settings.json",
+  "env": {
+    "CLAUDE_CODE_THRIFTY_SONIC": "0"
+  }
+}

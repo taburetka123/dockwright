@@ -50,7 +50,7 @@ if [ "$LANE" = "frontier" ]; then
   MARKER="$GARDENER_DIR/last-frontier-run"
 fi
 
-TIMEOUT_SEC="${GARDENER_TIMEOUT_SEC:-1800}"
+TIMEOUT_SEC="${GARDENER_TIMEOUT_SEC:-3600}"
 if [ "$LANE" = "frontier" ] && [ -z "${GARDENER_TIMEOUT_SEC:-}" ]; then
   TIMEOUT_SEC=2700
 fi
@@ -208,6 +208,31 @@ else
 EOF
 fi
 
+DEDUP_SCRIPT="$HOMEDIR/.claude/scripts/dup_sentences.py"
+if [ "$MODE" = "visible" ] && [ -f "$DEDUP_SCRIPT" ]; then
+  DEDUP_ARGS=(--base "$HOMEDIR/.claude")
+  [ -f "$HOMEDIR/.claude/scripts/dup_sentences.baseline.json" ] && DEDUP_ARGS+=(--baseline "$HOMEDIR/.claude/scripts/dup_sentences.baseline.json")
+  for extra in "$GARDENER_CWD/deploy" "$GARDENER_CWD/src"; do
+    [ -d "$extra" ] && DEDUP_ARGS+=(--extra-root "$extra")
+  done
+  UNITS_DIR="$(command -v _dockwright_toml_get >/dev/null 2>&1 && _dockwright_toml_get paths project_units_dir path || true)"
+  [ -n "$UNITS_DIR" ] && [ -d "$UNITS_DIR" ] && DEDUP_ARGS+=(--extra-root "$UNITS_DIR")
+  DEDUP_OUT="$RUN_DIR/dup-sentences.txt"
+  if python3 "$DEDUP_SCRIPT" "${DEDUP_ARGS[@]}" > "$DEDUP_OUT" 2>&1; then
+    run_log "dedup" "three-repo dedup clean (${DEDUP_ARGS[*]})"
+  else
+    DEDUP_RC=$?
+    mkdir -p "$FINDINGS_DIR" 2>/dev/null || true
+    {
+      echo "# Three-repo sentence dedup, gardener run $RUN_ID (exit $DEDUP_RC)"
+      echo "# python3 $DEDUP_SCRIPT ${DEDUP_ARGS[*]}"
+      echo
+      cat "$DEDUP_OUT"
+    } > "$FINDINGS_DIR/dedup-$RUN_ID.md"
+    run_log "dedup" "three-repo dedup exit $DEDUP_RC — finding filed at $FINDINGS_DIR/dedup-$RUN_ID.md"
+  fi
+fi
+
 SETTINGS_PRESET="$HOMEDIR/.claude/dockwright/presets/gardener-analyst-settings.json"
 if ! cp "$SETTINGS_PRESET" "$SETTINGS_FILE" 2>/dev/null; then
   run_log "error" "settings preset missing: $SETTINGS_PRESET — run setup.sh"
@@ -326,10 +351,19 @@ if [ "$MODE" = "headless" ]; then
     cat "$PROMPT_FILE"
   } > "$HEADLESS_PROMPT_FILE"
   mkdir -p "$FINDINGS_DIR" "$GARDENER_DIR" 2>/dev/null || true
+  GARDENER_MODEL="$(dockwright model resolve '@sonnet')"
+  [ -n "$GARDENER_MODEL" ] || { run_log "error" "model-unresolved — dockwright model resolve '@sonnet' printed nothing — run setup.sh"; notify "gardener $RUN_ID: model unresolved — update the dockwright on PATH"; exit 1; }
+  ROLE_RENDER=()
+  if ROLE_LINES="$(dockwright role-args GenericWorker --launch lane --cwd "$PWD" --render-only 2>>"$RUN_LOG")"; then
+    while IFS= read -r a; do [ -n "$a" ] && ROLE_RENDER+=("$a"); done <<< "$ROLE_LINES"
+  else
+    run_log "role" "role-args refused — launching without a role render"
+  fi
   set -m
   ( exec env -u CLAUDE_AGENT -u CLAUDE_WORKER_NAME -u CLAUDE_PARENT_MANAGER -u CLAUDE_DOMAIN \
       claude -p \
-      --model claude-sonnet-5 \
+      --model "$GARDENER_MODEL" \
+      ${ROLE_RENDER[@]+"${ROLE_RENDER[@]}"} \
       --add-dir "$FINDINGS_DIR" \
       --add-dir "$GARDENER_DIR" \
       --allowedTools 'Bash(cat:*) Bash(ls:*) Bash(wc:*) Bash(head:*) Bash(tail:*) Bash(grep:*) Bash(jq:*)' \
@@ -392,7 +426,20 @@ if tmux -L "$TMUX_SOCK" has-session -t claude-workers 2>/dev/null; then
 else
   TMUX_HEAD=(new-session -d -s claude-workers)
 fi
-INNER_CMD="cd $(printf '%q' "$GARDENER_CWD") && env -u CLAUDE_AGENT -u CLAUDE_WORKER_NAME -u CLAUDE_PARENT_MANAGER -u CLAUDE_DOMAIN claude --model claude-sonnet-5 --settings $(printf '%q' "$SETTINGS_FILE") \"\$(cat $(printf '%q' "$PROMPT_FILE"))\""
+GARDENER_MODEL="$(dockwright model resolve '@sonnet')"
+[ -n "$GARDENER_MODEL" ] || { run_log "error" "model-unresolved — dockwright model resolve '@sonnet' printed nothing — run setup.sh"; notify "gardener $RUN_ID: model unresolved — update the dockwright on PATH"; exit 1; }
+DOCKWRIGHT_BIN="${DOCKWRIGHT_BIN:-$(command -v dockwright 2>/dev/null || true)}"
+[ -n "$DOCKWRIGHT_BIN" ] || DOCKWRIGHT_BIN="$HOME/.local/bin/dockwright"
+ROLE_FLAGS=""
+if ROLE_LINES="$(dockwright role-args GenericWorker --launch lane --cwd "$GARDENER_CWD" --base "$SETTINGS_FILE" 2>>"$RUN_LOG")"; then
+  while IFS= read -r arg; do
+    [ -n "$arg" ] && ROLE_FLAGS+="$(printf '%q' "$arg") "
+  done <<< "$ROLE_LINES"
+else
+  run_log "role" "role-args GenericWorker --launch lane refused (its stderr is above) — launching on the lane's own settings"
+  ROLE_FLAGS="--settings $(printf '%q' "$SETTINGS_FILE") "
+fi
+INNER_CMD="cd $(printf '%q' "$GARDENER_CWD") && env -u CLAUDE_AGENT -u CLAUDE_WORKER_NAME -u CLAUDE_PARENT_MANAGER -u CLAUDE_DOMAIN $(printf '%q' "$DOCKWRIGHT_BIN") launch --model '$GARDENER_MODEL' ${ROLE_FLAGS}\"\$(cat $(printf '%q' "$PROMPT_FILE"))\""
 SPAWN_SHELL="$(command -v zsh || command -v bash || echo sh)"
 WINDOW_ID=$(tmux -L "$TMUX_SOCK" ${FFLAG[@]+"${FFLAG[@]}"} "${TMUX_HEAD[@]}" \
   -n "🌱 gardener $RUN_ID" -c "$GARDENER_CWD" -P -F '#{pane_id}' -- \

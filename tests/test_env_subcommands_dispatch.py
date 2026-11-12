@@ -26,6 +26,13 @@ def _usage_entries(text):
     ("ensure-worker-home", "ensure_worker_home"),
     ("boot-brief", "boot_brief"),
     ("accounts-sync", "accounts_sync"),
+    ("account-hold", "account_hold"),
+    ("revive", "revive"),
+    ("pipeline", "pipeline"),
+    ("notebook-migrate", "notebook_migrate"),
+    ("tech-debt", "tech_debt"),
+    ("board", "board"),
+    ("role-args", "roles"),
 ])
 def test_dispatch_routes_to_module_main(monkeypatch, cmd, modattr):
     import importlib
@@ -42,6 +49,18 @@ def test_dispatch_routes_to_module_main(monkeypatch, cmd, modattr):
     assert called["argv"] == ["--x", "1"]
 
 
+@pytest.mark.parametrize("cmd", ["pause", "resume"])
+def test_pause_and_resume_dispatch_with_the_subcommand_first(monkeypatch, cmd):
+    from dockwright import pause
+    called = {}
+    monkeypatch.setattr(pause, "main", lambda argv: called.setdefault("argv", argv) and 0)
+    monkeypatch.setattr(m.sys, "argv", ["dockwright", cmd, "--dry-run"])
+    with pytest.raises(SystemExit) as ei:
+        m.main()
+    assert ei.value.code == 0 and called["argv"] == [cmd, "--dry-run"]
+    assert cmd in _usage_entries(m.USAGE)
+
+
 @pytest.mark.parametrize("flag", ["--help", "-h", "help"])
 def test_help_prints_usage_rc0(monkeypatch, capsys, flag):
     monkeypatch.setattr(m.sys, "argv", ["dockwright", flag])
@@ -51,7 +70,7 @@ def test_help_prints_usage_rc0(monkeypatch, capsys, flag):
     captured = capsys.readouterr()
     assert captured.err == ""
     entries = _usage_entries(captured.out)
-    for sub in ("doctor", "manager", "monitor", "selffix", "gardener", "uninstall"):
+    for sub in ("doctor", "manager", "monitor", "selffix", "gardener", "uninstall", "role-args"):
         assert sub in entries
     assert "session-start" in entries
     assert "Internal" in captured.out

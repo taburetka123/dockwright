@@ -130,6 +130,12 @@ def test_registry_has_loops():
     assert len(LOOPS) >= 5
 
 
+def test_new_loop_convention_names_the_role_render():
+    text = REGISTRY_PATH.read_text()
+    convention = text[text.index("- **New loop**"):text.index("- **Pausing")]
+    assert "dockwright role-args" in convention and "--render-only" in convention
+
+
 @pytest.mark.parametrize("loop", LOOPS, ids=lambda l: l.get("name", "?"))
 def test_block_has_all_required_fields_non_empty(loop):
     for field in _status.REQUIRED_FIELDS:

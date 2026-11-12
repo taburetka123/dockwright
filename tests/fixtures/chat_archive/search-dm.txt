@@ -1,0 +1,28 @@
+# Search Results for:
+
+## Messages (2 results)
+### Result 1 of 2
+Channel: DM (ID: D01ABCDEF)
+Participants: Ada Example (ID: U01ABCDEF), Bot Example (ID: U01BOT000)
+From: Bot Example (ID: U01BOT000)  [BOT]
+Time: 2026-10-27 13:10:58 +00
+Message_ts: 1793106658.209309
+Permalink: [link](https://chat.example.test/archives/D01ABCDEF/p1793106658209309)
+Text:
+Lorem ipsum from a bot, dolor sit amet.
+
+---
+
+### Result 2 of 2
+Channel: DM (ID: D01ABCDEF)
+Participants: Ada Example (ID: U01ABCDEF), Me Example (ID: U01ME00000)
+From: Ada Example <ada@example.test> (ID: U01ABCDEF)
+Time: 2026-10-27 13:20:59 +00
+Message_ts: 1793107259.250289
+Permalink: [link](https://chat.example.test/archives/D01ABCDEF/p1793107259250289)
+Text:
+Consectetur adipiscing elit, sed do eiusmod.
+
+---
+
+For the next page of results use cursor `c2VhcmNoLWRt`

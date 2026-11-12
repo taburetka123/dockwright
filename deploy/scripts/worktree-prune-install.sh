@@ -35,6 +35,37 @@ else
   echo "      If that is not the gh you want, re-run with WORKTREE_PRUNE_GH=<path>." >&2
 fi
 
+if [ -z "${WORKTREE_PRUNE_MIN_AGE_DAYS:-}" ] && [ -f "$PLIST_PATH" ]; then
+  PRESERVED_AGE="$(sed -n '/<key>WORKTREE_PRUNE_MIN_AGE_DAYS<\/key>/{n;s:.*<string>\(.*\)</string>.*:\1:p;}' "$PLIST_PATH" | head -1)"
+  if [ -n "$PRESERVED_AGE" ]; then
+    WORKTREE_PRUNE_MIN_AGE_DAYS="$PRESERVED_AGE"
+    echo "→ Preserving WORKTREE_PRUNE_MIN_AGE_DAYS from the existing plist: $PRESERVED_AGE"
+  fi
+fi
+if [ -n "${WORKTREE_PRUNE_MIN_AGE_DAYS:-}" ]; then
+  MIN_AGE_OK=0
+  case "$WORKTREE_PRUNE_MIN_AGE_DAYS" in
+    *[!0-9]*) ;;
+    *[1-9]*) MIN_AGE_OK=1;;
+  esac
+  if [ "$MIN_AGE_OK" = 0 ]; then
+    echo "ERROR: WORKTREE_PRUNE_MIN_AGE_DAYS must be a positive whole number of days," >&2
+    echo "  got '$WORKTREE_PRUNE_MIN_AGE_DAYS'." >&2
+    echo "  Refusing rather than writing it: the tick would fall back to the built-in default" >&2
+    echo "  and silently run a different window than you asked for, and a bad value in the plist" >&2
+    echo "  is preserved by every later bare re-run." >&2
+    exit 1
+  fi
+fi
+MIN_AGE_LINE=""
+if [ -n "${WORKTREE_PRUNE_MIN_AGE_DAYS:-}" ]; then
+  MIN_AGE_LINE="        <key>WORKTREE_PRUNE_MIN_AGE_DAYS</key>
+        <string>$WORKTREE_PRUNE_MIN_AGE_DAYS</string>"
+  echo "→ Age window: $WORKTREE_PRUNE_MIN_AGE_DAYS days"
+else
+  echo "→ Age window: the script default (a tree younger than it is never removed)"
+fi
+
 APPLY_ARG="        <string>--apply</string>"
 if [ "${WORKTREE_PRUNE_INSTALL_APPLY:-1}" = "0" ]; then
   APPLY_ARG=""
@@ -52,6 +83,30 @@ fi
 if ! /usr/bin/python3 "$SCRIPT" --capabilities 2>/dev/null | grep -qx "keeplist"; then
   echo "ERROR: deployed $SCRIPT does not report the 'keeplist' capability." >&2
   echo "  Installing this plist over it would widen deletion with no way to hold a tree." >&2
+  echo "  Run ./setup.sh from the main clone first, then re-run this installer." >&2
+  exit 1
+fi
+
+if ! /usr/bin/python3 "$SCRIPT" --capabilities 2>/dev/null | grep -qx "age-gate"; then
+  echo "ERROR: deployed $SCRIPT does not report the 'age-gate' capability." >&2
+  echo "  Without it a worktree is prunable the minute it is created: clean, no commits," >&2
+  echo "  so its head is an ancestor of main, and no PR. Installing this plist over such" >&2
+  echo "  a script lets the prune remove a fresh tree a worker is still using." >&2
+  echo "  Run ./setup.sh from the main clone first, then re-run this installer." >&2
+  exit 1
+fi
+
+if ! /usr/bin/python3 "$SCRIPT" --capabilities 2>/dev/null | grep -qx "merged-gate"; then
+  echo "ERROR: deployed $SCRIPT does not report the 'merged-gate' capability." >&2
+  echo "  Without it a tree whose PR closed unmerged, or merged at an older commit," >&2
+  echo "  counts as finished and is removed with its unmerged commits." >&2
+  echo "  Run ./setup.sh from the main clone first, then re-run this installer." >&2
+  exit 1
+fi
+
+if ! /usr/bin/python3 "$SCRIPT" --capabilities 2>/dev/null | grep -qx "open-work-gate"; then
+  echo "ERROR: deployed $SCRIPT does not report the 'open-work-gate' capability." >&2
+  echo "  Without it the loop removes the worktree of a dockwright work that is still running." >&2
   echo "  Run ./setup.sh from the main clone first, then re-run this installer." >&2
   exit 1
 fi
@@ -124,6 +179,7 @@ $APPLY_ARG
         <key>PATH</key>
         <string>$BAKED_PATH</string>
 $GH_BIN_LINE
+$MIN_AGE_LINE
     </dict>
 </dict>
 </plist>

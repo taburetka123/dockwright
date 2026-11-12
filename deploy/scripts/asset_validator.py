@@ -13,14 +13,14 @@ import time
 
 COMMAND_EXEMPT = {
     "manager", "manager-assign", "manager-close", "manager-reboot", "manager-recycle",
-    "manager-resume", "manager-takeover-recovery", "recreate-manager", "tab", "fix",
+    "manager-resume", "manager-takeover-recovery", "recreate-manager", "tab",
 }
 COMMAND_EXEMPT_PREFIXES: tuple[str, ...] = ()
 SKILL_EXEMPT: set[str] = set()
 NAME_PREFIXES = ("dockwright-",)
 
 _REF_RE = re.compile(r"~/\.claude/[A-Za-z0-9_/.-]+\.md")
-_SKILL_REF_RE = re.compile(r"\breferences/[A-Za-z0-9_.-]+")
+_SKILL_REF_RE = re.compile(r"(?<![A-Za-z0-9_/.-])references/[A-Za-z0-9_.-]+")
 _ALIAS_RE = re.compile(
     r"DEPRECATED alias(?:[ \t]+(?:for|use|renamed(?:[ \t]+to)?)|[ \t]*[—–-]+[ \t]*(?:for|use|renamed(?:[ \t]+to)?))?[ \t]+[`/]*([a-z0-9][a-z0-9:-]*)",
     re.IGNORECASE,
@@ -212,6 +212,21 @@ def _check_skill_refs(repo: str, rel: str, text: str) -> list[str]:
     return warnings
 
 
+_ROLE_FRAGMENT_RE = re.compile(r"roles/[^/]+/fragments/.+\.md")
+
+
+def _strip_frontmatter(text: str) -> str:
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end != -1:
+            return text[end + 5:]
+    return text
+
+
+def _is_rule(rel: str) -> bool:
+    return (rel.startswith("rules/") and rel.endswith(".md")) or bool(_ROLE_FRAGMENT_RE.fullmatch(rel))
+
+
 def validate_one(repo: str, rel: str, config: dict | None = None) -> list[str]:
     text = _read(repo, rel)
     if text is None:
@@ -220,13 +235,14 @@ def validate_one(repo: str, rel: str, config: dict | None = None) -> list[str]:
         config = load_config(repo)
     settings = _settings(config)
     warnings: list[str] = []
-    if rel.startswith("rules/") and rel.endswith(".md"):
-        head = text.splitlines()[:10]
+    if _is_rule(rel):
+        rule_text = _strip_frontmatter(text)
+        head = rule_text.splitlines()[:10]
         if not any(line.startswith("TRIGGER:") or " TRIGGER:" in line for line in head):
             warnings.append(
                 f"W-RULE-TRIGGER {rel}: no TRIGGER: line in first 10 lines — add "
                 f"'TRIGGER: Load when <situation>' so a reader knows when it applies")
-        if not text.lstrip().startswith("# "):
+        if not rule_text.lstrip().startswith("# "):
             warnings.append(
                 f"W-RULE-TITLE {rel}: does not start with a '# ' title — add "
                 f"'# <Rule name>' as the first line")
@@ -332,6 +348,10 @@ def _all_asset_files(repo: str) -> list[str]:
         d = os.path.join(repo, sub)
         if os.path.isdir(d):
             rels += [f"{sub}/{f}" for f in _listdir(d) if f.endswith(".md")]
+    roles = os.path.join(repo, "roles")
+    for role in _listdir(roles):
+        fragments = os.path.join(roles, role, "fragments")
+        rels += [f"roles/{role}/fragments/{f}" for f in _listdir(fragments) if f.endswith(".md")]
     skills = os.path.join(repo, "skills")
     if os.path.isdir(skills):
         for name in _listdir(skills):

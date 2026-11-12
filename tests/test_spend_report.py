@@ -285,3 +285,104 @@ def test_gardener_ledger_falls_back_to_legacy_home(tmp_path, monkeypatch):
     finally:
         monkeypatch.undo()
         importlib.reload(spend_report)
+
+
+CODEX_NOTE = ("note: codex sessions in window with no recorded spend are not counted; "
+              "spend-report <session> reads a Codex session's tokens from its rollout")
+
+CHILD_NOTE_1 = ("note: 1 headless Codex child round(s) in window logged no turn.completed, "
+                "so nothing was counted for them")
+CHILD_NOTE_2 = ("note: 2 headless Codex child round(s) in window logged no turn.completed, "
+                "so nothing was counted for them")
+
+
+def test_codex_note_absent_when_a_codex_child_carries_spend(world, capsys):
+    spend_ledger.append_drop_event(
+        {"claude_sid": "c1", "agent": "worker", "name": "alpha-review",
+         "runtime": "codex", "spend": SPEND}, "session_end")
+    assert spend_report.main(["--days", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "alpha-review" in out
+    assert CODEX_NOTE not in out
+    assert "headless Codex child round(s)" not in out
+
+
+def test_codex_note_present_when_the_only_codex_session_has_no_spend(world, capsys):
+    state.write_json_atomic(world / "closed" / "tui.json", {
+        "claude_sid": "tui", "name": "codex-tui", "closed_at": _ts(),
+        "closed_reason": "session_end", "runtime": "codex",
+    })
+    assert spend_report.main(["--days", "1"]) == 0
+    assert CODEX_NOTE in capsys.readouterr().out
+
+
+def test_codex_note_present_when_a_spendless_tui_sits_beside_a_counted_child(world, capsys):
+    spend_ledger.append_drop_event(
+        {"claude_sid": "c1", "agent": "worker", "name": "alpha-review",
+         "runtime": "codex", "spend": SPEND}, "session_end")
+    state.write_json_atomic(world / "closed" / "tui.json", {
+        "claude_sid": "tui", "name": "codex-tui", "closed_at": _ts(),
+        "closed_reason": "session_end", "runtime": "codex",
+    })
+    assert spend_report.main(["--days", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "alpha-review" in out
+    assert CODEX_NOTE in out
+    assert "headless Codex child round(s)" not in out
+
+
+def test_codex_note_absent_when_the_window_holds_no_codex_session(world, capsys):
+    spend_ledger.append_drop_event(
+        {"claude_sid": "a", "agent": "worker", "name": "w1", "spend": SPEND}, "session_end")
+    assert spend_report.main(["--days", "1"]) == 0
+    assert CODEX_NOTE not in capsys.readouterr().out
+
+
+def test_codex_note_present_for_a_spendless_codex_ledger_event(world, capsys):
+    spend_ledger.append_drop_event(
+        {"claude_sid": "c9", "name": "alpha-review-final", "runtime": "codex"},
+        "prune")
+    assert spend_report.main(["--days", "1"]) == 0
+    assert CODEX_NOTE in capsys.readouterr().out
+
+
+def _spendless_codex_child(world, sid, name):
+    state.write_json_atomic(world / "closed" / f"{sid}.json", {
+        "claude_sid": sid, "name": name, "kind": "subworker", "closed_at": _ts(),
+        "closed_reason": "session_end", "runtime": "codex", "parent_name": "alpha"})
+
+
+def test_a_spendless_codex_child_round_gets_its_own_note_not_the_tui_one(world, capsys):
+    spend_ledger.append_drop_event(
+        {"claude_sid": "c1", "agent": "worker", "name": "alpha-review",
+         "runtime": "codex", "spend": SPEND}, "session_end")
+    _spendless_codex_child(world, "c2", "alpha-build")
+    assert spend_report.main(["--days", "1"]) == 0
+    out = capsys.readouterr().out
+    assert CHILD_NOTE_1 in out
+    assert CODEX_NOTE not in out
+
+
+def test_an_in_flight_codex_child_round_is_not_reported_as_uncounted(world, capsys):
+    import os
+    state.write_json_atomic(world / "active" / "c2.json", {
+        "claude_sid": "c2", "name": "alpha-build", "kind": "subworker",
+        "runtime": "codex", "parent_name": "alpha", "agent": "worker",
+        "state": "processing", "pid": os.getpid(), "started_at": _ts(),
+    })
+    assert spend_report.main(["--days", "1"]) == 0
+    out = capsys.readouterr().out
+    assert "headless Codex child round(s)" not in out
+    assert CODEX_NOTE not in out
+
+
+def test_a_spendless_tui_beside_a_spendless_child_prints_both_notes(world, capsys):
+    state.write_json_atomic(world / "closed" / "tui.json", {
+        "claude_sid": "tui", "name": "codex-tui", "closed_at": _ts(),
+        "closed_reason": "session_end", "runtime": "codex"})
+    _spendless_codex_child(world, "c2", "alpha-build")
+    _spendless_codex_child(world, "c3", "alpha-review")
+    assert spend_report.main(["--days", "1"]) == 0
+    out = capsys.readouterr().out
+    assert CODEX_NOTE in out
+    assert CHILD_NOTE_2 in out

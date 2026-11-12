@@ -1,5 +1,9 @@
 import asyncio
+import os
+import shutil
 import subprocess
+import time
+from pathlib import Path
 import pytest
 from dockwright import terminal, paths
 from dockwright.terminal import TmuxDriver, TerminalDriver, get_driver, WORKERS_OS_WINDOW_CLASS
@@ -279,7 +283,8 @@ def test_tmux_send_text_swallows_and_default_submits_enter(monkeypatch):
     def boom(args, *a, **kw):
         raise RuntimeError("boom")
     monkeypatch.setattr(subprocess, "run", boom)
-    assert TmuxDriver().send_text("%5", "x") is None
+    assert TmuxDriver().send_text("%5", "x") is False, (
+        "the exception is still swallowed; the return now reports the failure")
 
 
 def test_tmux_send_text_checked_short_circuits(monkeypatch):
@@ -326,6 +331,25 @@ def test_tmux_send_text_checked_ignores_failing_pin(monkeypatch):
     assert TmuxDriver().send_text_checked("%5", "hi") is True
 
 
+def test_tmux_send_key_presses_one_key_without_enter(monkeypatch):
+    monkeypatch.setenv("CLAUDE_ORCH_TMUX_SOCKET", "S")
+    calls = _capture_run(monkeypatch)
+    assert TmuxDriver().send_key("%5", "2") is True
+    assert [c["args"] for c in calls] == [["tmux", "-L", "S", "send-keys", "-t", "%5", "2"]]
+
+
+def test_tmux_send_key_reports_a_failed_press(monkeypatch):
+    monkeypatch.setenv("CLAUDE_ORCH_TMUX_SOCKET", "S")
+    monkeypatch.setattr(subprocess, "run",
+                        lambda args, *a, **kw: subprocess.CompletedProcess(args, 1, "", "no pane"))
+    assert TmuxDriver().send_key("%5", "2") is False
+
+    def boom(args, *a, **kw):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(subprocess, "run", boom)
+    assert TmuxDriver().send_key("%5", "2") is False
+
+
 def test_tmux_capture_screen_argv(monkeypatch):
     monkeypatch.setenv("CLAUDE_ORCH_TMUX_SOCKET", "S")
     calls = _capture_run(monkeypatch)
@@ -344,9 +368,9 @@ def _panes_stdout(*rows):
 def test_tmux_ls_builds_pane_tree(monkeypatch):
     monkeypatch.setenv("CLAUDE_ORCH_TMUX_SOCKET", "S")
     out = _panes_stdout(
-        ("claude-workers","@1","w-a","%4","/tmp/a","[w] a","111"),
-        ("claude-workers","@2","w-b","%5","/tmp/b","[w] b","222"),
-        ("other","@9","z","%9","/tmp/z","z","333"),
+        ("claude-workers","@1","w-a","%4","/tmp/a","[w] a","111","0","cmd"),
+        ("claude-workers","@2","w-b","%5","/tmp/b","[w] b","222","0","cmd"),
+        ("other","@9","z","%9","/tmp/z","z","333","0","cmd"),
     )
     seen = {}
     def fake(args, *a, **kw):
@@ -509,3 +533,85 @@ def test_terminal_module_is_fastmcp_free():
     r = sp.run([sys.executable, "-c", code], capture_output=True, text=True,
                env={**os.environ, "PYTHONPATH": src})
     assert r.returncode == 0 and "OK" in r.stdout, r.stderr
+
+
+def test_tmux_ls_carries_pane_dead_and_start_command(monkeypatch):
+    monkeypatch.setenv("CLAUDE_ORCH_TMUX_SOCKET", "S")
+    out = _panes_stdout(
+        ("claude-workers", "@1", "w-a", "%4", "/tmp/a", "[w] a", "111", "1",
+         '/bin/zsh -ic "cd /tmp/a && codex exec -o /r/children/ab12/r1.report.md.tmp"'),
+        ("claude-workers", "@2", "w-b", "%5", "/tmp/b", "[w] b", "222", "0", "claude"),
+    )
+    monkeypatch.setattr(subprocess, "run",
+                        lambda args, *a, **kw: subprocess.CompletedProcess(
+                            args, 0, out if kw.get("text") else out.encode(), b""))
+    wins = [w for o in TmuxDriver().ls() for t in o["tabs"] for w in t["windows"]]
+    w4 = next(w for w in wins if w["id"] == "%4")
+    assert w4["dead"] == "1" and "children/ab12/r1.report.md.tmp" in w4["start_command"]
+    w5 = next(w for w in wins if w["id"] == "%5")
+    assert w5["dead"] == "0" and w5["start_command"] == "claude"
+
+
+def test_tmux_ls_drops_rows_with_the_old_seven_fields(monkeypatch):
+    monkeypatch.setenv("CLAUDE_ORCH_TMUX_SOCKET", "S")
+    out = _panes_stdout(("claude-workers", "@1", "w-a", "%4", "/tmp/a", "[w] a", "111"))
+    monkeypatch.setattr(subprocess, "run",
+                        lambda args, *a, **kw: subprocess.CompletedProcess(
+                            args, 0, out if kw.get("text") else out.encode(), b""))
+    assert TmuxDriver().ls() == []
+
+
+REPO = Path(__file__).resolve().parent.parent
+CANON_CONF = REPO / "deploy" / "tmux" / "dockwright.conf"
+
+
+def _render_conf(tmp_path, prepend):
+    from dockwright import render
+    conf = tmp_path / "dockwright.tmux.conf"
+    render.render_file(CANON_CONF, conf, {"tmux_path_prepend": prepend})
+    return conf
+
+
+def _global_env(sock):
+    return subprocess.run(["tmux", "-L", sock, "show-environment", "-g"],
+                          capture_output=True, text=True, check=True).stdout
+
+
+@pytest.mark.real_tmux
+def test_a_server_started_with_the_rendered_conf_drops_tokens_and_prepends_path(
+        real_tmux, monkeypatch, tmp_path):
+    conf = _render_conf(tmp_path, "/opt/operator-tools/bin")
+    monkeypatch.setattr(paths, "TMUX_CONF", conf)
+    tmux_dir = os.path.dirname(shutil.which("tmux"))
+    monkeypatch.setenv("PATH", f"{tmux_dir}:/usr/bin:/bin")
+    inherited = ("GH_TOKEN", "GITHUB_TOKEN", "DIRENV_DIFF", "DIRENV_DIR", "DIRENV_FILE", "DIRENV_WATCHES")
+    for var in inherited:
+        monkeypatch.setenv(var, "leak")
+    out = tmp_path / "first-pane.env"
+    asyncio.run(TmuxDriver().spawn(cwd=str(tmp_path), title="iso",
+                                   argv=["sh", "-c", f"env > {out}; sleep 600"],
+                                   route_to_workers_window=True))
+    deadline = time.time() + 5
+    while not (out.exists() and out.stat().st_size) and time.time() < deadline:
+        time.sleep(0.05)
+    first = out.read_text().splitlines()
+    for _ in range(2):
+        subprocess.run(["tmux", "-L", real_tmux, "source-file", str(conf)], check=True)
+    shown = _global_env(real_tmux).splitlines()
+    for var in inherited:
+        assert not any(line.startswith(f"{var}=") for line in first), var
+        assert not any(line.startswith(f"{var}=") for line in shown), var
+    assert f"PATH=/opt/operator-tools/bin:{tmux_dir}:/usr/bin:/bin" in shown
+
+
+@pytest.mark.real_tmux
+def test_an_empty_path_prepend_loads_cleanly_and_leaves_the_global_path_alone(
+        real_tmux, monkeypatch, tmp_path):
+    conf = _render_conf(tmp_path, "")
+    monkeypatch.setattr(paths, "TMUX_CONF", conf)
+    tmux_dir = os.path.dirname(shutil.which("tmux"))
+    monkeypatch.setenv("PATH", f"{tmux_dir}:/usr/bin:/bin")
+    asyncio.run(TmuxDriver().spawn(cwd=str(tmp_path), title="iso", argv=["sleep", "600"],
+                                   route_to_workers_window=True))
+    subprocess.run(["tmux", "-L", real_tmux, "source-file", str(conf)], check=True)
+    assert f"PATH={tmux_dir}:/usr/bin:/bin\n" in _global_env(real_tmux)

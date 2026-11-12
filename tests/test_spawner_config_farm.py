@@ -440,7 +440,7 @@ def test_spawn_worker_tab_pretrusts_host_then_farm(monkeypatch, tmp_path):
     monkeypatch.setattr(
         trust, "pretrust_dir",
         lambda cwd, config_json=None: calls.append((str(cwd), config_json)) or True)
-    monkeypatch.setattr(spawner, "_pick_account", lambda force=False: "b")
+    monkeypatch.setattr(spawner, "_pick_account", lambda force=False, fable=False: "b")
     monkeypatch.setattr(config, "default_account", lambda: "a")
     farm = tmp_path / "farm-b"
     farm.mkdir()
@@ -452,7 +452,8 @@ def test_spawn_worker_tab_pretrusts_host_then_farm(monkeypatch, tmp_path):
         return ""
     monkeypatch.setattr(spawner, "_build_account_prefix", fake_prefix)
 
-    asyncio.run(spawner.spawn_worker_tab(cwd=str(tmp_path), initial_prompt="x", name="w1"))
+    asyncio.run(spawner.spawn_worker_tab(cwd=str(tmp_path), initial_prompt="x", name="w1",
+                                         extra_args=["--model", "@opus", "--effort", "xhigh"]))
 
     assert calls[0] == (str(tmp_path), None), "host pre-trust must come first"
     assert prefix_seen[0][1] == [calls[0]], \
@@ -463,11 +464,13 @@ def test_spawn_worker_tab_pretrusts_host_then_farm(monkeypatch, tmp_path):
 def test_spawn_worker_tab_codex_never_pretrusts(monkeypatch, tmp_path):
     import asyncio
     from dockwright import spawner, trust
+    from tests.conftest import allow_codex
+    allow_codex(monkeypatch, tmp_path, str(tmp_path))
     calls = []
     monkeypatch.setattr(
         trust, "pretrust_dir",
         lambda cwd, config_json=None: calls.append(str(cwd)) or True)
-    monkeypatch.setattr(spawner, "_pick_account", lambda force=False: None)
+    monkeypatch.setattr(spawner, "_pick_account", lambda force=False, fable=False: None)
     asyncio.run(spawner.spawn_worker_tab(
         cwd=str(tmp_path), initial_prompt="x", name="w2", runtime="codex"))
     assert calls == []

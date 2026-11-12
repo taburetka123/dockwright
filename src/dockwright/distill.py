@@ -8,20 +8,26 @@ from datetime import datetime
 from typing import Any
 
 from . import config, paths, state
+from .compaction import VOICES, preserve_clause
+from .models import resolve_model
 from .transcript import find_session_log
 
 
 _TRANSCRIPT_DATA_OPEN = "<<<TRANSCRIPT_DATA_BEGIN>>>"
 _TRANSCRIPT_DATA_CLOSE = "<<<TRANSCRIPT_DATA_END>>>"
 
+_DISTILL_WORD_BUDGET = 400
+
 _DISTILL_PROMPT = (
     "Distill this Claude Code manager session transcript into a journal entry "
-    "for a successor manager. Format: markdown. Sections: Decisions (what we "
-    "settled on and why), User direction changes (where the user redirected "
-    "mid-task), Shipped (commits with SHAs from worker_done events I saw), "
-    "Open threads (unfinished discussions or pending dispatches). Be concrete; "
-    "skip pleasantries and tool-call mechanics; preserve the user's verbatim "
-    "phrasings on contentious points. Aim for ≤80 lines. "
+    "for a successor manager who has none of this context, so the successor "
+    "continues without redoing work or being re-told constraints. Format: "
+    f"markdown. Be sure to preserve: {preserve_clause()}. {VOICES} "
+    f"HARD BUDGET: at most {_DISTILL_WORD_BUDGET} words in total, "
+    "counted as whitespace-separated tokens; the entry is rejected "
+    "above that. Keep only what a cold successor acts on; cut narrative, "
+    "process, tool-call mechanics and pleasantries first, then shorten "
+    "items (1) and (2). "
     "Output ONLY the journal markdown to stdout — no preamble, no sign-off, no "
     "surrounding code fence. Cite a commit SHA or file:line only if it "
     "appears verbatim in the transcript — never infer, complete, or reconstruct "
@@ -186,14 +192,98 @@ def _distill_manager_session(claude_sid: str) -> str | None:
     distill_env = {k: v for k, v in os.environ.items() if k not in paths.ORCHESTRATOR_ENV_KEYS}
     distill_env[paths.DISTILL_ENV_SENTINEL] = "1"
     distill_env["CLAUDE_SPEND_CLASS"] = "distill"
+    first = _run_distill_once(claude_bin, _DISTILL_PROMPT, slimmed, distill_env, claude_sid)
+    if first is None:
+        return None
+    first_words = _word_count(first)
+    if first_words <= _DISTILL_WORD_BUDGET:
+        return first
+    print(
+        f"manager-memory: distill of {claude_sid} is {first_words} words against a budget "
+        f"of {_DISTILL_WORD_BUDGET}; re-asking once",
+        file=sys.stderr,
+    )
+    retry_prompt = _retry_prompt(first_words)
+    second = _run_distill_once(claude_bin, retry_prompt, slimmed, distill_env, claude_sid)
+    if second is None:
+        return _fit_to_word_budget(first, _DISTILL_WORD_BUDGET)
+    second_words = _word_count(second)
+    if second_words <= _DISTILL_WORD_BUDGET:
+        return second
+    print(
+        f"manager-memory: re-asked distill of {claude_sid} is still {second_words} words; "
+        f"truncating to {_DISTILL_WORD_BUDGET}",
+        file=sys.stderr,
+    )
+    return _fit_to_word_budget(second, _DISTILL_WORD_BUDGET)
+
+
+def _retry_prompt(previous_words: int) -> str:
+    return (
+        f"Your previous draft of this entry was {previous_words} words; the hard budget is "
+        f"{_DISTILL_WORD_BUDGET} words. Rewrite it within the budget. "
+        + _DISTILL_PROMPT
+    )
+
+
+def _word_count(text: str) -> int:
+    return len(text.split())
+
+
+def _fit_to_word_budget(text: str, budget: int) -> str:
+    words = text.split()
+    if len(words) <= budget:
+        return text
+    notice = (
+        f"[truncated: the distill was {len(words)} words against a budget of "
+        f"{budget}; the tail is cut]"
+    )
+    head_budget = budget - _word_count(notice)
+    if head_budget <= 0:
+        return _cut_after_words(notice, budget)
+    return f"{notice}\n\n{_cut_after_words(text, head_budget)}"
+
+
+def _cut_after_words(text: str, n: int) -> str:
+    if n <= 0:
+        return ""
+    count = 0
+    for i, ch in enumerate(text):
+        if ch.isspace():
+            continue
+        if i == 0 or text[i - 1].isspace():
+            count += 1
+            if count > n:
+                return text[:i].rstrip()
+    return text.rstrip()
+
+
+def _distill_role_args() -> list[str]:
+    from . import roles
+    try:
+        files = roles.launch_files("Blank", "lane")
+    except roles.RoleError as err:
+        print(f"manager-memory: role Blank unavailable ({err}); distill uses the GenericWorker lane render",
+              file=sys.stderr)
+        try:
+            files = roles.launch_files("GenericWorker", "lane")
+        except roles.RoleError as err:
+            print(f"manager-memory: distill runs without a role render: {err}", file=sys.stderr)
+            return []
+    return [] if files is None else ["--append-system-prompt-file", str(files[0])]
+
+
+def _run_distill_once(claude_bin: str, prompt: str, slimmed: bytes, distill_env: dict,
+                      claude_sid: str) -> str | None:
     started_at = time.monotonic()
     try:
         result = subprocess.run(
             [
-                claude_bin, "-p", _DISTILL_PROMPT,
-                "--model", config.distill_model(),
+                claude_bin, "-p", prompt,
+                "--model", resolve_model(config.distill_model()),
                 "--effort", "high",
                 "--output-format", "text",
+                *_distill_role_args(),
                 *_DISTILL_LOCKDOWN_ARGV,
             ],
             input=slimmed,
@@ -231,7 +321,7 @@ def _distill_manager_session(claude_sid: str) -> str | None:
     elapsed = time.monotonic() - started_at
     print(
         f"manager-memory: distilled {claude_sid} in {elapsed:.1f}s "
-        f"(input {len(slimmed)} bytes, output {len(out)} bytes) via {claude_bin}",
+        f"(input {len(slimmed)} bytes, output {len(out)} bytes, {_word_count(out)} words) via {claude_bin}",
         file=sys.stderr,
     )
     return out

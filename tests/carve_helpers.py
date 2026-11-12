@@ -15,12 +15,18 @@ def _overlay_home() -> Path:
 
 
 OPERATOR_OVERLAY = _overlay_home()
+OPERATOR_ROLES = Path.home() / ".claude" / "roles"
 OPERATOR_CONFIG = Path.home() / ".claude" / "dockwright.toml"
 
 
 def _core_path(output_name: str) -> Path:
     core = CORE_DIR / (Path(output_name).stem + ".core.md")
     return core if core.is_file() else CORE_DIR / output_name
+
+
+def _core_text(output_name: str) -> str:
+    return compose.expand_includes(
+        _core_path(output_name).read_text(), compose.core_fragments_dir(CORE_DIR))
 
 
 def operator_agent_vars() -> dict[str, str]:
@@ -36,11 +42,9 @@ def operator_agent_vars() -> dict[str, str]:
 
 
 def operator_overlay_installed() -> bool:
-    stems = {Path(compose.output_name(p.name)).stem
-             for p in CORE_DIR.glob("*.md")}
-    has_dropins = any((OPERATOR_OVERLAY / s).is_dir()
-                      and any((OPERATOR_OVERLAY / s).glob("*.md"))
-                      for s in stems)
+    names = {compose.output_name(p.name) for p in CORE_DIR.glob("*.md")}
+    has_dropins = any(compose._legacy_dropins(OPERATOR_OVERLAY, OPERATOR_ROLES, Path(n).stem, _core_text(n))
+                      for n in names)
     return bool(has_dropins and operator_agent_vars())
 
 
@@ -50,10 +54,10 @@ requires_operator_overlay = pytest.mark.skipif(
 
 
 def compose_operator_with_warnings(output_name: str) -> tuple[str, list[str]]:
-    dropins = compose.load_dropins(OPERATOR_OVERLAY, Path(output_name).stem)
+    text = _core_text(output_name)
+    dropins = compose._legacy_dropins(OPERATOR_OVERLAY, OPERATOR_ROLES, Path(output_name).stem, text)
     merged = {**compose.load_default_vars(CORE_DIR), **operator_agent_vars()}
-    return compose.compose_text(
-        _core_path(output_name).read_text(), dropins, merged)
+    return compose.compose_text(text, dropins, merged)
 
 
 def compose_operator(output_name: str) -> str:
@@ -63,6 +67,5 @@ def compose_operator(output_name: str) -> str:
 
 def compose_generic(output_name: str) -> str:
     text, _ = compose.compose_text(
-        _core_path(output_name).read_text(), [],
-        compose.load_default_vars(CORE_DIR))
+        _core_text(output_name), [], compose.load_default_vars(CORE_DIR))
     return text

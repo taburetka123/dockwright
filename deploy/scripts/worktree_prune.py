@@ -5,6 +5,7 @@ import argparse
 import errno
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -103,11 +104,13 @@ ROOTS = _resolve_paths("WORKTREE_PRUNE_ROOTS", "worktree_roots",
                        "~/worktrees,~/worktrees-personal")
 CLONE_PARENTS = _resolve_paths("WORKTREE_PRUNE_CLONE_PARENTS", "repo_roots",
                                "~/projects/work,~/projects/personal")
-MAX_REMOVALS = _env_positive_int("WORKTREE_PRUNE_MAX_REMOVALS", 25)
+MAX_REMOVALS = _env_positive_int("WORKTREE_PRUNE_MAX_REMOVALS", 75)
+MIN_AGE_DAYS = _env_positive_int("WORKTREE_PRUNE_MIN_AGE_DAYS", 14)
 
 INJECTED_UNTRACKED = {".claude", "CLAUDE.md", ".mcp.json"}
 
 GH_BIN = os.environ.get("WORKTREE_PRUNE_GH", "gh")
+LSOF_BIN = os.environ.get("WORKTREE_PRUNE_LSOF", "/usr/sbin/lsof")
 
 KEEPLIST_PATH = WT_DIR / "keep.txt"
 
@@ -134,6 +137,9 @@ CAPABILITY_IMPLS = (
     ("ignored-content-gate", "ignored_ok_from_porcelain"),
     ("containment-gate", "gate_contained"),
     ("in-progress-gate", "gate_in_progress"),
+    ("age-gate", "gate_old_enough"),
+    ("merged-gate", "gate_merged_head"),
+    ("open-work-gate", "gate_no_open_work"),
 )
 
 
@@ -269,15 +275,19 @@ def _log_check(decision: str, detail: dict, ts: Optional[float] = None) -> None:
         f.write(f"{stamp}  {decision}  {json.dumps(detail, sort_keys=True)}\n")
 
 
-def _worktree_reflog_shas(run: RunFn, cand: Candidate) -> List[str]:
+def _worktree_gitdir(run: RunFn, cand: Candidate) -> Optional[str]:
     try:
         res = run(["git", "-C", cand.path, "rev-parse", "--absolute-git-dir"], None)
     except Exception:
-        return []
+        return None
     if res is None or res.returncode != 0:
-        return []
-    gitdir = (res.stdout or "").strip()
-    if not gitdir:
+        return None
+    return (res.stdout or "").strip() or None
+
+
+def _worktree_reflog_shas(run: RunFn, cand: Candidate) -> List[str]:
+    gitdir = _worktree_gitdir(run, cand)
+    if gitdir is None:
         return []
     log = os.path.join(gitdir, "logs", "HEAD")
     try:
@@ -317,7 +327,7 @@ def _default_run(args: List[str], cwd: Optional[str] = None) -> RunResult:
 
 def _empty_summary() -> dict:
     return {"scanned": 0, "would_remove": 0, "removed": 0, "skipped": 0,
-            "capped": 0, "gh_failed": 0, "by_reason": {}}
+            "capped": 0, "gh_failed": 0, "works_failed": 0, "by_reason": {}}
 
 
 def _is_under(path: str, parent: str) -> bool:
@@ -410,9 +420,11 @@ def enumerate_candidates(run: RunFn, clone_parents: Optional[List[str]] = None,
 DECIDE_ORDER = (
     ("kept", "kept"),
     ("not_locked", "locked"),
+    ("no_open_work", "open_work"),
+    ("old_enough", "too_young"),
     ("in_progress_clear", "in_progress"),
     ("contained", "uncontained"),
-    ("terminal", "not_terminal"),
+    ("merged", "unmerged"),
     ("clean", "dirty"),
     ("ignored_ok", "ignored_content"),
     ("unowned", "owned"),
@@ -420,6 +432,9 @@ DECIDE_ORDER = (
 
 
 def decide(cand: Candidate, gates: dict) -> Tuple[str, Optional[str]]:
+    unlisted = set(gates) - {key for key, _reason in DECIDE_ORDER}
+    if unlisted:
+        raise ValueError(f"gates missing from DECIDE_ORDER: {sorted(unlisted)}")
     if gates.get("kept"):
         return "SKIP", "kept"
     for key, reason in DECIDE_ORDER[1:]:
@@ -466,17 +481,21 @@ def _summarize(outcomes: List[ScanRow], removed: int = 0, capped: int = 0) -> di
                 by_reason[reason] = by_reason.get(reason, 0) + 1
     return {"scanned": len(outcomes), "would_remove": would_remove,
             "removed": removed, "skipped": skipped, "capped": capped,
-            "gh_failed": 0, "by_reason": by_reason}
+            "gh_failed": 0, "works_failed": 0, "by_reason": by_reason}
 
 
 def _scan(run: RunFn, clone_parents: List[str], roots: List[str],
           active_dir: Path, self_path: Optional[str], now: float,
+          min_age_days: int,
           keeplist: Optional[List[str]] = None,
           stats: Optional[dict] = None,
           failed_gates: Optional[dict] = None) -> List[ScanRow]:
     candidates = enumerate_candidates(run, clone_parents, roots)
     active_records = _load_active_records(active_dir)
     lsof_cwds = _collect_lsof_cwds(run)
+    works = _load_open_works(run)
+    if works is None and stats is not None:
+        stats["works_failed"] = 1
 
     held = {c.path for c in candidates if keeplist_matches(keeplist or [], c.path)}
 
@@ -509,10 +528,12 @@ def _scan(run: RunFn, clone_parents: List[str], roots: List[str],
                 gates = {
                     "kept": False,
                     "not_locked": not cand.locked,
+                    "no_open_work": gate_no_open_work(cand, works, roots),
+                    "old_enough": gate_old_enough(run, cand, now, min_age_days),
                     "in_progress_clear": gate_in_progress(run, cand),
                     "contained": (gate_contained(run, cand) if cand.detached
                                   else (True, None)),
-                    "terminal": gate_terminal(run, cand, stats),
+                    "merged": gate_merged_head(run, cand, stats),
                     "clean": text is not None and clean_from_porcelain(text),
                     "ignored_ok": check_ignored(run, cand, text),
                     "unowned": gate_unowned(cand, active_records, lsof_cwds, self_path),
@@ -545,6 +566,7 @@ def _finish_dry_run(run: RunFn, scanned: List[ScanRow], now: float,
                            head=cand.head, clone=cand.clone)
     summary = _summarize(scanned)
     summary["gh_failed"] = (stats or {}).get("gh_failed", 0)
+    summary["works_failed"] = (stats or {}).get("works_failed", 0)
     _log_check("dry-run", {"mode": "dry-run", **summary}, ts=now)
     return "dry-run", {"results": _results_list(run, scanned, failed_gates),
                        "summary": summary}
@@ -562,8 +584,12 @@ def _head_unchanged(run: RunFn, cand: Candidate) -> bool:
 
 def _apply_arm(run: RunFn, scanned: List[ScanRow], active_dir: Path,
                self_path: Optional[str], max_removals: int, now: float,
+               min_age_days: int,
                stats: Optional[dict] = None,
-               failed_gates: Optional[dict] = None) -> PruneResult:
+               failed_gates: Optional[dict] = None,
+               roots: Optional[List[str]] = None) -> PruneResult:
+    if roots is None:
+        roots = ROOTS
     eligible = [cand for (cand, action, _r) in scanned if action == "WOULD-REMOVE"]
     outcomes: List[ScanRow] = [(cand, action, reason)
                                for (cand, action, reason) in scanned
@@ -578,18 +604,29 @@ def _apply_arm(run: RunFn, scanned: List[ScanRow], active_dir: Path,
         fresh_lsof = _collect_lsof_cwds(run)
         fresh_keep, keep_fatal = load_keeplist(KEEPLIST_PATH)
         try:
+            fresh_works = _load_open_works(run)
+            work_ok, work_why = gate_no_open_work(cand, fresh_works, roots)
             text = _porcelain(run, cand)
             clean = text is not None and clean_from_porcelain(text)
             ignored_ok, ignored_why = check_ignored(run, cand, text)
             unowned = gate_unowned(cand, fresh_active, fresh_lsof, self_path)
             in_progress_clear = gate_in_progress(run, cand)
             contained_ok = (gate_contained(run, cand)[0] if cand.detached else True)
+            old_enough, age_why = gate_old_enough(run, cand, now, min_age_days)
         except Exception:
             clean = ignored_ok = unowned = in_progress_clear = contained_ok = False
+            old_enough = False
             ignored_why = "ignored_content"
+            age_why = "age_unknown"
+            work_ok, work_why = False, "work_scan_failed"
         if keep_fatal is not None or keeplist_matches(fresh_keep or [], cand.path):
             _ledger_append("skip_toctou", ts=now, path=cand.path, reason="toctou_kept")
             outcomes.append((cand, "SKIP", "toctou_kept"))
+            continue
+        if not old_enough:
+            why = "toctou_" + (age_why or "too_young")
+            _ledger_append("skip_toctou", ts=now, path=cand.path, reason=why)
+            outcomes.append((cand, "SKIP", why))
             continue
         if not clean:
             _ledger_append("skip_toctou", ts=now, path=cand.path, reason="toctou_dirty")
@@ -609,6 +646,11 @@ def _apply_arm(run: RunFn, scanned: List[ScanRow], active_dir: Path,
             _ledger_append("skip_toctou", ts=now, path=cand.path,
                            reason="toctou_uncontained")
             outcomes.append((cand, "SKIP", "toctou_uncontained"))
+            continue
+        if not work_ok:
+            why = "toctou_" + (work_why or "open_work")
+            _ledger_append("skip_toctou", ts=now, path=cand.path, reason=why)
+            outcomes.append((cand, "SKIP", why))
             continue
         if not unowned:
             _ledger_append("skip_toctou", ts=now, path=cand.path, reason="toctou_owned")
@@ -661,6 +703,7 @@ def _apply_arm(run: RunFn, scanned: List[ScanRow], active_dir: Path,
 
     summary = _summarize(outcomes, removed=removed, capped=len(capped))
     summary["gh_failed"] = (stats or {}).get("gh_failed", 0)
+    summary["works_failed"] = (stats or {}).get("works_failed", 0)
     _log_check("apply", {"mode": "apply", **summary}, ts=now)
     return "applied", {"results": _results_list(run, outcomes, failed_gates,
                                                 removed_reflogs),
@@ -672,7 +715,8 @@ def run_prune(now: float, apply: bool = False, run: Optional[RunFn] = None,
               roots: Optional[List[str]] = None,
               max_removals: Optional[int] = None,
               active_dir: Optional[Path] = None,
-              self_path: Optional[str] = None) -> PruneResult:
+              self_path: Optional[str] = None,
+              min_age_days: Optional[int] = None) -> PruneResult:
     if any(p.exists() for p in STOP_PATHS):
         _log_check("stopped", {}, ts=now)
         return "stopped", {"results": [], "summary": _empty_summary()}
@@ -690,6 +734,8 @@ def run_prune(now: float, apply: bool = False, run: Optional[RunFn] = None,
         roots = ROOTS
     if max_removals is None:
         max_removals = MAX_REMOVALS
+    if min_age_days is None or min_age_days <= 0:
+        min_age_days = MIN_AGE_DAYS
     if active_dir is None:
         active_dir = ORCH_ACTIVE
     if self_path is None:
@@ -698,10 +744,10 @@ def run_prune(now: float, apply: bool = False, run: Optional[RunFn] = None,
     stats: dict = {}
     failed_gates: dict = {}
     scanned = _scan(run, clone_parents, roots, active_dir, self_path, now,
-                    keeplist, stats, failed_gates)
+                    min_age_days, keeplist, stats, failed_gates)
     if apply:
         result = _apply_arm(run, scanned, active_dir, self_path, max_removals, now,
-                            stats, failed_gates)
+                            min_age_days, stats, failed_gates, roots=roots)
     else:
         result = _finish_dry_run(run, scanned, now, stats, failed_gates)
     _write_last_scan(result[1].get("results", []), result[1].get("summary", {}), now)
@@ -790,22 +836,26 @@ def gate_contained(run: RunFn, cand: Candidate) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
-def gate_terminal(run: RunFn, cand: Candidate,
-                  stats: Optional[dict] = None) -> bool:
+def gate_merged_head(run: RunFn, cand: Candidate,
+                     stats: Optional[dict] = None) -> Tuple[bool, Optional[str]]:
     if cand.detached:
-        return True
+        return True, None
     prs = _gh_prs(run, cand, stats)
     if prs is not None:
         if any((pr or {}).get("state") == "OPEN" for pr in prs):
-            return False
-        if any((pr or {}).get("state") in ("MERGED", "CLOSED") for pr in prs):
-            return True
+            return False, "open_pr"
+        if any((pr or {}).get("state") == "MERGED"
+               and (pr or {}).get("baseRefName") == "main"
+               and (pr or {}).get("headRefOid") == cand.head for pr in prs):
+            return True, None
     try:
         anc = run(["git", "-C", cand.clone, "merge-base", "--is-ancestor",
                    cand.head, "origin/main"], None)
-        return bool(anc is not None and anc.returncode == 0)
     except Exception:
-        return False
+        return False, "unmerged"
+    if anc is not None and anc.returncode == 0:
+        return True, None
+    return False, "unmerged"
 
 
 def _gh_prs(run: RunFn, cand: Candidate,
@@ -819,7 +869,7 @@ def _gh_prs(run: RunFn, cand: Candidate,
         return None
     try:
         res = run([GH_BIN, "pr", "list", "--head", cand.branch, "--state", "all",
-                   "--json", "number,state,headRefOid"], cand.path)
+                   "--json", "number,state,headRefOid,baseRefName"], cand.path)
     except Exception:
         return _failed()
     if res is None or res.returncode != 0:
@@ -918,6 +968,54 @@ def gate_ignored(run: RunFn, cand: Candidate) -> bool:
     return check_ignored(run, cand)[0]
 
 
+def _reflog_first_timestamp(gitdir: str) -> Optional[float]:
+    try:
+        with open(os.path.join(gitdir, "logs", "HEAD")) as fh:
+            first = fh.readline()
+    except OSError:
+        return None
+    fields = first.split("\t")[0].split()
+    if len(fields) < 2:
+        return None
+    try:
+        return float(int(fields[-2]))
+    except ValueError:
+        return None
+
+
+def _admin_birthtime(gitdir: str) -> Optional[float]:
+    try:
+        birth = getattr(os.stat(gitdir), "st_birthtime", None)
+    except OSError:
+        return None
+    if birth is None:
+        return None
+    try:
+        birth = float(birth)
+    except (TypeError, ValueError):
+        return None
+    return birth if birth > 0 else None
+
+
+def worktree_born_at(run: RunFn, cand: Candidate) -> Optional[float]:
+    gitdir = _worktree_gitdir(run, cand)
+    if gitdir is None:
+        return None
+    stamps = [s for s in (_reflog_first_timestamp(gitdir), _admin_birthtime(gitdir))
+              if s is not None]
+    return max(stamps) if stamps else None
+
+
+def gate_old_enough(run: RunFn, cand: Candidate, now: float,
+                    min_age_days: int) -> Tuple[bool, Optional[str]]:
+    created = worktree_born_at(run, cand)
+    if created is None:
+        return False, "age_unknown"
+    if now - created < min_age_days * 86400:
+        return False, "too_young"
+    return True, None
+
+
 def gate_in_progress(run: RunFn, cand: Candidate) -> bool:
     args = ["git", "-C", cand.path, "rev-parse"]
     for marker in IN_PROGRESS_MARKERS:
@@ -954,18 +1052,107 @@ def _load_active_records(active_dir: Path) -> Optional[List[dict]]:
     return records
 
 
+def _lsof_candidates() -> List[str]:
+    candidates = [LSOF_BIN]
+    fallback = shutil.which("lsof")
+    if fallback and fallback not in candidates:
+        candidates.append(fallback)
+    return candidates
+
+
 def _collect_lsof_cwds(run: RunFn) -> Optional[List[str]]:
+    for binary in _lsof_candidates():
+        try:
+            res = run([binary, "-d", "cwd", "-F", "pn"], None)
+        except Exception:
+            continue
+        if res is None:
+            continue
+        cwds = [line[1:] for line in (res.stdout or "").splitlines()
+                if line.startswith("n")]
+        if res.returncode != 0 and not cwds:
+            continue
+        return cwds
+    return None
+
+
+def _dockwright_bin() -> Optional[str]:
+    env = os.environ.get("WORKTREE_PRUNE_DOCKWRIGHT", "").strip()
+    if env:
+        return env
+    found = shutil.which("dockwright")
+    if found:
+        return found
+    local = HOME / ".local" / "bin" / "dockwright"
+    return str(local) if local.exists() else None
+
+
+def _work_scan_failed(why: str, **detail) -> None:
+    _log_check("work_scan_failed", {"why": why, **detail})
+    return None
+
+
+def _load_open_works(run: RunFn) -> Optional[List[Tuple[str, List[str]]]]:
     try:
-        res = run(["lsof", "-d", "cwd", "-F", "pn"], None)
-    except Exception:
+        binary = _dockwright_bin()
+    except Exception as e:
+        return _work_scan_failed("no_binary", error=str(e)[-500:])
+    if binary is None:
+        return _work_scan_failed("no_binary")
+    try:
+        res = run([binary, "pipeline", "active-paths", "--json"], None)
+    except Exception as e:
+        return _work_scan_failed("exec", error=str(e)[-500:])
+    if res is None or res.returncode != 0:
+        return _work_scan_failed("exit", rc=(res.returncode if res is not None else None),
+                                 stderr=((res.stderr or "").strip()[-500:] if res is not None else ""))
+    try:
+        data = json.loads(res.stdout or "")
+    except ValueError:
+        return _work_scan_failed("not_json")
+    if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("works"), list):
+        return _work_scan_failed("shape")
+    works: List[Tuple[str, List[str]]] = []
+    for item in data["works"]:
+        key = item.get("task_key") if isinstance(item, dict) else None
+        claimed = item.get("paths") if isinstance(item, dict) else None
+        if (not isinstance(key, str) or not key or not isinstance(claimed, list)
+                or not all(isinstance(p, str) for p in claimed)):
+            return _work_scan_failed("shape")
+        works.append((key, claimed))
+    return works
+
+
+def _group(path: str, roots: List[str]) -> Optional[str]:
+    try:
+        real = os.path.realpath(path)
+    except (ValueError, OSError):
         return None
-    if res is None:
-        return None
-    cwds = [line[1:] for line in (res.stdout or "").splitlines()
-            if line.startswith("n")]
-    if res.returncode != 0 and not cwds:
-        return None
-    return cwds
+    for root in roots:
+        try:
+            rroot = os.path.realpath(root)
+            if real == rroot or os.path.commonpath([real, rroot]) != rroot:
+                continue
+        except (ValueError, OSError):
+            continue
+        return os.path.relpath(real, rroot).split(os.sep, 1)[0].casefold()
+    return None
+
+
+def gate_no_open_work(cand: Candidate, works: Optional[List[Tuple[str, List[str]]]],
+                      roots: List[str]) -> Tuple[bool, Optional[str]]:
+    if works is None:
+        return False, "work_scan_failed"
+    group = _group(cand.path, roots)
+    for key, claimed in works:
+        if group is not None and group == key.casefold():
+            return False, "open_work"
+        for path in claimed:
+            if _is_under(path, cand.path):
+                return False, "open_work"
+            if group is not None and _group(path, roots) == group:
+                return False, "open_work"
+    return True, None
 
 
 def gate_unowned(cand: Candidate, active_records: Optional[List[dict]],
@@ -973,7 +1160,7 @@ def gate_unowned(cand: Candidate, active_records: Optional[List[dict]],
                  pid_alive: Callable[[int], bool] = _pid_alive) -> bool:
     if self_path and _is_under(self_path, cand.path):
         return False
-    if active_records is None and lsof_cwds is None:
+    if active_records is None or lsof_cwds is None:
         return False
     if active_records:
         for rec in active_records:
@@ -994,7 +1181,10 @@ def gate_unowned(cand: Candidate, active_records: Optional[List[dict]],
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Worktree prune: remove merged+clean+unowned worktrees (dry-run by default).")
+        description="Worktree prune: remove aged+merged+clean+unowned worktrees "
+                    "that no unfinished dockwright work claims "
+                    f"(dry-run by default; a tree younger than "
+                    f"WORKTREE_PRUNE_MIN_AGE_DAYS={MIN_AGE_DAYS} days is never removed).")
     parser.add_argument("--apply", action="store_true",
                         help="Actually remove eligible worktrees (default: dry-run).")
     parser.add_argument("--dry-run", action="store_true",
@@ -1028,7 +1218,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"removed={summary.get('removed', 0)} "
         f"skipped={summary.get('skipped', 0)} "
         f"capped={summary.get('capped', 0)} "
-        f"gh_failed={summary.get('gh_failed', 0)}"
+        f"gh_failed={summary.get('gh_failed', 0)} "
+        f"works_failed={summary.get('works_failed', 0)}"
     )
     return 0
 

@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import time
 from pathlib import Path
 
@@ -32,6 +33,8 @@ def preflight(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "QUESTIONS", tmp_path / "questions")
     monkeypatch.setattr(mod, "MANAGER_LOCK", tmp_path / "manager.lock")
     monkeypatch.setattr(mod, "NOTIFY_OUTBOX", tmp_path / "notify-outbox")
+    monkeypatch.setattr(mod, "REVIVE", tmp_path / "revive")
+    monkeypatch.setattr(mod, "LANES", tmp_path / "lanes")
     (tmp_path / "active").mkdir()
     (tmp_path / "done").mkdir()
     (tmp_path / "turn-ends").mkdir()
@@ -44,6 +47,13 @@ def _write_old(path: Path, age_sec: float) -> None:
     state.write_json_atomic(path, {"x": 1})
     old = time.time() - age_sec
     import os
+    os.utime(path, (old, old))
+
+
+def _write_done(path: Path, sid: str, age_sec: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state.write_json_atomic(path, {"claude_sid": sid, "summary": "PARKED — x"})
+    old = time.time() - age_sec
     os.utime(path, (old, old))
 
 
@@ -72,6 +82,34 @@ def test_prune_done_recurses_per_manager_subdirs(preflight):
     assert pruned == 2
     remaining = list(preflight.DONE.rglob("*.json"))
     assert [p.name for p in remaining] == ["fresh.json"]
+
+
+def test_prune_done_keeps_the_done_files_of_a_session_with_an_active_record(preflight):
+    old_age = preflight.STALE_DONE_SEC + 60
+    live, gone = "aaaaaaaa-live", "bbbbbbbb-gone"
+    state.write_json_atomic(preflight.ACTIVE / f"{live}.json", {"claude_sid": live, "pid": os.getpid()})
+    _write_done(preflight.DONE / "manager-b" / f"{live}-1.json", live, old_age)
+    _write_done(preflight.DONE / "manager-b" / f"{gone}-1.json", gone, old_age)
+    _write_done(preflight.DONE / "manager-b" / f"{gone}-2.json", gone, 0)
+
+    pruned = preflight._prune_done(time.time())
+
+    assert pruned == 1
+    assert sorted(p.name for p in preflight.DONE.rglob("*.json")) == [f"{live}-1.json", f"{gone}-2.json"]
+
+
+def test_prune_done_reads_the_sid_from_the_file_name_when_the_json_is_unreadable(preflight):
+    old_age = preflight.STALE_DONE_SEC + 60
+    live = "cccccccc-live"
+    state.write_json_atomic(preflight.ACTIVE / f"{live}.json", {"claude_sid": live, "pid": os.getpid()})
+    broken = preflight.DONE / "manager-b" / f"{live}-7.json"
+    broken.parent.mkdir(parents=True, exist_ok=True)
+    broken.write_text("{not json")
+    old = time.time() - old_age
+    os.utime(broken, (old, old))
+
+    assert preflight._prune_done(time.time()) == 0
+    assert broken.exists()
 
 
 def test_prune_active_preserves_live_manager_records(preflight, monkeypatch):
@@ -238,6 +276,9 @@ def test_main_combined_summary_disambiguates_pruned_names_and_odd_reasons(prefli
         "name": "brave-griffin",
         "pid": 4242,
     })
+    preflight.REVIVE.mkdir()
+    _write_old(preflight.REVIVE / "old.md", preflight.STALE_REVIVE_SEC + 60)
+    (preflight.REVIVE / "fresh.md").write_text("x")
     monkeypatch.setattr(preflight, "_pid_alive", lambda pid: pid == 4242)
     monkeypatch.setattr(preflight, "_process_command", lambda pid: "/usr/sbin/distnoted agent")
 
@@ -245,6 +286,8 @@ def test_main_combined_summary_disambiguates_pruned_names_and_odd_reasons(prefli
 
     out = capsys.readouterr().out
     assert "1 stale active record(s) (late-yak)" in out
+    assert "1 old revive digest(s)" in out
+    assert (preflight.REVIVE / "fresh.md").is_file()
     assert "; kept 1 odd-looking active record(s), not pruned: brave-griffin (alive but non-session command)" in out
 
 
@@ -302,6 +345,15 @@ def test_gc_empty_bucket_dirs_removed(preflight):
     assert not (preflight.QUESTIONS / "dead-manager").exists()
     assert (preflight.DONE / "live-manager" / "evt.json").exists()
     assert preflight.DONE.is_dir() and preflight.TURN_ENDS.is_dir() and preflight.QUESTIONS.is_dir()
+
+
+def test_gc_removes_empty_topic_question_dirs(preflight):
+    (preflight.QUESTIONS / "by-task" / "K-1").mkdir(parents=True)
+
+    preflight._gc_husks(time.time())
+
+    assert not (preflight.QUESTIONS / "by-task").exists()
+    assert preflight.QUESTIONS.is_dir()
 
 
 def test_gc_dead_manager_lock_removed(preflight):
@@ -372,6 +424,21 @@ def test_prune_closed_ledgers_only_autoclosed_spend(preflight, tmp_path, monkeyp
     entries = [json.loads(l) for l in (tmp_path / "spend-ledger.jsonl").read_text().splitlines()]
     assert [e["sid"] for e in entries] == ["auto"]
     assert entries[0]["source"] == "closed_prune"
+
+
+def test_prune_revive_drops_digests_older_than_seven_days(preflight):
+    preflight.REVIVE.mkdir()
+    old = preflight.REVIVE / "old.md"
+    fresh = preflight.REVIVE / "fresh.md"
+    old.write_text("x")
+    fresh.write_text("x")
+    stale = time.time() - preflight.STALE_REVIVE_SEC - 60
+    os.utime(old, (stale, stale))
+
+    assert preflight._prune_revive(time.time()) == 1
+
+    assert not old.exists()
+    assert fresh.exists()
 
 
 def test_root_prefers_dockwright_home(tmp_path, monkeypatch):
@@ -503,3 +570,66 @@ def test_gc_prunes_every_declared_cursor_pattern(preflight):
         assert (preflight.ROOT / pattern.replace("*", "fresh-x")).exists(), pattern
     for name in canaries:
         assert (preflight.ROOT / name).exists(), f"an over-broad pattern swept {name}"
+
+
+def test_prune_active_ledger_entry_reads_parent_name_only(preflight, monkeypatch):
+    monkeypatch.setattr(preflight, "_pid_alive", lambda pid: False)
+    (preflight.ACTIVE / "w1.json").write_text(json.dumps({
+        "claude_sid": "w1", "agent": "worker", "name": "alpha", "pid": 4,
+        "parent_name": "boss", "started_at": 0,
+        "spend": {"turns": 1, "out_tokens": 5},
+    }))
+    preflight._prune_active()
+    entry = json.loads(preflight.SPEND_LEDGER.read_text().splitlines()[0])
+    assert entry["parent_manager_name"] == "boss"
+
+
+def test_prune_lanes_removes_dead_pid_dirs_and_keeps_live(preflight, tmp_path, monkeypatch):
+    mod = preflight
+    monkeypatch.setattr(mod, "_pid_alive", lambda pid: pid == os.getpid())
+    monkeypatch.setattr(mod, "_process_command_or_none", lambda pid: "claude --resume abc")
+    live = tmp_path / "lanes" / str(os.getpid())
+    dead = tmp_path / "lanes" / "424242"
+    junk = tmp_path / "lanes" / "not-a-pid"
+    for d in (live, dead, junk):
+        d.mkdir(parents=True)
+        (d / "questions.json").write_text("{}")
+    assert mod._prune_lanes() == 1
+    assert live.is_dir() and junk.is_dir() and not dead.exists()
+
+
+def _lane_dir(tmp_path, cli_pid):
+    d = tmp_path / "lanes" / str(cli_pid)
+    d.mkdir(parents=True)
+    (d / "questions.json").write_text("{}")
+    return d
+
+
+def test_prune_lanes_drops_a_recycled_pid_whose_command_is_not_a_session(
+        preflight, tmp_path, monkeypatch):
+    mod = preflight
+    monkeypatch.setattr(mod, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(mod, "_process_command_or_none", lambda pid: "/usr/sbin/distnoted agent")
+    d = _lane_dir(tmp_path, 424242)
+    assert mod._prune_lanes() == 1, (
+        "a recycled CLI pid kept a dead predecessor's lane markers, which hand "
+        "the new manager a false DEAD/HUNG verdict for a lane it never armed")
+    assert not d.exists()
+
+
+def test_prune_lanes_keeps_a_live_session_pid(preflight, tmp_path, monkeypatch):
+    mod = preflight
+    monkeypatch.setattr(mod, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(mod, "_process_command_or_none", lambda pid: "claude --resume abc")
+    d = _lane_dir(tmp_path, 424242)
+    assert mod._prune_lanes() == 0
+    assert d.is_dir() and (d / "questions.json").exists()
+
+
+def test_prune_lanes_keeps_a_live_pid_when_ps_could_not_answer(preflight, tmp_path, monkeypatch):
+    mod = preflight
+    monkeypatch.setattr(mod, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(mod, "_process_command_or_none", lambda pid: None)
+    d = _lane_dir(tmp_path, 424242)
+    assert mod._prune_lanes() == 0
+    assert d.is_dir() and (d / "questions.json").exists()
