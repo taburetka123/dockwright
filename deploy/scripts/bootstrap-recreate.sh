@@ -87,13 +87,15 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-records = []
-for path in root.rglob("*.json"):
+found = {}
+for path in sorted(root.rglob("*.json")):
     try:
-        records.append(json.loads(path.read_text()))
+        record = json.loads(path.read_text())
     except Exception:
-        pass
-records.sort(key=lambda r: r.get("asked_at") or 0)
+        continue
+    if isinstance(record, dict):
+        found.setdefault(record.get("question_id") or path.stem, record)
+records = sorted(found.values(), key=lambda r: r.get("asked_at") or 0)
 print(json.dumps(records))
 PY
 )
@@ -125,24 +127,29 @@ HANDOFF_JSON=$(jq -cn \
         questions_snapshot: $questions
     }')
 
-CWD=$(pwd)
-MANAGER_SETTINGS="$ORCH_DIR/presets/manager-settings.json"
-RC_ARG=""
-if [ "${DOCKWRIGHT_MANAGER_RC:-1}" != "0" ]; then
-    RC_ARG="--remote-control "
-fi
-SKIP_ARG=""
-if [ "${DOCKWRIGHT_MANAGER_SKIP_PERMS:-}" = "1" ]; then
-    SKIP_ARG="--dangerously-skip-permissions "
-fi
-unset DOCKWRIGHT_MANAGER_SKIP_PERMS
-if [ -f "$MANAGER_SETTINGS" ]; then
-    RUNTIME_CMD="claude ${RC_ARG}${SKIP_ARG}--model 'claude-opus-5[1m]' --settings '$MANAGER_SETTINGS' '/manager-resume $HANDOFF_ID'"
-else
-    RUNTIME_CMD="claude ${RC_ARG}${SKIP_ARG}--model 'claude-opus-5[1m]' '/manager-resume $HANDOFF_ID'"
+DOCKWRIGHT_BIN="${DOCKWRIGHT_BIN:-$(command -v dockwright || true)}"
+if [ -z "$DOCKWRIGHT_BIN" ] && [ -x "$HOME/.local/bin/dockwright" ]; then
+    DOCKWRIGHT_BIN="$HOME/.local/bin/dockwright"
 fi
 
+CWD="${DOCKWRIGHT_MANAGER_HOME:-}"
+if [ -z "$CWD" ]; then
+    if [ -n "$DOCKWRIGHT_BIN" ]; then
+        if ! CWD="$("$DOCKWRIGHT_BIN" ensure-manager-home)"; then
+            echo "ERROR: bootstrap-recreate: dockwright ensure-manager-home refused the manager home — not spawning a manager elsewhere. Fix [paths] manager_home or DOCKWRIGHT_MANAGER_HOME." >&2
+            exit 5
+        fi
+    fi
+fi
+if [ -z "$CWD" ]; then
+    CWD="$HOME/projects/work/manager"
+fi
+if ! mkdir -p "$CWD" 2>/dev/null || [ ! -d "$CWD" ]; then
+    echo "ERROR: bootstrap-recreate: manager home $CWD could not be created — refusing to spawn a manager that would land in \$HOME with no project rules. Fix [paths] manager_home or DOCKWRIGHT_MANAGER_HOME." >&2
+    exit 5
+fi
 CONFIG_PREFIX=""
+EFFECTIVE_LETTER=""
 ACCOUNT_ACTIVE_FILE="$HOME/.claude/dockwright/account-active"
 ACCOUNT_REGISTRY_FILE="$HOME/.claude/dockwright/account-registry.json"
 if [ -s "$ACCOUNT_ACTIVE_FILE" ]; then
@@ -157,15 +164,37 @@ if [ -s "$ACCOUNT_ACTIVE_FILE" ]; then
     fi
     if [ "$ACTIVE_LETTER" = "$DEFAULT_ACCOUNT" ]; then
         CONFIG_PREFIX="CLAUDE_ORCH_ACCOUNT=$ACTIVE_LETTER "
+        EFFECTIVE_LETTER="$ACTIVE_LETTER"
     else
         FARM="${FARM_OVERRIDE:-$HOME/.claude-$ACTIVE_LETTER}"
         if [ -f "$FARM/.claude.json" ] && jq -e '.mcpServers["dockwright"] // .mcpServers["claude-orchestrator"]' "$FARM/.claude.json" >/dev/null 2>&1; then
             CONFIG_PREFIX="CLAUDE_CONFIG_DIR=$FARM CLAUDE_ORCH_ACCOUNT=$ACTIVE_LETTER "
+            EFFECTIVE_LETTER="$ACTIVE_LETTER"
         else
             CONFIG_PREFIX="CLAUDE_ORCH_ACCOUNT=$DEFAULT_ACCOUNT "
+            EFFECTIVE_LETTER="$DEFAULT_ACCOUNT"
         fi
     fi
 fi
+
+LAUNCH_ARGS=""
+if [ -n "$DOCKWRIGHT_BIN" ]; then
+    LAUNCH_ARGS="$("$DOCKWRIGHT_BIN" manager-launch-args ${EFFECTIVE_LETTER:+--account "$EFFECTIVE_LETTER"})" || LAUNCH_ARGS=""
+fi
+if [ -z "$LAUNCH_ARGS" ]; then
+    echo "ERROR: bootstrap-recreate: \`${DOCKWRIGHT_BIN:-dockwright} manager-launch-args${EFFECTIVE_LETTER:+ --account $EFFECTIVE_LETTER}\` named no launch args — refusing to spawn a manager whose model, effort or Remote Control state is unknown. Put dockwright on PATH or at \$HOME/.local/bin/dockwright, or point DOCKWRIGHT_BIN at it; a dockwright older than this release predates \`dockwright manager-launch-args\`." >&2
+    exit 1
+fi
+if ! NOTEBOOK_GATE=$("$DOCKWRIGHT_BIN" notebook check --sid="$FROM_SID" --domain="$DOMAIN" 2>&1); then
+    echo "ERROR: bootstrap-recreate: $NOTEBOOK_GATE" >&2
+    case "$NOTEBOOK_GATE" in
+        *"Unknown subcommand"*)
+            echo "${DOCKWRIGHT_BIN} is a dockwright older than this release: it predates \`dockwright notebook\`. Put the clone it runs from back on main." >&2 ;;
+    esac
+    exit 6
+fi
+unset DOCKWRIGHT_MANAGER_SKIP_PERMS
+RUNTIME_CMD="$(printf '%q' "$DOCKWRIGHT_BIN") launch ${LAUNCH_ARGS} '/manager-resume $HANDOFF_ID'"
 
 TMUX_SOCK="${DOCKWRIGHT_TMUX_SOCKET:-${CLAUDE_ORCH_TMUX_SOCKET:-dockwright}}"
 TMUX_CONF_FILE="$HOME/.claude/dockwright/dockwright.tmux.conf"
@@ -176,7 +205,7 @@ if [ -f "$TMUX_CONF_FILE" ]; then FFLAG=(-f "$TMUX_CONF_FILE")
 elif [ -f "$TMUX_CONF_LEGACY" ]; then FFLAG=(-f "$TMUX_CONF_LEGACY")
 elif [ -f "$TMUX_CONF_LEGACY2" ]; then FFLAG=(-f "$TMUX_CONF_LEGACY2"); fi
 if [ -n "$DRY_RUN" ]; then
-    echo "DRY_RUN: no spawn. socket=$TMUX_SOCK config_prefix=[$CONFIG_PREFIX] cmd=[$RUNTIME_CMD]"
+    echo "DRY_RUN: no spawn. socket=$TMUX_SOCK cwd=$CWD config_prefix=[$CONFIG_PREFIX] cmd=[$RUNTIME_CMD]"
     echo "handoff_id: $HANDOFF_ID"
     echo "handoff_path: (dry-run, not written) $HANDOFF_PATH"
     echo "handoff_payload: $HANDOFF_JSON"

@@ -2,6 +2,7 @@ import json
 import subprocess
 from pathlib import Path
 
+from dockwright import presets
 from tests.carve_helpers import compose_generic, compose_operator, requires_operator_overlay
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -87,6 +88,18 @@ def test_headless_preset_reasserts_spawner_settings_keys():
     assert settings.get("disableRemoteControl") is True
 
 
+NO_BASH_FIRST_SOURCE = REPO_ROOT / "deploy" / "derived-presets" / "worker-headless-no-bash-first-settings.json"
+
+
+def test_the_no_bash_first_source_extends_the_headless_preset_with_the_knob(tmp_path):
+    assert json.loads(NO_BASH_FIRST_SOURCE.read_text()) == {
+        "extends": "worker-headless-settings.json", "env": {"CLAUDE_CODE_THRIFTY_SONIC": "0"}}
+    out = tmp_path / "out.json"
+    presets.derive_preset(NO_BASH_FIRST_SOURCE, PRESETS, out)
+    derived = json.loads(out.read_text())
+    assert derived["permissions"]["allow"] == json.loads(HEADLESS_PRESET.read_text())["permissions"]["allow"]
+    assert derived["permissions"]["defaultMode"] == "auto"
+
 def test_headless_preset_allows_worker_protocol_tools():
     perms = json.loads(HEADLESS_PRESET.read_text())["permissions"]
     assert perms.get("defaultMode") == "auto"
@@ -94,7 +107,17 @@ def test_headless_preset_allows_worker_protocol_tools():
     for rule in (
         "mcp__dockwright__worker_done",
         "mcp__dockwright__ask_manager",
+        "mcp__dockwright__child_done",
+        "mcp__dockwright__ask_parent",
+        "mcp__dockwright__spawn_child",
+        "mcp__dockwright__wait_for_child",
+        "mcp__dockwright__answer_child",
+        "mcp__dockwright__list_children",
+        "mcp__dockwright__send_to_child",
+        "mcp__dockwright__kill_child",
+        "mcp__dockwright__get_child_tail",
         "mcp__dockwright__artifact_put",
+        "mcp__dockwright__pipeline_advance",
         "Bash(printenv:*)",
     ):
         assert rule in allow, f"headless preset must allow {rule}"
@@ -104,6 +127,7 @@ def test_verifier_preset_allows_worker_protocol_tools():
     settings = json.loads(VERIFIER_PRESET.read_text())
     allow = settings["permissions"]["allow"]
     for rule in ("mcp__dockwright__worker_done", "mcp__dockwright__ask_manager",
+                 "mcp__dockwright__child_done", "mcp__dockwright__ask_parent",
                  "Bash(printenv:*)"):
         assert rule in allow, f"verifier preset must allow {rule}"
     assert settings.get("enableAllProjectMcpServers") is True
@@ -117,7 +141,6 @@ def test_composed_generic_resolves_preset_paths_no_overlay():
     home = str(Path.home())
     assert "<absolute-home>" not in text
     assert f"{home}/.claude/dockwright/presets/verifier-settings.json" in text
-    assert f"{home}/.claude/dockwright/presets/worker-headless-settings.json" in text
 
 
 GIT_WILDCARD_VERBS = ("status", "diff", "log", "show", "add", "commit", "init",
@@ -176,15 +199,29 @@ def test_manager_settings_preset_allows_boot_mcp_tools():
         "mcp__dockwright__prepare_recovery_handoff",
         "mcp__dockwright__attach_existing",
         "mcp__dockwright__list_workers",
+        "mcp__dockwright__list_children",
         "mcp__dockwright__list_pending_questions",
         "mcp__dockwright__list_managers",
         "mcp__dockwright__list_closed_workers",
         "mcp__dockwright__get_worker_summary",
         "mcp__dockwright__get_worker_tail",
+        "mcp__dockwright__get_child_tail",
+        "mcp__dockwright__get_worker_pane",
         "Bash(printenv:*)",
         "Bash(dockwright boot-brief:*)",
+        "Bash(dockwright model manager:*)",
     ):
         assert rule in allow, f"manager preset must allow {rule}"
+
+
+def test_manager_settings_preset_allows_the_board_screens_and_never_its_server():
+    allow = json.loads(MANAGER_SETTINGS_PRESET.read_text())["permissions"]["allow"]
+    prefixes = [rule[len("Bash("):-len(":*)")] for rule in allow if rule.startswith("Bash(") and rule.endswith(":*)")]
+    for command in ("dockwright board inbox --domain general",
+                    "dockwright board topics --domain general --kind note --status open", "dockwright board topic W1"):
+        assert any(command.startswith(p) for p in prefixes), command
+    for command in ("dockwright board --serve", "dockwright board --port 8741 --serve"):
+        assert not any(command.startswith(p) for p in prefixes), command
 
 
 def test_manager_settings_preset_excludes_monitor_ungoverned_shell():
@@ -203,10 +240,19 @@ def test_manager_settings_preset_excludes_mutating_fleet_tools():
     allow = json.loads(MANAGER_SETTINGS_PRESET.read_text())["permissions"]["allow"]
     for banned in (
         "mcp__dockwright__spawn_worker",
+        "mcp__dockwright__spawn_child",
         "mcp__dockwright__kill_worker",
+        "mcp__dockwright__kill_child",
         "mcp__dockwright__resume_worker",
         "mcp__dockwright__answer_question",
+        "mcp__dockwright__answer_child",
         "mcp__dockwright__send_manager_to_worker",
+        "mcp__dockwright__send_to_child",
+        "mcp__dockwright__answer_permission_prompt",
+        "mcp__dockwright__pipeline_start",
+        "mcp__dockwright__pipeline_advance",
+        "mcp__dockwright__pipeline_rework",
+        "mcp__dockwright__pipeline_close",
     ):
         assert banned not in allow, f"{banned} must stay off the manager allowlist"
 

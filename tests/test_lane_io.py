@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from dockwright import lane_io
+from dockwright import lane_io, paths, state
 
 
 def test_probe_live_pipe_is_not_dead():
@@ -413,6 +413,8 @@ def _stale_scan_with_child_code(code, monkeypatch, tmp_path):
     from dockwright import monitor, paths
 
     monkeypatch.setattr(paths, "LANE_HEALTH", tmp_path / "lane-health")
+    monkeypatch.setattr(paths, "ROOT", tmp_path)
+    monkeypatch.setattr(paths, "ARTIFACTS", tmp_path / "artifacts")
     monkeypatch.setattr(lane_io, "reader_is_dead", lambda fd=1: False)
 
     class _Result:
@@ -497,3 +499,73 @@ def test_the_side_effecting_lane_gets_exactly_one_attempt():
 
 def test_a_lane_slower_than_the_window_still_ends():
     assert lane_io.max_consecutive_errors("nonexistent-lane") == 1
+
+
+def test_the_pages_lane_polls_every_second():
+    assert lane_io.LANES["pages"] == 1
+
+
+def test_awake_seconds_is_monotonic_and_positive():
+    a = lane_io.awake_seconds()
+    b = lane_io.awake_seconds()
+    assert 0 < a <= b
+
+
+def test_heartbeat_carries_awake_and_extra_fields(tmp_path, monkeypatch):
+    monkeypatch.setattr(paths, "LANE_HEALTH", tmp_path / "lane-health")
+    monkeypatch.setattr(lane_io, "awake_seconds", lambda: 4321.0)
+    lane_io.write_heartbeat("mgr", "pages", emitted=False, now=100.0, extra={"daemon_silent_level": 2})
+    record = state.read_json(lane_io.heartbeat_path("mgr", "pages"))
+    assert record["awake"] == 4321.0 and record["daemon_silent_level"] == 2 and record["last_scan"] == 100.0
+
+
+def test_emit_writes_no_comparison_file(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(paths, "DAEMON", tmp_path / "daemon")
+    paths.DAEMON.mkdir()
+    lane_io.emit("DONE w1 → x")
+    assert capsys.readouterr().out == "DONE w1 → x\n"
+    assert not (paths.DAEMON / "shadow").exists()
+    assert not hasattr(lane_io, "shadow")
+
+
+def test_lanes_in_manager_keeps_the_daemons_last_mode_while_the_config_does_not_parse(tmp_path, monkeypatch):
+    from dockwright import config
+    monkeypatch.setattr(paths, "DAEMON", tmp_path / "daemon")
+    cfg = tmp_path / "dockwright.toml"
+    monkeypatch.setenv(config.ENV_CONFIG_PATH, str(cfg))
+    cfg.write_text("[lanes]\nin_manager = false\n")
+    assert lane_io.lanes_in_manager() is False
+    cfg.write_text("[lanes]\nin_manager = false\n[gh.logins]\nacme = alice-unquoted\n")
+    assert config.load_error() is not None
+    assert lane_io.lanes_in_manager() is True
+    lane_io.remember_lanes_mode(False)
+    assert lane_io.lanes_in_manager() is False
+    cfg.write_text("[lanes]\nin_manager = true\n")
+    assert lane_io.lanes_in_manager() is True
+
+def test_lanes_in_manager_keeps_the_daemons_last_mode_while_the_config_has_no_lanes_table(tmp_path, monkeypatch):
+    from dockwright import config
+    monkeypatch.setattr(paths, "DAEMON", tmp_path / "daemon")
+    cfg = tmp_path / "dockwright.toml"
+    monkeypatch.setenv(config.ENV_CONFIG_PATH, str(cfg))
+    lane_io.remember_lanes_mode(False)
+    cfg.write_text("")
+    assert lane_io.lanes_in_manager() is False
+    cfg.unlink()
+    assert lane_io.lanes_in_manager() is False
+    cfg.write_text("[lanes]\nin_manager = true\n")
+    assert lane_io.lanes_in_manager() is True
+    cfg.write_text("[daemon]\nenabled = true\n")
+    assert lane_io.lanes_in_manager() is False
+
+def test_a_non_boolean_in_manager_keeps_the_remembered_mode_and_names_the_error(tmp_path, monkeypatch):
+    from dockwright import config
+    monkeypatch.setattr(paths, "DAEMON", tmp_path / "daemon")
+    cfg = tmp_path / "dockwright.toml"
+    monkeypatch.setenv(config.ENV_CONFIG_PATH, str(cfg))
+    lane_io.remember_lanes_mode(False)
+    cfg.write_text('[lanes]\nin_manager = "false"\n')
+    assert lane_io.lanes_in_manager() is False
+    assert lane_io.lanes_mode_error() == "[lanes] in_manager = 'false' is not a boolean"
+    cfg.write_text("[lanes]\nin_manager = true\n")
+    assert lane_io.lanes_mode_error() is None and lane_io.lanes_in_manager() is True

@@ -609,3 +609,39 @@ def test_strip_removes_selffix_sessionend_hook():
     cmds = [h["command"] for b in out.get("hooks", {}).get("SessionEnd", []) for h in b["hooks"]]
     assert cmds == ["bash /other/native-hook.sh"]
     assert not any("selffix-trigger.sh" in c for c in cmds)
+
+
+def test_strip_plugin_registration_removes_only_our_keys():
+    settings = {"enabledPlugins": {"dockwright@dockwright": True, "other@m": True},
+                "extraKnownMarketplaces": {"dockwright": {"source": {}}, "m": {"source": {}}},
+                "hooks": {}}
+    out = un.strip_plugin_registration(settings)
+    assert out["enabledPlugins"] == {"other@m": True}
+    assert out["extraKnownMarketplaces"] == {"m": {"source": {}}}
+    assert un.strip_plugin_registration({"a": 1}) == {"a": 1}
+
+
+def test_plan_deregisters_the_plugin_and_removes_its_rendered_tree(fake_install, monkeypatch):
+    fx = fake_install
+    claude = fx["claude"]
+    settings_path = claude / "settings.json"
+    data = json.loads(settings_path.read_text())
+    data["enabledPlugins"] = {"dockwright@dockwright": True, "other@m": True}
+    data["extraKnownMarketplaces"] = {"dockwright": {"source": {}}, "m": {"source": {}}}
+    settings_path.write_text(json.dumps(data))
+    (claude / "dockwright" / "plugin").mkdir(parents=True)
+    monkeypatch.setattr(un.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    plan = un.build_plan(_roots_from(fx))
+    assert ["claude", "plugin", "uninstall", "dockwright@dockwright",
+            "--scope", "user"] in plan.mcp
+    assert ["claude", "plugin", "marketplace", "remove", "dockwright",
+            "--scope", "user"] in plan.mcp
+    assert claude / "dockwright" / "plugin" in plan.remove
+
+    edits = [e for e in plan.hook_edits if e.target == settings_path]
+    assert len(edits) == 1
+    after = json.loads(edits[0].new_text)
+    assert after["enabledPlugins"] == {"other@m": True}
+    assert after["extraKnownMarketplaces"] == {"m": {"source": {}}}
+    assert "hooks" not in after or "SessionStart" not in after["hooks"]

@@ -8,8 +8,19 @@ import time
 from pathlib import Path
 
 PLACEHOLDER = "@@DOCKWRIGHT_BIN@@"
-ORCH_SUBCOMMANDS = ("session-start", "user-prompt-submit", "stop", "session-end")
+ORCH_SUBCOMMANDS = ("session-start", "user-prompt-submit", "stop-failure", "stop", "session-end", "subagent-start",
+                    "permission-request", "post-tool-use")
 BACKUP_KEEP = 5
+CODEX_SESSION_END_TIMEOUT_SEC = 3
+
+
+def clamp_codex_session_end(hooks: dict) -> dict:
+    for block in hooks.get("SessionEnd", []):
+        for hook in block.get("hooks", []):
+            timeout = hook.get("timeout")
+            if isinstance(timeout, (int, float)) and timeout > CODEX_SESSION_END_TIMEOUT_SEC:
+                hook["timeout"] = CODEX_SESSION_END_TIMEOUT_SEC
+    return hooks
 
 _BIN_NAMES = r"(?:dockwright|orchestrator)"
 _SUBCMD_RE = re.compile(
@@ -145,8 +156,11 @@ def merge_settings_file(target, snippet_path, orch_bin: str, mode: str) -> None:
         existing = {}
 
     if mode == "codex":
+        rendered = copy.deepcopy(rendered)
+        rendered.get("hooks", {}).pop("PostToolUse", None)
+        rendered.get("hooks", {}).pop("StopFailure", None)
         base = {"hooks": existing.get("hooks", {})}
-        out = {"hooks": merge_hooks(base, rendered).get("hooks", {})}
+        out = {"hooks": clamp_codex_session_end(merge_hooks(base, rendered).get("hooks", {}))}
     else:
         out = merge_hooks(existing, rendered)
 

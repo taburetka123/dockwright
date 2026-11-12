@@ -34,6 +34,14 @@ def _prefer_new(new: Path, legacy: Path) -> Path:
 ORCH_ROOT = _prefer_new(HOME / ".claude" / "dockwright", HOME / ".claude" / "orchestrator")
 
 
+def _resolve_pane_helpers():
+    try:
+        from dockwright.stale_monitor import _pane_input_idle, _stamp_pane_send
+        return _pane_input_idle, _stamp_pane_send
+    except Exception:
+        return None, None
+
+
 def _resolve_get_driver():
     try:
         from dockwright.terminal import get_driver
@@ -50,6 +58,7 @@ def _resolve_get_driver():
     except Exception:
         return None
 ACTIVE = ORCH_ROOT / "active"
+PANE_SENDS = ORCH_ROOT / "pane-sends"
 QUESTIONS = ORCH_ROOT / "questions"
 ORPHANS = ORCH_ROOT / "orphans"
 BOOTLITE_DIR = _prefer_new(HOME / ".claude" / "dockwright" / "bootlite", HOME / ".claude" / "bootlite")
@@ -63,6 +72,7 @@ MAX_NOTIFY_PER_STRETCH = _env_positive_int("BOOTLITE_MAX_NOTIFY", 6)
 AUTONUDGE = os.environ.get("CLAUDE_ORCH_AUTONUDGE") == "1"
 
 UNSCOPED = "_unscoped"
+DAEMON_PARENT = "daemon"
 
 NUDGE_TEXT = (
     "[bootlite watchdog] Your manager session is gone (crashed or closed "
@@ -141,7 +151,7 @@ def _pending_question_sids() -> set:
         return sids
     for p in QUESTIONS.rglob("*.json"):
         record = _read_json(p)
-        if record and record.get("worker_sid"):
+        if record and record.get("worker_sid") and record.get("asked_by") != "manager":
             sids.add(record["worker_sid"])
     return sids
 
@@ -162,12 +172,14 @@ def scan_orphans() -> dict[str, list[dict]]:
         agent = record.get("agent")
         if agent == "manager" and record.get("name"):
             managers_alive[record["name"]] = managers_alive.get(record["name"]) or alive
-        elif agent == "worker" and alive:
+        elif agent == "worker" and alive and record.get("kind") != "subworker":
             workers.append(record)
     any_manager_alive = any(managers_alive.values())
     groups: dict[str, list[dict]] = {}
     for worker in workers:
-        parent = worker.get("parent_manager_name")
+        parent = worker.get("parent_name") or worker.get("parent_manager_name")
+        if parent == DAEMON_PARENT:
+            continue
         if parent:
             if managers_alive.get(parent):
                 continue
@@ -240,7 +252,8 @@ def _nudge_group(key: str, workers: list, entry: dict, pending_sids: set,
         window_id = worker.get("window_id") or worker.get("iterm_sid") or ""
         if not sid or sid in nudged_map or not window_id or sid in pending_sids:
             continue
-        send(str(window_id), NUDGE_TEXT)
+        if not send(str(window_id), NUDGE_TEXT, sid):
+            continue
         nudged_map[sid] = now
         nudged_sids.append(sid)
     return nudged_sids
@@ -270,8 +283,16 @@ def run_tick(now: float, dry_run: bool = False) -> tuple[str, dict]:
     send = None
     if AUTONUDGE:
         gd = _resolve_get_driver()
-        if gd is not None:
-            send = lambda wid, txt: gd().send_text(wid, txt)
+        pane_idle, stamp = _resolve_pane_helpers()
+        if gd is not None and pane_idle is not None:
+            def send(wid, txt, sid=None):
+                if not pane_idle(wid):
+                    return False
+                if gd().send_text(wid, txt) is False:
+                    return False
+                if sid:
+                    stamp(sid, root=PANE_SENDS)
+                return True
     for key, workers in groups.items():
         entry = state.get(key)
         if entry is None:

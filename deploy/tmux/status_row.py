@@ -24,11 +24,31 @@ BUSY_COLOR = ("#aa8800", "#ffffff")
 QUESTION_COLOR = ("#aa3300", "#ffffff")
 SELECTED_COLOR = ("#0099cc", "#ffffff")
 SELECTED_MARKER = "▸"
+STATE_COLOR = {"question": QUESTION_COLOR, "processing": BUSY_COLOR, "idle": IDLE_COLOR}
+CHILD_MARKER = "↳"
 
 MENU_MAX_ROWS = 20
 MENU_ROW_CELLS = 76
-MENU_HEIGHT_OVERHEAD = 8
+MENU_FRAME_ROWS = 6
 MENU_STATE_ICON = {"question": "❓", "processing": "🔧", "idle": "💤"}
+
+STATUS_MIN_LINES = 2
+STATUS_MAX_LINES = 5
+STATUS_SHRINK_DELAY_SEC = 300
+STATUS_SHRINK_TAIL_SEC = 60
+SHRINK_FLAG = "statusline-shrink-since"
+TOUCH_FLAG = "statusline-shrink-touched"
+IDLE_FLAG = "statusline-idle-expanded"
+IDLE_EXPANDED_TTL_SEC = 600
+ROWS_FLAG = "statusline-rows-collapsed"
+ROWS_TOGGLE = "toggle:rows"
+COLLAPSE_GLYPH = "⊟"
+EXPAND_GLYPH = "⊞"
+MANAGER_LINES_WHEN_FULL = 2
+CLOCK_CELLS = 7
+DEFAULT_CLIENT_WIDTH = 80
+MANAGERS_LABEL = " 🎯 MANAGERS "
+WORKERS_LABEL = "#[range=user|menu:fleet] 🔧 WORKERS ▾#[norange] "
 
 
 def tmux_escape(text):
@@ -168,16 +188,38 @@ def _is_live(record, now=None):
         return False
 
 
-def classify_worker(record, question_sids, now=None):
+def classify_worker(record, question_sids, now=None, delegating_names=None):
     if record.get("claude_sid") in question_sids:
         return "question"
     if record.get("state") == "processing":
+        return "processing"
+    if delegating_names and record.get("name") in delegating_names:
         return "processing"
     if _is_live(record, now):
         return "processing"
     if _is_delegating(record, now):
         return "processing"
     return "idle"
+
+
+def _is_child(record):
+    return record.get("kind") == "subworker" and not record.get("nested")
+
+
+def _split_children(workers):
+    parents, children, unattached = [], {}, []
+    for r in workers:
+        if not _is_child(r):
+            parents.append(r)
+        elif _parent_of(r):
+            children.setdefault(_parent_of(r), []).append(r)
+        else:
+            unattached.append(r)
+    return parents, children, unattached
+
+
+def _child_label(record):
+    return f"{CHILD_MARKER} {_label(record)} · {record.get('runtime') or 'claude'}"
 
 
 def _signature(record):
@@ -263,7 +305,7 @@ def _unread(record, selected_pane, orch, resolve_live_panes=None):
     return panes is None or wid in panes
 
 
-def render_managers(records, selected_pane="", orch=None):
+def manager_chips(records, selected_pane="", orch=None):
     mgrs = [r for r in records if r.get("agent") == "manager"]
     cached = []
 
@@ -277,19 +319,35 @@ def render_managers(records, selected_pane="", orch=None):
         unread = _unread(r, selected_pane, orch, resolve_live_panes)
         label = f"{UNREAD_MARKER} 🎯 {_manager_label(r)}" if unread else f"🎯 {_manager_label(r)}"
         parts.append(_switch_chip(label, UNREAD_COLOR if unread else MANAGER_COLOR, r, selected_pane))
-    return " ".join(parts)
+    return parts
 
 
-def render_workers(records, question_sids, idle_expanded=False, selected_pane=""):
+def render_managers(records, selected_pane="", orch=None):
+    return " ".join(manager_chips(records, selected_pane, orch))
+
+
+def worker_chips(records, question_sids, idle_expanded=False, selected_pane=""):
     workers = [r for r in records if r.get("agent") == "worker"]
+    parents, children, unattached = _split_children(workers)
+    delegating = set(children)
     buckets = {"question": [], "processing": [], "idle": []}
-    for r in workers:
-        buckets[classify_worker(r, question_sids)].append(r)
+    for r in parents:
+        buckets[classify_worker(r, question_sids, delegating_names=delegating)].append(r)
+
+    def child_chips(parent):
+        chips = []
+        for c in sorted(children.pop(parent.get("name"), []), key=_label):
+            color = STATE_COLOR[classify_worker(c, question_sids)]
+            chips.append(_switch_chip(_child_label(c), color, c, selected_pane))
+        return chips
+
     parts = []
     for r in sorted(buckets["question"], key=_label):
         parts.append(_switch_chip(f"🔧 {_label(r)}", QUESTION_COLOR, r, selected_pane))
+        parts.extend(child_chips(r))
     for r in sorted(buckets["processing"], key=_label):
         parts.append(_switch_chip(f"🔧 {_label(r)}", BUSY_COLOR, r, selected_pane))
+        parts.extend(child_chips(r))
     idle = buckets["idle"]
     if idle:
         n = len(idle)
@@ -302,18 +360,47 @@ def render_workers(records, question_sids, idle_expanded=False, selected_pane=""
                 r.get("window_id") and r.get("window_id") == selected_pane for r in idle
             )
             parts.append(clickable_chip(f"💤{n}", IDLE_COLOR, "toggle:idle", selected=selected_in_idle))
-    return " ".join(parts)
+    orphans = [c for name in sorted(children) for c in sorted(children[name], key=_label)]
+    for c in orphans + sorted(unattached, key=_label):
+        color = STATE_COLOR[classify_worker(c, question_sids)]
+        parts.append(_switch_chip(_child_label(c), color, c, selected_pane))
+    return parts
+
+
+def render_workers(records, question_sids, idle_expanded=False, selected_pane=""):
+    return " ".join(worker_chips(records, question_sids, idle_expanded, selected_pane))
+
+
+def rows_toggle_chip(collapsed):
+    return clickable_chip(EXPAND_GLYPH if collapsed else COLLAPSE_GLYPH, IDLE_COLOR, ROWS_TOGGLE)
+
+
+def collapsed_worker_chips(records, question_sids):
+    workers = [r for r in records if r.get("agent") == "worker"]
+    parents, children, unattached = _split_children(workers)
+    delegating = set(children)
+    attached = [c for group in children.values() for c in group]
+    states = [classify_worker(r, question_sids, delegating_names=delegating) for r in parents]
+    states += [classify_worker(c, question_sids) for c in attached + unattached]
+    parts = [rows_toggle_chip(True)]
+    for state in ("question", "processing", "idle"):
+        count = states.count(state)
+        if count:
+            parts.append(clickable_chip(f"{MENU_STATE_ICON[state]}{count}", STATE_COLOR[state], ROWS_TOGGLE))
+    return parts
 
 
 def _pid_alive(pid):
-    if not pid:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid < 1:
         return True
     try:
-        os.kill(int(pid), 0)
-    except (ProcessLookupError, ValueError, TypeError):
+        os.kill(pid, 0)
+    except ProcessLookupError:
         return False
     except PermissionError:
         return True
+    except OSError:
+        return False
     return True
 
 
@@ -323,8 +410,19 @@ def _is_visible(record):
     return _pid_alive(record.get("pid"))
 
 
-def _idle_expanded(orch):
-    return (orch / "statusline-idle-expanded").exists()
+def _idle_expanded(orch, now=None):
+    try:
+        clicked = (orch / IDLE_FLAG).stat().st_mtime
+    except OSError:
+        return False
+    return (time.time() if now is None else now) - clicked < IDLE_EXPANDED_TTL_SEC
+
+
+def _rows_collapsed(orch):
+    try:
+        return (orch / ROWS_FLAG).exists()
+    except OSError:
+        return False
 
 
 def _tmux(*args):
@@ -346,8 +444,35 @@ def _selected_pane():
     return out.stdout.strip() if out.returncode == 0 else ""
 
 
+def _status_lines():
+    try:
+        out = subprocess.run(["tmux", "show-options", "-gv", "status"],
+                             capture_output=True, text=True, timeout=2, check=False)
+    except Exception:
+        return None
+    value = out.stdout.strip()
+    if value == "on":
+        return 1
+    return int(value) if value.isdigit() else None
+
+
+def _client_widths():
+    try:
+        out = subprocess.run(["tmux", "list-clients", "-F", "#{client_width}"],
+                             capture_output=True, text=True, timeout=2, check=False)
+    except Exception:
+        return []
+    return [int(v) for v in out.stdout.split() if v.isdigit()]
+
+
+def _char_cells(c):
+    if unicodedata.category(c) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+
+
 def _cells(text):
-    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in text)
+    return sum(_char_cells(c) for c in text)
 
 
 def _truncate_cells(text, budget):
@@ -355,12 +480,128 @@ def _truncate_cells(text, budget):
         return text
     out, used = [], 0
     for c in text:
-        w = 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+        w = _char_cells(c)
         if used + w > budget - 1:
             break
         out.append(c)
         used += w
     return "".join(out) + "…"
+
+
+def _markup_cells(markup):
+    cells, i = 0, 0
+    while i < len(markup):
+        if markup.startswith("##", i):
+            cells, i = cells + 1, i + 2
+        elif markup.startswith("#[", i):
+            end = markup.find("]", i)
+            i = len(markup) if end < 0 else end + 1
+        else:
+            cells, i = cells + _char_cells(markup[i]), i + 1
+    return cells
+
+
+def _row_cells(chips):
+    return sum(_markup_cells(c) for c in chips) + max(len(chips) - 1, 0)
+
+
+def _wrap(chips, first_room, room):
+    lines, left = [[]], first_room
+    for c in chips:
+        gap = 1 if lines[-1] else 0
+        if gap and gap + _markup_cells(c) > left:
+            lines.append([])
+            left, gap = room, 0
+        lines[-1].append(c)
+        left -= gap + _markup_cells(c)
+    return lines
+
+
+def _split_lines(need_managers, need_workers):
+    if need_managers + need_workers <= STATUS_MAX_LINES:
+        return need_managers, need_workers
+    managers = min(need_managers, max(MANAGER_LINES_WHEN_FULL, STATUS_MAX_LINES - need_workers))
+    return managers, STATUS_MAX_LINES - managers
+
+
+def _fit(lines, max_lines, last_room, overflow):
+    if len(lines) <= max_lines:
+        return lines
+    kept = [list(line) for line in lines[:max_lines]]
+    hidden = sum(len(line) for line in lines[max_lines:])
+    last = kept[-1]
+    while last and _row_cells(last + [overflow(hidden)]) > last_room:
+        last.pop()
+        hidden += 1
+    last.append(overflow(hidden))
+    return kept
+
+
+def _labelled(lines, label):
+    indent = " " * _markup_cells(label)
+    return [(label if i == 0 else indent) + " ".join(chips) for i, chips in enumerate(lines)]
+
+
+def status_lines(records, question_sids, idle_expanded, selected_pane, orch, width, collapsed=False):
+    managers_room = width - _markup_cells(MANAGERS_LABEL)
+    workers_room = width - _markup_cells(WORKERS_LABEL)
+    managers = _wrap(manager_chips(records, selected_pane, orch), managers_room - CLOCK_CELLS, managers_room)
+    if collapsed:
+        worker_parts = collapsed_worker_chips(records, question_sids)
+    else:
+        worker_parts = [rows_toggle_chip(False)] + worker_chips(records, question_sids, idle_expanded, selected_pane)
+    workers = _wrap(worker_parts, workers_room, workers_room)
+    m, w = _split_lines(len(managers), 1 if collapsed else len(workers))
+    managers = _fit(managers, m, managers_room - (CLOCK_CELLS if m == 1 else 0),
+                    lambda n: chip(f"+{n}", MANAGER_COLOR))
+    workers = _fit(workers, w, workers_room,
+                   lambda n: clickable_chip(f"+{n}", IDLE_COLOR, "menu:all"))
+    return _labelled(managers, MANAGERS_LABEL) + _labelled(workers, WORKERS_LABEL)
+
+
+def _age(path, now):
+    try:
+        return now - path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _shrink_due(orch, now, wanted, current):
+    waited = _age(orch / SHRINK_FLAG, now)
+    if waited is None:
+        if wanted == current:
+            return False
+        try:
+            (orch / SHRINK_FLAG).touch()
+        except OSError:
+            return True
+        return False
+    if waited < STATUS_SHRINK_DELAY_SEC:
+        if wanted == current:
+            try:
+                (orch / TOUCH_FLAG).touch()
+            except OSError:
+                pass
+        return False
+    touched = _age(orch / TOUCH_FLAG, now)
+    return wanted == current or touched is None or touched >= STATUS_SHRINK_TAIL_SEC
+
+
+def _sync_status_lines(records, question_sids, idle_expanded, orch, width, collapsed=False):
+    narrowest = min([width, *_client_widths()]) - _cells(SELECTED_MARKER)
+    wanted = len(status_lines(records, question_sids, idle_expanded, "", orch, narrowest, collapsed))
+    current = _status_lines()
+    if current is None:
+        return
+    if wanted <= current and not (collapsed or _shrink_due(orch, time.time(), wanted, current)):
+        return
+    for name in (SHRINK_FLAG, TOUCH_FLAG):
+        try:
+            (orch / name).unlink()
+        except OSError:
+            pass
+    if current != wanted:
+        _tmux("set-option", "-g", "status", str(wanted))
 
 
 def _first_line(text):
@@ -371,11 +612,20 @@ def _first_line(text):
     return ""
 
 
-def _menu_label(record, question_sids, selected_pane):
-    icon = MENU_STATE_ICON[classify_worker(record, question_sids)]
+def _menu_label(record, question_sids, selected_pane, delegating_names=None):
+    child = _is_child(record)
+    icon = MENU_STATE_ICON[classify_worker(record, question_sids,
+                                           delegating_names=None if child else delegating_names)]
+    question = question_sids.get(record.get("claude_sid")) if isinstance(question_sids, dict) else None
+    if question and question.get("task_key") and icon == MENU_STATE_ICON["question"]:
+        marker = "▸" if record.get("window_id") and record.get("window_id") == selected_pane else ""
+        head = f"{marker}{icon} {question['task_key']} — {_first_line(question.get('text'))}"
+        return _truncate_cells(head, MENU_ROW_CELLS)
     funny = record.get("funny_name") or ""
     task = record.get("name") or ""
     who = f"{funny} · {task}" if funny and task else (funny or task or "worker")
+    if child:
+        who = f"{CHILD_MARKER} {who} · {record.get('runtime') or 'claude'}"
     marker = "▸" if record.get("window_id") and record.get("window_id") == selected_pane else ""
     head = f"{marker}{icon} {who}"
     summary = _first_line(record.get("last_summary"))
@@ -385,23 +635,31 @@ def _menu_label(record, question_sids, selected_pane):
     return _truncate_cells(head, MENU_ROW_CELLS)
 
 
+def _parent_of(record):
+    name = record.get("parent_name")
+    return name if name is not None else record.get("parent_manager_name")
+
+
 def _resolve_scope(records, pane):
     if pane:
         for r in records:
             if r.get("window_id") and r.get("window_id") == pane:
                 if r.get("agent") == "manager":
                     return r.get("name")
-                return r.get("parent_manager_name")
+                if _is_child(r):
+                    parent = next((p for p in records if p.get("name") == _parent_of(r)), None)
+                    return _parent_of(parent) if parent else None
+                return _parent_of(r)
     managers = [r for r in records if r.get("agent") == "manager"]
     if len(managers) == 1:
         return managers[0].get("name")
     return None
 
 
-def _bucketed(workers, question_sids):
+def _bucketed(workers, question_sids, delegating_names=None):
     buckets = {"question": [], "processing": [], "idle": []}
     for r in workers:
-        buckets[classify_worker(r, question_sids)].append(r)
+        buckets[classify_worker(r, question_sids, delegating_names=delegating_names)].append(r)
     return (sorted(buckets["question"], key=_label)
             + sorted(buckets["processing"], key=_label)
             + sorted(buckets["idle"], key=_freshest_first))
@@ -414,22 +672,31 @@ def _switch_cmd(script, wid):
 def build_fleet_menu(records, question_sids, scope, selected_pane="", max_rows=MENU_MAX_ROWS, script=None):
     script = script or os.path.abspath(__file__)
     workers = [r for r in records if r.get("agent") == "worker"]
+    parents, children, _unattached = _split_children(workers)
+    delegating = set(children)
     if scope:
-        workers = [w for w in workers if w.get("parent_manager_name") in (scope, None)]
-    title = tmux_escape(f" {scope or 'all managers'} · {len(workers)} workers ")
-    if not workers:
+        parents = [w for w in parents if _parent_of(w) in (scope, None)]
+    title = tmux_escape(f" {scope or 'all managers'} · {len(parents)} workers ")
+    if not parents:
         return title, ["-no workers", "", ""]
+
+    def with_children(worker_rows):
+        rows = []
+        for w in worker_rows:
+            rows.append(("worker", w))
+            rows.extend(("worker", c) for c in sorted(children.get(w.get("name"), []), key=_label))
+        return rows
 
     rows = []
     by_mgr = {}
-    for w in workers:
-        by_mgr.setdefault(w.get("parent_manager_name") or "?", []).append(w)
+    for w in parents:
+        by_mgr.setdefault(_parent_of(w) or "?", []).append(w)
     if scope is None and len(by_mgr) > 1:
         for mgr in sorted(by_mgr):
             rows.append(("header", mgr))
-            rows.extend(("worker", w) for w in _bucketed(by_mgr[mgr], question_sids))
+            rows.extend(with_children(_bucketed(by_mgr[mgr], question_sids, delegating)))
     else:
-        rows = [("worker", w) for w in _bucketed(workers, question_sids)]
+        rows = with_children(_bucketed(parents, question_sids, delegating))
 
     args, n_rows, key_n = [], 0, 0
     for i, (kind, item) in enumerate(rows):
@@ -442,7 +709,7 @@ def build_fleet_menu(records, question_sids, scope, selected_pane="", max_rows=M
         if kind == "header":
             args += [f"-#[bold]{tmux_escape(str(item))}", "", ""]
             continue
-        label = tmux_escape(_menu_label(item, question_sids, selected_pane))
+        label = tmux_escape(_menu_label(item, question_sids, selected_pane, delegating))
         wid = item.get("window_id")
         if wid:
             key_n += 1
@@ -452,22 +719,34 @@ def build_fleet_menu(records, question_sids, scope, selected_pane="", max_rows=M
     return title, args
 
 
-def show_fleet_menu(orch, client, mouse_x, pane, height):
+def show_fleet_menu(orch, client, mouse_x, pane, height, whole_fleet=False):
     records, qsids = collect(orch / "active", orch / "questions")
-    scope = _resolve_scope(records, pane)
+    scope = None if whole_fleet else _resolve_scope(records, pane)
     max_rows = MENU_MAX_ROWS
     if str(height).isdigit():
-        max_rows = max(3, min(MENU_MAX_ROWS, int(height) - MENU_HEIGHT_OVERHEAD))
+        status = _status_lines() or STATUS_MIN_LINES
+        max_rows = max(3, min(MENU_MAX_ROWS, int(height) - MENU_FRAME_ROWS - status))
     title, items = build_fleet_menu(records, qsids, scope, pane, max_rows)
     cmd = ["tmux", "display-menu", "-M", "-O"]
     if client:
         cmd += ["-c", client]
-    cmd += ["-x", mouse_x if str(mouse_x).isdigit() else "M", "-y", "S", "-T", title]
+    cmd += ["-x", mouse_x if str(mouse_x).isdigit() else "M", "-y", "S", "-T", title, "--"]
     cmd += items
     try:
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
+
+
+def _toggle_flag(orch, name, on):
+    try:
+        if on:
+            (orch / name).unlink()
+        else:
+            orch.mkdir(parents=True, exist_ok=True)
+            (orch / name).touch()
+    finally:
+        _tmux("refresh-client", "-S")
 
 
 def handle_click(payload, orch, client="", mouse_x="", pane="", height=""):
@@ -476,17 +755,11 @@ def handle_click(payload, orch, client="", mouse_x="", pane="", height=""):
         if target:
             _tmux("switch-client", "-t", target)
     elif payload == "toggle:idle":
-        flag = orch / "statusline-idle-expanded"
-        try:
-            if flag.exists():
-                flag.unlink()
-            else:
-                orch.mkdir(parents=True, exist_ok=True)
-                flag.touch()
-        finally:
-            _tmux("refresh-client", "-S")
-    elif payload == "menu:fleet":
-        show_fleet_menu(orch, client, mouse_x, pane, height)
+        _toggle_flag(orch, IDLE_FLAG, _idle_expanded(orch))
+    elif payload == ROWS_TOGGLE:
+        _toggle_flag(orch, ROWS_FLAG, _rows_collapsed(orch))
+    elif payload in ("menu:fleet", "menu:all"):
+        show_fleet_menu(orch, client, mouse_x, pane, height, whole_fleet=payload == "menu:all")
 
 
 def collect(active_dir, questions_dir):
@@ -499,15 +772,21 @@ def collect(active_dir, questions_dir):
                 continue
             if isinstance(rec, dict) and _is_visible(rec):
                 records.append(rec)
-    question_sids = set()
+    question_sids = {}
+    oldest = {}
     if questions_dir.is_dir():
-        for p in questions_dir.rglob("*.json"):
+        for p in sorted(questions_dir.rglob("*.json")):
             try:
                 q = json.loads(p.read_text())
             except (OSError, ValueError):
                 continue
-            if isinstance(q, dict) and q.get("worker_sid"):
-                question_sids.add(q["worker_sid"])
+            if not isinstance(q, dict) or not q.get("worker_sid"):
+                continue
+            sid = q["worker_sid"]
+            asked_at = q.get("asked_at") if isinstance(q.get("asked_at"), (int, float)) else float("inf")
+            if sid not in oldest or asked_at < oldest[sid]:
+                oldest[sid] = asked_at
+                question_sids[sid] = {"task_key": q.get("task_key"), "text": q.get("question")}
     return records, question_sids
 
 
@@ -529,6 +808,17 @@ def main(argv, home):
         return 0
     try:
         records, qsids = collect(orch / "active", orch / "questions")
+        if which == "line":
+            index = int(argv[2]) if len(argv) > 2 and argv[2].isdigit() else -1
+            selected = argv[3] if len(argv) > 3 and argv[3] else _selected_pane()
+            width = int(argv[4]) if len(argv) > 4 and argv[4].isdigit() else DEFAULT_CLIENT_WIDTH
+            idle = _idle_expanded(orch)
+            collapsed = _rows_collapsed(orch)
+            lines = status_lines(records, qsids, idle, selected, orch, width, collapsed)
+            sys.stdout.write(lines[index] if 0 <= index < len(lines) else "")
+            if index == 0:
+                _sync_status_lines(records, qsids, idle, orch, width, collapsed)
+            return 0
         selected = argv[2] if len(argv) > 2 and argv[2] else _selected_pane()
         if which == "managers":
             sys.stdout.write(render_managers(records, selected, orch))

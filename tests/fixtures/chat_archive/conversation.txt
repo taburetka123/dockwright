@@ -1,0 +1,19 @@
+Channel: DM (D01ABCDEF)
+
+=== Message from Ada Example <ada@example.test> (U01ABCDEF) at 2026-10-27 13:00:47 +00 ===
+Message TS: 1793106047.590119
+Lorem ipsum dolor sit amet, consectetur adipiscing elit.
+Thread: 2 replies (latest: 13:20)
+
+=== Message from Bob Example <bob@example.test> (U01BOBBOB) at 2026-10-27 12:40:09 +00 ===
+Message TS: 1793104809.851149
+Sed do eiusmod tempor &lt;incididunt&gt; ut labore &amp; dolore.
+*Sent using* <@U01APPAPP|SomeApp>
+Reactions: eyes (1)
+
+=== Message from Ada Example <ada@example.test> (U01ABCDEF) at 2026-09-21 10:46:36 +00 ===
+Message TS: 1789987596.964679
+
+Files: notes.md (ID: F01ABCDEF, text/plain, 54.5 KB)
+
+There are more messages available. To view the next page, use cursor: `bmV4dF9jb252`

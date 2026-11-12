@@ -20,38 +20,7 @@ print(config.loop_label_prefix())
     fi
   fi
 
-  prefix="$(python3 - <<'PYEOF' 2>/dev/null
-import os
-import pathlib
-
-
-def _expand(raw):
-    return pathlib.Path(raw).expanduser()
-
-
-env = os.environ.get("DOCKWRIGHT_CONFIG", "").strip()
-if env:
-    candidates = [_expand(env)]
-else:
-    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
-    xdg_base = _expand(xdg) if xdg else pathlib.Path.home() / ".config"
-    candidates = [xdg_base / "dockwright" / "dockwright.toml",
-                  pathlib.Path.home() / ".claude" / "dockwright.toml"]
-
-for candidate in candidates:
-    if candidate.is_file():
-        try:
-            import tomllib
-            with open(candidate, "rb") as fh:
-                data = tomllib.load(fh)
-            value = data.get("loops", {}).get("label_prefix")
-            if isinstance(value, str) and value:
-                print(value)
-        except Exception:
-            pass
-        break
-PYEOF
-)" || prefix=""
+  prefix="$(_dockwright_toml_get loops label_prefix)" || prefix=""
   echo "${prefix:-com.dockwright}"
 }
 

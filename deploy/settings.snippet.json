@@ -16,6 +16,13 @@
         ]
       }
     ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash -c '@@DOCKWRIGHT_BIN@@ subagent-start'", "timeout": 5 }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "hooks": [
@@ -34,6 +41,28 @@
       {
         "hooks": [
           { "type": "command", "command": "bash -c 'CLAUDE_PARENT_PID=$PPID @@DOCKWRIGHT_BIN@@ session-end'", "timeout": 5 }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash -c 'CLAUDE_PARENT_PID=$PPID @@DOCKWRIGHT_BIN@@ stop-failure'", "timeout": 10 }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash -c 'CLAUDE_PARENT_PID=$PPID @@DOCKWRIGHT_BIN@@ permission-request'", "timeout": 5 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__.*",
+        "hooks": [
+          { "type": "command", "command": "bash -c 'CLAUDE_PARENT_PID=$PPID @@DOCKWRIGHT_BIN@@ post-tool-use'", "timeout": 5 }
         ]
       }
     ]

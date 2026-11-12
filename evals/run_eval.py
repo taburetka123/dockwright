@@ -7,8 +7,8 @@ read-only via verifier-settings.json), records the verdict, and scores
 catch-rate / false-positive-rate / precision into ONE headline metric.
 
 Usage:
-    python -m evals.run_eval                      # full run, model=sonnet, 3 runs/case
-    python -m evals.run_eval --model opus         # production-faithful tier
+    python -m evals.run_eval                          # full run, model=claude-sonnet-5, 3 runs/case
+    python -m evals.run_eval --model claude-opus-5    # production-faithful tier
     python -m evals.run_eval --repeats 1 --limit 4  # quick smoke
     python -m evals.run_eval --dry-run            # plumbing check, no API calls
 
@@ -300,8 +300,9 @@ def _print_report(agg: dict, head: str) -> None:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--model", default="sonnet",
-                    help="verifier model (default sonnet; opus = production tier)")
+    ap.add_argument("--model", default="claude-sonnet-5",
+                    help="verifier model, a concrete id (default claude-sonnet-5; "
+                         "claude-opus-5 = production tier)")
     ap.add_argument("--repeats", type=int, default=3,
                     help="runs per case for variance (default 3)")
     ap.add_argument("--concurrency", type=int, default=4)

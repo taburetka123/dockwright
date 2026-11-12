@@ -3,25 +3,27 @@ import re
 
 import pytest
 
-from dockwright.spend_session import build_report
+from dockwright.spend_session import _render_text, build_report, heredoc_write, python_heredoc
 
 
 def _asst(mid, *, ts=None, model="claude-opus-5", out=10, cin=0, ccr=0, ccc=0,
           cc=None, stop="end_turn", sidechain=None, skill=None, server=None,
-          mcp_tool=None, tool_uses=(), usage_extra=None):
+          mcp_tool=None, tool_uses=(), usage_extra=None, version=None):
     usage = {"output_tokens": out, "input_tokens": cin,
              "cache_read_input_tokens": ccr, "cache_creation_input_tokens": ccc}
     if cc is not None:
         usage["cache_creation"] = cc
     if usage_extra:
         usage.update(usage_extra)
-    content = [{"type": "tool_use", "id": tid, "name": tname}
-               for tid, tname in tool_uses]
+    content = [{"type": "tool_use", "id": tid, "name": tname, **({"input": rest[0]} if rest else {})}
+               for tid, tname, *rest in tool_uses]
     rec = {"type": "assistant",
            "message": {"id": mid, "model": model, "usage": usage,
                        "stop_reason": stop, "content": content}}
     if ts is not None:
         rec["timestamp"] = ts
+    if version is not None:
+        rec["version"] = version
     if sidechain is not None:
         rec["isSidechain"] = sidechain
     if skill is not None:
@@ -34,7 +36,9 @@ def _asst(mid, *, ts=None, model="claude-opus-5", out=10, cin=0, ccr=0, ccc=0,
 
 
 def _user(*, ts=None, text=None, tool_results=(), meta=False):
-    blocks = [{"type": "tool_result", "tool_use_id": tid} for tid in tool_results]
+    blocks = [{"type": "tool_result", "tool_use_id": item[0], "content": item[1]}
+              if isinstance(item, tuple) else {"type": "tool_result", "tool_use_id": item}
+              for item in tool_results]
     if text is not None:
         blocks.append({"type": "text", "text": text})
     rec = {"type": "user", "message": {"role": "user", "content": blocks}}
@@ -403,10 +407,12 @@ def world(tmp_path, monkeypatch):
 
 
 def _closed(world, sid, name, *, closed_at=1785400000.0, started_at=None,
-            transcript_path=None, runtime="claude"):
+            transcript_path=None, runtime="claude", spend=None):
     record = {"claude_sid": sid, "name": name, "closed_at": closed_at,
               "closed_reason": "idle>7200s", "runtime": runtime,
               "started_at": started_at, "transcript_path": transcript_path}
+    if spend is not None:
+        record["spend"] = spend
     (world["root"] / "closed" / f"{sid}.json").write_text(json.dumps(record))
     return record
 
@@ -682,6 +688,122 @@ def test_codex_json_mode_emits_json_not_prose(world, capsys):
     assert "no usage data" in data["note"]
 
 
+def _cx_usage(inp, cached=0, out=0, reasoning=0):
+    return {"input_tokens": inp, "cached_input_tokens": cached,
+            "cache_write_input_tokens": 0, "output_tokens": out,
+            "reasoning_output_tokens": reasoning, "total_tokens": inp + out}
+
+
+def _codex_records(sid, usages, *, parent=None, model="gpt-5.5"):
+    meta = {"id": sid}
+    if parent is not None:
+        meta.update(parent_thread_id=parent,
+                    source={"subagent": {"other": "guardian"}})
+    records = [{"timestamp": T.format(0), "type": "session_meta", "payload": meta},
+               {"timestamp": T.format(1), "type": "turn_context",
+                "payload": {"model": model}}]
+    total = _cx_usage(0)
+    for i, last in enumerate(usages):
+        total = {key: total[key] + last[key] for key in last}
+        records.append({"timestamp": T.format(2 + i), "type": "event_msg",
+                        "payload": {"type": "token_count",
+                                    "info": {"total_token_usage": total,
+                                             "last_token_usage": last}}})
+    return records
+
+
+def _codex_rollout(world, sid, usages, **kwargs):
+    day = world["projects"].parents[2] / ".codex" / "sessions" / "2026" / "09" / "24"
+    day.mkdir(parents=True, exist_ok=True)
+    return _write(day / f"rollout-2026-09-24T17-16-59-{sid}.jsonl",
+                  _codex_records(sid, usages, **kwargs))
+
+
+def test_codex_session_reports_rollout_tokens_with_its_guardian(world, capsys):
+    from dockwright.spend_session import run
+    rollout = _codex_rollout(world, "cx01", [_cx_usage(1000, 400, 20, 5),
+                                             _cx_usage(1200, 900, 30, 6)])
+    _codex_rollout(world, "cx01-guard", [_cx_usage(500, 100, 4, 2)],
+                   parent="cx01", model="codex-auto-review")
+    _closed(world, "cx01", "codex-node", runtime="codex")
+    assert run(["codex-node", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["source"] == "rollout"
+    assert data["transcript"]["path"] == str(rollout)
+    assert data["tokens"]["main"]["in_tokens"] == 900
+    assert data["tokens"]["subagents"]["in_tokens"] == 400
+    assert data["api_calls"]["unique"] == 3
+    assert run(["codex-node"]) == 0
+    out = capsys.readouterr().out
+    assert "no usage data" not in out
+    assert "TOKENS        main: in 900" in out
+    assert "sub-agents: in 400" in out
+
+
+def test_codex_recorded_transcript_path_wins(world, tmp_path, capsys):
+    from dockwright.spend_session import run
+    _codex_rollout(world, "cx02", [_cx_usage(10, 0, 1)])
+    moved = _write(tmp_path / "moved-rollout.jsonl",
+                   _codex_records("cx02", [_cx_usage(77, 0, 1)]))
+    _closed(world, "cx02", "codex-moved", runtime="codex",
+            transcript_path=str(moved))
+    assert run(["codex-moved", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["transcript"]["path"] == str(moved)
+    assert data["tokens"]["main"]["in_tokens"] == 77
+
+
+def test_codex_session_without_a_rollout_falls_back_to_record_spend(world, capsys):
+    from dockwright.spend_session import run
+    _closed(world, "cx03", "codex-child", runtime="codex",
+            spend={"turns": 1, "out_tokens": 2387, "in_tokens": 109099,
+                   "cache_read_tokens": 673280, "cache_creation_tokens": 0,
+                   "reasoning_tokens": 141, "last_turn_out": 2387, "by_model": {}})
+    assert run(["codex-child", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["source"] == "record"
+    assert data["tokens"]["main"]["in_tokens"] == 109099
+    assert "latest round" in data["note"]
+    assert run(["codex-child"]) == 0
+    out = capsys.readouterr().out
+    assert "rollout not found or empty" in out
+    assert "(reasoning 141)" in out
+
+
+def test_codex_session_with_an_empty_rollout_falls_back_to_record_spend(world, capsys):
+    from dockwright.spend_session import run
+    _codex_rollout(world, "cx04", [])
+    _closed(world, "cx04", "codex-empty", runtime="codex",
+            spend={"turns": 1, "in_tokens": 5, "out_tokens": 1})
+    assert run(["codex-empty", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["source"] == "record"
+
+
+def test_codex_fallback_reads_the_ledger_spend_when_no_record_remains(world, capsys):
+    from dockwright import spend_ledger
+    from dockwright.spend_session import run
+    spend_ledger.append_drop_event(
+        {"claude_sid": "cx05", "name": "codex-pruned", "runtime": "codex",
+         "spend": {"turns": 1, "in_tokens": 42, "out_tokens": 3}}, "prune")
+    assert run(["codex-pruned", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["source"] == "record"
+    assert data["tokens"]["main"] == {"in_tokens": 42, "out_tokens": 3}
+
+
+def test_codex_ambiguous_name_carries_the_resolution_block(world, capsys):
+    from dockwright.spend_session import run
+    _codex_rollout(world, "cx06", [_cx_usage(10, 0, 1)])
+    _codex_rollout(world, "cx07", [_cx_usage(20, 0, 1)])
+    _closed(world, "cx06", "codex-twin", runtime="codex", closed_at=100.0)
+    _closed(world, "cx07", "codex-twin", runtime="codex", closed_at=200.0)
+    assert run(["codex-twin", "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["resolution"] == {"picked_sid": "cx07",
+                                  "ambiguous_sids": ["cx07", "cx06"]}
+    assert data["tokens"]["main"]["in_tokens"] == 20
+
+
 def test_fleet_mode_untouched_and_positional_dispatches(world, capsys):
     from dockwright import spend_report
     assert spend_report.main([]) == 0
@@ -822,3 +944,202 @@ def test_build_report_auto_discovers_sidecars_like_recount(tmp_path):
     scoped = build_report(main, subagent_logs=[])
     assert scoped["tokens"]["subagents"]["out_tokens"] == 0
     assert scoped["transcript"]["subagent_files"] == 0
+
+
+def test_report_rates_every_priced_model_including_one_with_no_cache_reads(tmp_path):
+    main = _write(tmp_path / "s.jsonl", [
+        _asst("m1", ts=T.format(0), model="claude-fable-5-1[1m]", ccr=1_000_000),
+        _asst("m2", ts=T.format(1), model="claude-opus-5", ccr=1_000_000),
+        _asst("m3", ts=T.format(2), model="claude-haiku-4-5", out=10),
+    ])
+    r = build_report(main)
+    assert r["prices"]["cache_read_by_model"] == {
+        "claude-fable-5-1[1m]": 0.025, "claude-opus-5": 0.1, "claude-haiku-4-5": 0.1}
+    assert r["money"]["anatomy"]["cache_read"] == pytest.approx(0.75)
+
+
+def test_render_cache_read_rates_a_model_that_had_no_cache_reads_yet(tmp_path, capsys):
+    from dockwright.spend_session import run
+    log = _write(tmp_path / "s.jsonl", [
+        _asst("m1", ts=T.format(0), model="claude-fable-5-1[1m]", out=10)])
+    assert run(["--transcript", str(log)]) == 0
+    line = next(l for l in capsys.readouterr().out.splitlines() if "cache rd" in l)
+    assert "cache rd 0.025x" in line
+
+
+def test_render_cache_read_names_each_multiplier_when_models_differ(tmp_path, capsys):
+    from dockwright.spend_session import run
+    log = _write(tmp_path / "s.jsonl", [
+        _asst("m1", ts=T.format(0), model="claude-fable-5-1[1m]", ccr=1_000_000),
+        _asst("m2", ts=T.format(1), model="claude-opus-5", ccr=1_000_000),
+    ])
+    assert run(["--transcript", str(log)]) == 0
+    line = next(l for l in capsys.readouterr().out.splitlines() if "cache rd" in l)
+    assert "claude-fable-5-1[1m] 0.025x" in line
+    assert "claude-opus-5 0.1x" in line
+
+
+def test_render_cache_read_is_one_multiplier_for_a_single_model_session(tmp_path, capsys):
+    from dockwright.spend_session import run
+    log = _write(tmp_path / "s.jsonl", [
+        _asst("m1", ts=T.format(0), model="claude-fable-5-1[1m]", ccr=1_000_000)])
+    assert run(["--transcript", str(log)]) == 0
+    line = next(l for l in capsys.readouterr().out.splitlines() if "cache rd" in l)
+    assert "cache rd 0.025x" in line
+
+
+def _cmd(head, body="x = 1"):
+    return f"{head}\n{body}\nEOF"
+
+
+@pytest.mark.parametrize("command,expected", [
+    (_cmd("cat > /tmp/v.md <<'EOF'"), (True, False)),
+    (_cmd("cat >> notes.md <<EOF"), (True, False)),
+    (_cmd('cat > "$OUT" << \'EOF\''), (True, False)),
+    (_cmd("cat <<EOF | tee -a out.md"), (True, False)),
+    (_cmd("cd /w\ncat > f <<'EOF'"), (True, False)),
+    (_cmd("python3 - <<'EOF'"), (False, True)),
+    (_cmd("cd /w && python3 - <<EOF"), (False, True)),
+    (_cmd("git commit -F - <<'EOF'", "subject\n> quoted > y"), (False, False)),
+    (_cmd("gh pr comment 1 --body-file - <<'EOF' 2>&1"), (False, False)),
+    ('cat <<< "x" > f', (False, False)),
+    ("echo hi > f", (False, False)),
+    (_cmd("cat <<EOF > /dev/null"), (False, False)),
+])
+def test_heredoc_classifiers(command, expected):
+    assert (heredoc_write(command), python_heredoc(command)) == expected
+
+
+def _auto_mode(bash_first=True, ts=None):
+    rec = {"type": "attachment", "attachment": {"type": "auto_mode", "bashFirst": bash_first,
+                                                "bashFirstSteer": "strict", "steerOnly": True}}
+    if ts is not None:
+        rec["timestamp"] = ts
+    return rec
+
+
+def test_shape_reads_the_first_auto_mode_attachment(tmp_path):
+    main = _write(tmp_path / "s.jsonl", [
+        _user(ts=T.format(0), text="go"), _auto_mode(ts=T.format(0)),
+        _asst("m1", ts=T.format(1)), _auto_mode(bash_first=False, ts=T.format(2))])
+    subdir = tmp_path / "s" / "subagents"
+    subdir.mkdir(parents=True)
+    sub = _write(subdir / "agent-a.jsonl", [_auto_mode(ts=T.format(3))])
+    r = build_report(main, subagent_logs=[sub])
+    assert r["shape"]["steer"] == {"attachments": 2, "bash_first": True, "variant": "strict"}
+
+
+def test_shape_without_an_attachment_reports_none(tmp_path):
+    main = _write(tmp_path / "s.jsonl", [_user(ts=T.format(0), text="go"), _asst("m1", ts=T.format(1))])
+    assert build_report(main)["shape"]["steer"] == {"attachments": 0, "bash_first": None, "variant": None}
+
+
+def test_shape_names_the_claude_code_version(tmp_path):
+    main = _write(tmp_path / "s.jsonl", [_asst("m1", ts=T.format(0), version="2.1.306"),
+                                          _asst("m2", ts=T.format(1), version="2.1.307")])
+    assert build_report(main)["shape"]["claude_code_version"] == "2.1.306"
+    bare = _write(tmp_path / "b.jsonl", [_asst("m1", ts=T.format(0))])
+    assert build_report(bare)["shape"]["claude_code_version"] is None
+
+
+def test_shape_counts_main_bash_result_chars(tmp_path):
+    main = _write(tmp_path / "s.jsonl", [
+        _asst("m1", ts=T.format(0), stop="tool_use",
+              tool_uses=[("b1", "Bash", {"command": "ls"}), ("b2", "Bash", {"command": "ls"}),
+                         ("r1", "Read", {"file_path": "/f"})]),
+        _user(ts=T.format(1), tool_results=[
+            ("b1", "x" * 100),
+            ("b2", [{"type": "text", "text": "abc"}, {"type": "image", "source": {}}]),
+            ("r1", "y" * 500)]),
+    ])
+    subdir = tmp_path / "s" / "subagents"
+    subdir.mkdir(parents=True)
+    sub = _write(subdir / "agent-a.jsonl", [
+        _asst("s1", ts=T.format(2), stop="tool_use", tool_uses=[("sb", "Bash", {"command": "ls"})]),
+        _user(ts=T.format(3), tool_results=[("sb", "z" * 70)]),
+    ])
+    assert build_report(main, subagent_logs=[sub])["shape"]["bash_result_chars"] == 103
+
+
+def test_shape_counts_one_compaction_per_boundary(tmp_path):
+    summary = _user(ts=T.format(2), text="summary of the conversation")
+    summary["isCompactSummary"] = True
+    main = _write(tmp_path / "s.jsonl", [
+        _user(ts=T.format(0), text="go"), _asst("m1", ts=T.format(1)),
+        {"type": "system", "subtype": "compact_boundary", "timestamp": T.format(2)}, summary])
+    assert build_report(main)["shape"]["compactions"] == 1
+
+
+def test_shape_mean_context_and_cost_per_call(tmp_path):
+    main = _write(tmp_path / "s.jsonl", [_asst("m1", ts=T.format(0), cin=10, ccr=1000, ccc=90),
+                                          _asst("m2", ts=T.format(1), cin=0, ccr=3000, ccc=0)])
+    subdir = tmp_path / "s" / "subagents"
+    subdir.mkdir(parents=True)
+    sub = _write(subdir / "agent-a.jsonl", [_asst("s1", ts=T.format(2), cin=5, ccr=90000)])
+    r = build_report(main, subagent_logs=[sub])
+    assert r["shape"]["main_api_calls"] == 2
+    assert r["shape"]["mean_context_tokens"] == 2050.0
+    assert r["shape"]["cost_per_call"] == pytest.approx(r["money"]["main"] / 2)
+
+
+def test_shape_with_no_main_call_reports_none(tmp_path):
+    main = _write(tmp_path / "s.jsonl", [_user(ts=T.format(0), text="go")])
+    shape = build_report(main)["shape"]
+    assert shape["main_api_calls"] == 0
+    assert shape["mean_context_tokens"] is None and shape["cost_per_call"] is None
+
+
+def test_shape_counts_heredocs_of_the_main_session(tmp_path):
+    write = "cat > /tmp/a <<'EOF'\nhello\nEOF"
+    main = _write(tmp_path / "s.jsonl", [
+        _asst("m1", ts=T.format(0), stop="tool_use", tool_uses=[
+            ("t1", "Bash", {"command": write}), ("t2", "Bash", {"command": "python3 - <<'EOF'\nprint(1)\nEOF"}),
+            ("t3", "Bash", {"command": "ls"})]),
+        _asst("m1", ts=T.format(0), stop="tool_use", tool_uses=[("t1", "Bash", {"command": write})]),
+    ])
+    subdir = tmp_path / "s" / "subagents"
+    subdir.mkdir(parents=True)
+    sub = _write(subdir / "agent-a.jsonl", [
+        _asst("s1", ts=T.format(2), stop="tool_use", tool_uses=[("s1t", "Bash", {"command": write})])])
+    shape = build_report(main, subagent_logs=[sub])["shape"]
+    assert shape["heredoc_writes"] == 1 and shape["heredoc_write_chars"] == len(write)
+    assert shape["python_heredocs"] == 1
+
+
+def test_shape_follows_the_birth_filter(tmp_path):
+    import datetime
+    old, new = T.format(0), T.format(30)
+    new_epoch = datetime.datetime.fromisoformat(T.format(20)).timestamp()
+    main = _write(tmp_path / "s.jsonl", [
+        _auto_mode(ts=old),
+        {"type": "system", "subtype": "compact_boundary", "timestamp": old},
+        _asst("old", ts=old, stop="tool_use", tool_uses=[("b0", "Bash", {"command": "ls"})]),
+        _user(ts=old, tool_results=[("b0", "x" * 50)]),
+        _user(ts=new, text="fresh prompt"),
+        _asst("new", ts=new),
+    ])
+    shape = build_report(main, started_at=new_epoch)["shape"]
+    assert shape["steer"]["attachments"] == 0 and shape["compactions"] == 0
+    assert shape["bash_result_chars"] == 0 and shape["main_api_calls"] == 1
+
+
+def test_text_render_prints_shape_and_steer(tmp_path):
+    bare = _write(tmp_path / "b.jsonl", [_user(ts=T.format(0), text="go")])
+    lines = _render_text(build_report(bare)).splitlines()
+    assert any(line.startswith("SHAPE") for line in lines)
+    [steer] = [line for line in lines if line.startswith("STEER")]
+    assert "no auto_mode attachment" in steer
+    on = _write(tmp_path / "s.jsonl", [_user(ts=T.format(0), text="go"), _auto_mode(ts=T.format(0)),
+                                        _asst("m1", ts=T.format(1))])
+    [steer] = [line for line in _render_text(build_report(on)).splitlines() if line.startswith("STEER")]
+    assert "bash-first strict" in steer
+
+
+def test_a_raw_line_separator_inside_a_record_keeps_the_record(tmp_path):
+    main = tmp_path / "s.jsonl"
+    main.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in [
+        _asst("m1", ts=T.format(0), stop="tool_use", tool_uses=[("b1", "Bash", {"command": "ls"})]),
+        _user(ts=T.format(1), tool_results=[("b1", "a b")]),
+    ]))
+    assert " " in main.read_text()
+    assert build_report(main)["shape"]["bash_result_chars"] == 3

@@ -16,6 +16,8 @@
     "allow": [
       "mcp__dockwright__worker_done",
       "mcp__dockwright__ask_manager",
+      "mcp__dockwright__child_done",
+      "mcp__dockwright__ask_parent",
       "Bash(printenv:*)"
     ],
     "deny": [

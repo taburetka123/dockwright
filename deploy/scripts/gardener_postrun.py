@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import re
 import shutil
+import stat
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -189,6 +193,10 @@ def _as_list(value) -> list:
     return list(value)
 
 
+def _supersedes_ids(meta) -> list:
+    return [str(sid).strip() for sid in _as_list(meta.get("supersedes")) if str(sid).strip()]
+
+
 _DIFF_HEADER_RE = re.compile(r"^(?:\+\+\+|---)\s+(\S+)", re.MULTILINE)
 _DIFF_FENCE_RE = re.compile(r"^```diff\s*$", re.MULTILINE)
 
@@ -266,7 +274,7 @@ def _overlay_dir() -> str:
 
 _OVERLAY_DIR = _overlay_dir()
 _LEGACY_OVERLAY_DIR = os.path.realpath(os.path.expanduser("~/.claude/orchestrator-overlay"))
-_ALWAYS_ON_PARTS = frozenset({"rules", "agents"})
+_ALWAYS_ON_PARTS = frozenset({"rules", "agents", "roles"})
 
 
 def _is_always_on(resolved_path: str) -> bool:
@@ -363,8 +371,6 @@ def _bytes_tolerance() -> int:
 def _always_on_bytes_violations(meta, body: str) -> list:
     if "always_on_bytes" not in meta:
         return []
-    if not _DIFF_FENCE_RE.search(body):
-        return []
     violations = []
     declared = None
     declared_raw = str(meta.get("always_on_bytes", "")).strip()
@@ -372,6 +378,8 @@ def _always_on_bytes_violations(meta, body: str) -> list:
         declared = int(declared_raw)
     except (TypeError, ValueError):
         violations.append(f"always_on_bytes is not an integer: {declared_raw!r}")
+    if not _DIFF_FENCE_RE.search(body):
+        return violations
     computed = compute_always_on_delta(body, _as_list(meta.get("targets")))
     if computed is None:
         return violations
@@ -446,6 +454,42 @@ def validate_check(meta) -> list[str]:
             for field in CHECK_REQUIRED_FIELDS if not meta.get(field)]
 
 
+class _ValidateError(Exception):
+    pass
+
+
+def _always_on_info(meta, body: str) -> str:
+    declared = meta.get("always_on_bytes", "<missing>") if isinstance(meta, dict) else "<missing>"
+    if not _DIFF_FENCE_RE.search(body):
+        return f"always_on_bytes: declared {declared}, n/a (no diff fence)"
+    computed = compute_always_on_delta(body, _as_list(meta.get("targets"))
+                                       if isinstance(meta, dict) else [])
+    if computed is None:
+        return f"always_on_bytes: declared {declared}, computed unknown (diff unresolvable)"
+    return f"always_on_bytes: declared {declared}, computed {computed:+d}"
+
+
+def validate_artifact(path_str: str, is_check: bool) -> tuple:
+    path = Path(path_str)
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _ValidateError(f"cannot read {path_str}: {exc}")
+    meta, body = parse_frontmatter(text)
+    if is_check:
+        return validate_check(meta), [], ""
+    violations = validate_proposal(meta, body)
+    notes = []
+    if isinstance(meta, dict):
+        violations.extend(supersede_violations(path, meta, body, known_from_ledger()))
+        verdict, detail = _apply_check(str(path), body)
+        if verdict in _APPLY_CHECK_FAIL:
+            violations.append(f"apply-check failed ({verdict}): {detail}")
+        elif verdict == "skipped-env":
+            notes.append(f"apply-check skipped (environment): {detail}")
+    return violations, notes, _always_on_info(meta, body)
+
+
 def _unique_dest(dest_dir: Path, name: str) -> Path:
     dest = dest_dir / name
     if not dest.exists():
@@ -455,6 +499,250 @@ def _unique_dest(dest_dir: Path, name: str) -> Path:
     while (dest_dir / f"{stem}-{n}{suffix}").exists():
         n += 1
     return dest_dir / f"{stem}-{n}{suffix}"
+
+
+def superseded_dir() -> Path:
+    return PENDING_DIR.parent / "superseded"
+
+
+def _move_lock_path() -> Path:
+    return LEDGER_PATH.parent / "proposals" / ".move.lock"
+
+
+@contextlib.contextmanager
+def move_lock():
+    path = _move_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def open_apply_ids() -> set:
+    last_started: dict = {}
+    last_closed: dict = {}
+    for idx, rec in enumerate(_iter_ledger_events()):
+        pid = rec.get("proposal_id")
+        if not pid:
+            continue
+        kind = _event_type(rec)
+        if kind == "proposal_apply_started":
+            last_started[pid] = idx
+        elif kind == "proposal_reverted":
+            last_closed[pid] = idx
+        elif (kind == "proposal_apply_failed" and rec.get("after_start") is True
+              and rec.get("rollback_failed") is not True):
+            last_closed[pid] = idx
+    return {pid for pid, idx in last_started.items() if idx > last_closed.get(pid, -1)}
+
+
+def supersession_touched_ids() -> set:
+    return {str(rec.get("proposal_id")) for rec in _iter_ledger_events()
+            if _event_type(rec) in ("proposal_superseded", "proposal_restored")
+            and rec.get("proposal_id")}
+
+
+def pending_by_id(exclude=None) -> dict:
+    found: dict = {}
+    for path in sorted(PENDING_DIR.glob("*.md")):
+        if exclude is not None and path.name == Path(exclude).name:
+            continue
+        try:
+            meta, _body = parse_frontmatter(path.read_text())
+        except (OSError, UnicodeDecodeError):
+            continue
+        if isinstance(meta, dict) and meta.get("id"):
+            found[str(meta["id"])] = (path, meta)
+    return found
+
+
+def _member_covered(member: str, carriers: list) -> bool:
+    return any(c == member or c.startswith(member) or member.startswith(c)
+               for c in carriers)
+
+
+def _pending_members() -> list:
+    carried: list = []
+    for _path, other in pending_by_id().values():
+        carried.extend(_as_list(other.get("members")))
+    return carried
+
+
+def _supersede_id_violations(sid: str, meta: dict, hit, known: set, open_ids: set) -> list:
+    if sid == str(meta.get("id")):
+        return [f"supersedes names the proposal itself: {sid}"]
+    if hit is None:
+        return [f"supersedes id is not a pending proposal: {sid}"]
+    old_path, old_meta = hit
+    violations = []
+    if old_path.name not in known:
+        violations.append(
+            f"supersedes id was born in this postrun and is not yet in the ledger: {sid}")
+    if str(old_meta.get("lane") or "digest") != str(meta.get("lane") or "digest"):
+        violations.append(f"supersedes id is in another lane: {sid}")
+    if sid in open_ids:
+        violations.append(f"supersedes id has an open apply: {sid}")
+    old_members = _as_list(old_meta.get("members"))
+    new_is_findings = str(meta.get("evidence_kind") or "findings") == "findings"
+    if old_members and not new_is_findings:
+        violations.append(
+            f"supersedes {sid}, which carries members, but evidence_kind is not findings")
+    elif old_members:
+        new_members = _as_list(meta.get("members"))
+        dropped = [m for m in old_members if not _member_covered(m, new_members)]
+        if dropped:
+            violations.append(
+                f"supersedes {sid} but drops its members: {','.join(dropped)}")
+    return violations
+
+
+def supersede_violations(path: Path, meta: dict, body: str, known: set, ids=None) -> list:
+    if ids is None:
+        ids = _supersedes_ids(meta)
+    if not ids:
+        return []
+    violations = []
+    if "## Supersedes" not in body:
+        violations.append("missing required section: ## Supersedes (supersedes is set)")
+    pending = pending_by_id(exclude=path)
+    open_ids = open_apply_ids()
+    for sid in ids:
+        violations.extend(_supersede_id_violations(sid, meta, pending.get(sid), known, open_ids))
+    return violations
+
+
+def _edit_frontmatter(path: Path, add=None, remove=()) -> None:
+    st = path.stat()
+    lines = path.read_text().splitlines(keepends=True)
+    close = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+    head = [ln for ln in lines[1:close] if ln.partition(":")[0].strip() not in remove]
+    head += [f"{key}: {value}\n" for key, value in (add or {}).items()]
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write("".join([lines[0], *head, *lines[close:]]))
+        os.chmod(tmp, stat.S_IMODE(st.st_mode))
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+
+def _supersede_one(old_path: Path, old_meta: dict, successor_id: str, run_id: str) -> Path:
+    dest_dir = superseded_dir()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = _unique_dest(dest_dir, old_path.name)
+    ledger_append("proposal_superseded", proposal_id=str(old_meta.get("id")),
+                  superseded_by=successor_id, run_id=run_id, path=str(dest),
+                  from_path=str(old_path), lane=str(old_meta.get("lane") or "digest"),
+                  members=",".join(_as_list(old_meta.get("members"))))
+    shutil.move(str(old_path), str(dest))
+    _edit_frontmatter(dest, add={"superseded_by": successor_id, "superseded_run": run_id},
+                      remove=("superseded_by", "superseded_run"))
+    return dest
+
+
+def apply_supersession(meta: dict, run_id: str) -> tuple:
+    ids = _supersedes_ids(meta)
+    if not ids:
+        return 0, ""
+    successor = str(meta.get("id"))
+    with move_lock():
+        blocked = sorted(set(ids) & open_apply_ids())
+        if blocked:
+            return 0, f"supersedes id has an open apply: {','.join(blocked)}"
+        pending = pending_by_id()
+        missing = [sid for sid in ids if sid not in pending]
+        if missing:
+            return 0, f"supersedes id is not a pending proposal: {','.join(missing)}"
+        for sid in ids:
+            old_path, old_meta = pending[sid]
+            _supersede_one(old_path, old_meta, successor, run_id)
+    return len(ids), ""
+
+
+def _completion_plan(meta: dict) -> list:
+    successor = str(meta.get("id"))
+    open_ids = open_apply_ids()
+    touched = supersession_touched_ids()
+    pending = pending_by_id()
+    return [sid for sid in _supersedes_ids(meta)
+            if sid != successor and sid in pending and sid not in open_ids
+            and sid not in touched]
+
+
+def _complete_supersession_locked(meta: dict, run_id: str, ids: list) -> int:
+    successor = str(meta.get("id"))
+    pending = pending_by_id()
+    moved = 0
+    for sid in ids:
+        hit = pending.get(sid)
+        if hit is None:
+            continue
+        old_path, old_meta = hit
+        _supersede_one(old_path, old_meta, successor, run_id)
+        moved += 1
+    return moved
+
+
+def _in_superseded_dir(src: Path) -> bool:
+    return os.path.realpath(str(src.parent)) == os.path.realpath(str(superseded_dir()))
+
+
+def _restorable_source(sid: str, successor_id: str, rec: dict):
+    src = Path(str(rec.get("path", "")))
+    if not src.is_file() or not _in_superseded_dir(src):
+        return None
+    try:
+        src_meta, _body = parse_frontmatter(src.read_text())
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not isinstance(src_meta, dict) or str(src_meta.get("id")) != sid:
+        return None
+    stamp = src_meta.get("superseded_by")
+    if stamp and str(stamp) != successor_id:
+        return None
+    return src
+
+
+def restore_candidates(successor_id: str, ids: list) -> tuple:
+    moved: dict = {}
+    restored_at: dict = {}
+    for idx, rec in enumerate(_iter_ledger_events()):
+        sid = rec.get("proposal_id")
+        kind = _event_type(rec)
+        if kind == "proposal_superseded" and rec.get("superseded_by") == successor_id:
+            moved[sid] = (idx, rec)
+        elif kind == "proposal_restored":
+            restored_at[sid] = idx
+    pending = pending_by_id()
+    plan, unrestorable = [], {}
+    for sid in ids:
+        if sid not in moved or restored_at.get(sid, -1) > moved[sid][0]:
+            continue
+        if sid in pending:
+            continue
+        rec = moved[sid][1]
+        src = _restorable_source(sid, successor_id, rec)
+        if src is None:
+            unrestorable[sid] = [m for m in str(rec.get("members") or "").split(",") if m]
+            continue
+        plan.append((sid, src, Path(str(rec.get("from_path") or src.name)).name))
+    return plan, unrestorable
+
+
+def restore_one(sid: str, src: Path, name: str, successor_id: str) -> Path:
+    dest = PENDING_DIR / name
+    shutil.move(str(src), str(dest))
+    _edit_frontmatter(dest, remove=("superseded_by", "superseded_run"))
+    ledger_append("proposal_restored", proposal_id=sid, restored_by=successor_id,
+                  path=str(dest))
+    return dest
 
 
 def _quarantine(path: Path, reasons: list[str], run_id: str, lane: str = "digest") -> None:
@@ -518,8 +806,7 @@ def record_backpressure(run_id: str, proposals: int, negative: int):
     if violation:
         print(f"WARNING: back-pressure violation — {streak} consecutive "
               "proposal-bearing digest runs carried zero negative-byte "
-              "proposals; the always-on corpus only grew (spec: "
-              "PRD v2 Amendment A4)", file=sys.stderr)
+              "proposals (spec: PRD v2 Amendment A4)", file=sys.stderr)
     ledger_append("backpressure", run_id=run_id, lane="digest",
                   proposals=proposals, negative=negative,
                   streak=streak, violation=violation)
@@ -528,7 +815,7 @@ def record_backpressure(run_id: str, proposals: int, negative: int):
 
 def process_run_artifacts(run_id: str, known: set[str], lane: str = "") -> dict:
     summary = {"proposals": 0, "checks": 0, "rejected": 0, "skipped_env": 0,
-               "digest_proposals": 0, "digest_negative": 0}
+               "digest_proposals": 0, "digest_negative": 0, "superseded": 0}
     for d in (PENDING_DIR, CHECKS_DIR, REJECTED_DIR):
         d.mkdir(parents=True, exist_ok=True)
     for path in sorted(PENDING_DIR.glob("*.md")):
@@ -536,6 +823,8 @@ def process_run_artifacts(run_id: str, known: set[str], lane: str = "") -> dict:
             continue
         meta, body = parse_frontmatter(path.read_text())
         violations = validate_proposal(meta, body)
+        if isinstance(meta, dict):
+            violations.extend(supersede_violations(path, meta, body, known))
         if violations:
             _quarantine(path, violations, run_id,
                         lane=str((meta or {}).get("lane") or lane or "digest"))
@@ -555,16 +844,25 @@ def process_run_artifacts(run_id: str, known: set[str], lane: str = "") -> dict:
             continue
         members = _as_list(meta.get("members"))
         targets = _as_list(meta.get("targets"))
+        supersedes = _supersedes_ids(meta)
         ledger_append("proposal", run_id=run_id, proposal_id=str(meta.get("id")),
                       path=str(path), cluster=str(meta.get("cluster", "")),
                       members=",".join(members), targets=",".join(targets),
                       lane=str(meta.get("lane") or lane or "digest"),
                       evidence_kind=str(meta.get("evidence_kind") or "findings"),
                       apply_check=verdict,
+                      supersedes=",".join(supersedes),
                       **{"class": str(meta.get("kind", ""))})
+        moved, refusal = apply_supersession(meta, run_id)
+        if refusal:
+            _quarantine(path, [refusal], run_id,
+                        lane=str(meta.get("lane") or lane or "digest"))
+            summary["rejected"] += 1
+            continue
+        summary["superseded"] += moved
         summary["proposals"] += 1
         eff_lane = str(meta.get("lane") or lane or "digest")
-        if eff_lane == "digest":
+        if eff_lane == "digest" and str(meta.get("kind", "")) != "proposal-retire":
             summary["digest_proposals"] += 1
             if verdict in _APPLY_CHECK_QUALIFY:
                 min_bytes = config_toml_int("gardener", "backpressure_min_bytes",
@@ -603,13 +901,18 @@ def _resolve_member(sid: str):
     return None, "missing"
 
 
-def decide(proposal_path: str, kind: str, reason: str, applied_rev=None) -> int:
+def decide(proposal_path: str, kind: str, reason: str, applied_rev=None,
+           restore_superseded: bool = False) -> int:
     if kind not in ("accept", "decline"):
         print(f"gardener-decide: unknown kind {kind!r} (accept|decline)", file=sys.stderr)
         return 2
     if kind == "decline" and not reason.strip():
         print("gardener-decide: decline requires --reason — the recorded reason is "
               "what stops the cluster from re-surfacing (PRD §7.5)", file=sys.stderr)
+        return 2
+    if kind == "accept" and restore_superseded:
+        print("gardener-decide: --restore-superseded applies to a decline only",
+              file=sys.stderr)
         return 2
     path = Path(proposal_path)
     if not path.is_file():
@@ -622,20 +925,66 @@ def decide(proposal_path: str, kind: str, reason: str, applied_rev=None) -> int:
               "already-decided proposals are final; a second decide would write "
               "contradictory ledger events", file=sys.stderr)
         return 2
-    meta, _body = parse_frontmatter(path.read_text())
+    meta, body = parse_frontmatter(path.read_text())
     if not isinstance(meta, dict):
         print(f"gardener-decide: unparseable frontmatter in {path}", file=sys.stderr)
         return 2
+    proposal_id = str(meta.get("id"))
+    proposal_kind = str(meta.get("kind", ""))
+    supersedes = _supersedes_ids(meta)
+    restoring = kind == "decline" and bool(supersedes) and (
+        proposal_kind == "proposal-retire" or restore_superseded)
     members = _as_list(meta.get("members"))
     evidence_kind = str(meta.get("evidence_kind") or "findings")
-    keep_evidence = kind == "decline" and str(meta.get("kind", "")) == "corpus-retire"
+    keep_evidence = kind == "decline" and proposal_kind in ("corpus-retire", "proposal-retire")
     dest_dir = ACCEPTED_DIR if kind == "accept" else DECLINED_DIR
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = _unique_dest(dest_dir, path.name)
-    shutil.move(str(path), str(dest))
-    marked, ambiguous, missing = [], [], []
+    restored = []
+    withheld = []
+    with move_lock():
+        restore_plan, unrestorable = (restore_candidates(proposal_id, supersedes)
+                                      if restoring else ([], {}))
+        collisions = [name for _sid, _src, name in restore_plan
+                      if (PENDING_DIR / name).exists()]
+        if collisions:
+            print(f"gardener-decide: cannot restore — proposals/pending/ already holds "
+                  f"{', '.join(collisions)}; nothing was moved", file=sys.stderr)
+            return 2
+        if not path.is_file():
+            print(f"gardener-decide: no such proposal: {path} — a run superseded it "
+                  "while this decide was starting; look in proposals/superseded/",
+                  file=sys.stderr)
+            return 2
+        completion = _completion_plan(meta) if supersedes and not restoring else []
+        if completion:
+            violations = supersede_violations(path, meta, body, known_from_ledger(),
+                                              ids=completion)
+            if violations:
+                hint = ("\n  to decline without moving the proposals it supersedes, re-run "
+                        "with --restore-superseded" if kind == "decline" else "")
+                print(f"gardener-decide: cannot complete the supersession declared by "
+                      f"{proposal_id} — nothing was moved:\n  "
+                      + "\n  ".join(violations) + hint, file=sys.stderr)
+                return 2
+            _complete_supersession_locked(meta, f"decide-{proposal_id}", completion)
+        for sid in unrestorable:
+            print(f"gardener-decide: {sid} not restored — the ledger says {proposal_id} "
+                  "superseded it, but proposals/superseded/ holds no file with that id under "
+                  "that stamp: the file is missing, the proposal was decided since, or a "
+                  "later run superseded it again", file=sys.stderr)
+        for sid, src, name in restore_plan:
+            restore_one(sid, src, name, proposal_id)
+            restored.append(sid)
+        dest = _unique_dest(dest_dir, path.name)
+        shutil.move(str(path), str(dest))
+        if evidence_kind == "findings" and not keep_evidence:
+            withheld = _pending_members() + [m for ms in unrestorable.values() for m in ms]
+    marked, ambiguous, missing, kept = [], [], [], []
     if evidence_kind == "findings" and not keep_evidence:
         for sid in members:
+            if _member_covered(sid, withheld):
+                kept.append(sid)
+                continue
             finding, how = _resolve_member(sid)
             if how == "ambiguous":
                 ambiguous.append(sid)
@@ -647,20 +996,28 @@ def decide(proposal_path: str, kind: str, reason: str, applied_rev=None) -> int:
             if not marker.exists():
                 marker.touch()
             marked.append(sid)
-    ledger_append("decision", kind=kind, proposal_id=str(meta.get("id")),
+    ledger_append("decision", kind=kind, proposal_id=proposal_id,
                   path=str(dest), cluster=str(meta.get("cluster", "")),
                   members=",".join(members), reason=reason,
                   members_marked=",".join(marked),
                   members_ambiguous=",".join(ambiguous),
+                  members_kept=",".join(kept),
                   lane=str(meta.get("lane") or "digest"),
                   evidence_kind=evidence_kind,
                   applied_rev=";".join(applied_rev or []),
-                  **{"class": str(meta.get("kind", ""))})
-    print(f"gardener-decide: {kind} {meta.get('id')} → {dest}; "
+                  supersedes=",".join(supersedes),
+                  restored=",".join(restored),
+                  not_restored=",".join(unrestorable),
+                  **{"class": proposal_kind})
+    kept_why = ("still carried by a pending proposal"
+                + (" or by an id not restored" if unrestorable else ""))
+    print(f"gardener-decide: {kind} {proposal_id} → {dest}; "
           f"marked reviewed: {len(marked)}/{len(members)} members"
+          + (f"; kept unmarked ({kept_why}): {len(kept)}" if kept else "")
           + (f"; AMBIGUOUS prefixes left unmarked: {','.join(ambiguous)}" if ambiguous else "")
           + (f"; no finding file for: {','.join(missing)}" if missing else "")
-          + ("; members kept as evidence (corpus-retire decline)" if keep_evidence else ""))
+          + (f"; members kept as evidence ({proposal_kind} decline)" if keep_evidence else "")
+          + (f"; restored to pending: {','.join(restored)}" if restored else ""))
     return 0
 
 
@@ -882,6 +1239,10 @@ def main(argv: list[str] | None = None) -> int:
                        help="root=sha that applied this proposal (repeatable; recorded "
                             "in the decision event — closes the Phase-2 'capture the "
                             "applying SHA' item)")
+    p_dec.add_argument("--restore-superseded", action="store_true",
+                       dest="restore_superseded",
+                       help="On decline, return the proposals this one superseded to "
+                            "proposals/pending/.")
     p_eval = sub.add_parser("evaluate")
     p_eval.add_argument("--verdicts", default=None,
                         help="JSON file mapping check_id -> 'kept'|'violated' or "
@@ -895,8 +1256,35 @@ def main(argv: list[str] | None = None) -> int:
                        help="ts or id of the ledger event being annotated.")
     p_ann.add_argument("--note", required=True,
                        help="The correction/annotation text.")
+    sub.add_parser("open-applies",
+                   help="Print each proposal id with an open apply, one per line (read-only).")
+    p_val = sub.add_parser("validate",
+                           help="Read-only pre-flight: run the birth gate's own "
+                                "rules against a drafted artifact.")
+    g_val = p_val.add_mutually_exclusive_group(required=True)
+    g_val.add_argument("--proposal")
+    g_val.add_argument("--check", dest="check_path")
     args = parser.parse_args(argv)
 
+    if args.cmd == "open-applies":
+        for pid in sorted(open_apply_ids()):
+            print(pid)
+        return 0
+    if args.cmd == "validate":
+        is_check = args.check_path is not None
+        target = args.check_path if is_check else args.proposal
+        try:
+            violations, notes, info = validate_artifact(target, is_check)
+        except _ValidateError as exc:
+            print(f"gardener-validate: {exc}", file=sys.stderr)
+            return 2
+        if info:
+            print(info)
+        for violation in violations:
+            print(violation)
+        for note in notes:
+            print(f"NOTE {note}")
+        return 1 if violations else 0
     if args.cmd == "postrun":
         known = known_from_ledger()
         if args.known and Path(args.known).is_file():
@@ -905,7 +1293,8 @@ def main(argv: list[str] | None = None) -> int:
         summary = process_run_artifacts(args.run_id, known, lane=args.lane)
         line = (f"gardener-postrun: proposals={summary['proposals']} "
                 f"checks={summary['checks']} rejected={summary['rejected']} "
-                f"skipped_env={summary['skipped_env']}")
+                f"skipped_env={summary['skipped_env']} "
+                f"superseded={summary['superseded']}")
         if args.lane in ("", "digest"):
             bp = record_backpressure(args.run_id,
                                      summary["digest_proposals"],
@@ -924,7 +1313,8 @@ def main(argv: list[str] | None = None) -> int:
         return evaluate(args.verdicts, args.dry_run, now)
     if args.cmd == "annotate":
         return annotate(args.ref, args.note)
-    return decide(args.proposal, args.kind, args.reason, applied_rev=args.applied_rev)
+    return decide(args.proposal, args.kind, args.reason, applied_rev=args.applied_rev,
+                  restore_superseded=args.restore_superseded)
 
 
 if __name__ == "__main__":

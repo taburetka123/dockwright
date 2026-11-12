@@ -113,9 +113,24 @@ trap _selffix_cleanup EXIT INT TERM
   printf '\n\n---\nExecute the skill above now, in headless mode, with --transcript %s\n' \
     "$TRANSCRIPT"
 } > "$PROMPT_FILE"
-( exec env -u CLAUDE_AGENT -u CLAUDE_WORKER_NAME -u CLAUDE_PARENT_MANAGER -u CLAUDE_DOMAIN \
-    claude -p \
-    --model claude-sonnet-5 \
+CLAUDE_BIN="${DOCKWRIGHT_CLAUDE_BIN:-claude}"
+if [ "$CLAUDE_BIN" != claude ] && { [ ! -f "$CLAUDE_BIN" ] || [ ! -x "$CLAUDE_BIN" ]; }; then
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null
+  echo "$(TS)  worker:warn  ${SESSION_ID}  DOCKWRIGHT_CLAUDE_BIN=$CLAUDE_BIN is not an executable file; using claude from PATH" >> "$LOG"
+  CLAUDE_BIN=claude
+fi
+SELFFIX_MODEL="$(dockwright model resolve '@sonnet')"
+[ -n "$SELFFIX_MODEL" ] || { worker_log "error" "model-unresolved — dockwright model resolve '@sonnet' printed nothing — run setup.sh"; echo "Status: error (model-unresolved)" >> "$OUT"; enqueue_retry "model-unresolved"; exit 1; }
+ROLE_RENDER=()
+if ROLE_LINES="$(dockwright role-args GenericWorker --launch lane --cwd "$PWD" --render-only 2>>"$LOG")"; then
+  while IFS= read -r a; do [ -n "$a" ] && ROLE_RENDER+=("$a"); done <<< "$ROLE_LINES"
+else
+  worker_log "role" "role-args refused — launching without a role render"
+fi
+( unset CLAUDE_AGENT CLAUDE_WORKER_NAME CLAUDE_PARENT_MANAGER CLAUDE_DOMAIN
+  exec "$CLAUDE_BIN" -p \
+    --model "$SELFFIX_MODEL" \
+    ${ROLE_RENDER[@]+"${ROLE_RENDER[@]}"} \
     --add-dir "$(dirname "$TRANSCRIPT")" \
     --allowedTools 'Bash(jq:*) Bash(wc:*) Bash(head:*) Bash(tail:*) Bash(grep:*)' \
     --tools "Bash,Read,Grep,Glob" \

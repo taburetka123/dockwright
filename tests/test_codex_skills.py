@@ -14,7 +14,7 @@ def test_render_manager_resume_codex_skill_uses_current_command_body():
     assert 'description: "Resume an orchestrator manager session from a handoff' in text
     assert 'argument-hint: "<handoff_id>"' in text
     assert "Resolve `<your sid>` from the session id" in text
-    assert "Arm the four Monitor tasks" in text
+    assert "Invoke `Skill(dockwright:arm-lanes)`" in text
     assert "codex-push-watch" not in text
     assert "inotifywait -m -e create ~/.claude/orchestrator/questions/" not in text
 
@@ -29,5 +29,5 @@ def test_install_codex_skills_overwrites_stale_skill_from_command(tmp_path):
     assert stale_skill in installed
     text = stale_skill.read_text(encoding="utf-8")
     assert "old Monitor task text" not in text
-    assert "Arm the four Monitor tasks" in text
+    assert "Invoke `Skill(dockwright:arm-lanes)`" in text
     assert "codex-push-watch" not in text

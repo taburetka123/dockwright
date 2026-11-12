@@ -3,7 +3,7 @@ import os
 import time
 from pathlib import Path
 
-from . import paths
+from . import paths, state
 
 _SPEND_KEYS = ("turns", "out_tokens", "in_tokens", "cache_read_tokens", "cache_creation_tokens")
 
@@ -43,7 +43,7 @@ def append_drop_event(record, source: str) -> None:
             "sid": record.get("claude_sid"),
             "name": record.get("name"),
             "agent": "nested" if record.get("nested") else (record.get("agent") or "worker"),
-            "parent_manager_name": record.get("parent_manager_name"),
+            "parent_manager_name": state.parent_name_of(record),
             "runtime": record.get("runtime") or "claude",
             "account": record.get("account"),
             "started_at": record.get("started_at"),

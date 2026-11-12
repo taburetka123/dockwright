@@ -138,3 +138,11 @@ def test_read_events_keeps_zero_spend_lines(ledger):
     events = spend_ledger.read_events()
     assert len(events) == 1
     assert events[0]["spend"] == {}
+
+
+def test_append_drop_event_reads_parent_name_only_record(ledger):
+    record = _record(parent_name="new-mgr")
+    record.pop("parent_manager_name")
+    spend_ledger.append_drop_event(record, "session_end")
+    entry = json.loads(ledger.read_text().splitlines()[0])
+    assert entry["parent_manager_name"] == "new-mgr"

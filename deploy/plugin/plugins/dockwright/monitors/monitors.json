@@ -1,0 +1,8 @@
+[
+  {"name": "questions", "description": "dockwright questions lane", "when": "on-skill-invoke:dockwright:arm-lanes", "command": "@@DOCKWRIGHT_BIN@@ monitor-loop questions"},
+  {"name": "done", "description": "dockwright done lane", "when": "on-skill-invoke:dockwright:arm-lanes", "command": "@@DOCKWRIGHT_BIN@@ monitor-loop done"},
+  {"name": "turn-ends", "description": "dockwright turn-ends lane", "when": "on-skill-invoke:dockwright:arm-lanes", "command": "@@DOCKWRIGHT_BIN@@ monitor-loop turn-ends"},
+  {"name": "stale", "description": "dockwright stale lane", "when": "on-skill-invoke:dockwright:arm-lanes", "command": "@@DOCKWRIGHT_BIN@@ monitor-loop stale"},
+  {"name": "pages", "description": "dockwright pages lane", "when": "on-skill-invoke:dockwright:arm-lanes", "command": "@@DOCKWRIGHT_BIN@@ monitor-loop pages"},
+  {"name": "chat-archive", "description": "dockwright chat archive (manager runner)", "when": "on-skill-invoke:dockwright:arm-lanes", "command": "@@DOCKWRIGHT_BIN@@ chat-archive loop"}
+]

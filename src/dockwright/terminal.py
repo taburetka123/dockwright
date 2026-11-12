@@ -22,8 +22,11 @@ class TerminalDriver(Protocol):
                     target_window_match: str | None = None) -> str: ...
     async def find_group_pane(self) -> str | None: ...
     async def pane_exists(self, pane: str) -> bool: ...
-    def send_text(self, pane: str, text: str, submit: bool = True) -> None: ...
+    def pane_state(self, pane: str) -> str: ...
+    def pane_current_command(self, pane: str) -> str | None: ...
+    def send_text(self, pane: str, text: str, submit: bool = True) -> bool: ...
     def send_text_checked(self, pane: str, text: str) -> bool: ...
+    def send_key(self, pane: str, key: str) -> bool: ...
     def capture_screen(self, pane: str) -> str | None: ...
     def capture_screen_ansi(self, pane: str) -> str | None: ...
     def ls(self) -> list | None: ...
@@ -31,12 +34,14 @@ class TerminalDriver(Protocol):
     def close(self, pane: str) -> None: ...
     def set_tab_title(self, title: str) -> None: ...
     def set_tab_color(self, active_bg: str, inactive_bg: str) -> None: ...
+    def set_window_option(self, pane: str, option: str, value: str) -> None: ...
 
 
 _LS_FS = "\x1f"
 _LS_FORMAT = _LS_FS.join([
     "#{session_name}", "#{window_id}", "#{window_name}",
     "#{pane_id}", "#{pane_current_path}", "#{pane_title}", "#{pane_pid}",
+    "#{pane_dead}", "#{pane_start_command}",
 ])
 
 
@@ -93,6 +98,36 @@ class TmuxDriver:
             return False
         ids = {l.strip() for l in stdout.decode("utf-8", errors="replace").splitlines()}
         return str(pane) in ids
+
+    def pane_state(self, pane: str) -> str:
+        if not pane:
+            return "gone"
+        try:
+            result = subprocess.run(
+                [*self._tmux_base(), "display-message", "-p", "-t", pane, "#{pane_dead}"],
+                capture_output=True, timeout=2, check=False)
+        except Exception:
+            return "unknown"
+        if result.returncode != 0:
+            return "gone"
+        flag = result.stdout.decode("utf-8", errors="replace").strip()
+        if not flag:
+            return "gone"
+        return "dead" if flag == "1" else "alive"
+
+    def pane_current_command(self, pane: str) -> str | None:
+        if not pane:
+            return None
+        try:
+            result = subprocess.run(
+                [*self._tmux_base(), "display-message", "-p", "-t", pane,
+                 "#{pane_current_command}"],
+                capture_output=True, timeout=2, check=False)
+        except Exception:
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout.decode("utf-8", errors="replace").strip()
 
     async def _has_session(self, session: str) -> bool:
         try:
@@ -164,22 +199,25 @@ class TmuxDriver:
         except Exception:
             pass
 
-    def send_text(self, pane: str, text: str, submit: bool = True) -> None:
+    def send_text(self, pane: str, text: str, submit: bool = True) -> bool:
         self._ensure_inject_safe()
         buf = self._buffer_name(pane)
         body = text.rstrip("\n")
         try:
-            subprocess.run([*self._tmux_base(), "load-buffer", "-b", buf, "-"],
-                           input=body.encode("utf-8"), capture_output=True,
-                           timeout=2, check=False)
-            subprocess.run([*self._tmux_base(), "paste-buffer", "-p", "-d",
-                            "-b", buf, "-t", pane],
-                           capture_output=True, timeout=2, check=False)
+            load = subprocess.run([*self._tmux_base(), "load-buffer", "-b", buf, "-"],
+                                  input=body.encode("utf-8"), capture_output=True,
+                                  timeout=2, check=False)
+            paste = subprocess.run([*self._tmux_base(), "paste-buffer", "-p", "-d",
+                                    "-b", buf, "-t", pane],
+                                   capture_output=True, timeout=2, check=False)
+            enter = None
             if submit:
-                subprocess.run([*self._tmux_base(), "send-keys", "-t", pane, "Enter"],
-                               capture_output=True, timeout=2, check=False)
+                enter = subprocess.run([*self._tmux_base(), "send-keys", "-t", pane, "Enter"],
+                                       capture_output=True, timeout=2, check=False)
         except Exception:
-            pass
+            return False
+        codes = [r.returncode for r in (load, paste, enter) if r is not None]
+        return all(c == 0 for c in codes)
 
     def send_text_checked(self, pane: str, text: str) -> bool:
         self._ensure_inject_safe()
@@ -201,6 +239,14 @@ class TmuxDriver:
             return enter.returncode == 0
         except Exception:
             return False
+
+    def send_key(self, pane: str, key: str) -> bool:
+        try:
+            result = subprocess.run([*self._tmux_base(), "send-keys", "-t", pane, key],
+                                    capture_output=True, text=True, check=False, timeout=2)
+        except Exception:
+            return False
+        return result.returncode == 0
 
     def capture_screen(self, pane: str) -> str | None:
         try:
@@ -231,9 +277,9 @@ class TmuxDriver:
             if not line:
                 continue
             parts = line.split(_LS_FS)
-            if len(parts) != 7:
+            if len(parts) != 9:
                 continue
-            sess, win_id, win_name, pane_id, cwd, pane_title, pid = parts
+            sess, win_id, win_name, pane_id, cwd, pane_title, pid, dead, start_command = parts
             if sess not in sessions:
                 sessions[sess] = {}
                 order.append(sess)
@@ -241,7 +287,8 @@ class TmuxDriver:
             if win_id not in tabs:
                 tabs[win_id] = {"title": win_name, "windows": []}
             tabs[win_id]["windows"].append(
-                {"id": pane_id, "cwd": cwd, "title": pane_title, "pid": pid})
+                {"id": pane_id, "cwd": cwd, "title": pane_title, "pid": pid,
+                 "dead": dead, "start_command": start_command})
         return [{"wm_class": s, "tabs": list(sessions[s].values())} for s in order]
 
     def _run_list_panes(self, *, text: bool, timeout: int):
@@ -303,6 +350,15 @@ class TmuxDriver:
                                capture_output=True, timeout=2, check=False)
             except Exception:
                 pass
+
+    def set_window_option(self, pane: str, option: str, value: str) -> None:
+        if not pane:
+            return
+        try:
+            subprocess.run([*self._tmux_base(), "set-window-option", "-t", pane, option, value],
+                           capture_output=True, timeout=2, check=False)
+        except Exception:
+            pass
 
 
 _DRIVER: "TerminalDriver | None" = None

@@ -13,6 +13,8 @@ def test_orch_subcommand_matches_bare_and_abs_and_none():
     assert ei.orch_subcommand(f"bash -c '$PPID {ABS} stop'") == "stop"
     assert ei.orch_subcommand("bash -c 'echo orchestrating nothing'") is None
     assert ei.orch_subcommand("some other hook") is None
+    assert ei.orch_subcommand("dockwright subagent-start") == "subagent-start"
+    assert ei.orch_subcommand("dockwright stop-failure") == "stop-failure"
 
 def test_subcommand_matches_both_generations():
     assert ei.orch_subcommand("/abs/.venv/bin/dockwright session-end") == "session-end"
@@ -77,6 +79,38 @@ def test_merge_settings_file_codex_keeps_only_hooks_and_backs_up(tmp_path):
     out = json.loads(target.read_text())
     assert set(out.keys()) == {"hooks"}
     assert any(p.name.startswith("hooks.json.bak.") for p in tmp_path.iterdir())
+
+def test_merge_settings_file_codex_drops_the_post_tool_use_block(tmp_path):
+    snippet = tmp_path / "snippet.json"
+    snippet.write_text(json.dumps({"hooks": {
+        "PostToolUse": [{"matcher": "mcp__.*", "hooks": [_hook("$PPID @@DOCKWRIGHT_BIN@@ post-tool-use")]}],
+        "StopFailure": [{"hooks": [_hook("$PPID @@DOCKWRIGHT_BIN@@ stop-failure")]}],
+        "Stop": [{"hooks": [_hook("$PPID @@DOCKWRIGHT_BIN@@ stop")]}]}}))
+    codex = tmp_path / "hooks.json"
+    ei.merge_settings_file(codex, snippet, ABS, "codex")
+    out = json.loads(codex.read_text())
+    assert "Stop" in out["hooks"] and "PostToolUse" not in out["hooks"]
+    assert "StopFailure" not in out["hooks"]
+    claude = tmp_path / "settings.json"
+    ei.merge_settings_file(claude, snippet, ABS, "claude")
+    out = json.loads(claude.read_text())
+    assert "Stop" in out["hooks"] and out["hooks"]["PostToolUse"][0]["matcher"] == "mcp__.*"
+    assert "StopFailure" in out["hooks"]
+
+
+def test_codex_mode_clamps_session_end_timeout_to_three_seconds(tmp_path):
+    snippet = tmp_path / "snippet.json"
+    snippet.write_text(json.dumps({"hooks": {
+        "SessionEnd": [{"hooks": [_hook("$PPID @@DOCKWRIGHT_BIN@@ session-end", timeout=5)]}],
+        "Stop": [{"hooks": [_hook("$PPID @@DOCKWRIGHT_BIN@@ stop", timeout=5)]}]}}))
+    codex = tmp_path / "hooks.json"
+    ei.merge_settings_file(codex, snippet, ABS, "codex")
+    out = json.loads(codex.read_text())
+    assert out["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"] == 3
+    assert out["hooks"]["Stop"][0]["hooks"][0]["timeout"] == 5
+    claude = tmp_path / "settings.json"
+    ei.merge_settings_file(claude, snippet, ABS, "claude")
+    assert json.loads(claude.read_text())["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"] == 5
 
 def test_rendered_orch_bin_extracts_path_and_handles_empty():
     rendered = {"hooks": {"Stop": [{"hooks": [_hook(f"bash -c '$PPID {ABS} stop'")]}]}}

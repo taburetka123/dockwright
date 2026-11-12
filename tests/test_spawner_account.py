@@ -1,3 +1,4 @@
+import asyncio
 import json
 import subprocess
 import time
@@ -5,7 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from dockwright import config, paths, spawner
+from dockwright import config, models, paths, spawner
+from tests.conftest import allow_codex
 
 
 @pytest.fixture
@@ -29,6 +31,15 @@ def sp(tmp_path, monkeypatch):
     yield tmp_path
 
 
+@pytest.fixture
+def sp3(sp, monkeypatch):
+    cfg = sp / "three-pool.toml"
+    cfg.write_text('[accounts]\ndefault = "a"\n' + "".join(f'[[accounts.pool]]\nname = "{n}"\n' for n in "abc"))
+    monkeypatch.setenv(config.ENV_CONFIG_PATH, str(cfg))
+    monkeypatch.delenv("CLAUDE_ORCH_ACCOUNT_WEIGHT_C", raising=False)
+    yield sp
+
+
 def _write_active(tmp_path: Path, letter: str) -> None:
     (tmp_path / "account-active").write_text(letter + "\n")
 
@@ -37,6 +48,11 @@ def _write_state(tmp_path: Path, accounts: dict) -> None:
     (tmp_path / "account-state.json").write_text(
         json.dumps({"accounts": accounts})
     )
+
+
+def _write_marks(tmp_path: Path, marks: dict) -> None:
+    (tmp_path / "account-state.json").write_text(
+        json.dumps({"accounts": {}, "model_spent": marks}))
 
 
 def _bricked_entry(reset_ts: float | None = None) -> dict:
@@ -50,12 +66,16 @@ def _bricked_entry(reset_ts: float | None = None) -> dict:
 
 
 def _write_usage(tmp_path, letter, *, pct5=None, pct7=None, ts_offset=0.0,
-                 r5=None, r7=None, ts="auto"):
+                 r5=None, r7=None, ts="auto", fable=None, fable_reset=None, fable_at="auto",
+                 fable_name="Fable"):
     udir = tmp_path / "usage"
     udir.mkdir(parents=True, exist_ok=True)
     rec = {"five_hour_pct": pct5, "seven_day_pct": pct7,
            "five_hour_resets_at": r5, "seven_day_resets_at": r7}
     rec["ts"] = (time.time() - ts_offset) if ts == "auto" else ts
+    if fable is not None:
+        rec["model_scoped"] = [{"name": fable_name, "pct": fable, "resets_at": fable_reset}]
+        rec["model_scoped_at"] = time.time() if fable_at == "auto" else fable_at
     (udir / f"{letter}.json").write_text(json.dumps(rec))
 
 
@@ -401,6 +421,243 @@ def test_pick_saturated_a_never_picked_under_force(sp):
     assert set(picks) == {"b"}, picks
 
 
+def _counts(picks):
+    return tuple(picks.count(n) for n in "abc")
+
+
+def test_pick_renormalizes_weights_over_accounts_not_near_limit(sp3, monkeypatch):
+    for n, w in (("A", "2"), ("B", "2"), ("C", "1")):
+        monkeypatch.setenv(f"CLAUDE_ORCH_ACCOUNT_WEIGHT_{n}", w)
+    _write_active(sp3, "a")
+    _write_usage(sp3, "b", pct5=95.0, pct7=0.0)
+    assert _counts([spawner._pick_account() for _ in range(30)]) == (20, 0, 10)
+
+
+def test_pick_renormalizes_weights_over_accounts_not_bricked(sp3, monkeypatch):
+    for n, w in (("A", "1"), ("B", "1"), ("C", "2")):
+        monkeypatch.setenv(f"CLAUDE_ORCH_ACCOUNT_WEIGHT_{n}", w)
+    _write_active(sp3, "a")
+    _write_state(sp3, {"a": _bricked_entry()})
+    assert _counts([spawner._pick_account() for _ in range(30)]) == (0, 10, 20)
+
+
+def test_pick_falls_back_to_unblocked_accounts_by_weight_when_all_are_near_limit(sp3):
+    _write_active(sp3, "a")
+    _write_usage(sp3, "a", pct5=95.0, pct7=0.0)
+    _write_usage(sp3, "b", pct5=95.0, pct7=0.0)
+    _write_usage(sp3, "c", pct5=0.0, pct7=0.0)
+    _write_state(sp3, {"c": _bricked_entry()})
+    assert _counts([spawner._pick_account() for _ in range(10)]) == (5, 5, 0)
+
+
+def test_pick_uses_base_weights_when_the_candidates_weights_sum_to_zero(sp3):
+    _write_active(sp3, "a")
+    _write_usage(sp3, "a", pct5=100.0, pct7=0.0)
+    _write_usage(sp3, "b", pct5=100.0, pct7=0.0)
+    _write_usage(sp3, "c", pct5=0.0, pct7=0.0)
+    _write_state(sp3, {"c": _bricked_entry()})
+    assert _counts([spawner._pick_account(force=True) for _ in range(10)]) == (5, 5, 0)
+
+
+@pytest.mark.parametrize("pct, reset_in, at_age, spent", [
+    (88, 3600, 0, True),
+    (87, 3600, 0, False),
+    (99, 3600, 7200, True),
+    (100, -60, 7200, False),
+    (100, None, 7200, False),
+    (100, None, 0, True),
+])
+def test_fable_spent_by_snapshot_follows_pause_freshness_and_reset(sp, pct, reset_in, at_age, spent):
+    now = time.time()
+    _write_usage(sp, "a", pct5=0.0, pct7=0.0, fable=pct,
+                 fable_reset=None if reset_in is None else now + reset_in,
+                 fable_at=now - at_age)
+    assert spawner._fable_spent("a", now) is spent
+
+
+def test_fable_spent_without_a_row_a_mark_or_a_record_is_false(sp):
+    now = time.time()
+    _write_usage(sp, "a", pct5=0.0, pct7=0.0)
+    assert spawner._fable_spent("a", now) is False
+    assert spawner._fable_spent("b", now) is False
+
+
+@pytest.mark.parametrize("row, reset_after_mark, snapshot_after_mark, now_after_mark, spent", [
+    (False, None, None, 600, True),
+    (True, 4200, -1800, 600, True),
+    (True, 540, -1800, 600, False),
+    (True, 4200, 60, 600, False),
+    (True, -60, -7200, 600, True),
+])
+def test_fable_spent_by_mark_holds_until_a_newer_snapshot_or_a_later_reset(
+        sp, row, reset_after_mark, snapshot_after_mark, now_after_mark, spent):
+    marked = 1_800_000_000.0
+    now = marked + now_after_mark
+    if row:
+        _write_usage(sp, "a", pct5=0.0, pct7=0.0, fable=38,
+                     fable_reset=marked + reset_after_mark,
+                     fable_at=marked + snapshot_after_mark)
+    else:
+        _write_usage(sp, "a", pct5=0.0, pct7=0.0)
+    _write_marks(sp, {"a": {"fable": marked, "claude opus": marked + 100}})
+    assert spawner._fable_spent("a", now) is spent
+
+
+WEEK = 7 * 86400
+
+
+@pytest.mark.parametrize("age, r7_after_mark, spent", [
+    (600, None, True),
+    (WEEK - 1, None, True),
+    (WEEK, None, False),
+    (600, 300, False),
+    (600, -60, True),
+    (600, 3600, True),
+    (600, WEEK, True),
+    (600, WEEK + 60, False),
+    (60, WEEK + 3000, True),
+    (3000, WEEK + 3000, False),
+    (600, "not-a-date", True),
+    (WEEK, "not-a-date", False),
+])
+def test_a_mark_with_no_row_ends_at_the_seven_day_reset_or_the_cap(sp, age, r7_after_mark, spent):
+    marked = 1_800_000_000.0
+    r7 = r7_after_mark if not isinstance(r7_after_mark, (int, float)) else marked + r7_after_mark
+    _write_usage(sp, "a", pct5=0.0, pct7=0.0, r7=r7)
+    _write_marks(sp, {"a": {"fable": marked}})
+    assert spawner._fable_spent("a", marked + age) is spent
+
+
+@pytest.mark.parametrize("row_reset_after_mark, r7_after_mark, age, spent", [
+    (4200, WEEK + 60, 600, True),
+    (None, WEEK + 60, 600, False),
+    (-60, WEEK + 60, 600, False),
+    (None, None, 600, True),
+    (None, None, WEEK, False),
+    (-60, None, WEEK, False),
+])
+def test_a_row_reset_later_than_the_mark_wins_and_any_other_row_falls_to_the_rule(
+        sp, row_reset_after_mark, r7_after_mark, age, spent):
+    marked = 1_800_000_000.0
+    _write_usage(sp, "a", pct5=0.0, pct7=0.0, fable=38, fable_at=marked - 1800,
+                 fable_reset=None if row_reset_after_mark is None else marked + row_reset_after_mark,
+                 r7=None if r7_after_mark is None else marked + r7_after_mark)
+    _write_marks(sp, {"a": {"fable": marked}})
+    assert spawner._fable_spent("a", marked + age) is spent
+
+
+def test_a_mark_with_no_usage_record_holds_until_the_cap(sp):
+    marked = 1_800_000_000.0
+    _write_marks(sp, {"a": {"fable": marked}})
+    assert spawner._fable_spent("a", marked + 600) is True
+    assert spawner._fable_spent("a", marked + WEEK) is False
+
+
+def test_the_reported_stuck_mark_ends(sp):
+    (sp / "usage").mkdir(parents=True, exist_ok=True)
+    (sp / "usage" / "a.json").write_text(json.dumps({
+        "five_hour_pct": 5, "seven_day_pct": 1, "five_hour_resets_at": 1793822400,
+        "seven_day_resets_at": 1794409200, "ts": 1793812938,
+        "model_scoped": [], "model_scoped_at": None}))
+    _write_marks(sp, {"a": {"fable": 1793111915.013}})
+    assert spawner._fable_spent("a", 1793812894.0) is False
+
+
+def test_a_fable_pick_leaves_a_refused_account_for_one_with_an_ended_mark(sp):
+    now = time.time()
+    _write_active(sp, "a")
+    _write_usage(sp, "a", pct5=0.0, pct7=0.0, fable=84, fable_reset=now + 86400, fable_at=now - 36000)
+    _write_usage(sp, "b", pct5=0.0, pct7=0.0, r7=now + 6 * 86400)
+    _write_marks(sp, {"a": {"fable": now - 600}, "b": {"fable": now - 8 * 86400}})
+    assert {spawner._pick_account(fable=True) for _ in range(12)} == {"b"}
+
+
+def test_model_spent_at_matches_the_family_word_in_the_banner_name(sp):
+    _write_marks(sp, {"a": {"claude fable 5.1": 10.0, "fable": 5.0, "claude opus": 99.0},
+                      "b": {"fable-5.2": 7.0, "fabled": 50.0}})
+    assert spawner._model_spent_at("a", "fable") == 10.0
+    assert spawner._model_spent_at("b", "fable") == 7.0
+    assert spawner._model_spent_at("c", "fable") is None
+
+
+@pytest.mark.parametrize("name, spent", [
+    ("Fable", True),
+    ("Fable 5.1", True),
+    ("Claude Fable", True),
+    ("fable-5.1", True),
+    ("Opus", False),
+    ("Fabled", False),
+])
+def test_the_snapshot_rule_finds_the_fable_row_by_its_family_word(sp, name, spent):
+    now = time.time()
+    _write_usage(sp, "a", pct5=0.0, pct7=0.0, fable=100, fable_reset=now + 3600, fable_name=name)
+    assert spawner._fable_spent("a", now) is spent
+
+
+def test_fable_left_needs_an_unbricked_cool_account_with_fable(sp):
+    now = time.time()
+    _write_usage(sp, "a", pct5=0.0, pct7=0.0, fable=100, fable_reset=now + 3600)
+    _write_usage(sp, "b", pct5=0.0, pct7=0.0, fable=30, fable_reset=now + 3600)
+    assert spawner._fable_left(now) is True
+    _write_usage(sp, "b", pct5=95.0, pct7=0.0, fable=30, fable_reset=now + 3600)
+    assert spawner._fable_left(now) is False
+    assert spawner._fable_left(now, force=True) is True
+    _write_state(sp, {"b": _bricked_entry()})
+    assert spawner._fable_left(now, force=True) is False
+
+
+def test_fable_pick_skips_spent_account_and_other_picks_do_not(sp):
+    now = time.time()
+    _write_active(sp, "a")
+    _write_usage(sp, "a", pct5=0.0, pct7=0.0, fable=100, fable_reset=now + 3600)
+    _write_usage(sp, "b", pct5=0.0, pct7=0.0, fable=30, fable_reset=now + 3600)
+    assert {spawner._pick_account(fable=True) for _ in range(12)} == {"b"}
+    assert {spawner._pick_account() for _ in range(12)} == {"a", "b"}
+
+
+def test_fable_pick_skips_a_marked_account(sp):
+    now = time.time()
+    _write_active(sp, "a")
+    _write_usage(sp, "a", pct5=0.0, pct7=0.0, fable=38, fable_reset=now + 3600, fable_at=now - 7200)
+    _write_usage(sp, "b", pct5=0.0, pct7=0.0, fable=30, fable_reset=now + 3600)
+    _write_marks(sp, {"a": {"fable": now - 60}})
+    assert {spawner._pick_account(fable=True) for _ in range(12)} == {"b"}
+
+
+def test_fable_pick_force_still_skips_spent_account(sp):
+    now = time.time()
+    _write_active(sp, "a")
+    _write_usage(sp, "a", pct5=0.0, pct7=0.0, fable=100, fable_reset=now + 3600)
+    _write_usage(sp, "b", pct5=99.0, pct7=0.0, fable=30, fable_reset=now + 3600)
+    assert {spawner._pick_account(force=True, fable=True) for _ in range(6)} == {"b"}
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("@fable", "@opus"),
+    ("@fable[1m]", "@opus[1m]"),
+    ("@opus", "@opus"),
+    ("@sonnet", "@sonnet"),
+    ("sonnet", "sonnet"),
+])
+def test_fable_as_opus_moves_only_fable(value, expected):
+    assert spawner._fable_as_opus(value) == expected
+
+
+def test_fable_as_opus_moves_a_concrete_fable_id():
+    concrete = models.families()["fable"]
+    assert spawner._fable_as_opus(concrete) == "@opus"
+    assert spawner._fable_as_opus(f"{concrete}[1m]") == "@opus[1m]"
+
+
+def test_fable_to_opus_args_raises_the_effort_to_xhigh_and_keeps_max():
+    assert spawner._fable_to_opus_args(["--model", "@fable[1m]", "--effort", "medium"]) == [
+        "--model", "@opus[1m]", "--effort", "xhigh"]
+    assert spawner._fable_to_opus_args(["--model=@fable", "--effort=medium", "-x"]) == [
+        "--model=@opus", "--effort=xhigh", "-x"]
+    assert spawner._fable_to_opus_args(["--model", "@fable", "--effort", "max"]) == [
+        "--model", "@opus", "--effort", "max"]
+
+
 def test_gate_pool_off_ok(sp):
     assert spawner.usage_spawn_gate()["status"] == "ok"
 
@@ -591,3 +848,67 @@ def test_pick_combined_carry_forward_weights_drive_smooth_selection(sp):
     seq = [spawner._pick_account() for _ in range(53)]
     assert seq[0] == "a"
     assert seq.count("a") == 4 and seq.count("b") == 49, seq
+
+
+def _held_state(tmp_path: Path, *names: str) -> None:
+    (tmp_path / "account-state.json").write_text(json.dumps(
+        {"accounts": {}, "held": {n: {"at": 1, "reason": "operator", "source": "cli"} for n in names}}))
+
+
+def test_pick_skips_a_held_account(sp):
+    _write_active(sp, "a")
+    _held_state(sp, "a")
+    (sp / "spawn-counter.json").write_text(json.dumps({"counter": 0}))
+    assert spawner._pick_account() == "b"
+
+
+def test_gate_reports_held(sp):
+    _write_active(sp, "a")
+    _held_state(sp, "a", "b")
+    gate = spawner.usage_spawn_gate()
+    assert gate["status"] == "held" and gate["account"] == "a"
+    assert "account-hold --release a" in gate["hint"]
+
+
+def test_gate_with_the_default_free_and_the_other_held_is_ok(sp):
+    _write_active(sp, "a")
+    _held_state(sp, "b")
+    assert spawner.usage_spawn_gate()["status"] == "ok"
+
+
+class _Proc:
+    returncode = 0
+
+    async def communicate(self):
+        return (b"42\n", b"")
+
+
+def _patch_launch(monkeypatch):
+    launches = []
+
+    async def fake_exec(*args, **kwargs):
+        launches.append(args)
+        return _Proc()
+
+    monkeypatch.setattr(spawner.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(spawner, "_fable_left", lambda now, force=False: False)
+    return launches
+
+
+def test_a_held_default_account_refuses_the_spawn_instead_of_the_default_login(sp, monkeypatch):
+    _write_active(sp, "a")
+    _held_state(sp, "a", "b")
+    launches = _patch_launch(monkeypatch)
+    with pytest.raises(ValueError, match="on hold"):
+        asyncio.run(spawner.spawn_worker_tab(cwd="/x", initial_prompt="hi", name="x",
+                                             extra_args=["--model", "claude-opus-5-5"]))
+    assert launches == []
+
+
+def test_a_codex_spawn_ignores_a_held_default_account(sp, monkeypatch):
+    allow_codex(monkeypatch, sp, "/x", extra_toml=(sp / "two-pool.toml").read_text())
+    _write_active(sp, "a")
+    _held_state(sp, "a", "b")
+    launches = _patch_launch(monkeypatch)
+    asyncio.run(spawner.spawn_worker_tab(cwd="/x", initial_prompt="hi", name="x", runtime="codex"))
+    assert len(launches) == 1

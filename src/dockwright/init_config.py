@@ -21,7 +21,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--path", type=Path, default=None,
                         help="Target file (default: $XDG_CONFIG_HOME/dockwright/dockwright.toml)")
     parser.add_argument("--force", action="store_true",
-                        help="Overwrite an existing file.")
+                        help="Overwrite an existing dockwright.toml.")
     args = parser.parse_args(argv)
 
     target = args.path or _default_target()

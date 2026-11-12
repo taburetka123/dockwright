@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from dockwright import manager_launch
+from dockwright.models import resolve_model
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "deploy" / "scripts" / "bootstrap-recreate.sh"
@@ -51,7 +52,9 @@ def _lane_stale_monitor(monkeypatch, tmp_path, value):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     monkeypatch.setattr(mod, "ROOT", tmp_path)
-    monkeypatch.setattr(mod, "_account_config_prefix", lambda letter: "")
+    monkeypatch.setattr(mod, "_account_effective", lambda letter: ("a", None))
+    monkeypatch.setattr(mod, "_resolve_model_token", resolve_model)
+    mod.manager_fallback_model.cache_clear()
     captured = {}
 
     class FakeDrv:

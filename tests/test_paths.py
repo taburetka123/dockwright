@@ -168,3 +168,16 @@ def test_per_manager_dirs_cannot_escape_their_root(helper, tmp_path, monkeypatch
     resolved = getattr(paths, helper)("..").resolve()
     assert resolved.parent.resolve().is_relative_to(tmp_path.resolve())
     assert resolved.resolve() != tmp_path.resolve()
+
+
+def test_worker_kind_env_key_registered():
+    assert "CLAUDE_WORKER_KIND" in paths.ORCHESTRATOR_ENV_KEYS
+
+
+def test_worker_provider_is_an_orchestrator_env_key():
+    assert "CLAUDE_WORKER_PROVIDER" in paths.ORCHESTRATOR_ENV_KEYS
+
+
+def test_child_rounds_dir_follows_root(monkeypatch, tmp_path):
+    monkeypatch.setattr(paths, "ROOT", tmp_path)
+    assert paths.child_rounds_dir("abc123") == tmp_path / "children" / "abc123"

@@ -19,3 +19,21 @@ def test_render_then_subcommand_resolves(tmp_path):
             for blocks in rendered["hooks"].values() for b in blocks for h in b["hooks"]}
     subs.discard(None)
     assert subs == set(ei.ORCH_SUBCOMMANDS)
+
+
+def test_post_tool_use_block_matches_every_mcp_tool():
+    data = json.loads(SNIPPET.read_text())
+    rendered = ei.render_snippet(data, "/abs/orchestrator")
+    block, = rendered["hooks"]["PostToolUse"]
+    hook, = block["hooks"]
+    assert block["matcher"] == "mcp__.*"
+    assert ei.orch_subcommand(hook["command"]) == "post-tool-use" and hook["timeout"] == 5
+
+
+def test_stop_failure_block_runs_its_verb_with_no_matcher():
+    data = json.loads(SNIPPET.read_text())
+    rendered = ei.render_snippet(data, "/abs/orchestrator")
+    block, = rendered["hooks"]["StopFailure"]
+    hook, = block["hooks"]
+    assert "matcher" not in block
+    assert ei.orch_subcommand(hook["command"]) == "stop-failure" and hook["timeout"] == 10

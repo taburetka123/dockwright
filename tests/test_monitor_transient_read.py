@@ -30,6 +30,11 @@ def _cursor(tmp_path, lane):
     return path.read_text() if path.exists() else ""
 
 
+def _consumed(tmp_path, lane, event_path):
+    key = event_path.stem if lane == "questions" else str(event_path)
+    return key in _cursor(tmp_path, lane).splitlines()
+
+
 def _explode_on(monkeypatch, target_name, error):
     from pathlib import Path
     original = Path.read_text
@@ -52,7 +57,7 @@ def test_a_transient_read_error_never_consumes_a_question(scan_state, monkeypatc
 
     monitor.run_questions_scan(dict(MGR))
 
-    assert str(path) not in _cursor(tmp_path, "questions"), (
+    assert not _consumed(tmp_path, "questions", path), (
         "a transient read error consumed the question — it can never be "
         "emitted again")
 
@@ -92,7 +97,7 @@ def test_a_permanently_malformed_payload_is_consumed_loudly(
 
     scan(dict(MGR))
 
-    assert str(path) in _cursor(tmp_path, lane), (
+    assert _consumed(tmp_path, lane, path), (
         "an unparseable payload was left to retry forever")
     assert "unparseable" in capsys.readouterr().err, (
         "the drop was silent — a consumed-and-never-emitted event must say so")

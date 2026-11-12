@@ -14,6 +14,7 @@ STALE_CONSUMED_HANDOFF_SEC = 24 * 60 * 60
 STALE_DONE_SEC = 24 * 60 * 60
 STALE_TURN_END_SEC = 24 * 60 * 60
 STALE_CLOSED_SEC = 7 * 24 * 60 * 60
+STALE_REVIVE_SEC = 7 * 24 * 60 * 60
 STALE_CURSOR_SEC = 7 * 24 * 60 * 60
 STALE_CURSOR_PATTERNS = (".seen-*", ".batch-turn-ends-*", ".last-seen*",
                          ".fs-emitted-*", ".read-*")
@@ -41,6 +42,8 @@ TURN_ENDS = ROOT / "turn-ends"
 MANAGER_LOCK = ROOT / "manager.lock"
 SPEND_LEDGER = ROOT / "spend-ledger.jsonl"
 NOTIFY_OUTBOX = ROOT / "notify-outbox"
+REVIVE = ROOT / "revive"
+LANES = ROOT / "lanes"
 
 
 def _load(p: Path) -> dict | None:
@@ -63,7 +66,7 @@ def _pid_alive(pid: int) -> bool:
 def _process_command(pid: int) -> str:
     try:
         result = subprocess.run(
-            ["ps", "-o", "command=", "-p", str(pid)],
+            ["ps", "-ww", "-o", "command=", "-p", str(pid)],
             capture_output=True, text=True, timeout=2, check=False,
         )
         if result.returncode != 0:
@@ -71,6 +74,19 @@ def _process_command(pid: int) -> str:
         return result.stdout.strip()
     except Exception:
         return ""
+
+
+def _process_command_or_none(pid: int):
+    try:
+        result = subprocess.run(
+            ["ps", "-ww", "-o", "command=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
 
 
 def _looks_like_session(command: str) -> bool:
@@ -119,16 +135,25 @@ def _prune_handoffs(now: float) -> tuple[int, int]:
     return stale_unconsumed, stale_consumed
 
 
+def _done_sid(p: Path) -> str:
+    payload = _load(p)
+    sid = payload.get("claude_sid") if isinstance(payload, dict) else None
+    if isinstance(sid, str) and sid:
+        return sid
+    return p.stem.rpartition("-")[0]
+
+
 def _prune_done(now: float) -> int:
     if not DONE.is_dir():
         return 0
+    live = {p.stem for p in ACTIVE.glob("*.json")} if ACTIVE.is_dir() else set()
     pruned = 0
     for p in DONE.rglob("*.json"):
         try:
             mtime = p.stat().st_mtime
         except OSError:
             continue
-        if now - mtime > STALE_DONE_SEC:
+        if now - mtime > STALE_DONE_SEC and _done_sid(p) not in live:
             p.unlink(missing_ok=True)
             pruned += 1
     return pruned
@@ -171,6 +196,45 @@ def _prune_closed(now: float) -> int:
     return pruned
 
 
+def _prune_revive(now: float) -> int:
+    if not REVIVE.is_dir():
+        return 0
+    pruned = 0
+    for p in REVIVE.iterdir():
+        if p.suffix != ".md":
+            continue
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue
+        if now - mtime > STALE_REVIVE_SEC:
+            p.unlink(missing_ok=True)
+            pruned += 1
+    return pruned
+
+
+def _prune_lanes() -> int:
+    if not LANES.is_dir():
+        return 0
+    pruned = 0
+    for d in LANES.iterdir():
+        if not d.is_dir() or not d.name.isdigit():
+            continue
+        cli_pid = int(d.name)
+        if _pid_alive(cli_pid):
+            command = _process_command_or_none(cli_pid)
+            if command is None or _looks_like_session(command):
+                continue
+        for p in d.iterdir():
+            p.unlink(missing_ok=True)
+        try:
+            d.rmdir()
+            pruned += 1
+        except OSError:
+            continue
+    return pruned
+
+
 def _append_spend_drop(record: dict, source: str) -> None:
     try:
         spend = record.get("spend")
@@ -186,7 +250,7 @@ def _append_spend_drop(record: dict, source: str) -> None:
             "sid": record.get("claude_sid"),
             "name": record.get("name"),
             "agent": "nested" if record.get("nested") else (record.get("agent") or "worker"),
-            "parent_manager_name": record.get("parent_manager_name"),
+            "parent_manager_name": record.get("parent_name") or record.get("parent_manager_name"),
             "runtime": record.get("runtime") or "claude",
             "started_at": record.get("started_at"),
             "source": source,
@@ -204,7 +268,7 @@ def _drop_questions_for_worker(worker_sid: str) -> None:
         return
     for q in QUESTIONS.rglob("*.json"):
         record = _load(q)
-        if record and record.get("worker_sid") == worker_sid:
+        if record and record.get("worker_sid") == worker_sid and record.get("asked_by") != "manager":
             q.unlink(missing_ok=True)
 
 
@@ -277,6 +341,16 @@ def _gc_husks(now: float) -> int:
                     pruned += 1
             except OSError:
                 continue
+    by_task = QUESTIONS / "by-task"
+    if by_task.is_dir():
+        for sub in by_task.iterdir():
+            if not sub.is_dir():
+                continue
+            try:
+                sub.rmdir()
+                pruned += 1
+            except OSError:
+                continue
     for bucket in (DONE, TURN_ENDS, QUESTIONS, NOTIFY_OUTBOX, lane_health):
         if not bucket.is_dir():
             continue
@@ -300,10 +374,12 @@ def main() -> int:
     done_pruned = _prune_done(now)
     turn_ends_pruned = _prune_turn_ends(now)
     closed_pruned = _prune_closed(now)
+    revive_pruned = _prune_revive(now)
+    lanes_pruned = _prune_lanes()
     active_pruned, active_kept_odd = _prune_active()
     husks_pruned = _gc_husks(now)
     total = (stale_unconsumed + stale_consumed + done_pruned + turn_ends_pruned
-             + closed_pruned + len(active_pruned) + husks_pruned)
+             + closed_pruned + revive_pruned + lanes_pruned + len(active_pruned) + husks_pruned)
     segments = []
     if total > 0:
         parts = []
@@ -317,6 +393,10 @@ def main() -> int:
             parts.append(f"{turn_ends_pruned} old turn-end event(s)")
         if closed_pruned:
             parts.append(f"{closed_pruned} old closed worker record(s)")
+        if revive_pruned:
+            parts.append(f"{revive_pruned} old revive digest(s)")
+        if lanes_pruned:
+            parts.append(f"{lanes_pruned} lane marker dir(s) of dead CLI pid(s)")
         if active_pruned:
             parts.append(f"{len(active_pruned)} stale active record(s) ({', '.join(active_pruned)})")
         if husks_pruned:

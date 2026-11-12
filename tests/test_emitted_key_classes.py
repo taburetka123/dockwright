@@ -5,8 +5,6 @@ import pytest
 
 from dockwright import stale_monitor
 
-SOURCE = Path(stale_monitor.__file__).read_text(encoding="utf-8")
-
 
 def test_the_two_classes_do_not_overlap():
     overlap = set(stale_monitor.ACTION_KEY_PREFIXES) & set(
@@ -23,11 +21,15 @@ def test_the_two_classes_do_not_overlap():
     ("last_autoclose_run", True),
     ("codex_log_cache", True),
     ("processing:abc:1", False),
-    ("question:abc", False),
     ("orphan:%1", False),
     ("approval:a:b", False),
+    ("safeguard:abc", True),
+    ("safeguard-page:abc:stop-1", False),
     ("auth-emit:abc", False),
     ("lane_silent:done", False),
+    ("account-hold:a:banner", False),
+    ("fable-move:abc:1792000000", True),
+    ("fable-limit-page:abc", False),
 ])
 def test_the_classifier_puts_each_known_key_on_the_right_side(key, is_action):
     assert stale_monitor._is_action_key(key) is is_action

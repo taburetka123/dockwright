@@ -1,0 +1,22 @@
+=== THREAD PARENT MESSAGE ===
+From: Ada Example <ada@example.test> (U01ABCDEF)
+Time: 2026-10-27 13:00:47 +00
+Message TS: 1793106047.590119
+Lorem ipsum top-level <@S01GRP0001> dolor sit amet.
+Reactions: eyes (1)
+
+=== THREAD REPLIES (2 total) ===
+
+--- Reply 1 of 2 ---
+From: Bob Example <bob@example.test> (U01BOBBOB)
+Time: 2026-10-27 13:14:15 +00
+Message TS: 1793106855.095329
+Consectetur adipiscing elit, the first reply.
+
+--- Reply 2 of 2 ---
+From: Ada Example <ada@example.test> (U01ABCDEF)
+Time: 2026-10-27 13:20:59 +00
+Message TS: 1793107259.250289
+Lorem ipsum reply in a thread, <@U01ME00000> dolor.
+
+There are more messages available. To view the next page, use cursor: `bmV4dF90cw`

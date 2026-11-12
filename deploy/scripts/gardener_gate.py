@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -82,6 +83,163 @@ def gardener_module_enabled() -> bool:
     return value if isinstance(value, bool) else True
 
 
+RESERVED_RETRY_ENV_KEYS = ("SELFFIX_RETRY_ATTEMPT", "HOME", "PATH")
+RETRY_ENV_UNPARSED = "[gardener] retry_env present in a shape this reader cannot parse"
+RETRY_ENV_NOT_ALONE = ("[gardener] retry_env refused: this reader needs its own line to be the only one "
+                       "that mentions retry_env outside whole-line comments")
+_TOML_UNICODE_ESCAPE = re.compile(r"\\u([0-9A-Fa-f]{4})|\\U([0-9A-Fa-f]{8})")
+
+
+def _toml_string_end(s: str, i: int) -> int:
+    quote = s[i]
+    j = i + 1
+    while j < len(s):
+        if s[j] == quote:
+            return j + 1
+        j += 2 if quote == '"' and s[j] == "\\" else 1
+    raise ValueError("unterminated string")
+
+
+def _toml_multiline_after(line: str, ml: str | None) -> str | None:
+    i = 0
+    while i < len(line):
+        if ml is not None:
+            if ml == '"""' and line[i] == "\\":
+                i += 2
+            elif line.startswith(ml, i):
+                i += 3
+                while i < len(line) and line[i] == ml[0]:
+                    i += 1
+                ml = None
+            else:
+                i += 1
+        elif line[i] == "#":
+            break
+        elif line.startswith('"""', i) or line.startswith("'''", i):
+            ml = line[i:i + 3]
+            i += 3
+        elif line[i] in "\"'":
+            i = _toml_string_end(line, i)
+        else:
+            i += 1
+    return ml
+
+
+def _skip_blanks(s: str, i: int) -> int:
+    while i < len(s) and s[i] in " \t":
+        i += 1
+    return i
+
+
+def _toml_one_line_str_list(value: str, what: str) -> list[str]:
+    s = value.strip()
+    if not s.startswith("["):
+        raise ValueError(f"{what} is not a one-line list")
+    items: list[str] = []
+    i = 1
+    while True:
+        i = _skip_blanks(s, i)
+        if s.startswith("]", i):
+            break
+        if i >= len(s) or s[i] not in "\"'":
+            raise ValueError(f"{what} is not a one-line list of strings")
+        end = _toml_string_end(s, i)
+        body = s[i + 1:end - 1]
+        if s[i] == '"' and "\\" in body:
+            raise ValueError(f"{what} uses an escape sequence, which this reader does not support")
+        items.append(body)
+        i = _skip_blanks(s, end)
+        if s.startswith(",", i):
+            i += 1
+        elif not s.startswith("]", i):
+            raise ValueError(f"{what} is not a one-line list of strings")
+    rest = s[i + 1:].strip()
+    if rest and not rest.startswith("#"):
+        raise ValueError(f"{what} has text after the list")
+    return items
+
+
+def _scan_toml_str_list(text: str, section: str, key: str) -> list[str] | None:
+    cur = None
+    ml = None
+    for raw in text.split("\n"):
+        if ml is not None:
+            ml = _toml_multiline_after(raw, ml)
+            continue
+        line = raw.strip()
+        if line.startswith("["):
+            head = line.split("#", 1)[0].rstrip()
+            cur = head[1:-1].strip() if head.endswith("]") else None
+        elif cur == section:
+            k, sep, v = line.partition("=")
+            if sep and k.strip() == key:
+                return _toml_one_line_str_list(v, f"[{section}] {key}")
+        ml = _toml_multiline_after(raw, None)
+    return None
+
+
+def _decode_unicode_escape(m: re.Match) -> str:
+    try:
+        return chr(int(m.group(1) or m.group(2), 16))
+    except ValueError:
+        return m.group(0)
+
+
+def _toml_key_mention_lines(text: str, key: str) -> list[int]:
+    mention = re.compile(re.escape(key) + r"[\"']?\s*[=\].]")
+    found = []
+    for number, raw in enumerate(text.split("\n"), start=1):
+        line = raw.strip()
+        if line.startswith("#"):
+            continue
+        if mention.search(_TOML_UNICODE_ESCAPE.sub(_decode_unicode_escape, line)):
+            found.append(number)
+    return found
+
+
+def _line_list(numbers: list[int]) -> str:
+    return ("line " if len(numbers) == 1 else "lines ") + ", ".join(map(str, numbers))
+
+
+def retry_env() -> tuple[dict[str, str], list[str]]:
+    path = _dockwright_config_file()
+    if path is None:
+        return {}, []
+    try:
+        try:
+            import tomllib
+        except ImportError:
+            tomllib = None
+        if tomllib is not None:
+            with open(path, "rb") as fh:
+                raw = tomllib.load(fh).get("gardener", {}).get("retry_env")
+        else:
+            text = path.read_text()
+            raw = _scan_toml_str_list(text, "gardener", "retry_env")
+            mentions = _toml_key_mention_lines(text, "retry_env")
+            if raw is None and mentions:
+                return {}, [f"{RETRY_ENV_UNPARSED}, on {_line_list(mentions)}"]
+            if raw is not None and len(mentions) > 1:
+                return {}, [f"{RETRY_ENV_NOT_ALONE}; mentioned on {_line_list(mentions)}"]
+    except Exception as e:
+        return {}, [f"[gardener] retry_env unreadable: {e}"]
+    if raw is None:
+        return {}, []
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        return {}, ["[gardener] retry_env must be a list of KEY=VALUE strings"]
+    pairs: dict[str, str] = {}
+    for item in raw:
+        if "\x00" in item:
+            return {}, ["[gardener] retry_env entry contains a NUL character"]
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            return {}, [f"[gardener] retry_env entry without KEY=: {item!r}"]
+        if key in RESERVED_RETRY_ENV_KEYS:
+            return {}, [f"[gardener] retry_env may not set {key}"]
+        pairs[key] = value
+    return pairs, []
+
+
 HOME = Path(os.environ.get("HOME", ""))
 
 
@@ -117,7 +275,6 @@ EXPECTED_SESSION_END_HOOKS = (
     ("selffix-trigger.sh",),
 )
 
-K_THRESHOLD = _env_positive_int("GARDENER_K", 8)
 FLOOR_DAYS = _env_positive_float("GARDENER_FLOOR_DAYS", 7.0)
 MAX_RUNS_PER_WEEK = _env_positive_int("GARDENER_MAX_RUNS_PER_WEEK", 3)
 MIN_RUN_GAP_SEC = _env_positive_int("GARDENER_MIN_RUN_GAP", 6 * 3600)
@@ -267,6 +424,16 @@ def _warn_producer(now: float) -> None:
         WARN_MARKER_PATH.touch()
 
 
+def _log_warn(message: str) -> None:
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        GATE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with GATE_LOG_PATH.open("a") as f:
+            f.write(f"{stamp}  WARN  {message}\n")
+    except OSError:
+        pass
+
+
 def _selffix_log(verb: str, sid: str, detail: str) -> None:
     if not (any(p.exists() for p in SELFFIX_DEBUG_PATHS) or os.environ.get("SELFFIX_DEBUG") == "1"):
         return
@@ -288,10 +455,21 @@ def limit_bricked(now: float) -> bool:
     return False
 
 
+def usage_capped() -> bool:
+    try:
+        return subprocess.run(["dockwright", "usage-cap", "--paused"], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=60).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def spawn_retry(transcript: str, sid: str) -> None:
+    extra, warnings = retry_env()
+    for warning in warnings:
+        _log_warn(warning)
     subprocess.Popen(
         ["bash", str(SELFFIX_RUN_SCRIPT), transcript, sid],
-        env={**os.environ, "SELFFIX_RETRY_ATTEMPT": "1"},
+        env={**os.environ, **extra, "SELFFIX_RETRY_ATTEMPT": "1"},
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
@@ -326,10 +504,13 @@ def process_retry_queue(now: float) -> bool:
         if limit_bricked(now):
             _selffix_log("retry:deferred", sid, "reason=brick")
             return False
+        if usage_capped():
+            _selffix_log("retry:deferred", sid, "reason=usage-cap")
+            return False
         path.unlink(missing_ok=True)
         try:
             spawn_retry(transcript, sid)
-        except OSError as e:
+        except (OSError, ValueError) as e:
             _selffix_log("retry:dropped", sid, f"reason=spawn-failed {e}")
             return False
         _selffix_log("retry:spawn", sid, "attempts=1")
@@ -358,11 +539,9 @@ def decide(now: float, force: bool) -> tuple[str, dict]:
     fresh = count_new_unreviewed(marker)
     detail["new_unreviewed"] = fresh
     detail["marker_age_days"] = round((now - marker) / 86400, 2) if marker else None
-    if fresh >= K_THRESHOLD:
-        return "accum", detail
-    if marker and (now - marker) >= FLOOR_DAYS * 86400 and fresh >= 1:
-        return "floor", detail
-    if not marker and fresh >= 1:
+    if marker and (now - marker) < FLOOR_DAYS * 86400:
+        return "not_due", detail
+    if fresh >= 1:
         return "floor", detail
     return "no_material", detail
 
@@ -387,8 +566,8 @@ def _log_gate(decision: str, detail: dict, spawned: bool) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Gardener trigger gate (LLM-free).")
     parser.add_argument("--force", action="store_true",
-                        help="Bypass accumulation/floor/cap. Still refuses under "
-                             "the stop file and the live run mutex.")
+                        help="Bypass the weekly interval, cooldown and cap. Still "
+                             "refuses under the stop file and the live run mutex.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the decision without spawning a run.")
     args = parser.parse_args(argv)
@@ -413,7 +592,7 @@ def main(argv: list[str] | None = None) -> int:
             detail["retry_queue"] = retry_queue
             retry_spawned = process_retry_queue(now)
             detail["retry_spawned"] = retry_spawned
-    should_spawn = (decision in ("accum", "floor", "force")
+    should_spawn = (decision in ("floor", "force")
                     and not args.dry_run and not retry_spawned)
     if should_spawn:
         spawn_run(decision)

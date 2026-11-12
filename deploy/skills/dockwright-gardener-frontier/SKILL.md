@@ -16,8 +16,9 @@ You are the FRONTIER loop's analyst run — a separate registered loop from the 
 - Write ONLY under `~/.claude/dockwright/gardener/` — the digest file (path given in args) and proposal files in `proposals/pending/`. A PreToolUse guard mechanically denies everything else; do not fight it.
 - No Bash that mutates state. Prefer Read/Glob/Grep for local files; WebSearch/WebFetch for the field.
 - Do not apply, draft-in-place, or edit any adoption anywhere. Proposals carry diffs or build-briefs as TEXT for a human to act on.
+- Never edit, overwrite, or move an existing file in `proposals/pending/`. A replacement is declared only by the `supersedes:` field of a NEW proposal (Step 2b); `gardener_postrun.py` carries out the move.
 - When your artifacts are written, stop. No follow-up actions, no questions.
-- Budget: ≤8 proposals per run; ≤4 research subagents; prefer direct fetches of known-good sources over broad searches.
+- Budget: ≤8 proposals per run; ≤4 research subagents; prefer direct fetches of known-good sources over broad searches. Reconciliation proposals (Step 2b) count beyond the ≤8.
 
 ## Args
 
@@ -31,6 +32,7 @@ Read, in this order (`<dockwright_repo>` is the dockwright checkout path, `[path
 3. `docs/loops-registry.md` (repo or `deploy/`) if present — the current loop census and conventions.
 4. The repo's recent state: `git -C <dockwright_repo> log --oneline -30` — so "already shipped" answers are current.
 5. `~/.claude/dockwright/gardener/ledger.jsonl` — prior frontier proposals/decisions (dedup: never re-propose an accepted or declined adoption absent material new evidence; cite the decline reason when mentioning it).
+6. Every file in `~/.claude/dockwright/gardener/proposals/pending/`, BOTH lanes — never duplicate a pending proposal; the frontier ones are also Step 2b's input.
 
 ## Step 2 — Evaluate the baseline's own forward-pointers FIRST
 
@@ -38,6 +40,17 @@ Before any new sweeping, settle what the baseline already queued:
 - **A1 queue status:** for each baseline adopt-item, is it shipped (cite commit/PR), in-flight, or stale? Shipped items need no proposal — record status in the digest.
 - **A3 watch-triggers:** evaluate each named re-visit trigger against today's facts. A fired trigger is a first-class proposal candidate.
 - **A4 skips / A5 re-checks:** spot-check that the named reasons still hold; a skip whose reason has collapsed is a proposal candidate.
+
+## Step 2b — Reconcile pending frontier proposals
+
+Read in full every pending proposal with `lane: frontier`. Run `python3 ~/.claude/scripts/gardener_postrun.py open-applies` once (read-only): every id it prints has an open apply — an `apply` that started and has not been reverted or cleanly failed since — and is `keep` and appears in no `supersedes`. Reconcile at most 20 pending proposals per run, oldest first by the timestamp prefix of each proposal's `run_id`; the rest wait for the next run, and Notes carries `reconcile: <n> of <m> pending not reconciled this run`. Give every other one ONE form:
+
+- **retire** — the adoption already shipped (a commit in `git log`, or the target already carries the change): fold every such proposal into ONE `kind: proposal-retire` proposal, following the dockwright-gardener-digest skill's "Proposal-retire lane" with `evidence_kind: external` and no `members`.
+- **consolidate** — a Step-3 candidate overlaps a pending adoption: ONE proposal whose `supersedes` names every absorbed id.
+- **redraft** — the evidence moved but the adoption still fits: a new proposal with fresh evidence and `supersedes: [<old id>]`.
+- **keep** — everything else.
+
+`supersedes` names only frontier proposals, and a proposal that sets it carries a `## Supersedes` section with one line per id: `<id>: redraft|consolidate|retire — <why>`. The postrun moves the replaced files into `proposals/superseded/`.
 
 ## Step 3 — Sweep the field (the delta pass)
 
@@ -55,14 +68,15 @@ cluster: <kebab-case adoption name>
 lane: frontier
 evidence_kind: external
 targets: [<absolute path of each file the change touches — or the docs/ path of the build-brief for larger adoptions>]
-kind: <rule-edit|skill-edit|agent-edit|code-change|new-asset|build-brief>
-always_on_bytes: <UTF-8 BYTES added to always-loaded context (compute via len(text.encode()), not len(text) — the postrun gate quarantines a >16-byte mismatch vs the diff); 0 otherwise>
+kind: <rule-edit|skill-edit|agent-edit|code-change|new-asset|build-brief|proposal-retire>
+always_on_bytes: <signed integer — UTF-8 BYTES added to always-loaded context (compute via len(text.encode()), not len(text)). A target counts only when it is IN SCOPE (`~/.claude`, or `<dockwright_repo>` when `[paths] dockwright_repo` is set — an out-of-scope target is 0 regardless of its name) AND ANY directory component of its path is named `rules` or `agents`, or it sits in the overlay dir — so `~/.claude/rules/`, `~/.claude/agents/` and `<dockwright_repo>/deploy/agents/` all count. Everything else, `flows/` and `skills/` included, is 0. `validate` prints the computed value beside yours; correct yours to it.>
 cost_justification: <REQUIRED when the diff nets positive always-on bytes beyond the noise floor ([gardener] bytes_tolerance, default 16) — the postrun quarantines it otherwise. Frontier has no digest-side clusters/priors: state the value claim against the external evidence + the cheaper home rejected; the human judges the content at the sitting, the machine only checks non-emptiness. Omit for ≤0>
 flow_cost: <none | adds — <one clause> | removes — <one clause>> — REQUIRED. What does this cost on every ordinary run that does NOT hit the problem it solves? Full contract: the dockwright-gardener-digest skill's "Flow-cost question" section.
 base_rev: <short git rev of the primary target's repo — `git -C <repo> rev-parse --short HEAD`>
 expectation: <one falsifiable sentence — what observable changes if adopted (used-by date, incident class stops, tokens saved)>
 check_window_days: <14 or 28>
 revert: <git revert of the applying commit | "close the build-brief unbuilt">
+supersedes: <OPTIONAL — [<id of a pending frontier proposal>, ...] from Step 2b; omit otherwise>
 ---
 
 ## Evidence
@@ -78,11 +92,14 @@ frontier ACCEPTs often mean "build this", not "apply this patch">
 ## Rationale
 <bar-fit walk: which north-star axis improves, what could regress and why it doesn't,
 why this home, cost accounting, and what the baseline said about it (cite section)>
+
+## Supersedes
+<ONLY when supersedes is set: one line per id — `<id>: redraft|consolidate|retire — <what was carried over, or why it died>`>
 ```
 
 NO `members` — external evidence has no finding files; the validator enforces `evidence_kind: external` semantics. Updating the baseline document itself is a legitimate proposal (kind: rule-edit-style diff against the baseline maintained in the development repo) — that is how the baseline evolves under human control.
 
-Diff hunk headers MUST be numbered (`@@ -<start>,<count> +<start>,<count> @@` — never a bare `@@`), and every change needs ≥1 context line on BOTH sides (git anchors a hunk with no trailing context at end-of-file; mid-file appends with leading-only context can never apply). After writing each diff-bearing proposal, self-check it: `python3 ~/.claude/scripts/gardener_apply.py check --proposal <path>` (read-only) and fix any `check BLOCKED (<class>)` before finishing. `kind: build-brief` proposals carry no diff and skip the self-check.
+Diff hunk headers MUST be numbered (`@@ -<start>,<count> +<start>,<count> @@` — never a bare `@@`), and every change needs ≥1 context line on BOTH sides (git anchors a hunk with no trailing context at end-of-file; mid-file appends with leading-only context can never apply). After writing each artifact, self-check it: `python3 ~/.claude/scripts/gardener_postrun.py validate --proposal <path>` (read-only) — every proposal of every `kind`, fence or no fence; a check artifact uses `validate --check <path>`. A proposal carrying a ```diff fence ALSO runs `python3 ~/.claude/scripts/gardener_apply.py check --proposal <path>`. Fix any violation before finishing. `validate` is for an artifact drafted THIS run, not for re-checking one the gate already admitted — a predecessor moved to `superseded/` reports a spurious `supersedes id is not a pending proposal` violation.
 
 ## Step 5 — The frontier digest
 
@@ -101,6 +118,9 @@ baseline: <local baseline digest> (<its date>) · sweep window: <baseline date>.
 ## Adoption proposals (ranked)
 ### 1. <name> → proposals/pending/<file>
 <2-3 sentences: what the field shipped, why it clears the bar here, the expectation>
+
+## Pending queue reconciled
+<one line per pending frontier proposal: `<id> → keep`, `<id> → keep (open apply)`, or `<id> → redraft|consolidate|retire → <new id>`>
 
 ## Skips confirmed / collapsed
 <A4 deltas only>

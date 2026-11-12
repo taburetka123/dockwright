@@ -176,6 +176,7 @@ def test_recount_fresh_counts_whole_file_deduped(tmp_path):
         "in_tokens": 7,
         "cache_read_tokens": 1500,
         "cache_creation_tokens": 30,
+        "model_requests": 2,
         "last_turn_out": 150,
         "by_model": {"claude-fable-5": {
             "out_tokens": 150, "in_tokens": 7, "cache_read_tokens": 1500,
@@ -205,6 +206,7 @@ def test_recount_growth_bumps_turn_and_delta(tmp_path):
         "in_tokens": 3,
         "cache_read_tokens": 7,
         "cache_creation_tokens": 0,
+        "model_requests": 2,
         "last_turn_out": 40,
         "by_model": {"claude-fable-5": {
             "out_tokens": 140, "in_tokens": 3, "cache_read_tokens": 7,
@@ -234,6 +236,7 @@ def test_recount_excludes_replayed_history_before_started_at(tmp_path):
     spend = recount_spend(log, None, started_at=born)
     assert spend["out_tokens"] == 70
     assert spend["turns"] == 1
+    assert spend["model_requests"] == 2
 
 
 def test_recount_missing_timestamp_counts(tmp_path):
@@ -497,6 +500,30 @@ def test_recount_missing_sidecar_skipped_main_kept(tmp_path):
     spend = recount_spend(log, None,
                           subagent_logs=[tmp_path / "gone.jsonl"])
     assert spend["out_tokens"] == 100
+
+
+def test_recount_counts_model_requests_of_the_main_transcript_only(tmp_path):
+    log = tmp_path / "sid.jsonl"
+    synthetic = json.dumps({
+        "type": "assistant",
+        "timestamp": "2026-06-11T00:00:00Z",
+        "message": {"id": "msg_syn", "type": "message", "role": "assistant", "model": "<synthetic>",
+                    "content": [{"type": "text", "text": "x"}], "usage": _usage()},
+    })
+    log.write_text("\n".join([
+        _assistant_line("msg_a", _usage(output=10)),
+        _assistant_line("msg_a", _usage(output=10)),
+        _assistant_line("msg_b", _usage(output=5)),
+        synthetic,
+    ]) + "\n")
+    subdir = tmp_path / "sid" / "subagents"
+    subdir.mkdir(parents=True)
+    (subdir / "agent-a.jsonl").write_text(
+        _assistant_line("msg_sub", _usage(output=40)) + "\n"
+        + _assistant_line("msg_a", _usage(output=10)) + "\n")
+    spend = recount_spend(log, None)
+    assert spend["model_requests"] == 2
+    assert spend["out_tokens"] == 55
 
 
 def test_nested_known_value_shape_flagged():

@@ -3,8 +3,9 @@ from __future__ import annotations
 import os
 import select
 import sys
+import time
 
-from . import paths, state
+from . import config, paths, state
 
 EXIT_LANE_DEAD = 3
 
@@ -15,9 +16,69 @@ LANES: dict[str, int] = {
     "done": 2,
     "turn-ends": 5,
     "stale": 60,
+    "pages": 1,
 }
 
 HEARTBEAT_STALE_INTERVALS = 3
+HEARTBEAT_STALE_MIN_SEC = 6
+
+
+def stale_window(lane: str) -> float:
+    return max(LANES.get(lane, 0) * HEARTBEAT_STALE_INTERVALS, HEARTBEAT_STALE_MIN_SEC)
+
+
+MODE_NAME = "mode.json"
+
+
+def remember_lanes_mode(in_manager: bool) -> None:
+    try:
+        state.write_json_atomic(paths.DAEMON / MODE_NAME, {"in_manager": in_manager, "ts": time.time()})
+    except OSError as exc:
+        print(f"daemon: cannot remember the lanes mode ({exc})", file=sys.stderr)
+
+
+def lanes_mode_error() -> str | None:
+    error = config.load_error()
+    if error is not None:
+        return error
+    lanes = config.load().get("lanes")
+    if isinstance(lanes, dict) and "in_manager" in lanes and not isinstance(lanes["in_manager"], bool):
+        return f"[lanes] in_manager = {lanes['in_manager']!r} is not a boolean"
+    return None
+
+
+def config_names_lanes_mode() -> bool:
+    if lanes_mode_error() is not None:
+        return False
+    lanes = config.load().get("lanes")
+    return isinstance(lanes, dict) and isinstance(lanes.get("in_manager"), bool)
+
+
+def lanes_in_manager() -> bool:
+    if config_names_lanes_mode():
+        return config.lanes_in_manager()
+    saved = state.read_json(paths.DAEMON / MODE_NAME)
+    value = saved.get("in_manager") if isinstance(saved, dict) else None
+    return value if isinstance(value, bool) else True
+
+
+OBSERVED_NAME = "observed.json"
+OBSERVED_LANES = ("done", "turn-ends", "questions")
+
+
+def remember_observed(scanned: dict[str, float]) -> None:
+    saved = state.read_json(paths.DAEMON / OBSERVED_NAME)
+    try:
+        state.write_json_atomic(paths.DAEMON / OBSERVED_NAME,
+                                {**(saved if isinstance(saved, dict) else {}), **scanned})
+    except OSError as exc:
+        print(f"daemon: cannot record the observed lanes ({exc})", file=sys.stderr)
+
+
+def observed_at(lane: str) -> float | None:
+    saved = state.read_json(paths.DAEMON / OBSERVED_NAME)
+    ts = saved.get(lane) if isinstance(saved, dict) else None
+    return ts if isinstance(ts, (int, float)) else None
 
 MAX_SCAN_ERROR_WINDOW_SEC = 60
 
@@ -29,8 +90,11 @@ def max_consecutive_errors(lane: str) -> int:
     return max(1, -(-MAX_SCAN_ERROR_WINDOW_SEC // interval))
 
 EXIT_LANE_WEDGED = 4
+EXIT_LANE_DUPLICATE = 5
+EXIT_NO_CLI = 6
+EXIT_LANE_UNRESOLVED = 7
 
-BACKLOG_CHECKED_LANES = ("questions", "done")
+BACKLOG_CHECKED_LANES = ("questions", "done", "pages")
 
 UNRESOLVED_BUCKET = None
 
@@ -48,6 +112,18 @@ def reader_is_dead(fd: int = 1) -> bool:
         return False
     except Exception:
         return False
+
+
+def awake_seconds() -> float:
+    clk = getattr(time, "CLOCK_UPTIME_RAW", None)
+    if clk is not None:
+        return time.clock_gettime(clk)
+    return time.monotonic()
+
+
+def awake_since(stamp: float) -> float:
+    now = awake_seconds()
+    return now if stamp > now else now - stamp
 
 
 def preflight(fd: int = 1) -> None:
@@ -90,8 +166,7 @@ def heartbeat_path(manager_name: str, lane: str):
 
 
 def write_heartbeat(manager_name: str, lane: str, *, emitted: bool,
-                    now: float | None = None) -> None:
-    import time
+                    now: float | None = None, extra: dict | None = None) -> None:
     now = time.time() if now is None else now
     path = heartbeat_path(manager_name, lane)
     prior = state.read_json(path) or {}
@@ -102,9 +177,11 @@ def write_heartbeat(manager_name: str, lane: str, *, emitted: bool,
             "manager": manager_name,
             "pid": os.getpid(),
             "last_scan": now,
+            "awake": awake_seconds(),
             "last_emit": last_emit if isinstance(last_emit, (int, float)) else None,
             "interval_hint": LANES.get(lane, 0),
             "consecutive_errors": 0,
+            **(extra or {}),
         })
     except OSError as exc:
         print(f"monitor: heartbeat write failed for {lane} ({exc})",

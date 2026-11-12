@@ -110,6 +110,36 @@ def _run_full(tmp_path, repo):
                           text=True, cwd=str(repo), timeout=180)
 
 
+STUB_PYTHON_TOO_OLD = """#!/bin/sh
+if [ "$1" = "-c" ]; then
+    case "$2" in
+        *version_info*) exit 1 ;;
+        *) exit 0 ;;
+    esac
+fi
+exit 0
+"""
+
+
+def test_discovers_versioned_interpreter_when_path_python3_too_old(tmp_path):
+    repo = _full_tree(tmp_path)
+    stub_bin = tmp_path / "stub-bin"
+    stub_bin.mkdir()
+    old = stub_bin / "python3"
+    old.write_text(STUB_PYTHON_TOO_OLD)
+    old.chmod(0o755)
+    for name in ("python3.11", "python3.12", "python3.13", "python3.14"):
+        cand = stub_bin / name
+        cand.write_text(STUB_PYTHON)
+        cand.chmod(0o755)
+    path = f"{stub_bin}:/usr/bin:/bin"
+    r = subprocess.run([shutil.which("bash"), str(repo / "setup.sh")],
+                       env=_env(tmp_path, path), capture_output=True,
+                       text=True, cwd=str(repo), timeout=180)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (repo / ".venv" / "bin" / "dockwright").exists()
+
+
 def test_full_tree_setup_completes_with_adequate_python(tmp_path):
     repo = _full_tree(tmp_path)
     r = _run_full(tmp_path, repo)

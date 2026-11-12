@@ -242,10 +242,16 @@ fi
 case "$LEVEL" in
   high)
     if [ -n "$DEDUP_KEY" ]; then : > "$DEDUP_DIR/$DEDUP_KEY" 2>/dev/null || true; fi
-    if [ -n "$(find "$HOME/.claude/dockwright" -maxdepth 1 -name '.manager-limited-*' -mmin -5 2>/dev/null | head -1)" ] \
+    DEFER_REASON=""
+    if [ -n "$(find "$HOME/.claude/dockwright" -maxdepth 1 -name '.manager-limited-*' -mmin -5 2>/dev/null | head -1)" ]; then
+      DEFER_REASON="brick"
+    elif dockwright usage-cap --paused >/dev/null 2>&1; then
+      DEFER_REASON="usage-cap"
+    fi
+    if [ -n "$DEFER_REASON" ] \
        && . "$HOME/.claude/scripts/selffix-retry-lib.sh" 2>/dev/null \
-       && selffix_enqueue_retry "$SESSION_ID" "$TRANSCRIPT" "brick"; then
-      log_line "retry:enqueued" "$SESSION_ID" "reason=brick $REASONS"
+       && selffix_enqueue_retry "$SESSION_ID" "$TRANSCRIPT" "$DEFER_REASON"; then
+      log_line "retry:enqueued" "$SESSION_ID" "reason=$DEFER_REASON $REASONS"
       exit 0
     fi
     nohup bash "$HOME/.claude/scripts/selffix-run.sh" \

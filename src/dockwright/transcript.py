@@ -3,33 +3,100 @@ import os
 from pathlib import Path
 from typing import Tuple
 
-def _find_claude_session_log(session_id: str) -> Path | None:
-    projects_root = Path(os.environ.get("HOME", "")) / ".claude" / "projects"
-    if not projects_root.is_dir():
+from .codex_translate import default_codex_dir
+
+
+def _find_claude_session_log(session_id: str, root: Path | None = None) -> Path | None:
+    projects_root = (root if root is not None
+                     else Path(os.environ.get("HOME", "")) / ".claude" / "projects")
+    try:
+        if not projects_root.is_dir():
+            return None
+        for project_dir in projects_root.iterdir():
+            candidate = project_dir / f"{session_id}.jsonl"
+            if candidate.is_file():
+                return candidate
+    except OSError:
         return None
-    for project_dir in projects_root.iterdir():
-        candidate = project_dir / f"{session_id}.jsonl"
-        if candidate.is_file():
-            return candidate
     return None
 
 
-def _find_codex_session_log(session_id: str) -> Path | None:
-    sessions_root = Path(os.environ.get("HOME", "")) / ".codex" / "sessions"
-    if not sessions_root.is_dir():
+def _find_codex_session_log(session_id: str, root: Path | None = None) -> Path | None:
+    sessions_root = root if root is not None else default_codex_dir() / "sessions"
+    try:
+        if not sessions_root.is_dir():
+            return None
+        matches = sorted(
+            sessions_root.rglob(f"rollout-*-{session_id}.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
         return None
-    matches = sorted(
-        sessions_root.rglob(f"rollout-*-{session_id}.jsonl"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
     return matches[0] if matches else None
 
 
-def find_session_log(session_id: str, runtime: str = "claude") -> Path | None:
+def find_session_log(session_id: str, runtime: str = "claude",
+                     root: Path | None = None) -> Path | None:
     if runtime == "codex":
-        return _find_codex_session_log(session_id)
-    return _find_claude_session_log(session_id)
+        return _find_codex_session_log(session_id, root)
+    return _find_claude_session_log(session_id, root)
+
+
+def _codex_thread_link(path: Path) -> tuple[str, str, bool] | None:
+    try:
+        with open(path, "r", errors="replace") as f:
+            first = f.readline()
+    except OSError:
+        return None
+    try:
+        record = json.loads(first)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(record, dict) or record.get("type") != "session_meta":
+        return None
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    thread_id = payload.get("id")
+    parent = payload.get("parent_thread_id")
+    if not isinstance(parent, str) or not parent:
+        source = payload.get("source")
+        subagent = source.get("subagent") if isinstance(source, dict) else None
+        spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+        parent = spawn.get("parent_thread_id") if isinstance(spawn, dict) else None
+    if not (isinstance(thread_id, str) and thread_id
+            and isinstance(parent, str) and parent):
+        return None
+    forked = payload.get("forked_from_id")
+    return thread_id, parent, isinstance(forked, str) and bool(forked)
+
+
+def codex_subagent_rollouts(session_id: str, root: Path | None = None) -> list:
+    sessions_root = root if root is not None else default_codex_dir() / "sessions"
+    try:
+        if not sessions_root.is_dir():
+            return []
+        rollouts = sorted(sessions_root.rglob("rollout-*.jsonl"))
+    except OSError:
+        return []
+    children: dict = {}
+    for path in rollouts:
+        link = _codex_thread_link(path)
+        if link is not None:
+            thread_id, parent, forked = link
+            children.setdefault(parent, []).append((thread_id, path, forked))
+    found = []
+    seen = {session_id}
+    queue = [session_id]
+    while queue:
+        for thread_id, path, forked in children.get(queue.pop(0), []):
+            if thread_id in seen:
+                continue
+            seen.add(thread_id)
+            found.append((path, forked))
+            queue.append(thread_id)
+    return found
 
 
 def latest_subagent_mtime(session_log: Path, session_id: str) -> float:
@@ -74,8 +141,11 @@ def episode_grace_sec() -> int:
 
 
 def is_delegating(record: dict, now: float, log: Path | None = None,
-                  fresh_sec: float | None = None) -> bool:
+                  fresh_sec: float | None = None, records=None) -> bool:
     try:
+        from .state import has_live_child
+        if has_live_child(record, records):
+            return True
         if fresh_sec is None:
             fresh_sec = episode_grace_sec()
         if (record.get("runtime") or "claude") != "claude":
@@ -196,9 +266,10 @@ def recount_spend(log_path: Path, prior_spend: dict | None,
     totals = {key: 0 for key in _SPEND_TOTAL_KEYS}
     by_model: dict = {}
     seen_ids: set[str] = set()
+    request_ids: set[str] = set()
     check_birth = isinstance(started_at, (int, float)) and started_at > 0
-    for line in (line for file_raw in raws
-                 for line in file_raw.decode("utf-8", errors="replace").splitlines()):
+    for in_main, line in ((index == 0, line) for index, file_raw in enumerate(raws)
+                          for line in file_raw.decode("utf-8", errors="replace").splitlines()):
         line = line.strip()
         if not line:
             continue
@@ -208,11 +279,13 @@ def recount_spend(log_path: Path, prior_spend: dict | None,
             continue
         if not isinstance(event, dict) or event.get("type") != "assistant":
             continue
+        entry = usage_totals_of(event)
+        if in_main and entry is not None and entry["model"] != "<synthetic>":
+            request_ids.add(entry["message_id"])
         if check_birth:
             event_ts = _parse_event_ts(event.get("timestamp"))
             if event_ts is not None and event_ts < started_at:
                 continue
-        entry = usage_totals_of(event)
         if entry is None or entry["message_id"] in seen_ids:
             continue
         seen_ids.add(entry["message_id"])
@@ -239,9 +312,62 @@ def recount_spend(log_path: Path, prior_spend: dict | None,
     return {
         "turns": _int_field(prior, "turns") + 1,
         **totals,
+        "model_requests": len(request_ids),
         "last_turn_out": max(0, totals["out_tokens"] - prior_totals["out_tokens"]),
         "by_model": by_model,
     }
+
+
+_CODEX_SPEND_KEYS = ("out_tokens", "in_tokens", "cache_read_tokens", "cache_creation_tokens",
+                     "reasoning_tokens")
+
+
+def codex_usage_totals(usage: dict) -> dict:
+    cached = _int_field(usage, "cached_input_tokens")
+    return {
+        "out_tokens": _int_field(usage, "output_tokens"),
+        "in_tokens": max(0, _int_field(usage, "input_tokens") - cached),
+        "cache_read_tokens": cached,
+        "cache_creation_tokens": _int_field(usage, "cache_write_input_tokens"),
+        "reasoning_tokens": _int_field(usage, "reasoning_output_tokens"),
+    }
+
+
+def codex_usage_of(event) -> dict | None:
+    if not isinstance(event, dict) or event.get("type") != "turn.completed":
+        return None
+    usage = event.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    return codex_usage_totals(usage)
+
+
+def recount_codex_spend(log_path, prior_spend) -> dict | None:
+    try:
+        raw = Path(log_path).read_bytes()
+    except OSError:
+        return prior_spend
+    totals = {key: 0 for key in _CODEX_SPEND_KEYS}
+    turns = 0
+    last_out = 0
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        entry = codex_usage_of(event)
+        if entry is None:
+            continue
+        turns += 1
+        last_out = entry["out_tokens"]
+        for key in _CODEX_SPEND_KEYS:
+            totals[key] += entry[key]
+    if turns == 0:
+        return prior_spend
+    return {"turns": turns, **totals, "last_turn_out": last_out, "by_model": {}}
 
 
 def _cache_creation_split(usage: dict) -> tuple[int, int]:
@@ -329,6 +455,35 @@ def usage_totals_of(event) -> dict | None:
         "cache_creation_flat": _int_field(usage, "cache_creation_input_tokens"),
         "unknown_usage_keys": _unknown_usage_keys(usage),
     }
+
+
+def context_tokens(session_id: str, runtime: str = "claude") -> int | None:
+    log = find_session_log(session_id, runtime)
+    if log is None:
+        return None
+    last = None
+    try:
+        with open(log, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"assistant"' not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict) or event.get("type") != "assistant" or event.get("isSidechain") is True:
+                    continue
+                message = event.get("message") or {}
+                if message.get("model") == "<synthetic>":
+                    continue
+                usage = message.get("usage")
+                if isinstance(usage, dict):
+                    last = usage
+    except OSError:
+        return None
+    if last is None:
+        return None
+    return sum(_int_field(last, k) for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
 
 
 def sum_usage_by_model(log_path: Path) -> dict:

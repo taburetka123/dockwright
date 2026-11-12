@@ -95,6 +95,56 @@ def test_handle_click_toggle_creates_then_removes_flag(monkeypatch, tmp_path):
     assert calls == [("refresh-client", "-S"), ("refresh-client", "-S")]
 
 
+def test_main_line_draws_the_expanded_idle_list_only_until_it_expires(tmp_path, capsys, monkeypatch):
+    _scripted_tmux(monkeypatch, status="2", clients="200")
+    home = _fleet_home(tmp_path, [])
+    orch = home / ".claude" / "dockwright"
+    for n in ("z1", "z2"):
+        _write(orch / "active" / f"{n}.json",
+               {"agent": "worker", "name": n, "state": "idle", "claude_sid": n, "pid": os.getpid()})
+    flag = orch / sr.IDLE_FLAG
+    flag.touch()
+    sr.main(["status_row.py", "line", "1", "%9", "200"], home)
+    assert "💤2▾" in capsys.readouterr().out
+    old = time.time() - sr.IDLE_EXPANDED_TTL_SEC - 1
+    os.utime(flag, (old, old))
+    sr.main(["status_row.py", "line", "1", "%9", "200"], home)
+    out = capsys.readouterr().out
+    assert "💤2" in out and "💤2▾" not in out
+
+
+def test_handle_click_toggle_expands_an_expired_idle_list(monkeypatch, tmp_path):
+    monkeypatch.setattr(sr, "_tmux", lambda *a: None)
+    flag = tmp_path / sr.IDLE_FLAG
+    flag.touch()
+    old = time.time() - sr.IDLE_EXPANDED_TTL_SEC - 1
+    os.utime(flag, (old, old))
+    sr.handle_click("toggle:idle", tmp_path)
+    assert sr._idle_expanded(tmp_path)
+    sr.handle_click("toggle:idle", tmp_path)
+    assert not flag.exists()
+
+
+def test_handle_click_rows_toggle_creates_then_removes_the_flag(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(sr, "_tmux", lambda *a: calls.append(a))
+    flag = tmp_path / "statusline-rows-collapsed"
+    sr.handle_click("toggle:rows", tmp_path)
+    assert flag.exists() and sr._rows_collapsed(tmp_path)
+    sr.handle_click("toggle:rows", tmp_path)
+    assert not flag.exists() and not sr._rows_collapsed(tmp_path)
+    assert calls == [("refresh-client", "-S"), ("refresh-client", "-S")]
+
+
+def test_rows_fold_holds_until_the_next_click_however_old(tmp_path):
+    flag = tmp_path / sr.ROWS_FLAG
+    flag.touch()
+    old = time.time() - 7 * 86400
+    os.utime(flag, (old, old))
+    assert sr._rows_collapsed(tmp_path)
+    assert not sr._rows_collapsed(tmp_path / "missing")
+
+
 def test_handle_click_unknown_or_empty_is_noop(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(sr, "_tmux", lambda *a: calls.append(a))
@@ -201,7 +251,7 @@ def test_collect_filters_nested_and_dead_pid(tmp_path):
     records, qsids = sr.collect(active, tmp_path / "questions")
     names = {r["name"] for r in records}
     assert names == {"live", "nopid"}
-    assert qsids == set()
+    assert qsids == {}
 
 
 def test_collect_reads_question_sids_recursively(tmp_path):
@@ -210,7 +260,7 @@ def test_collect_reads_question_sids_recursively(tmp_path):
     q = tmp_path / "questions"
     _write(q / "boss" / "q1.json", {"worker_sid": "wsid", "question": "?"})
     records, qsids = sr.collect(active, q)
-    assert "wsid" in qsids
+    assert qsids == {"wsid": {"task_key": None, "text": "?"}}
 
 
 def test_collect_skips_malformed_json(tmp_path):
@@ -1078,7 +1128,7 @@ def test_handle_click_menu_fleet_height_caps_rows(monkeypatch, tmp_path):
                {"agent": "worker", "name": f"w{i}", "state": "idle", "claude_sid": f"s{i}", "pid": os.getpid(), "window_id": f"%{i}"})
 
     def n_item_rows(cmd):
-        items = cmd[cmd.index("-T") + 2:]
+        items = cmd[cmd.index("--") + 1:]
         n, i = 0, 0
         while i < len(items) and items[i] != "":
             n += 1
@@ -1132,25 +1182,19 @@ def test_main_click_passes_extra_argv_through(monkeypatch, tmp_path):
 
 
 def _shipped_fleet_conf(orch):
-    conf_src = (Path(__file__).resolve().parents[1] / "deploy" / "tmux" / "dockwright.conf").read_text()
-    sf1 = next((l for l in conf_src.splitlines() if "'status-format[1]'" in l), None)
-    bind = next((l for l in conf_src.splitlines() if l.startswith("bind -n MouseUp1Status")), None)
-    unbind = next((l for l in conf_src.splitlines() if l.startswith("unbind -n MouseDown1Status")), None)
-    if sf1 is None or bind is None or unbind is None:
-        pytest.fail("could not extract shipped status-format[1] / unbind / MouseUp1Status lines from dockwright.conf")
+    conf_lines = (Path(__file__).resolve().parents[1] / "deploy" / "tmux" / "dockwright.conf").read_text().splitlines()
+    floor = next((l for l in conf_lines if l.startswith("if -F") and "status 2" in l), None)
+    formats = [l for l in conf_lines if "'status-format[" in l]
+    bind = next((l for l in conf_lines if l.startswith("bind -n MouseUp1Status")), None)
+    unbind = next((l for l in conf_lines if l.startswith("unbind -n MouseDown1Status")), None)
+    if floor is None or not formats or bind is None or unbind is None:
+        pytest.fail("could not extract the shipped status floor / status-format / unbind / MouseUp1Status lines from dockwright.conf")
     deployed = "$HOME/.claude/dockwright/status_row.py"
-    if deployed not in sf1 or deployed not in bind:
+    if any(deployed not in l for l in formats + [bind]):
         pytest.fail(f"shipped conf no longer references {deployed!r} — the path rewrite would be a silent no-op")
     script = str(orch / "status_row.py")
-    sf1 = sf1.replace(deployed, script)
-    bind = bind.replace(deployed, script)
-    return (
-        "set -g mouse on\n"
-        "set -g status 2\n"
-        "set -g status-interval 1\n"
-        'set -g \'status-format[0]\' "MGR"\n'
-        f"{sf1}\n{unbind}\n{bind}\n"
-    )
+    shipped = [floor, *formats, unbind, bind]
+    return "set -g mouse on\nset -g status-interval 1\n" + "\n".join(l.replace(deployed, script) for l in shipped) + "\n"
 
 
 def _accumulate(fd, secs, needle=None):
@@ -1761,6 +1805,8 @@ def test_unread_marker_is_one_cell_as_tmux_counts_it(real_tmux):
     try:
         assert (cells("A"), cells("漢"), cells("🎯")) == (1, 2, 2), "the width oracle itself is broken"
         assert cells(sr.UNREAD_MARKER) == 1
+        for glyph in ("🎯", "🔧", "💤", "❓", sr.UNREAD_MARKER, "▸", "·", "—", "↳", "▾", "漢", "é"):
+            assert sr._cells(glyph) == cells(glyph), glyph
     finally:
         subprocess.run(["tmux", "-L", sock, "kill-server"], capture_output=True)
     assert len(sr.UNREAD_MARKER) == 2 and sr.UNREAD_MARKER[1] == "\ufe0e"
@@ -2104,3 +2150,629 @@ def test_fleet_menu_row_marks_a_live_worker_as_working(tmp_path):
     log = _live_tree(tmp_path, log_age=3.0)
     label = sr._menu_label(_idle_record(log, name="alpha"), set(), "")
     assert "🔧" in label and "💤" not in label
+
+
+def test_resolve_scope_worker_pane_reads_parent_name_only():
+    recs = [{"agent": "worker", "name": "w", "window_id": "%7", "parent_name": "boss"}]
+    assert sr._resolve_scope(recs, "%7") == "boss"
+
+
+def test_build_fleet_menu_scoped_reads_parent_name_only():
+    recs = [
+        {"agent": "worker", "name": "mine", "state": "idle", "claude_sid": "m", "window_id": "%1", "parent_name": "boss"},
+        {"agent": "worker", "name": "theirs", "state": "idle", "claude_sid": "t", "window_id": "%3", "parent_name": "other"},
+    ]
+    _, args = sr.build_fleet_menu(recs, set(), "boss")
+    joined = " ".join(args)
+    assert "mine" in joined
+    assert "theirs" not in joined
+
+
+def _child(name, parent, runtime="codex", **extra):
+    rec = {"agent": "worker", "kind": "subworker", "name": name, "parent_name": parent,
+           "runtime": runtime, "state": "processing", "claude_sid": "c-" + name, "window_id": "%30"}
+    rec.update(extra)
+    return rec
+
+
+def test_render_workers_draws_the_child_right_after_its_parent_and_marks_the_parent_busy():
+    recs = [
+        {"agent": "worker", "name": "alpha", "state": "idle", "claude_sid": "a", "window_id": "%10"},
+        _child("alpha-review", "alpha"),
+        {"agent": "worker", "name": "bravo", "state": "idle", "claude_sid": "b"},
+    ]
+    out = sr.render_workers(recs, set())
+    assert "🔧 alpha" in out
+    assert out.index("🔧 alpha") < out.index("↳ alpha-review · codex")
+    assert "💤1" in out and "alpha-review" not in out[out.index("💤1"):]
+    assert "#[range=user|switch:%30]" in out
+
+
+def test_render_workers_child_color_follows_its_own_state():
+    recs = [{"agent": "worker", "name": "alpha", "state": "idle", "claude_sid": "a"},
+            _child("alpha-review", "alpha", state="idle")]
+    out = sr.render_workers(recs, set())
+    child_at = out.index("↳ alpha-review · codex")
+    parent_chip, child_chip = out[:child_at].rsplit("#[range", 1)[0], out[child_at - 60:child_at]
+    assert "#aa8800" in parent_chip
+    assert "#444444" in child_chip and "#aa8800" not in child_chip
+
+
+def test_render_workers_child_with_a_question_uses_the_question_color():
+    recs = [{"agent": "worker", "name": "alpha", "state": "idle", "claude_sid": "a"},
+            _child("alpha-probe", "alpha", runtime="claude")]
+    out = sr.render_workers(recs, {"c-alpha-probe"})
+    assert "↳ alpha-probe · claude" in out
+    assert "#aa3300" in out
+
+
+def test_render_workers_unattached_child_goes_last():
+    recs = [{"agent": "worker", "name": "bravo", "state": "processing", "claude_sid": "b"},
+            _child("ghost-review", "ghost")]
+    out = sr.render_workers(recs, set())
+    assert out.index("🔧 bravo") < out.index("↳ ghost-review · codex")
+
+
+def test_render_workers_without_children_is_unchanged():
+    recs = [
+        {"agent": "worker", "name": "alpha",  "state": "processing", "claude_sid": "a"},
+        {"agent": "worker", "name": "bravo",  "state": "idle",       "claude_sid": "b"},
+    ]
+    assert "↳" not in sr.render_workers(recs, set())
+
+
+def test_classify_worker_takes_delegating_names():
+    rec = {"agent": "worker", "name": "alpha", "state": "idle", "claude_sid": "a"}
+    assert sr.classify_worker(rec, set()) == "idle"
+    assert sr.classify_worker(rec, set(), delegating_names={"alpha"}) == "processing"
+    assert sr.classify_worker(rec, {"a"}, delegating_names={"alpha"}) == "question"
+
+
+def test_fleet_menu_lists_the_child_under_its_parent_and_scopes_it_with_the_parent():
+    recs = [
+        {"agent": "manager", "name": "boss", "window_id": "%1"},
+        {"agent": "worker", "name": "alpha", "state": "idle", "claude_sid": "a", "parent_name": "boss", "window_id": "%10"},
+        _child("alpha-review", "alpha"),
+        {"agent": "worker", "name": "zulu", "state": "idle", "claude_sid": "z", "parent_name": "other", "window_id": "%11"},
+    ]
+    title, args = sr.build_fleet_menu(recs, set(), "boss")
+    labels = [a for a in args if isinstance(a, str) and ("alpha" in a or "zulu" in a)]
+    assert any("🔧 " in a and "alpha" in a and "↳" not in a for a in labels)
+    assert any("↳ alpha-review · codex" in a for a in labels)
+    assert not any("zulu" in a for a in labels)
+    assert labels.index(next(a for a in labels if "↳" in a)) == 1
+    assert "1 workers" in title
+
+
+def test_resolve_scope_from_a_child_pane_is_the_grandparent():
+    recs = [
+        {"agent": "manager", "name": "boss", "window_id": "%1"},
+        {"agent": "worker", "name": "alpha", "parent_name": "boss", "window_id": "%10"},
+        _child("alpha-review", "alpha"),
+    ]
+    assert sr._resolve_scope(recs, "%30") == "boss"
+
+
+def test_render_workers_an_unnamed_parent_does_not_claim_an_unattached_child():
+    recs = [
+        {"agent": "worker", "state": "idle", "claude_sid": "a", "window_id": "%10", "funny_name": "ann"},
+        {"agent": "worker", "state": "idle", "claude_sid": "b", "window_id": "%11", "funny_name": "bob"},
+        _child("orphan-review", None),
+    ]
+    out = sr.render_workers(recs, set(), idle_expanded=True)
+    assert out.count("↳ orphan-review · codex") == 1
+    assert out.index("💤 bob") < out.index("↳ orphan-review · codex")
+
+
+def test_pid_alive_reads_an_unknown_pid_as_alive():
+    sr = _load()
+    assert sr._pid_alive("x") is True
+    assert sr._pid_alive(None) is True
+    assert sr._pid_alive(0) is True
+    assert sr._pid_alive(-1) is True
+    assert sr._pid_alive(os.getpid()) is True
+    assert sr._pid_alive(2 ** 22 + 3) is False
+
+
+def test_a_child_with_a_non_numeric_pid_still_marks_its_parent_busy():
+    sr = _load()
+    recs = [
+        {"agent": "worker", "name": "alpha", "kind": "worker", "pid": os.getpid(), "state": "idle"},
+        {"agent": "worker", "name": "alpha-review", "kind": "subworker", "parent_name": "alpha",
+         "pid": "x", "state": "idle", "runtime": "codex"},
+    ]
+    out = sr.render_workers(recs, set())
+    assert "🔧 alpha" in out and "💤" not in out
+    assert "↳ alpha-review · codex" in out
+
+
+def test_cells_counts_a_variation_selector_and_a_combining_mark_as_zero():
+    assert sr._cells(sr.UNREAD_MARKER) == 1
+    assert sr._cells("é") == 1
+    assert sr._cells("🎯 漢a") == 6
+
+
+def test_markup_cells_counts_only_what_tmux_draws():
+    assert sr._markup_cells(sr.clickable_chip("a#b", sr.IDLE_COLOR, "switch:%5")) == 5
+    assert sr._markup_cells("#[bg=#aa0066,fg=#ffffff] 🎯 x #[default]") == 6
+    assert sr._markup_cells(sr.chip("✉︎", sr.UNREAD_COLOR)) == 3
+
+
+def _busy(name):
+    return {"agent": "worker", "name": name, "state": "processing", "claude_sid": name, "pid": os.getpid()}
+
+
+def _boss(name="boss", domain=None):
+    rec = {"agent": "manager", "name": name, "pid": os.getpid()}
+    if domain:
+        rec["domain"] = domain
+    return rec
+
+
+def test_status_lines_fit_a_small_fleet_in_two_lines():
+    lines = sr.status_lines([_boss(), _busy("busyone")], {}, False, "", None, 200)
+    assert len(lines) == 2
+    assert lines[0].startswith(sr.MANAGERS_LABEL) and "🎯 boss" in lines[0]
+    assert lines[1].startswith(sr.WORKERS_LABEL) and "🔧 busyone" in lines[1]
+
+
+def test_status_lines_keep_both_labels_for_an_empty_fleet():
+    assert sr.status_lines([], {}, False, "", None, 120) == [sr.MANAGERS_LABEL, sr.WORKERS_LABEL + sr.rows_toggle_chip(False)]
+    assert sr.status_lines([], {}, False, "", None, 120, collapsed=True) == [sr.MANAGERS_LABEL, sr.WORKERS_LABEL + sr.rows_toggle_chip(True)]
+
+
+def test_status_lines_wrap_workers_without_losing_a_chip():
+    names = [f"w{i:02d}" for i in range(1, 15)]
+    lines = sr.status_lines([_boss()] + [_busy(n) for n in names], {}, False, "", None, 60)
+    assert len(lines) >= 3
+    assert lines[1].startswith(sr.WORKERS_LABEL)
+    indent = " " * sr._markup_cells(sr.WORKERS_LABEL)
+    assert all(line.startswith(indent) for line in lines[2:])
+    body = "".join(lines[1:])
+    assert all(body.count(f"🔧 {n} ") == 1 for n in names)
+    assert sr._markup_cells(lines[0]) <= 60 - sr.CLOCK_CELLS
+    assert all(sr._markup_cells(line) <= 60 for line in lines[1:])
+
+
+def test_status_lines_wrap_managers_too():
+    names = ["mgr-alpha-one", "mgr-beta-two", "mgr-gamma-three"]
+    lines = sr.status_lines([_boss(n, "domain-x") for n in names] + [_busy("busyone")], {}, False, "", None, 60)
+    assert len(lines) == 4
+    assert lines[0].startswith(sr.MANAGERS_LABEL)
+    assert all(sum(line.count(f"🎯 {n} ") for line in lines[:3]) == 1 for n in names)
+    assert lines[3].startswith(sr.WORKERS_LABEL) and "🔧 busyone" in lines[3]
+
+
+def test_status_lines_cap_at_five_with_a_clickable_overflow_chip():
+    lines = sr.status_lines([_boss()] + [_busy(f"w{i:02d}") for i in range(1, 41)], {}, False, "", None, 40)
+    assert len(lines) == sr.STATUS_MAX_LINES
+    hidden = re.search(r"#\[range=user\|menu:all\]#\[[^]]*\] \+(\d+) ", lines[-1])
+    assert hidden is not None, lines[-1]
+    shown = sum(line.count("🔧 w") for line in lines[1:])
+    assert shown + int(hidden.group(1)) == 40
+    assert all(sr._markup_cells(line) <= 40 for line in lines[1:])
+
+
+def _mixed_fleet():
+    asking = [_busy("q1"), _busy("q2")]
+    idle = [{"agent": "worker", "name": f"z{i}", "state": "idle", "claude_sid": f"z{i}", "pid": os.getpid()} for i in (1, 2, 3)]
+    child = {"agent": "worker", "kind": "subworker", "name": "kid", "parent_name": "w01",
+             "state": "processing", "claude_sid": "kid", "pid": os.getpid()}
+    records = [_boss()] + [_busy(f"w{i:02d}") for i in range(1, 15)] + asking + idle + [child]
+    questions = {"q1": {"task_key": None, "text": "?"}, "q2": {"task_key": None, "text": "?"}}
+    return records, questions
+
+
+def test_rows_toggle_chip_names_its_glyph_and_payload():
+    assert sr.rows_toggle_chip(False) == sr.clickable_chip("⊟", sr.IDLE_COLOR, "toggle:rows")
+    assert sr.rows_toggle_chip(True) == sr.clickable_chip("⊞", sr.IDLE_COLOR, "toggle:rows")
+
+
+def test_status_lines_put_the_rows_toggle_first_on_the_workers_line():
+    lines = sr.status_lines([_boss(), _busy("busyone")], {}, False, "", None, 200)
+    assert lines[1].startswith(sr.WORKERS_LABEL + sr.rows_toggle_chip(False) + " ")
+    assert "🔧 busyone" in lines[1]
+
+
+def test_status_lines_folded_fold_every_worker_into_one_counted_line():
+    records, questions = _mixed_fleet()
+    lines = sr.status_lines(records, questions, False, "", None, 60, collapsed=True)
+    assert len(lines) == 2
+    assert lines[1] == sr.WORKERS_LABEL + " ".join([
+        sr.rows_toggle_chip(True),
+        sr.clickable_chip("❓2", sr.QUESTION_COLOR, "toggle:rows"),
+        sr.clickable_chip("🔧15", sr.BUSY_COLOR, "toggle:rows"),
+        sr.clickable_chip("💤3", sr.IDLE_COLOR, "toggle:rows"),
+    ])
+    unfolded = sr.status_lines(records, questions, False, "", None, 60)
+    assert len(unfolded) > 2
+
+
+def test_status_lines_folded_drop_the_states_that_have_no_worker():
+    lines = sr.status_lines([_boss(), _busy("busyone")], {}, False, "", None, 120, collapsed=True)
+    assert lines[1] == sr.WORKERS_LABEL + sr.rows_toggle_chip(True) + " " + sr.clickable_chip("🔧1", sr.BUSY_COLOR, "toggle:rows")
+
+
+def test_status_lines_folded_keep_the_expand_chip_on_a_narrow_client():
+    records, questions = _mixed_fleet()
+    lines = sr.status_lines(records, questions, False, "", None, 30, collapsed=True)
+    assert len(lines) == 2
+    assert lines[1].startswith(sr.WORKERS_LABEL + sr.rows_toggle_chip(True))
+    assert "#[range=user|menu:all]" in lines[1]
+    assert sr._markup_cells(lines[1]) <= 30
+
+
+@pytest.mark.parametrize("need, split", [
+    ((1, 1), (1, 1)),
+    ((2, 3), (2, 3)),
+    ((1, 9), (1, 4)),
+    ((3, 4), (2, 3)),
+    ((6, 1), (4, 1)),
+])
+def test_split_lines_gives_workers_the_lines_managers_do_not_need(need, split):
+    assert sr._split_lines(*need) == split
+
+
+def test_render_functions_still_join_their_chips_on_one_line():
+    recs = [_boss(), _busy("busyone")]
+    assert sr.render_managers(recs) == " ".join(sr.manager_chips(recs))
+    assert sr.render_workers(recs, set()) == " ".join(sr.worker_chips(recs, set()))
+
+
+def _scripted_tmux(monkeypatch, status="2", clients="60"):
+    calls = []
+
+    def fake(args, *a, **k):
+        calls.append([str(x) for x in args])
+        answers = {"show-options": status, "list-clients": clients}
+        out = answers.get(str(args[1]), "") if len(args) > 1 and str(args[0]) == "tmux" else ""
+        return subprocess.CompletedProcess(args, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(sr.subprocess, "run", fake)
+    return calls
+
+
+def _fleet_home(tmp_path, workers):
+    orch = tmp_path / ".claude" / "dockwright"
+    (orch / "questions").mkdir(parents=True)
+    _write(orch / "active" / "m.json", _boss())
+    for name in workers:
+        _write(orch / "active" / f"{name}.json", _busy(name))
+    return tmp_path
+
+
+def test_main_line_writes_the_requested_line(tmp_path, capsys, monkeypatch):
+    _scripted_tmux(monkeypatch)
+    home = _fleet_home(tmp_path, ["busyone"])
+    sr.main(["status_row.py", "line", "1", "%9", "200"], home)
+    out = capsys.readouterr().out
+    assert out.startswith(sr.WORKERS_LABEL) and "🔧 busyone" in out
+    sr.main(["status_row.py", "line", "4", "%9", "200"], home)
+    assert capsys.readouterr().out == ""
+
+
+def test_main_line_zero_grows_the_bar_to_what_the_narrowest_client_needs(tmp_path, capsys, monkeypatch):
+    calls = _scripted_tmux(monkeypatch, status="2", clients="200\n60")
+    home = _fleet_home(tmp_path, [f"w{i:02d}" for i in range(1, 15)])
+    sr.main(["status_row.py", "line", "0", "%9", "200"], home)
+    assert capsys.readouterr().out.startswith(sr.MANAGERS_LABEL)
+    assert ["tmux", "set-option", "-g", "status", "4"] in calls
+
+
+def test_main_line_zero_leaves_a_bar_of_the_right_height_alone(tmp_path, capsys, monkeypatch):
+    calls = _scripted_tmux(monkeypatch, status="2", clients="200")
+    home = _fleet_home(tmp_path, ["busyone"])
+    sr.main(["status_row.py", "line", "0", "%9", "200"], home)
+    assert not [c for c in calls if "set-option" in c]
+    assert not (home / ".claude" / "dockwright" / sr.SHRINK_FLAG).exists()
+    assert not (home / ".claude" / "dockwright" / sr.TOUCH_FLAG).exists()
+
+
+def test_main_line_zero_defers_a_shrink_until_the_lower_need_has_lasted(tmp_path, capsys, monkeypatch):
+    calls = _scripted_tmux(monkeypatch, status="4", clients="200")
+    home = _fleet_home(tmp_path, ["busyone"])
+    sr.main(["status_row.py", "line", "0", "%9", "200"], home)
+    assert not [c for c in calls if "set-option" in c]
+    assert (home / ".claude" / "dockwright" / sr.SHRINK_FLAG).exists()
+
+
+def test_main_line_zero_shrinks_once_the_lower_need_outlasts_the_delay(tmp_path, capsys, monkeypatch):
+    calls = _scripted_tmux(monkeypatch, status="4", clients="200")
+    home = _fleet_home(tmp_path, ["busyone"])
+    flag = home / ".claude" / "dockwright" / sr.SHRINK_FLAG
+    flag.touch()
+    old = time.time() - sr.STATUS_SHRINK_DELAY_SEC - 1
+    os.utime(flag, (old, old))
+    sr.main(["status_row.py", "line", "0", "%9", "200"], home)
+    assert ["tmux", "set-option", "-g", "status", "2"] in calls
+    assert not flag.exists()
+
+
+def test_main_line_zero_growth_cancels_a_pending_shrink(tmp_path, capsys, monkeypatch):
+    calls = _scripted_tmux(monkeypatch, status="2", clients="60")
+    home = _fleet_home(tmp_path, [f"w{i:02d}" for i in range(1, 15)])
+    flag = home / ".claude" / "dockwright" / sr.SHRINK_FLAG
+    flag.touch()
+    sr.main(["status_row.py", "line", "0", "%9", "200"], home)
+    assert ["tmux", "set-option", "-g", "status", "4"] in calls
+    assert not flag.exists()
+
+
+def test_main_line_draws_the_folded_workers_line(tmp_path, capsys, monkeypatch):
+    _scripted_tmux(monkeypatch, status="2", clients="200")
+    home = _fleet_home(tmp_path, [f"w{i:02d}" for i in range(1, 15)])
+    (home / ".claude" / "dockwright" / sr.ROWS_FLAG).touch()
+    sr.main(["status_row.py", "line", "1", "%9", "200"], home)
+    assert capsys.readouterr().out == sr.WORKERS_LABEL + sr.rows_toggle_chip(True) + " " + sr.clickable_chip("🔧14", sr.BUSY_COLOR, "toggle:rows")
+    sr.main(["status_row.py", "line", "2", "%9", "200"], home)
+    assert capsys.readouterr().out == ""
+
+
+def test_main_line_zero_shrinks_a_folded_bar_at_once(tmp_path, capsys, monkeypatch):
+    calls = _scripted_tmux(monkeypatch, status="4", clients="60")
+    home = _fleet_home(tmp_path, [f"w{i:02d}" for i in range(1, 15)])
+    orch = home / ".claude" / "dockwright"
+    (orch / sr.SHRINK_FLAG).touch()
+    (orch / sr.ROWS_FLAG).touch()
+    sr.main(["status_row.py", "line", "0", "%9", "200"], home)
+    assert ["tmux", "set-option", "-g", "status", "2"] in calls
+    assert not (orch / sr.SHRINK_FLAG).exists()
+    assert not (orch / sr.TOUCH_FLAG).exists()
+
+
+def _touch_the_bar_during_a_wait(tmp_path, monkeypatch):
+    calls = _scripted_tmux(monkeypatch, status="4", clients="60")
+    home = _fleet_home(tmp_path, ["w01"])
+    orch = home / ".claude" / "dockwright"
+    flag = orch / sr.SHRINK_FLAG
+    extra = [f"w{i:02d}" for i in range(2, 15)]
+    sr.main(["status_row.py", "line", "0", "%9", "200"], home)
+    assert flag.exists()
+    for n in extra:
+        _write(orch / "active" / f"{n}.json", _busy(n))
+    sr.main(["status_row.py", "line", "0", "%9", "200"], home)
+    assert flag.exists()
+    for n in extra:
+        (orch / "active" / f"{n}.json").unlink()
+    old = time.time() - sr.STATUS_SHRINK_DELAY_SEC - 1
+    os.utime(flag, (old, old))
+    return calls, home, orch
+
+
+def test_main_line_zero_shrinks_after_the_wait_once_the_need_left_the_bar_for_the_tail(tmp_path, capsys, monkeypatch):
+    calls, home, orch = _touch_the_bar_during_a_wait(tmp_path, monkeypatch)
+    touched = orch / sr.TOUCH_FLAG
+    old = time.time() - sr.STATUS_SHRINK_TAIL_SEC - 1
+    os.utime(touched, (old, old))
+    sr.main(["status_row.py", "line", "0", "%9", "200"], home)
+    assert [c for c in calls if "set-option" in c] == [["tmux", "set-option", "-g", "status", "2"]]
+    assert not (orch / sr.SHRINK_FLAG).exists()
+    assert not touched.exists()
+
+
+def test_main_line_zero_holds_the_bar_when_the_need_touched_it_within_the_tail(tmp_path, capsys, monkeypatch):
+    calls, home, orch = _touch_the_bar_during_a_wait(tmp_path, monkeypatch)
+    sr.main(["status_row.py", "line", "0", "%9", "200"], home)
+    assert not [c for c in calls if "set-option" in c]
+    assert (orch / sr.SHRINK_FLAG).exists()
+
+
+def test_main_line_zero_starts_the_wait_over_when_it_runs_out_at_the_bar_height(tmp_path, capsys, monkeypatch):
+    calls = _scripted_tmux(monkeypatch, status="4", clients="60")
+    home = _fleet_home(tmp_path, [f"w{i:02d}" for i in range(1, 15)])
+    orch = home / ".claude" / "dockwright"
+    flag = orch / sr.SHRINK_FLAG
+    flag.touch()
+    old = time.time() - sr.STATUS_SHRINK_DELAY_SEC - 1
+    os.utime(flag, (old, old))
+    (orch / sr.TOUCH_FLAG).touch()
+    sr.main(["status_row.py", "line", "0", "%9", "200"], home)
+    assert not flag.exists()
+    for i in range(2, 15):
+        (orch / "active" / f"w{i:02d}.json").unlink()
+    sr.main(["status_row.py", "line", "0", "%9", "200"], home)
+    assert flag.exists()
+    assert not [c for c in calls if "set-option" in c]
+
+
+def test_main_other_lines_never_set_the_bar_height(tmp_path, capsys, monkeypatch):
+    calls = _scripted_tmux(monkeypatch, status="2", clients="60")
+    home = _fleet_home(tmp_path, [f"w{i:02d}" for i in range(1, 15)])
+    sr.main(["status_row.py", "line", "1", "%9", "60"], home)
+    assert not [c for c in calls if "set-option" in c]
+
+
+def test_fleet_menu_rows_shrink_by_each_extra_status_line(monkeypatch, tmp_path):
+    orch = tmp_path
+    for i in range(10):
+        _write(orch / "active" / f"w{i}.json",
+               {"agent": "worker", "name": f"w{i}", "state": "idle", "claude_sid": f"s{i}", "pid": os.getpid(), "window_id": f"%{i}"})
+    menus = []
+    monkeypatch.setattr(sr.subprocess, "Popen", lambda cmd, **k: menus.append(cmd))
+    _scripted_tmux(monkeypatch, status="4")
+    sr.handle_click("menu:fleet", orch, height="16")
+    items = menus[0][menus[0].index("--") + 1:]
+    rows = 0
+    while rows * 3 < len(items) and items[rows * 3] != "":
+        rows += 1
+    assert rows == 6
+
+
+def _status_value(sock):
+    return subprocess.run(["tmux", "-L", sock, "show-options", "-gv", "status"],
+                          capture_output=True, text=True).stdout.strip()
+
+
+def _watch_status(sock, fd, done, secs=10.0):
+    seen, end = "", time.time() + secs
+    while time.time() < end:
+        seen += _accumulate(fd, 0.5)
+        if done(_status_value(sock)):
+            return seen + _accumulate(fd, 2.5)
+    return seen
+
+
+@pytest.mark.real_tmux
+def test_live_status_bar_grows_with_the_fleet_and_shrinks_back(tmp_path, monkeypatch, real_tmux):
+    ROWS, COLS = 30, 60
+    home = tmp_path
+    orch = home / ".claude" / "dockwright"
+    (orch / "questions").mkdir(parents=True)
+    shutil.copy(_SCRIPT, orch / "status_row.py")
+    monkeypatch.setenv("HOME", str(home))
+    names = [f"w{i:02d}" for i in range(1, 15)]
+    _write(orch / "active" / "m.json", _boss())
+    for n in names:
+        _write(orch / "active" / f"{n}.json", _busy(n))
+    sock = real_tmux
+    conf = tmp_path / "t.conf"
+    conf.write_text(_shipped_fleet_conf(orch))
+    subprocess.run(["tmux", "-L", sock, "-f", str(conf), "new-session", "-d", "-s", "alpha",
+                    "-x", str(COLS), "-y", str(ROWS)], check=True)
+    pid, fd = _attach_pty_client(sock, "alpha", ROWS, COLS)
+    try:
+        grown_text = _watch_status(sock, fd, lambda v: v.isdigit() and int(v) >= 3)
+        grown = _status_value(sock)
+        for n in names[1:]:
+            (orch / "active" / f"{n}.json").unlink()
+        flag = orch / sr.SHRINK_FLAG
+        end = time.time() + 10
+        while not flag.exists() and time.time() < end:
+            _accumulate(fd, 0.3)
+        deferred = _status_value(sock)
+        old = time.time() - sr.STATUS_SHRINK_DELAY_SEC - 10
+        os.utime(flag, (old, old))
+        _watch_status(sock, fd, lambda v: v == "2")
+        shrunk = _status_value(sock)
+    finally:
+        os.kill(pid, 9)
+        subprocess.run(["tmux", "-L", sock, "kill-server"], capture_output=True)
+
+    assert grown.isdigit() and int(grown) >= 3, f"bar did not grow past two lines: status={grown!r}"
+    missing = [n for n in names if f"🔧 {n}" not in grown_text]
+    assert not missing, f"worker chips never drawn: {missing}"
+    assert deferred == grown, f"bar shrank before the delay ran out: {grown!r} -> {deferred!r}"
+    assert shrunk == "2", f"bar did not shrink back: status={shrunk!r}"
+
+
+@pytest.mark.real_tmux
+def test_live_rows_toggle_folds_the_workers_and_restores_them(tmp_path, monkeypatch, real_tmux):
+    ROWS, COLS = 30, 60
+    home = tmp_path
+    orch = home / ".claude" / "dockwright"
+    (orch / "questions").mkdir(parents=True)
+    shutil.copy(_SCRIPT, orch / "status_row.py")
+    monkeypatch.setenv("HOME", str(home))
+    _write(orch / "active" / "m.json", _boss())
+    for n in [f"w{i:02d}" for i in range(1, 15)]:
+        _write(orch / "active" / f"{n}.json", _busy(n))
+    sock = real_tmux
+    conf = tmp_path / "t.conf"
+    conf.write_text(_shipped_fleet_conf(orch))
+    subprocess.run(["tmux", "-L", sock, "-f", str(conf), "new-session", "-d", "-s", "alpha",
+                    "-x", str(COLS), "-y", str(ROWS)], check=True)
+    pid, fd = _attach_pty_client(sock, "alpha", ROWS, COLS)
+    col = sr._markup_cells(sr.WORKERS_LABEL) + 2
+
+    def click_the_rows_toggle():
+        row = ROWS - int(_status_value(sock)) + 2
+        os.write(fd, ("\x1b[<0;%d;%dM" % (col, row)).encode())
+        os.write(fd, ("\x1b[<0;%d;%dm" % (col, row)).encode())
+
+    try:
+        _watch_status(sock, fd, lambda v: v.isdigit() and int(v) >= 3)
+        grown = _status_value(sock)
+        click_the_rows_toggle()
+        folded_text = _watch_status(sock, fd, lambda v: v == "2", secs=5.0)
+        folded = _status_value(sock)
+        flagged = (orch / sr.ROWS_FLAG).exists()
+        click_the_rows_toggle()
+        _watch_status(sock, fd, lambda v: v.isdigit() and int(v) >= 3, secs=5.0)
+        restored = _status_value(sock)
+    finally:
+        os.kill(pid, 9)
+        subprocess.run(["tmux", "-L", sock, "kill-server"], capture_output=True)
+
+    assert grown.isdigit() and int(grown) >= 3, f"bar did not grow past two lines: status={grown!r}"
+    assert folded == "2" and flagged, f"the toggle click did not fold the bar within 5 s: status={folded!r} flag={flagged}"
+    assert "⊞" in folded_text and "🔧14" in folded_text, folded_text
+    assert restored == grown and not (orch / sr.ROWS_FLAG).exists(), f"the second click did not restore the bar: {restored!r}"
+
+
+@pytest.mark.parametrize("status", ["off", ""])
+def test_main_line_zero_leaves_an_off_or_unreadable_bar_alone(tmp_path, capsys, monkeypatch, status):
+    calls = _scripted_tmux(monkeypatch, status=status, clients="60")
+    home = _fleet_home(tmp_path, [f"w{i:02d}" for i in range(1, 15)])
+    flag = home / ".claude" / "dockwright" / sr.SHRINK_FLAG
+    flag.touch()
+    sr.main(["status_row.py", "line", "0", "%9", "60"], home)
+    assert not [c for c in calls if "set-option" in c]
+    assert flag.exists()
+
+
+def test_workers_overflow_chip_opens_a_menu_with_every_hidden_worker(monkeypatch, tmp_path):
+    orch = tmp_path
+    _write(orch / "active" / "alpha.json", {"agent": "manager", "name": "alpha", "pid": os.getpid(), "window_id": "%100"})
+    _write(orch / "active" / "beta.json", {"agent": "manager", "name": "beta", "pid": os.getpid(), "window_id": "%200"})
+    names = {n: "alpha" for n in ("a01", "a02", "a03")} | {f"z{i:02d}": "beta" for i in range(1, 16)}
+    for i, (n, mgr) in enumerate(names.items()):
+        _write(orch / "active" / f"{n}.json", dict(_busy(n), parent_manager_name=mgr, window_id=f"%{i + 1}"))
+    records, qsids = sr.collect(orch / "active", orch / "questions")
+    lines = sr.status_lines(records, qsids, False, "%100", orch, 50)
+    overflow = re.search(r"#\[range=user\|([^]]+)\]#\[[^]]*\] \+(\d+) ", lines[-1])
+    assert overflow is not None, lines[-1]
+    hidden = [n for n in names if not any(f"🔧 {n} " in line for line in lines)]
+    assert len(hidden) == int(overflow.group(2)) and any(names[n] == "beta" for n in hidden)
+    menus = []
+    monkeypatch.setattr(sr.subprocess, "Popen", lambda cmd, **k: menus.append(cmd))
+    _scripted_tmux(monkeypatch, status="5")
+    sr.handle_click(overflow.group(1), orch, pane="%100", height="40")
+    items = menus[0][menus[0].index("--") + 1:]
+    assert all(any(f" {n}" in item for item in items[::3]) for n in hidden), items[::3]
+
+
+@pytest.mark.real_tmux
+@requires_menu_tmux
+def test_live_whole_fleet_menu_opens_with_two_managers(tmp_path, monkeypatch, real_tmux):
+    ROWS, COLS = 30, 120
+    home = tmp_path
+    orch = home / ".claude" / "dockwright"
+    (orch / "active").mkdir(parents=True)
+    (orch / "questions").mkdir(parents=True)
+    shutil.copy(_SCRIPT, orch / "status_row.py")
+    monkeypatch.setenv("HOME", str(home))
+    sock = real_tmux
+    conf = tmp_path / "t.conf"
+    conf.write_text(_shipped_fleet_conf(orch))
+    subprocess.run(["tmux", "-L", sock, "-f", str(conf), "new-session", "-d", "-s", "alpha", "-x", str(COLS), "-y", str(ROWS)], check=True)
+    alpha_pane = subprocess.run(["tmux", "-L", sock, "display-message", "-p", "-t", "alpha:0", "#{pane_id}"], capture_output=True, text=True).stdout.strip()
+    subprocess.run(["tmux", "-L", sock, "new-session", "-d", "-s", "other", "-x", str(COLS), "-y", str(ROWS)], check=True)
+    subprocess.run(["tmux", "-L", sock, "new-window", "-t", "other"], check=True)
+    subprocess.run(["tmux", "-L", sock, "new-window", "-t", "other"], check=True)
+    p_b, p_wa, p_wb = (subprocess.run(["tmux", "-L", sock, "display-message", "-p", "-t", f"other:{i}", "#{pane_id}"],
+                                      capture_output=True, text=True).stdout.strip() for i in range(3))
+    _write(orch / "active" / "ma.json", {"agent": "manager", "name": "alpha-mgr", "pid": os.getpid(), "window_id": alpha_pane})
+    _write(orch / "active" / "mb.json", {"agent": "manager", "name": "beta-mgr", "pid": os.getpid(), "window_id": p_b})
+    _write(orch / "active" / "wa.json",
+           {"agent": "worker", "name": "wa-task", "funny_name": "wa-funny", "state": "processing",
+            "claude_sid": "wa", "pid": os.getpid(), "parent_manager_name": "alpha-mgr", "window_id": p_wa})
+    _write(orch / "active" / "wb.json",
+           {"agent": "worker", "name": "wb-task", "funny_name": "wb-funny", "state": "processing",
+            "claude_sid": "wb", "pid": os.getpid(), "parent_manager_name": "beta-mgr", "window_id": p_wb})
+
+    pid, fd = _attach_pty_client(sock, "alpha", ROWS, COLS)
+    try:
+        _drain(fd, 2.0)
+        client = subprocess.run(["tmux", "-L", sock, "list-clients", "-F", "#{client_name}"],
+                                capture_output=True, text=True).stdout.split()[0]
+        click = f'python3 "{orch / "status_row.py"}" click menu:all "{client}" 3 "{alpha_pane}" {ROWS}'
+        subprocess.run(["tmux", "-L", sock, "run-shell", "-b", "-t", alpha_pane, click], check=True)
+        overlay = _accumulate(fd, 3.0, needle="wb-funny")
+        os.write(fd, b"q")
+        _drain(fd, 0.3)
+    finally:
+        os.kill(pid, 9)
+        subprocess.run(["tmux", "-L", sock, "kill-server"], capture_output=True)
+
+    assert "wb-funny" in overlay, f"the whole-fleet menu did not draw the other manager's worker: {overlay!r}"
+    assert "wa-funny" in overlay and "all managers" in overlay, overlay

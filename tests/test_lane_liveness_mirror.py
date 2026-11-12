@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from dockwright import lane_io, stale_monitor
+from dockwright import lane_io, lane_lines, stale_monitor
 
 
 def test_the_lane_table_matches_the_canonical_one():
@@ -45,8 +45,9 @@ def test_a_lane_that_stopped_scanning_is_paged(sm_root):
     pages, _, _ = _run_scans(sm_root, {}, now, 2)
     assert pages[0] == [], "paged on the FIRST observation — a freeze looks like this"
     assert [k for k, _ in pages[1]] == ["lane_silent:done"]
-    assert "LANE_SILENT done" in pages[1][0][1]
-    assert "NOT reaching you" in pages[1][0][1]
+    line = lane_lines.render("LANE_SILENT", **pages[1][0][1])
+    assert "LANE_SILENT done" in line
+    assert "NOT reaching you" in line and "→ dockwright lanes" in line
 
 
 def test_a_freeze_shorter_than_the_observer_gap_check_still_does_not_page(sm_root):

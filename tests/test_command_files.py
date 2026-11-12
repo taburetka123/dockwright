@@ -7,20 +7,8 @@ from dockwright import compose
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 COMMANDS = REPO_ROOT / "deploy" / "commands"
-SKILLS = REPO_ROOT / "deploy" / "skills"
-SCRIPTS = REPO_ROOT / "deploy" / "scripts"
 PRESETS = REPO_ROOT / "deploy" / "presets"
 AGENTS = REPO_ROOT / "deploy" / "agents"
-DEPLOY = REPO_ROOT / "deploy"
-
-
-FOLDED_SKILLS = [
-    "dockwright-orchestrator-guide",
-    "dockwright-recap",
-    "dockwright-todo",
-    "dockwright-dotodo",
-    "dockwright-meta-improvement",
-]
 
 
 _RENDERED_GENERIC_FILES = [

@@ -214,7 +214,35 @@ def _grand_total(days) -> dict:
     return total
 
 
-def _render_text(days, since, until, spendless_closed) -> str:
+def _codex_marks(since, until):
+    for event in read_events():
+        if since <= _date_of(event.get("ts")) <= until:
+            yield event.get("runtime"), event.get("kind"), _spend_of(event.get("spend")), True
+    for record in state.list_json_in(paths.CLOSED):
+        if isinstance(record, dict) and since <= _date_of(record.get("closed_at")) <= until:
+            yield record.get("runtime"), record.get("kind"), _spend_of(record.get("spend")), True
+    if since <= date.today() <= until:
+        for record in state.list_json_in(paths.ACTIVE):
+            if isinstance(record, dict):
+                yield record.get("runtime"), record.get("kind"), _spend_of(record.get("spend")), False
+
+
+def _codex_spend_gaps(since, until) -> tuple[bool, int]:
+    tui_absent = False
+    child_rounds = 0
+    for runtime, kind, spend, landed in _codex_marks(since, until):
+        if runtime != "codex" or spend is not None:
+            continue
+        if kind == "subworker":
+            if landed:
+                child_rounds += 1
+        else:
+            tui_absent = True
+    return tui_absent, child_rounds
+
+
+def _render_text(days, since, until, spendless_closed, codex_note,
+                 codex_child_rounds=0) -> str:
     lines = [
         f"Spend report — {since} → {until}",
         "Tokens only: no $-cost field exists in the captured data; counts are",
@@ -239,7 +267,13 @@ def _render_text(days, since, until, spendless_closed) -> str:
                           if total.get(key) is not None)
         lines.append(f"  exact: {exact}")
         lines.append("")
-    lines.append("note: codex-runtime sessions carry no spend data (their transcripts lack usage)")
+    if codex_note:
+        lines.append("note: codex sessions in window with no recorded spend are not "
+                     "counted; spend-report <session> reads a Codex session's tokens "
+                     "from its rollout")
+    if codex_child_rounds:
+        lines.append(f"note: {codex_child_rounds} headless Codex child round(s) in window "
+                     "logged no turn.completed, so nothing was counted for them")
     if spendless_closed:
         lines.append(f"note: {spendless_closed} closed session(s) in window have no spend data"
                      " (pre-capture closures)")
@@ -323,5 +357,7 @@ def main(argv=None) -> int:
             "closed_without_spend": spendless_closed,
         }, indent=2))
     else:
-        sys.stdout.write(_render_text(days, since, until, spendless_closed))
+        tui_absent, child_rounds = _codex_spend_gaps(since, until)
+        sys.stdout.write(_render_text(days, since, until, spendless_closed,
+                                      tui_absent, child_rounds))
     return 0

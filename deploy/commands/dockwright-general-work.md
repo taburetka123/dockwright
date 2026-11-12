@@ -25,6 +25,6 @@ Do NOT:
 - Skip the design-review pass after writing the spec — self-approval waives the human approval prompt, not the review gate.
 - Remove your own worktree — a session that deletes its own cwd breaks every subsequent hook.
 
-**No PR to review against (e.g. editing `~/.claude` governance files with no code repo) does NOT exempt the review checkpoint.** Dispatch a review subagent — read-only on the SOURCE, scoped to `git diff` / `git log -1 -p` on the edited files, and additionally running the repo's test suite (executing tests is not editing) — before commit+push, and note the outcome in `worker_done`. A permission classifier may deny a Task/Agent subagent from EDITING `~/.claude` directly — that restriction does not extend to a read-only reviewer, which never writes.
+**No PR to review against (e.g. editing `~/.claude` governance files with no code repo) does NOT exempt the review checkpoint.** Dispatch a read-only reviewer — a subworker (`spawn_child(context="DocReviewer", mode="report", model="@opus", effort="xhigh", provider="claude-tui")`) — scoped to `git diff` / `git log -1 -p` on the edited files plus the repo's test suite, before commit+push, and note the outcome in `worker_done`.
 
-When done, call `worker_done(claude_sid, summary)` — your claude_sid is injected into your session context at start (the `dockwright: your claude_sid is …` line); if it isn't visible, run `printenv CLAUDE_CODE_SESSION_ID` (codex: `printenv CODEX_THREAD_ID`).
+When done, call `worker_done(claude_sid, summary)`.

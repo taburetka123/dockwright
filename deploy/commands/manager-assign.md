@@ -15,7 +15,7 @@ retrofitted into a live process).
 Run exactly this — `$ARGUMENTS` (may be empty) is the optional worker routing name:
 
 ```bash
-dockwright assign-to-manager --name "$ARGUMENTS"
+dockwright assign-to-manager --name "$ARGUMENTS" --model '@opus[1m]' --effort xhigh
 ```
 
 What it does (deterministically, no MCP dependency):
@@ -25,7 +25,8 @@ What it does (deterministically, no MCP dependency):
   nothing.
 - 1 → uses it. >1 → picks the newest by `started_at` and prints which, noting the others exist.
 - Relaunches `claude --resume $CLAUDE_CODE_SESSION_ID` as a worker in the workers window, scoped
-  to the chosen manager. Name defaults to `adopted-<first8ofsid>` when `$ARGUMENTS` is empty.
+  to the chosen manager, on the `--model` and `--effort` the command names (a worker launch without
+  both is refused). Name defaults to `adopted-<first8ofsid>` when `$ARGUMENTS` is empty.
 
 After it prints success, relay the chosen manager to the user and tell them to **close this tab
 (cmd+w)** — the worker copy now in the workers window is the live continuation; this tab is just a

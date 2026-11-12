@@ -36,7 +36,7 @@ def has_real_assistant_turn(raw: bytes) -> bool:
 
 
 FIX_CMD_RE = re.compile(
-    r"<command-name>\s*/(?:dockwright-fix|fix)\s*</command-name>", re.IGNORECASE)
+    r"<command-name>\s*/dockwright-fix\s*</command-name>", re.IGNORECASE)
 _ANY_CMD_NAME_RE = re.compile(r"<command-name>\s*(/[^<\s]*)\s*</command-name>",
                               re.IGNORECASE)
 

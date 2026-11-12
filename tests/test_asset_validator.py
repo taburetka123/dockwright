@@ -521,3 +521,48 @@ class TestConfig:
         kz = av.validate_files(str(repo), ["skills/corp-thing/SKILL.md"])
         assert "W-NAMING" not in _codes_for(acme, "acme-thing")
         assert "W-NAMING" in _codes_for(kz, "corp-thing")
+
+
+def test_a_role_fragment_gets_the_rule_checks(av, mini_repo):
+    codes = _codes_for(_warn_codes(av, mini_repo, "roles/_shared/fragments/x.md", "TRIGGER: Load when x.\n"),
+                       "roles/_shared/fragments/x.md")
+    assert codes == {"W-RULE-TITLE"}
+    codes = _codes_for(_warn_codes(av, mini_repo, "roles/Coder/fragments/y.md", "# Y\n\nprose\n"),
+                       "roles/Coder/fragments/y.md")
+    assert codes == {"W-RULE-TRIGGER"}
+
+
+def test_a_role_render_is_not_a_rule(av, mini_repo):
+    assert _warn_codes(av, mini_repo, "roles/Coder/role.worker.md", "rendered prose\n") == []
+
+
+def test_all_mode_walks_role_fragments(av, mini_repo, capsys):
+    (mini_repo / "roles" / "_shared" / "fragments").mkdir(parents=True)
+    (mini_repo / "roles" / "_shared" / "fragments" / "untitled.md").write_text("TRIGGER: x\n")
+    (mini_repo / "roles" / "Coder" / "fragments").mkdir(parents=True)
+    (mini_repo / "roles" / "Coder" / "fragments" / "untriggered.md").write_text("# U\n")
+    assert av.main(["--repo", str(mini_repo), "--all"]) == 0
+    out = capsys.readouterr().out
+    assert "W-RULE-TITLE roles/_shared/fragments/untitled.md" in out
+    assert "W-RULE-TRIGGER roles/Coder/fragments/untriggered.md" in out
+
+
+def test_a_fragment_in_a_domain_folder_with_frontmatter_keeps_the_rule_checks(av, mini_repo):
+    rel = "roles/_shared/fragments/git/commit.md"
+    codes = _codes_for(_warn_codes(av, mini_repo, rel, "---\nkind: guard\nbinds: [push]\ndomain: git\n---\n# Commit\n\nTRIGGER: Load when x.\n"), rel)
+    assert codes == set()
+    codes = _codes_for(_warn_codes(av, mini_repo, rel, "---\nkind: guard\nbinds: [push]\ndomain: git\n---\nTRIGGER: Load when x.\n"), rel)
+    assert codes == {"W-RULE-TITLE"}
+
+
+def test_a_references_segment_inside_another_skills_path_is_not_a_local_skill_ref(av, mini_repo):
+    (mini_repo / "skills" / "corp-other" / "references").mkdir(parents=True)
+    (mini_repo / "skills" / "corp-other" / "references" / "shared.md").write_text("s")
+    (mini_repo / "skills" / "corp-good" / "SKILL.md").write_text(
+        "---\nname: corp-good\ndescription: Fine skill.\n---\n\n# Good\n"
+        "Semantics: `~/.claude/skills/corp-other/references/shared.md`; local `references/notes.md`; "
+        "missing `references/gone.md`.\n"
+    )
+    w = av.validate_files(str(mini_repo), ["skills/corp-good/SKILL.md"])
+    missing = [x for x in w if x.startswith("W-REF-MISSING")]
+    assert len(missing) == 1 and "references/gone.md" in missing[0], w

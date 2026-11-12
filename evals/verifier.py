@@ -76,7 +76,7 @@ class VerifierError(RuntimeError):
 def run_verifier(
     prompt: str,
     *,
-    model: str = "sonnet",
+    model: str = "claude-sonnet-5",
     settings: str | None = None,
     timeout: int = 240,
     cwd: str | None = None,

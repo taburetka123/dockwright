@@ -1,0 +1,28 @@
+# Search Results for:
+
+## Messages (1 results)
+### Result 1 of 1
+Channel: #some-channel (ID: C01ABCDEF)
+From: Ada Example <ada@example.test> (ID: U01ABCDEF)
+Time: 2026-10-27 13:00:47 +00
+Message_ts: 1793106047.590119
+Permalink: [link](https://chat.example.test/archives/C01ABCDEF/p1793106047590119)
+Reply count: 2
+Text:
+Lorem ipsum top-level <@S01GRP0001> dolor sit amet.
+
+Context before:
+From: Bob Example (ID: U01BOBBOB)
+Time: 2026-10-27 12:59:00 +00
+Message_ts: 1793105940.000001
+Text:
+Context text before, never stored.
+
+Context after:
+From: Bob Example (ID: U01BOBBOB)
+Time: 2026-10-27 13:01:00 +00
+Message_ts: 1793106060.000002
+Text:
+Context text after, never stored.
+
+---

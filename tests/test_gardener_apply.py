@@ -260,12 +260,6 @@ def test_apply_clean_and_revert_roundtrip(wired, postrun_of, git_root, tmp_path)
     assert reverted and "path" not in reverted[-1]
 
 
-def test_no_path_key_proven_red(wired, postrun_of, git_root, tmp_path):
-    postrun_of.ledger_append("proposal_applied", proposal_id="x", path="/tmp/leak")
-    evs = events(postrun_of)
-    assert any("path" in e for e in evs if e["type"] == "proposal_applied")
-
-
 def test_apply_context_mismatch_blocks_and_leaves_tree_untouched(
         wired, postrun_of, git_root, tmp_path):
     (git_root / "rules" / "x.md").write_text("drifted content\n")
@@ -761,3 +755,201 @@ def test_currency_truncated_reflog_degrades_to_the_declared_weak_key(
     assert "key=since " in body
     assert "blind to a backdated commit" in body
     assert verdict_of(out, "cur-1") == "STALE"
+
+
+def test_apply_writes_started_before_applied(wired, postrun_of, git_root, tmp_path):
+    prop = make_proposal(tmp_path, [str(git_root / "rules" / "x.md")], DIFF_MOD)
+    assert wired.main(["apply", "--proposal", str(prop)]) == 0
+    kinds = [e["type"] for e in events(postrun_of)]
+    assert kinds.index("proposal_apply_started") < kinds.index("proposal_applied")
+
+
+def test_apply_stops_when_the_proposal_is_superseded_while_starting(
+        wired, postrun_of, git_root, tmp_path, monkeypatch, capsys):
+    prop = make_proposal(tmp_path, [str(git_root / "rules" / "x.md")], DIFF_MOD)
+    real_append = postrun_of.ledger_append
+
+    def vanish_on_start(event, **fields):
+        real_append(event, **fields)
+        if event == "proposal_apply_started":
+            prop.unlink()
+
+    monkeypatch.setattr(postrun_of, "ledger_append", vanish_on_start)
+    assert wired.main(["apply", "--proposal", str(prop)]) == 2
+    assert (git_root / "rules" / "x.md").read_text() == "old line\nkeep\n"
+    failed = [e for e in events(postrun_of) if e["type"] == "proposal_apply_failed"]
+    assert failed[-1]["proposal_id"] == "r1-1"
+    assert failed[-1]["after_start"] is True
+    assert failed[-1]["rollback_failed"] is False
+    assert "r1-1" not in postrun_of.open_apply_ids()
+    err = capsys.readouterr().err
+    assert "(superseded)" not in err
+    assert "superseded or decided" in err and "nothing was written" in err
+
+
+class _Proc:
+    def __init__(self, returncode, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _apply_that_boils_in_execute_plan(wired, git_root, monkeypatch):
+    real_git_root = os.path.realpath(str(git_root))
+
+    def fake_git_apply(root, patch, check=False, reverse=False):
+        if check or root != real_git_root:
+            return _Proc(0)
+        return _Proc(1, stderr="apply boom")
+
+    monkeypatch.setattr(wired, "git_apply", fake_git_apply)
+
+
+def _failures(postrun_of):
+    return [e for e in events(postrun_of) if e["type"] == "proposal_apply_failed"]
+
+
+def _last_failure(postrun_of):
+    return _failures(postrun_of)[-1]
+
+
+def test_clean_rollback_closes_the_apply(wired, postrun_of, git_root, tmp_path, monkeypatch):
+    prop = make_proposal(tmp_path, [str(git_root / "rules" / "x.md")], DIFF_MOD)
+    _apply_that_boils_in_execute_plan(wired, git_root, monkeypatch)
+    assert wired.main(["apply", "--proposal", str(prop)]) == 1
+    assert (git_root / "rules" / "x.md").read_text() == "old line\nkeep\n"
+    assert len(_failures(postrun_of)) == 1
+    failed = _last_failure(postrun_of)
+    assert failed["after_start"] is True and failed["rollback_failed"] is False
+    assert "r1-1" not in postrun_of.open_apply_ids()
+
+
+def _assert_interrupted_apply_closed(postrun_of, git_root):
+    assert (git_root / "rules" / "x.md").read_text() == "old line\nkeep\n"
+    failed = _failures(postrun_of)
+    assert len(failed) == 1
+    assert failed[0]["proposal_id"] == "r1-1"
+    assert failed[0]["after_start"] is True and failed[0]["rollback_failed"] is False
+    assert postrun_of.open_apply_ids() == set()
+
+
+def test_interrupt_in_the_canon_gate_restores_and_closes_the_apply(
+        wired, postrun_of, git_root, tmp_path, monkeypatch):
+    prop = make_proposal(tmp_path, [str(git_root / "rules" / "x.md")], DIFF_MOD)
+
+    def interrupt(plan, pre_validator):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(wired, "_canon_gate", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        wired.main(["apply", "--proposal", str(prop)])
+    _assert_interrupted_apply_closed(postrun_of, git_root)
+
+
+def test_interrupt_in_execute_plan_restores_and_closes_the_apply(
+        wired, postrun_of, git_root, tmp_path, monkeypatch):
+    prop = make_proposal(tmp_path, [str(git_root / "rules" / "x.md")], DIFF_MOD)
+    real_git_apply = wired.git_apply
+
+    def interrupt_on_write(root, patch, check=False, reverse=False):
+        if check:
+            return real_git_apply(root, patch, check=check, reverse=reverse)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(wired, "git_apply", interrupt_on_write)
+    with pytest.raises(KeyboardInterrupt):
+        wired.main(["apply", "--proposal", str(prop)])
+    _assert_interrupted_apply_closed(postrun_of, git_root)
+
+
+def test_interrupt_during_the_red_suite_rerun_restores_and_closes_the_apply(
+        wired, postrun_of, git_root, tmp_path, monkeypatch):
+    prop = make_proposal(tmp_path, [str(git_root / "rules" / "x.md")], DIFF_MOD)
+
+    def suite_red(plan, pre_validator):
+        raise wired._SuiteRed(os.path.realpath(str(git_root)), _Proc(1, stdout="1 failed"))
+
+    def interrupt(root):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(wired, "_canon_gate", suite_red)
+    monkeypatch.setattr(wired, "_run_repo_suite", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        wired.main(["apply", "--proposal", str(prop)])
+    _assert_interrupted_apply_closed(postrun_of, git_root)
+
+
+def test_snapshot_failure_writes_one_failed_event_and_closes_the_apply(
+        wired, postrun_of, git_root, tmp_path, monkeypatch):
+    prop = make_proposal(tmp_path, [str(git_root / "rules" / "x.md")], DIFF_MOD)
+
+    def boom(plan):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(wired, "_snapshot", boom)
+    with pytest.raises(OSError):
+        wired.main(["apply", "--proposal", str(prop)])
+    _assert_interrupted_apply_closed(postrun_of, git_root)
+
+
+def test_failed_rollback_in_execute_plan_keeps_the_apply_open(
+        wired, postrun_of, git_root, tmp_path, monkeypatch):
+    prop = make_proposal(tmp_path, [str(git_root / "rules" / "x.md")], DIFF_MOD)
+    _apply_that_boils_in_execute_plan(wired, git_root, monkeypatch)
+    monkeypatch.setattr(wired, "_restore", lambda snapshot: list(snapshot))
+    assert wired.main(["apply", "--proposal", str(prop)]) == 1
+    assert len(_failures(postrun_of)) == 1
+    failed = _last_failure(postrun_of)
+    assert failed["after_start"] is True and failed["rollback_failed"] is True
+    assert "r1-1" in postrun_of.open_apply_ids()
+
+
+def test_failed_rollback_in_canon_gate_keeps_the_apply_open(
+        wired, postrun_of, git_root, tmp_path, monkeypatch):
+    prop = make_proposal(tmp_path, [str(git_root / "rules" / "x.md")], DIFF_MOD)
+
+    def gate_boom(plan, pre_validator):
+        raise wired.ApplyError("gate boom", code=1, klass="canon-gate")
+
+    monkeypatch.setattr(wired, "_canon_gate", gate_boom)
+    monkeypatch.setattr(wired, "_restore", lambda snapshot: list(snapshot))
+    assert wired.main(["apply", "--proposal", str(prop)]) == 1
+    assert len(_failures(postrun_of)) == 1
+    failed = _last_failure(postrun_of)
+    assert failed["after_start"] is True and failed["rollback_failed"] is True
+    assert "r1-1" in postrun_of.open_apply_ids()
+
+
+def test_failed_rollback_after_a_red_suite_keeps_the_apply_open(
+        wired, postrun_of, git_root, tmp_path, monkeypatch):
+    prop = make_proposal(tmp_path, [str(git_root / "rules" / "x.md")], DIFF_MOD)
+
+    def suite_red(plan, pre_validator):
+        raise wired._SuiteRed(os.path.realpath(str(git_root)), _Proc(1, stdout="1 failed"))
+
+    monkeypatch.setattr(wired, "_canon_gate", suite_red)
+    monkeypatch.setattr(wired, "_run_repo_suite", lambda root: _Proc(0, stdout="ok"))
+    monkeypatch.setattr(wired, "_restore", lambda snapshot: list(snapshot))
+    assert wired.main(["apply", "--proposal", str(prop)]) == 1
+    assert len(_failures(postrun_of)) == 1
+    failed = _last_failure(postrun_of)
+    assert failed["after_start"] is True and failed["rollback_failed"] is True
+    assert "r1-1" in postrun_of.open_apply_ids()
+
+
+def test_refusal_before_start_is_marked_not_started(wired, postrun_of, git_root, tmp_path):
+    (git_root / "rules" / "x.md").write_text("drifted content\n")
+    git(git_root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-aqm", "drift")
+    prop = make_proposal(tmp_path, [str(git_root / "rules" / "x.md")], DIFF_MOD)
+    assert wired.main(["apply", "--proposal", str(prop)]) == 1
+    evs = events(postrun_of)
+    assert "proposal_apply_started" not in [e["type"] for e in evs]
+    assert evs[-1]["type"] == "proposal_apply_failed"
+    assert evs[-1]["after_start"] is False
+
+
+def test_currency_proposal_retire_with_missing_target_is_na(wired, git_root, tmp_path, capsys):
+    prop = make_proposal(tmp_path, [str(git_root / "rules" / "gone.md")], DIFF_MOD,
+                         meta_extra="kind: proposal-retire\n")
+    assert wired.main(["currency", "--proposal", str(prop)]) == 0
+    assert "r1-1  n/a" in capsys.readouterr().out

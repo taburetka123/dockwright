@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from dockwright import config, paths, spawner
+from dockwright import config, models, paths, spawner
 
 
 @pytest.fixture
@@ -119,15 +119,6 @@ def test_two_pool_gate_keys_unchanged(sp, monkeypatch):
     payload = spawner.usage_spawn_gate()
     assert payload["status"] == "paused"
     assert "a_pct" in payload and "b_pct" in payload
-
-
-def test_worker_model_from_config(sp, monkeypatch):
-    _use_pool(monkeypatch, sp, '[spawn]\nworker_model = "sonnet"\n')
-    cmd = spawner._runtime_command("claude", "hi", None, None)
-    assert "--model sonnet" in cmd
-    monkeypatch.setenv(config.ENV_CONFIG_PATH, str(sp / "no-config.toml"))
-    cmd = spawner._runtime_command("claude", "hi", None, None)
-    assert "--model 'claude-opus-5[1m]'" in cmd or "--model claude-opus-5[1m]" in cmd
 
 
 def test_env_weight_override_generalizes(sp, monkeypatch):

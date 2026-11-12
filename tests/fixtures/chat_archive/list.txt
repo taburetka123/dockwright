@@ -1,0 +1,16 @@
+## My Channels (showing 2, more results available)
+
+### Group DM
+- **ID:** C01GRPDM01
+- **Type:** Group DM
+- **Members:** Group messaging with: @ada.example, @bob.example, @me.example
+- **Archived:** No
+
+### DM with Ada Example
+- **ID:** D01ABCDEF
+- **Type:** Direct Message
+- **User ID:** U01ABCDEF
+- **Archived:** No
+
+---
+Pagination: More results available. Use cursor: "dHJ1bmM6"

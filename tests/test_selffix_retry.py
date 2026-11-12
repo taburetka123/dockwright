@@ -181,6 +181,21 @@ def test_trigger_brick_check_enqueues_instead_of_spawning(retry_home):
     assert list((retry_home["home"] / ".claude" / "dockwright" / "selffix" / "findings" / ".dedup").glob("*"))
 
 
+def test_trigger_queues_the_retro_while_a_usage_cap_pauses_the_fleet(retry_home):
+    _stub_claude(retry_home, OK_CLAUDE_STUB)
+    stub = retry_home["bin"] / "dockwright"
+    stub.write_text('#!/usr/bin/env bash\n[ "$*" = "usage-cap --paused" ] && exit 0\nexit 9\n')
+    stub.chmod(0o755)
+    sid = "cap-trigger-1"
+    transcript = _write_transcript(retry_home["home"], sid)
+    _invoke_trigger(retry_home, sid, transcript)
+    entry_path = retry_home["retry_dir"] / f"{sid}.json"
+    assert entry_path.is_file(), f"no queue entry; log:\n{_log_text(retry_home)}"
+    assert json.loads(entry_path.read_text())["reason"] == "usage-cap"
+    assert "reason=usage-cap" in _log_text(retry_home)
+    assert "  spawn  " not in _log_text(retry_home)
+
+
 def test_trigger_stale_brick_flag_spawns_normally(retry_home):
     _stub_claude(retry_home, OK_CLAUDE_STUB)
     _touch_limited_flag(retry_home, age_sec=600)
@@ -234,3 +249,70 @@ def test_zero_exit_status_error_is_not_success(retry_home):
     assert entry_path.is_file(), f"no retry entry; log:\n{log}"
     entry = json.loads(entry_path.read_text())
     assert entry["reason"] == "status-error", "status-error must beat the <200B stub check"
+
+
+def test_run_uses_dockwright_claude_bin(retry_home, tmp_path):
+    _stub_claude(retry_home, OK_CLAUDE_STUB)
+    hop = tmp_path / "hop-claude"
+    hop.write_text(ARGV_RECORDING_OK_STUB)
+    hop.chmod(0o755)
+    sid = "hop-1"
+    transcript = _write_transcript(retry_home["home"], sid)
+    _run_sh(retry_home, transcript, sid, {"DOCKWRIGHT_CLAUDE_BIN": str(hop)})
+    assert (retry_home["home"] / "claude-argv.txt").is_file(), "DOCKWRIGHT_CLAUDE_BIN was not used"
+
+
+def test_run_falls_back_when_dockwright_claude_bin_is_not_executable(retry_home, tmp_path):
+    _stub_claude(retry_home, ARGV_RECORDING_OK_STUB)
+    sid = "hop-2"
+    transcript = _write_transcript(retry_home["home"], sid)
+    _run_sh(retry_home, transcript, sid, {"DOCKWRIGHT_CLAUDE_BIN": str(tmp_path / "missing")})
+    assert (retry_home["home"] / "claude-argv.txt").is_file(), "PATH claude did not run"
+    assert "not an executable file" in _log_text(retry_home)
+
+
+def test_fallback_line_is_written_with_debug_off(retry_home, tmp_path):
+    (retry_home["home"] / ".claude" / "selffix-debug").unlink()
+    _stub_claude(retry_home, ARGV_RECORDING_OK_STUB)
+    sid = "hop-3"
+    transcript = _write_transcript(retry_home["home"], sid)
+    _run_sh(retry_home, transcript, sid, {"DOCKWRIGHT_CLAUDE_BIN": str(tmp_path / "missing")})
+    assert "not an executable file" in _log_text(retry_home)
+
+
+def test_dockwright_claude_bin_in_a_directory_named_with_equals_runs(retry_home, tmp_path):
+    _stub_claude(retry_home, OK_CLAUDE_STUB)
+    wrapper_dir = tmp_path / "opt=wrappers"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "claude-wrapper"
+    wrapper.write_text(ARGV_RECORDING_OK_STUB)
+    wrapper.chmod(0o755)
+    sid = "equals-1"
+    transcript = _write_transcript(retry_home["home"], sid)
+    _run_sh(retry_home, transcript, sid, {"DOCKWRIGHT_CLAUDE_BIN": str(wrapper)})
+    argv_file = retry_home["home"] / "claude-argv.txt"
+    assert argv_file.is_file(), f"wrapper under {wrapper_dir} did not run; log:\n{_log_text(retry_home)}"
+    assert argv_file.read_text().splitlines()[0] == "-p"
+
+
+ENV_RECORDING_OK_STUB = (
+    "#!/usr/bin/env bash\n"
+    'env > "$HOME/claude-env.txt"\n'
+    "echo '## Selffix findings (stub)'\n"
+    "for i in $(seq 1 20); do echo \"- finding line $i: lorem ipsum dolor sit\"; done\n"
+    "echo 'Status: ok'\n"
+)
+SESSION_IDENTITY_VARS = ("CLAUDE_AGENT", "CLAUDE_WORKER_NAME", "CLAUDE_PARENT_MANAGER", "CLAUDE_DOMAIN")
+
+
+def test_child_environment_drops_the_session_identity_vars(retry_home):
+    _stub_claude(retry_home, ENV_RECORDING_OK_STUB)
+    sid = "env-1"
+    transcript = _write_transcript(retry_home["home"], sid)
+    parent_env = {name: "set-by-parent" for name in SESSION_IDENTITY_VARS}
+    _run_sh(retry_home, transcript, sid, {**parent_env, "EXAMPLE_KEPT_VAR": "kept"})
+    env_file = retry_home["home"] / "claude-env.txt"
+    assert env_file.is_file(), f"claude stub did not run; log:\n{_log_text(retry_home)}"
+    names = {line.partition("=")[0] for line in env_file.read_text().splitlines()}
+    assert "EXAMPLE_KEPT_VAR" in names
+    assert names.isdisjoint(SESSION_IDENTITY_VARS), names & set(SESSION_IDENTITY_VARS)

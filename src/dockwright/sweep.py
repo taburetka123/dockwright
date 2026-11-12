@@ -6,8 +6,9 @@ import sys
 import time
 from datetime import datetime
 
-from . import config, paths, state
+from . import config, paths, registry, state
 from .spawner import WORKERS_OS_WINDOW_CLASS
+from .session_pid import _looks_like_session
 from .terminal import get_driver
 from .state import _pid_alive, window_id_of
 
@@ -23,7 +24,7 @@ def _pending_question_sids() -> set[str]:
         return sids
     for q_path in paths.QUESTIONS.rglob("*.json"):
         record = state.read_json(q_path)
-        if record and record.get("worker_sid"):
+        if record and record.get("worker_sid") and not registry.is_engineer_ask(record):
             sids.add(record["worker_sid"])
     return sids
 
@@ -185,11 +186,6 @@ def _is_mcp_client(command: str, images: tuple[str, ...]) -> bool:
     if "run" not in tokens:
         return False
     return any(_image_matches(tok, images) for tok in tokens)
-
-
-def _looks_like_session(command: str) -> bool:
-    tokens = command.split()
-    return bool(tokens) and os.path.basename(tokens[0]) in ("claude", "codex")
 
 
 def _chain_reaches_live_session(pid: int, proc_by_pid: dict[int, dict]) -> bool:

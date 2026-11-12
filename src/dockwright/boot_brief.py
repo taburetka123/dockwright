@@ -4,15 +4,16 @@ import argparse
 import time
 from pathlib import Path
 
-from . import paths
+from . import notebook_mark, paths
 
 MEMORY_WINDOW_DAYS = 7
-MEMORY_CAP = 5
+MEMORY_CAP = 3
 NOTEBOOK_WARN_BYTES = 4096
 
 
 def _agent_file() -> Path:
-    return Path.home() / ".claude" / "agents" / "manager.md"
+    render = paths.ROLES_DIR / "Manager" / "role.manager.md"
+    return render if render.is_file() else paths.AGENTS_DIR / "manager.md"
 
 
 def main(argv=None) -> int:
@@ -56,4 +57,9 @@ def main(argv=None) -> int:
             if size > NOTEBOOK_WARN_BYTES:
                 print(f"NOTEBOOK_WARN [notebook >4KB ({size} bytes) — archive "
                       f"resolved entries to notebook/archive/]")
+            mark = notebook_mark.read(args.domain)
+            if mark is not None and not mark["actualized"]:
+                at = time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(mark["at"]))
+                print(f"NOTEBOOK_NOT_ACTUALIZED [{mark['reason']} — session {mark['sid'][:8]} at {at}; "
+                      "after the boot steps, run Skill: dockwright-notebook-hygiene]")
     return 0
